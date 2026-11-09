@@ -1,0 +1,41 @@
+.{
+    .name = .edit,
+    .version = "0.0.0",
+    .fingerprint = 0x8135de1a49cafa79,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .raylib = .{
+            .url = "git+https://github.com/raysan5/raylib?ref=6.2#02566453880e06bec97f5b8160fa6fe1e98397ca",
+            .hash = "raylib-6.0.0-whq8uDpYOAVcH_KyOZ0--nYF1dEsjdQ5r4e9R24UkQOi",
+        },
+        .tree_sitter = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter?ref=v0.27.2#3fb7be49145acfb07e33b61ed5689e2b6771b2e9",
+            .hash = "tree_sitter-0.27.2-Tw2sR8H1DQA0X6RmzcaABPYo71PUgl1SnGAn9YOYBYyU",
+        },
+        .ts_zig = .{
+            .url = "git+https://github.com/tree-sitter-grammars/tree-sitter-zig?ref=v1.1.2#b670c8df85a1568f498aa5c8cae42f51a90473c0",
+            .hash = "N-V-__8AAN6NXgCZxLUnqe4620P_FqHrEY8PHTA1-VlOn4yX",
+        },
+        .ts_json = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-json?ref=v0.24.8#ee35a6ebefcef0c5c416c0d1ccec7370cfca5a24",
+            .hash = "N-V-__8AACVXAgA_t-N8nrK20OmKiOtw3RhaBCAnXwQIiQ8g",
+        },
+        .ts_python = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-python?ref=v0.25.0#293fdc02038ee2bf0e2e206711b69c90ac0d413f",
+            .hash = "N-V-__8AAK21PgAb_K86C9arl06radxCV934N2VALHkf1vDH",
+        },
+        .ts_rust = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-rust?ref=v0.24.2#77a3747266f4d621d0757825e6b11edcbf991ca5",
+            .hash = "N-V-__8AAHJYbgAipcanYj2A6rnj9wtGzjGzANkrOsqiFAxm",
+        },
+        .ts_c = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-c?ref=v0.24.1#7fa1be1b694b6e763686793d97da01f36a0e5c12",
+            .hash = "N-V-__8AANxPSABzw3WBTSH_YkwaGAfrK6PBqAMqQedkDDim",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

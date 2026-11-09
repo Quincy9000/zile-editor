@@ -1,0 +1,219 @@
+//! The languages compiled into the editor (see `grammars` in build.zig), their
+//! highlight queries, and query predicate evaluation.
+//!
+//! Queries are compiled lazily on first use and live for the whole process.
+//! Main thread only.
+
+const std = @import("std");
+const c = @import("tree_sitter");
+const grammars = @import("grammars");
+const highlight = @import("highlight.zig");
+const Regex = @import("Regex.zig");
+
+pub const Style = highlight.Style;
+
+pub const Language = struct {
+    name: []const u8,
+    extensions: []const []const u8,
+    highlights_source: []const u8,
+    ts: *const fn () callconv(.c) *const c.TSLanguage,
+    query: ?*Query = null,
+    query_failed: bool = false,
+
+    /// The compiled highlight query, or null if it failed to compile.
+    pub fn highlights(lang: *Language) ?*const Query {
+        if (lang.query) |q| return q;
+        if (lang.query_failed) return null;
+        lang.query = Query.load(lang) catch |err| blk: {
+            std.log.warn("{s} highlight query: {s}", .{ lang.name, @errorName(err) });
+            lang.query_failed = true;
+            break :blk null;
+        };
+        return lang.query;
+    }
+};
+
+/// One entry per grammar, with the `tree_sitter_<name>` entry point declared
+/// at compile time.
+var registry = blk: {
+    var langs: [grammars.all.len]Language = undefined;
+    for (grammars.all, 0..) |g, i| {
+        langs[i] = .{
+            .name = g.name,
+            .extensions = g.extensions,
+            .highlights_source = g.highlights,
+            .ts = @extern(*const fn () callconv(.c) *const c.TSLanguage, .{ .name = "tree_sitter_" ++ g.name }),
+        };
+    }
+    break :blk langs;
+};
+
+pub fn forPath(path: []const u8) ?*Language {
+    const base = std.fs.path.basename(path);
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
+    const ext = base[dot + 1 ..];
+    for (&registry) |*lang| {
+        for (lang.extensions) |e| if (std.mem.eql(u8, e, ext)) return lang;
+    }
+    return null;
+}
+
+pub fn byName(name: []const u8) ?*Language {
+    for (&registry) |*lang| if (std.mem.eql(u8, lang.name, name)) return lang;
+    return null;
+}
+
+// Query data lives as long as the process; tree-sitter itself uses malloc.
+const alloc = std.heap.c_allocator;
+
+pub const Query = struct {
+    ts: *c.TSQuery,
+    /// Style for each capture index.
+    capture_styles: []Style,
+    /// Predicates for each pattern index.
+    predicates: [][]Predicate,
+
+    const LoadError = error{ QueryCompile, OutOfMemory };
+
+    fn load(lang: *Language) LoadError!*Query {
+        var err_offset: u32 = 0;
+        var err_type: c.TSQueryError = c.TSQueryErrorNone;
+        const src = lang.highlights_source;
+        const ts = c.ts_query_new(lang.ts(), src.ptr, @intCast(src.len), &err_offset, &err_type) orelse {
+            std.log.warn("{s}: query error {d} at byte {d}", .{ lang.name, err_type, err_offset });
+            return error.QueryCompile;
+        };
+        const q = try alloc.create(Query);
+        q.ts = ts;
+
+        q.capture_styles = try alloc.alloc(Style, c.ts_query_capture_count(ts));
+        for (q.capture_styles, 0..) |*s, i| {
+            var len: u32 = 0;
+            const name = c.ts_query_capture_name_for_id(ts, @intCast(i), &len);
+            s.* = highlight.styleForCapture(name[0..len]);
+        }
+
+        q.predicates = try alloc.alloc([]Predicate, c.ts_query_pattern_count(ts));
+        for (q.predicates, 0..) |*preds, i| preds.* = try parsePredicates(ts, @intCast(i));
+        return q;
+    }
+
+    /// Whether all predicates of the match's pattern hold.
+    pub fn matches(q: *const Query, m: c.TSQueryMatch, text: []const u8) bool {
+        for (q.predicates[m.pattern_index]) |p| {
+            if (!p.holds(m, text)) return false;
+        }
+        return true;
+    }
+};
+
+pub const Predicate = struct {
+    kind: enum { eq, any_of, match },
+    negate: bool,
+    capture: u32,
+    values: []const []const u8,
+    regex: ?Regex = null,
+
+    fn holds(p: Predicate, m: c.TSQueryMatch, text: []const u8) bool {
+        const node_text = captureText(m, p.capture, text) orelse return true;
+        const result = switch (p.kind) {
+            .eq => std.mem.eql(u8, node_text, p.values[0]),
+            .any_of => for (p.values) |v| {
+                if (std.mem.eql(u8, node_text, v)) break true;
+            } else false,
+            .match => if (p.regex) |re| re.isMatch(node_text) else true,
+        };
+        return result != p.negate;
+    }
+};
+
+fn captureText(m: c.TSQueryMatch, capture: u32, text: []const u8) ?[]const u8 {
+    for (m.captures[0..m.capture_count]) |cap| {
+        if (cap.index != capture) continue;
+        const start = c.ts_node_start_byte(cap.node);
+        const end = c.ts_node_end_byte(cap.node);
+        if (end > text.len or start > end) return null;
+        return text[start..end];
+    }
+    return null;
+}
+
+/// Parses the predicates of one pattern. Unknown ones (`#set!`, ...) are ignored.
+fn parsePredicates(ts: *c.TSQuery, pattern: u32) ![]Predicate {
+    var count: u32 = 0;
+    const steps_ptr = c.ts_query_predicates_for_pattern(ts, pattern, &count);
+    if (count == 0) return &.{};
+    const steps = steps_ptr[0..count];
+    var out: std.ArrayList(Predicate) = .empty;
+
+    var i: usize = 0;
+    while (i < steps.len) {
+        // One predicate: name, args..., done.
+        var end = i;
+        while (end < steps.len and steps[end].type != c.TSQueryPredicateStepTypeDone) end += 1;
+        defer i = end + 1;
+        const args = steps[i..end];
+        if (args.len < 2 or args[0].type != c.TSQueryPredicateStepTypeString) continue;
+        if (args[1].type != c.TSQueryPredicateStepTypeCapture) continue;
+
+        const name = stringValue(ts, args[0].value_id);
+        const negate = std.mem.startsWith(u8, name, "not-");
+        const base = if (negate) name["not-".len..] else name;
+
+        var values: std.ArrayList([]const u8) = .empty;
+        for (args[2..]) |a| {
+            if (a.type == c.TSQueryPredicateStepTypeString) try values.append(alloc, stringValue(ts, a.value_id));
+        }
+        if (values.items.len == 0) continue;
+
+        var p: Predicate = .{ .kind = .eq, .negate = negate, .capture = args[1].value_id, .values = try values.toOwnedSlice(alloc) };
+        if (std.mem.eql(u8, base, "eq?")) {
+            p.kind = .eq;
+        } else if (std.mem.eql(u8, base, "any-of?")) {
+            p.kind = .any_of;
+        } else if (std.mem.eql(u8, base, "match?") or std.mem.eql(u8, base, "lua-match?")) {
+            p.kind = .match;
+            p.regex = Regex.compile(p.values[0], std.mem.eql(u8, base, "lua-match?"));
+        } else continue;
+        try out.append(alloc, p);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn stringValue(ts: *c.TSQuery, id: u32) []const u8 {
+    var len: u32 = 0;
+    const s = c.ts_query_string_value_for_id(ts, id, &len);
+    return s[0..len];
+}
+
+/// Runs `q` over `[start, end)` of the tree, writing a style for every byte
+/// into `out` (indexed from `start`). Later captures override earlier ones,
+/// so specific patterns (listed after general ones) win.
+pub fn run(q: *const Query, cursor: *c.TSQueryCursor, root: c.TSNode, text: []const u8, start: usize, end: usize, out: []Style) void {
+    @memset(out, .none);
+    _ = c.ts_query_cursor_set_byte_range(cursor, @intCast(start), @intCast(end));
+    c.ts_query_cursor_exec(cursor, q.ts, root);
+    var m: c.TSQueryMatch = undefined;
+    var capture_index: u32 = 0;
+    while (c.ts_query_cursor_next_capture(cursor, &m, &capture_index)) {
+        const cap = m.captures[capture_index];
+        const style = q.capture_styles[cap.index];
+        if (style == .none) continue;
+        if (!q.matches(m, text)) continue;
+        const s = @max(c.ts_node_start_byte(cap.node), start);
+        const e = @min(c.ts_node_end_byte(cap.node), end);
+        if (e > s) @memset(out[s - start .. e - start], style);
+    }
+}
+
+test "every grammar's highlight query compiles" {
+    for (&registry) |*lang| {
+        if (lang.highlights() == null) {
+            std.debug.print("query failed for {s}\n", .{lang.name});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqualStrings("zig", forPath("src/main.zig").?.name);
+    try std.testing.expectEqualStrings("rust", forPath("/x/lib.rs").?.name);
+    try std.testing.expectEqual(null, forPath("README"));
+}
