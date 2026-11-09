@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
     const theme = &Theme.default;
 
     // Size the view before scripted keys so scrolling behaves like the real window.
-    ed.setViewSize(render.layout(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight()).rows, 80);
+    _ = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
     // Scripted keys: "<Wait>" splits them into segments fed ~0.75s apart, so
     // async results (language server, pickers) can arrive in between.
     var script = std.mem.splitSequence(u8, test_keys orelse "", "<Wait>");
@@ -100,9 +100,8 @@ pub fn main(init: std.process.Init) !void {
         while (glfw.next()) |ev| ed.handleKey(ev);
         ed.tick();
 
-        const l = render.layout(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
-        ed.setViewSize(l.rows, l.cols);
-        handleMouse(&ed, &font, l);
+        handleMouse(&ed, &font);
+        const l = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
         title.update(&ed);
 
         rl.BeginDrawing();
@@ -136,13 +135,19 @@ fn clipboardSet(gpa: std.mem.Allocator, text: []const u8) void {
     rl.SetClipboardText(z.ptr);
 }
 
-fn handleMouse(ed: *Editor, font: *const Font, l: render.Layout) void {
+/// The wheel scrolls the window under the pointer; a click focuses that
+/// window and moves the cursor there.
+fn handleMouse(ed: *Editor, font: *const Font) void {
+    const pos = rl.GetMousePosition();
     const wheel = rl.GetMouseWheelMove();
+    const clicked = rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
+    if (wheel == 0 and !clicked) return;
+    const w = ed.windows.at(pos.x, pos.y) orelse return;
+    ed.focusWindow(w);
     if (wheel != 0) ed.scrollLines(@intFromFloat(-wheel * 3));
-
-    if (rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT)) {
-        const pos = rl.GetMousePosition();
-        if (l.cellAt(font, pos.x, pos.y)) |cell| ed.clickCell(cell.row, cell.col);
+    if (clicked) {
+        const l = render.windowLayout(ed, font, w);
+        if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.clickCell(cell.row, cell.col);
     }
 }
 

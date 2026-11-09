@@ -49,6 +49,8 @@ pub const Command = struct {
     /// With several cursors, runs at the primary only instead of at each one
     /// (undo, `.`, macros, cursor management). Leader commands always are.
     once: bool = false,
+    /// A jump: the place it leaves goes on the jumplist (`<C-o>` returns).
+    jump: bool = false,
     /// Works while the cursor is on a ghost line (otherwise the cursor
     /// returns to the text first, or the command is refused if it edits).
     ghost: bool = false,
@@ -71,29 +73,29 @@ const base = [_]Command{
     .{ .name = "line_start", .doc = "Start of line", .run = ghostCol(.start, motion(lineStart, .exclusive, .reset)), .ghost = true },
     .{ .name = "first_non_blank", .doc = "First non-blank", .run = ghostCol(.first_non_blank, motion(firstNonBlank, .exclusive, .reset)), .ghost = true },
     .{ .name = "line_end", .doc = "End of line", .run = ghostCol(.end, motion(lineEnd, .inclusive, .eol)), .ghost = true },
-    .{ .name = "goto_first_line", .doc = "First line (or line [count])", .run = motion(firstLine, .linewise, .reset) },
-    .{ .name = "goto_last_line", .doc = "Last line (or line [count])", .run = motion(lastLine, .linewise, .reset) },
+    .{ .name = "goto_first_line", .doc = "First line (or line [count])", .run = motion(firstLine, .linewise, .reset) , .jump = true },
+    .{ .name = "goto_last_line", .doc = "Last line (or line [count])", .run = motion(lastLine, .linewise, .reset) , .jump = true },
     .{ .name = "find_char", .doc = "Find character", .run = ghostFind(.{ .forward = true, .till = false }, motion(findChar(true, false), .inclusive, .reset)), .takes_char = true, .ghost = true },
     .{ .name = "find_char_backward", .doc = "Find character backward", .run = ghostFind(.{ .forward = false, .till = false }, motion(findChar(false, false), .exclusive, .reset)), .takes_char = true, .ghost = true },
     .{ .name = "till_char", .doc = "Till character", .run = ghostFind(.{ .forward = true, .till = true }, motion(findChar(true, true), .inclusive, .reset)), .takes_char = true, .ghost = true },
     .{ .name = "till_char_backward", .doc = "Till character backward", .run = ghostFind(.{ .forward = false, .till = true }, motion(findChar(false, true), .exclusive, .reset)), .takes_char = true, .ghost = true },
     .{ .name = "repeat_find", .doc = "Repeat f/t", .run = ghostFind(.repeat, repeatFind(false)), .ghost = true },
     .{ .name = "repeat_find_reverse", .doc = "Repeat f/t backward", .run = ghostFind(.repeat_reverse, repeatFind(true)), .ghost = true },
-    .{ .name = "match_bracket", .doc = "Matching bracket", .run = motion(matchBracket, .inclusive, .reset) },
-    .{ .name = "paragraph_forward", .doc = "Next paragraph", .run = motion(paragraphForward, .exclusive, .reset) },
-    .{ .name = "paragraph_backward", .doc = "Previous paragraph", .run = motion(paragraphBackward, .exclusive, .reset) },
-    .{ .name = "screen_top", .doc = "Top of screen", .run = motion(screenLine(.top), .linewise, .reset) },
-    .{ .name = "screen_middle", .doc = "Middle of screen", .run = motion(screenLine(.middle), .linewise, .reset) },
-    .{ .name = "screen_bottom", .doc = "Bottom of screen", .run = motion(screenLine(.bottom), .linewise, .reset) },
-    .{ .name = "search_next", .doc = "Next match", .run = searchNextCmd(false), .ghost = true },
-    .{ .name = "search_previous", .doc = "Previous match", .run = searchNextCmd(true), .ghost = true },
+    .{ .name = "match_bracket", .doc = "Matching bracket", .run = motion(matchBracket, .inclusive, .reset) , .jump = true },
+    .{ .name = "paragraph_forward", .doc = "Next paragraph", .run = motion(paragraphForward, .exclusive, .reset) , .jump = true },
+    .{ .name = "paragraph_backward", .doc = "Previous paragraph", .run = motion(paragraphBackward, .exclusive, .reset) , .jump = true },
+    .{ .name = "screen_top", .doc = "Top of screen", .run = motion(screenLine(.top), .linewise, .reset) , .jump = true },
+    .{ .name = "screen_middle", .doc = "Middle of screen", .run = motion(screenLine(.middle), .linewise, .reset) , .jump = true },
+    .{ .name = "screen_bottom", .doc = "Bottom of screen", .run = motion(screenLine(.bottom), .linewise, .reset) , .jump = true },
+    .{ .name = "search_next", .doc = "Next match", .run = searchNextCmd(false), .ghost = true , .jump = true },
+    .{ .name = "search_previous", .doc = "Previous match", .run = searchNextCmd(true), .ghost = true , .jump = true },
 
     // Search
     .{ .name = "search_forward", .doc = "Search forward", .run = startSearch(true, .search) },
     .{ .name = "search_backward", .doc = "Search backward", .run = startSearch(false, .search) },
     .{ .name = "snipe", .doc = "Jump to text on screen", .run = startSearch(true, .snipe) },
-    .{ .name = "search_word_forward", .doc = "Search word under cursor", .run = searchWord(true) },
-    .{ .name = "search_word_backward", .doc = "Search word under cursor backward", .run = searchWord(false) },
+    .{ .name = "search_word_forward", .doc = "Search word under cursor", .run = searchWord(true) , .jump = true },
+    .{ .name = "search_word_backward", .doc = "Search word under cursor backward", .run = searchWord(false) , .jump = true },
     .{ .name = "clear_search_highlight", .doc = "Clear search highlight", .run = clearSearchHighlight , .once = true },
     .{ .name = "search_accept", .doc = "Go to the match", .run = searchAccept, .hidden = true },
     .{ .name = "search_cancel", .doc = "Cancel the search", .run = searchCancel, .hidden = true },
@@ -188,8 +190,8 @@ const base = [_]Command{
     .{ .name = "git_changed_files", .doc = "Changed files", .run = openPicker(.git_changes) },
     .{ .name = "git_set_remote", .doc = "Set remote URL", .run = gitAction(.remote) },
     .{ .name = "git_restore_hunk", .doc = "Restore hunk from HEAD", .run = gitCmd(.restore), .ghost = true },
-    .{ .name = "git_next_hunk", .doc = "Next change", .run = gitCmd(.next), .ghost = true },
-    .{ .name = "git_previous_hunk", .doc = "Previous change", .run = gitCmd(.previous), .ghost = true },
+    .{ .name = "git_next_hunk", .doc = "Next change", .run = gitCmd(.next), .ghost = true , .jump = true },
+    .{ .name = "git_previous_hunk", .doc = "Previous change", .run = gitCmd(.previous), .ghost = true , .jump = true },
     .{ .name = "git_reload", .doc = "Reload HEAD", .run = gitCmd(.reload), .ghost = true },
 
     // Entering insert mode
@@ -242,8 +244,33 @@ const base = [_]Command{
     .{ .name = "find_file", .doc = "Find file", .run = openPicker(.files) },
     .{ .name = "switch_buffer", .doc = "Switch buffer", .run = openPicker(.buffers) },
     .{ .name = "kill_buffer", .doc = "Kill buffer", .run = killBuffer },
-    .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) },
-    .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) },
+    .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) , .jump = true },
+    .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) , .jump = true },
+    .{ .name = "jump_older", .doc = "Back (jumplist)", .run = jumpCmd(.older), .once = true },
+    .{ .name = "jump_newer", .doc = "Forward (jumplist)", .run = jumpCmd(.newer), .once = true },
+    .{ .name = "jump_list", .doc = "Jumplist", .run = openPicker(.jumps), .once = true },
+    .{ .name = "new_buffer", .doc = "New empty buffer", .run = bufferCmd(.new) },
+    .{ .name = "last_buffer", .doc = "Other buffer (flip back)", .run = bufferCmd(.last) , .jump = true },
+    .{ .name = "kill_other_buffers", .doc = "Kill other buffers", .run = bufferCmd(.kill_others) },
+    .{ .name = "revert_buffer", .doc = "Revert from disk", .run = bufferCmd(.revert) },
+    .{ .name = "save_all", .doc = "Save all buffers", .run = bufferCmd(.save_all) },
+    // Windows (SPC w): s + direction splits, the direction alone moves.
+    .{ .name = "split_left", .doc = "Split left", .run = windowCmd(.{ .split = .left }), .once = true },
+    .{ .name = "split_down", .doc = "Split below", .run = windowCmd(.{ .split = .down }), .once = true },
+    .{ .name = "split_up", .doc = "Split above", .run = windowCmd(.{ .split = .up }), .once = true },
+    .{ .name = "split_right", .doc = "Split right", .run = windowCmd(.{ .split = .right }), .once = true },
+    .{ .name = "window_left", .doc = "Window left", .run = windowCmd(.{ .focus = .left }), .once = true },
+    .{ .name = "window_down", .doc = "Window below", .run = windowCmd(.{ .focus = .down }), .once = true },
+    .{ .name = "window_up", .doc = "Window above", .run = windowCmd(.{ .focus = .up }), .once = true },
+    .{ .name = "window_right", .doc = "Window right", .run = windowCmd(.{ .focus = .right }), .once = true },
+    .{ .name = "window_next", .doc = "Next window", .run = windowCmd(.next), .once = true },
+    .{ .name = "window_close", .doc = "Close window", .run = windowCmd(.close), .once = true },
+    .{ .name = "window_only", .doc = "Close other windows", .run = windowCmd(.only), .once = true },
+    .{ .name = "window_balance", .doc = "Equal sizes", .run = windowCmd(.balance), .once = true },
+    .{ .name = "window_wider", .doc = "Wider", .run = windowCmd(.{ .resize = .{ .horizontal, 0.05 } }), .once = true },
+    .{ .name = "window_narrower", .doc = "Narrower", .run = windowCmd(.{ .resize = .{ .horizontal, -0.05 } }), .once = true },
+    .{ .name = "window_taller", .doc = "Taller", .run = windowCmd(.{ .resize = .{ .vertical, 0.05 } }), .once = true },
+    .{ .name = "window_shorter", .doc = "Shorter", .run = windowCmd(.{ .resize = .{ .vertical, -0.05 } }), .once = true },
     .{ .name = "command_picker", .doc = "Run a command", .run = openPicker(.commands) },
     .{ .name = "resume_picker", .doc = "Resume last picker", .run = resumePicker },
     .{ .name = "quit", .doc = "Quit", .run = quit },
@@ -1284,6 +1311,62 @@ fn surroundStep(comptime step: enum { add, delete, change_from, change_to, visua
                     ed.exitVisual();
                     try pairs.add(ed, r, c.char, r.linewise);
                 },
+            }
+        }
+    }.run;
+}
+
+fn jumpCmd(comptime dir: enum { older, newer }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            switch (dir) {
+                .older => try c.ed.jumpOlder(c.count),
+                .newer => try c.ed.jumpNewer(c.count),
+            }
+        }
+    }.run;
+}
+
+fn bufferCmd(comptime action: enum { new, last, kill_others, revert, save_all }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            switch (action) {
+                .new => try ed.newBuffer(),
+                .last => try ed.lastBuffer(),
+                .kill_others => try ed.killOtherBuffers(),
+                .revert => {
+                    ed.reloadBuffer(ed.buffer) catch |err| return ed.setMessage(.err, "could not revert: {s}", .{@errorName(err)});
+                    ed.setMessage(.info, "reverted \"{s}\" from disk", .{ed.buffer.displayName()});
+                },
+                .save_all => ed.saveAll(),
+            }
+        }
+    }.run;
+}
+
+const WindowAction = union(enum) {
+    split: Editor.Windows.Dir,
+    focus: Editor.Windows.Dir,
+    next,
+    close,
+    only,
+    balance,
+    resize: struct { Editor.Windows.Axis, f32 },
+};
+
+fn windowCmd(comptime action: WindowAction) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            switch (action) {
+                .split => |d| try ed.splitWindow(d),
+                .focus => |d| for (0..c.count) |_| ed.focusDirection(d),
+                .next => for (0..c.count) |_| ed.focusNext(),
+                .close => ed.closeWindow(),
+                .only => try ed.onlyWindow(),
+                .balance => ed.windows.balance(),
+                .resize => |r| Editor.Windows.resize(ed.window, r[0], r[1] * @as(f32, @floatFromInt(c.count))),
             }
         }
     }.run;

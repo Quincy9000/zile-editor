@@ -68,6 +68,12 @@ under it is a compile error.
 | `qj` `qk`, visual `qI` `qA` | cursor + move down / up; cursors at line starts / ends without inserting | done |
 | `qu` `qq`, `<Esc>` in normal | remove the last cursor; remove all | done |
 | `Q{reg}` … `Q`, `@{reg}` | record / play a macro (`q` is the multicursor menu) | done |
+| `<C-o>` / `<C-i>` (`<Tab>`), `SPC s j` | jumplist: back / forward, or pick from a list (newest first, previewed) | done |
+| `SPC w s` + `h/j/k/l` | split: a new window on that side showing this buffer (focus moves into it) | done |
+| `SPC w h/j/k/l`, `SPC w w` | focus the window on that side; the next window (wrapping) | done |
+| `SPC w d` / `SPC w c`, `SPC w o`, `SPC w =` | close window, close the others, equal sizes | done |
+| `SPC w >` `<` `+` `-` | wider, narrower, taller, shorter | done |
+| `SPC b N`, `SPC b b` / `SPC b l` / ``SPC ` ``, `SPC b O`, `SPC b r`, `SPC b s` / `SPC b S` | new empty buffer, flip to the other buffer (picker: `SPC b B` / `SPC ,`), kill others (keeps unsaved), revert from disk, save / save all | done |
 | `SPC t p` | toggle autopairs (on by default): `(` → `()`, closers and quotes step over, quotes skip word neighbors, `<CR>` in `{}` opens a block | done |
 | `SPC g g` | git menu (plain-English actions: commit, push, pull, branches, changed files, set remote, ...) | done |
 | `SPC g c` / `SPC g b` / `SPC g s` | commit all (saves, prompts for a message) / switch or create branch / changed files | done |
@@ -76,7 +82,7 @@ under it is a compile error.
 | `SPC q q` / `SPC q s` / `SPC q Q` | quit (refuses if any buffer is unsaved) / save all and quit / quit without saving | done |
 | `SPC SPC`, `SPC f f` | find file in project (fuzzy, + create) | done |
 | `SPC .`, `SPC f e` | explore files (browser): one folder at a time, starting at the current file's folder. `Enter`/`/` on a folder goes in, `Enter` on a file opens it, `<BS>` on an empty query goes up (selecting where you came from), `~` home, `/` on an empty query the root; a new name offers "Create" | done |
-| `SPC ,`, `SPC b b` / `SPC b k` | switch / kill buffer | done |
+| `SPC ,`, `SPC b B` / `SPC b k` | buffer picker / kill buffer | done |
 | `SPC b n` / `SPC b p` | next / previous buffer | done |
 | `SPC :` | command picker (M-x) | done |
 | `SPC '` | resume last picker | done |
@@ -151,6 +157,24 @@ macros. Modern parts:
   selection. Motions are pure functions, so multiple cursors only add a loop.
 - **Which-key popup** for pending prefixes, generated from the keymap and
   command docs (see Keybindings).
+- **Jumplist (done):** `Editor.jumps` holds the places jumps left (buffer +
+  byte position, plus the path so a closed file reopens), one per line,
+  at most 100. Commands flagged `jump` (gg, G, %, {, }, H/M/L, n/N, *, #,
+  hunk and buffer moves) record before running; searches and snipes record
+  their origin; `jumpTo` (definitions, locations) and pickers that navigate
+  record too. Edits shift entries like cursors. `<C-o>` from the newest
+  place first records it, so `<C-i>` comes back.
+- **Windows (done):** `Windows.zig` is a tree of splits (side by side or
+  stacked, with a ratio) whose leaves are windows, each with a buffer and its
+  own `View`. The focused window's live state stays in `Editor.buffer`/`view`
+  so editing code is unchanged; focusing swaps it in and out. Edits shift the
+  cursors of other windows on the same buffer. The renderer lays out the tree
+  every frame (on whole cells), and draws each window clipped to its
+  rectangle with rlgl's matrix translated to its origin, so drawing code
+  stays in local coordinates; unfocused windows are drawn by temporarily
+  swapping in their buffer/view (`peekWindow`) and re-highlighting their
+  visible lines. With several windows each has a header line (file name).
+  Mouse clicks and the wheel focus the window under the pointer.
 - **Multicursor (done):** extra cursors live in `Editor.cursors`; the primary
   is `view`. A command's keys are collected until it completes (idle again, or
   in insert mode) and then replayed at every extra cursor from the mode the

@@ -28,4 +28,5 @@ comptime {
     _ = @import("picker/Picker.zig");
     _ = @import("commands.zig");
     _ = @import("Editor.zig");
+    _ = @import("Windows.zig");
 }

@@ -25,6 +25,7 @@ const Completion = @import("lsp/Completion.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
+pub const Windows = @import("Windows.zig");
 const textobjects = @import("core/textobjects.zig");
 
 const Editor = @This();
@@ -95,6 +96,14 @@ pub const GhostCursor = struct {
     col: usize,
     /// Visual selection over ghost lines: the anchor's index.
     anchor: ?u32 = null,
+};
+
+/// A place in the jumplist. `buffer` is null once that buffer is closed;
+/// `path` (owned) reopens it.
+pub const Jump = struct {
+    buffer: ?*Buffer,
+    path: ?[]u8,
+    pos: usize,
 };
 
 /// A cursor besides the primary one: position, visual anchor, wanted column.
@@ -188,6 +197,11 @@ options: Options = .{},
 /// All open buffers (owned). `buffer` is the one being shown.
 buffers: std.ArrayList(*Buffer) = .empty,
 buffer: *Buffer,
+/// Window splits. The focused window's live state is `buffer` and `view`.
+windows: Windows,
+window: *Windows.Window,
+/// Every window in reading order (rebuilt when the layout changes).
+window_list: std.ArrayList(*Windows.Window) = .empty,
 /// Bumped on every buffer switch, for most-recently-used ordering.
 use_counter: u64 = 0,
 view: View = .{},
@@ -227,6 +241,11 @@ multi_once: bool = false,
 replaying: bool = false,
 /// The primary cursor, set aside while replaying (edits still shift it).
 primary_saved: ?Cursor = null,
+/// Jumplist (`<C-o>` / `<C-i>`, `SPC s j`): places left by jumps, oldest
+/// first. `jump_index` is the entry being visited, or `jumps.len` when not
+/// moving through the list.
+jumps: std.ArrayList(Jump) = .empty,
+jump_index: usize = 0,
 /// Surround in progress: the range `ys` will wrap, the pair `cs` replaces.
 surround_range: operators.Range = .{ .start = 0, .end = 0 },
 surround_from: u21 = 0,
@@ -308,7 +327,14 @@ pub fn init(gpa: Allocator, io: Io) !Editor {
 
     var buffers: std.ArrayList(*Buffer) = .empty;
     try buffers.append(gpa, scratch);
+    var windows = try Windows.init(gpa, scratch);
+    errdefer windows.deinit();
+    var window_list: std.ArrayList(*Windows.Window) = .empty;
+    try window_list.append(gpa, windows.root.kind.window);
     return .{
+        .windows = windows,
+        .window = windows.root.kind.window,
+        .window_list = window_list,
         .gpa = gpa,
         .io = io,
         .cwd = cwd,
@@ -333,6 +359,8 @@ pub fn deinit(ed: *Editor) void {
         ed.gpa.destroy(b);
     }
     ed.buffers.deinit(ed.gpa);
+    ed.windows.deinit();
+    ed.window_list.deinit(ed.gpa);
     ed.resume_query.deinit(ed.gpa);
     ed.browse_dir.deinit(ed.gpa);
     ed.browse_label.deinit(ed.gpa);
@@ -344,6 +372,8 @@ pub fn deinit(ed: *Editor) void {
     ed.change_keys.deinit(ed.gpa);
     ed.cursors.deinit(ed.gpa);
     ed.multi_keys.deinit(ed.gpa);
+    for (ed.jumps.items) |j| if (j.path) |p| ed.gpa.free(p);
+    ed.jumps.deinit(ed.gpa);
     ed.last_change.deinit(ed.gpa);
     ed.macro_keys.deinit(ed.gpa);
     ed.queue.deinit(ed.gpa);
@@ -352,11 +382,9 @@ pub fn deinit(ed: *Editor) void {
     ed.* = undefined;
 }
 
-/// Per-frame housekeeping: reparses and highlights the visible lines, and
-/// picks up picker results from the worker.
-pub fn tick(ed: *Editor) void {
-    ed.tickLsp();
-    ed.pollGitJob();
+/// Reparses the current buffer and highlights the lines its view shows,
+/// and refreshes its git diff (each window calls this before drawing).
+pub fn highlightView(ed: *Editor) void {
     ed.updateGit();
     if (ed.buffer.syntax) |*s| {
         const t = ed.text();
@@ -367,6 +395,43 @@ pub fn tick(ed: *Editor) void {
         const last = if (ed.foldAt(last_visible)) |f| f.last else last_visible;
         s.highlight(ed.gpa, t, t.lineStart(first), t.lineEnd(last)) catch {};
     }
+}
+
+/// State set aside while drawing an unfocused window (`peekWindow`).
+pub const Peek = struct {
+    buffer: *Buffer,
+    view: View,
+    ghost: ?GhostCursor,
+    mode: Mode,
+    cursors: usize,
+};
+
+/// Shows `w`'s buffer and view as current, for drawing it. Undo with `unpeekWindow`.
+pub fn peekWindow(ed: *Editor, w: *Windows.Window) Peek {
+    const saved: Peek = .{ .buffer = ed.buffer, .view = ed.view, .ghost = ed.ghost, .mode = ed.mode, .cursors = ed.cursors.items.len };
+    ed.buffer = w.buffer;
+    ed.view = w.view;
+    ed.view.cursor = @min(ed.view.cursor, ed.text().len());
+    ed.ghost = null;
+    ed.mode = .normal;
+    ed.cursors.items.len = 0;
+    return saved;
+}
+
+pub fn unpeekWindow(ed: *Editor, p: Peek) void {
+    ed.buffer = p.buffer;
+    ed.view = p.view;
+    ed.ghost = p.ghost;
+    ed.mode = p.mode;
+    ed.cursors.items.len = p.cursors;
+}
+
+/// Per-frame housekeeping: reparses and highlights the visible lines, and
+/// picks up picker results from the worker.
+pub fn tick(ed: *Editor) void {
+    ed.tickLsp();
+    ed.pollGitJob();
+    ed.highlightView();
     if (ed.picker) |p| {
         p.poll();
         p.updatePreview();
@@ -581,6 +646,7 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
             };
             const register = ed.register;
             // Leader menus, undo, `.` and the like act once, not per cursor.
+            if (cmd.jump and !ed.replaying and (ed.mode == .normal or ed.mode == .visual)) ed.pushJump();
             if (cmd.once or (seq.len > 1 and seq[0].key == .codepoint and seq[0].key.codepoint == ' ')) ed.multi_once = true;
             ed.pending_len = 0;
             ed.count = 0;
@@ -877,18 +943,31 @@ fn pollGitJob(ed: *Editor) void {
 /// Re-reads every unmodified buffer from disk (after a pull or branch switch).
 fn reloadFromDisk(ed: *Editor) void {
     for (ed.buffers.items) |b| {
-        const path = b.path orelse continue;
-        if (b.modified) continue;
-        var fresh = Buffer.load(ed.gpa, ed.io, path) catch continue;
-        const cursor = if (b == ed.buffer) ed.view.cursor else b.saved.cursor;
-        ed.lspCloseBuffer(b);
-        const saved = b.saved;
-        const last_used = b.last_used;
-        b.deinit(ed.gpa);
-        fresh.saved = saved;
-        fresh.last_used = last_used;
-        b.* = fresh;
-        if (b == ed.buffer) ed.setCursor(@min(cursor, b.text.len()));
+        if (b.path == null or b.modified) continue;
+        ed.reloadBuffer(b) catch continue;
+    }
+}
+
+/// Replaces `b`'s text with the file on disk (discarding unsaved changes).
+pub fn reloadBuffer(ed: *Editor, b: *Buffer) !void {
+    const path = b.path orelse return error.NoPath;
+    var fresh = try Buffer.load(ed.gpa, ed.io, path);
+    const cursor = if (b == ed.buffer) ed.view.cursor else b.saved.cursor;
+    ed.lspCloseBuffer(b);
+    const saved = b.saved;
+    const last_used = b.last_used;
+    b.deinit(ed.gpa);
+    fresh.saved = saved;
+    fresh.last_used = last_used;
+    b.* = fresh;
+    ed.loadGitBase(b);
+    for (ed.window_list.items) |w| if (w != ed.window and w.buffer == b) {
+        w.view.cursor = @min(w.view.cursor, b.text.len());
+        w.view.anchor = w.view.cursor;
+    };
+    if (b == ed.buffer) {
+        ed.cursors.clearRetainingCapacity();
+        ed.setCursor(@min(cursor, b.text.len()));
     }
 }
 
@@ -1229,6 +1308,7 @@ fn finishSearch(ed: *Editor, pos: usize) !void {
     ed.mode = sp.return_mode;
     ed.view.cursor = sp.origin;
     ed.view.top = sp.origin_top;
+    if (sp.return_mode != .operator) ed.pushJumpAt(sp.origin);
     if (sp.return_mode == .operator) {
         return ed.applyPending(operators.motionRange(ed.text(), sp.origin, pos, .exclusive));
     }
@@ -1445,6 +1525,7 @@ fn finishSearchRow(ed: *Editor, rp: RowPos) !void {
     ed.search_highlight = true;
     ed.mode = sp.return_mode;
     ed.view.top = sp.origin_top;
+    if (sp.return_mode != .operator) ed.pushJumpAt(sp.origin);
     ed.setRowPos(rp);
 }
 
@@ -2056,6 +2137,7 @@ pub fn absolutePath(ed: *Editor, path: []const u8) Allocator.Error![]u8 {
 
 /// Opens `path` and puts the cursor at (`line`, `col`), both 0-based.
 pub fn jumpTo(ed: *Editor, path: []const u8, line: usize, col: usize) !void {
+    ed.pushJump();
     try ed.openFile(path);
     const t = ed.text();
     const l = @min(line, t.lineCount() - 1);
@@ -2110,17 +2192,22 @@ pub fn killBuffer(ed: *Editor, b: *Buffer) !void {
         const fresh = try Buffer.initEmpty(ed.gpa);
         b.deinit(ed.gpa);
         b.* = fresh;
+        for (ed.window_list.items) |w| w.view = .{ .rows = w.view.rows, .cols = w.view.cols };
         ed.activate(b);
         return;
     }
     _ = ed.buffers.orderedRemove(ed.bufferIndex(b));
-    if (b == ed.buffer) {
-        var next = ed.buffers.items[0];
-        for (ed.buffers.items) |o| {
-            if (o.last_used > next.last_used) next = o;
-        }
-        ed.activate(next);
+    ed.forgetJumps(b);
+    var next = ed.buffers.items[0];
+    for (ed.buffers.items) |o| {
+        if (o.last_used > next.last_used) next = o;
     }
+    // Windows showing it show the most recent other buffer instead.
+    for (ed.window_list.items) |w| if (w != ed.window and w.buffer == b) {
+        w.buffer = next;
+        w.view = .{ .cursor = next.saved.cursor, .top = next.saved.top, .left = next.saved.left, .rows = w.view.rows, .cols = w.view.cols };
+    };
+    if (b == ed.buffer) ed.activate(next);
     b.deinit(ed.gpa);
     ed.gpa.destroy(b);
 }
@@ -2214,6 +2301,12 @@ fn shiftCursors(ed: *Editor, start: usize, end: usize, inserted: usize) void {
         S.shift(&c.pos, start, end, inserted);
         S.shift(&c.anchor, start, end, inserted);
     }
+    for (ed.jumps.items) |*j| if (j.buffer == ed.buffer) S.shift(&j.pos, start, end, inserted);
+    // Other windows on this buffer keep their place too.
+    for (ed.window_list.items) |w| if (w != ed.window and w.buffer == ed.buffer) {
+        S.shift(&w.view.cursor, start, end, inserted);
+        S.shift(&w.view.anchor, start, end, inserted);
+    };
 }
 
 /// Drops cursors that landed on the primary or on each other.
@@ -2377,6 +2470,170 @@ pub fn cursorsFromPrompt(ed: *Editor) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Jumplist: where you were before each jump. `<C-o>` goes back, `<C-i>`
+// forward, `SPC s j` lists them. One entry per line (the newest wins).
+
+const max_jumps = 100;
+
+/// Records the cursor's place before a jump.
+pub fn pushJump(ed: *Editor) void {
+    ed.pushJumpAt(ed.view.cursor);
+}
+
+pub fn pushJumpAt(ed: *Editor, pos: usize) void {
+    if (ed.replaying) return;
+    const b = ed.buffer;
+    const t = ed.text();
+    const p = @min(pos, t.len());
+    const line = t.lineOf(p);
+    var i: usize = 0;
+    while (i < ed.jumps.items.len) {
+        const j = ed.jumps.items[i];
+        if (j.buffer == b and t.lineOf(@min(j.pos, t.len())) == line) {
+            if (j.path) |jp| ed.gpa.free(jp);
+            _ = ed.jumps.orderedRemove(i);
+        } else i += 1;
+    }
+    if (ed.jumps.items.len >= max_jumps) {
+        if (ed.jumps.items[0].path) |jp| ed.gpa.free(jp);
+        _ = ed.jumps.orderedRemove(0);
+    }
+    const path = if (b.path) |bp| ed.gpa.dupe(u8, bp) catch null else null;
+    ed.jumps.append(ed.gpa, .{ .buffer = b, .path = path, .pos = p }) catch {
+        if (path) |jp| ed.gpa.free(jp);
+    };
+    ed.jump_index = ed.jumps.items.len;
+}
+
+/// `<C-o>`: back to an older place.
+pub fn jumpOlder(ed: *Editor, count: usize) !void {
+    if (ed.jump_index >= ed.jumps.items.len) {
+        // Leaving the newest place: remember it, so `<C-i>` comes back.
+        ed.pushJump();
+        ed.jump_index = ed.jumps.items.len - 1;
+    }
+    if (count > ed.jump_index) return ed.setMessage(.info, "at the oldest jump", .{});
+    try ed.goJump(ed.jump_index - count);
+}
+
+/// `<C-i>` / `<Tab>`: forward to a newer place.
+pub fn jumpNewer(ed: *Editor, count: usize) !void {
+    const target = ed.jump_index + count;
+    if (target >= ed.jumps.items.len) return ed.setMessage(.info, "at the newest jump", .{});
+    try ed.goJump(target);
+}
+
+/// Goes to jump `i` (reopening its file if its buffer was closed).
+pub fn goJump(ed: *Editor, i: usize) !void {
+    const j = ed.jumps.items[i];
+    ed.jump_index = i;
+    if (j.buffer) |b| {
+        ed.switchTo(b);
+    } else if (j.path) |p| {
+        try ed.openFile(p);
+        // Entries for that file point at the new buffer again.
+        for (ed.jumps.items) |*o| if (o.buffer == null and o.path != null and std.mem.eql(u8, o.path.?, p)) {
+            o.buffer = ed.buffer;
+        };
+    } else return;
+    const t = ed.text();
+    const pos = @min(j.pos, t.len());
+    ed.revealLine(t.lineOf(pos));
+    ed.setCursor(pos);
+}
+
+/// A closed buffer's jumps keep their file path (or go, for scratch buffers).
+fn forgetJumps(ed: *Editor, b: *Buffer) void {
+    var i: usize = 0;
+    while (i < ed.jumps.items.len) {
+        const j = &ed.jumps.items[i];
+        if (j.buffer == b) {
+            j.buffer = null;
+            if (j.path == null) {
+                _ = ed.jumps.orderedRemove(i);
+                if (ed.jump_index > i) ed.jump_index -= 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    ed.jump_index = @min(ed.jump_index, ed.jumps.items.len);
+}
+
+// ---------------------------------------------------------------------------
+// Windows (SPC w): splits showing buffers, each with its own view.
+
+fn refreshWindowList(ed: *Editor) void {
+    ed.windows.list(&ed.window_list) catch {};
+}
+
+/// The buffer and view `w` shows (the live ones for the focused window).
+pub fn windowBuffer(ed: *Editor, w: *Windows.Window) *Buffer {
+    return if (w == ed.window) ed.buffer else w.buffer;
+}
+
+pub fn windowView(ed: *Editor, w: *Windows.Window) *View {
+    return if (w == ed.window) &ed.view else &w.view;
+}
+
+/// Moves focus to `w`, keeping the current window's state in it.
+pub fn focusWindow(ed: *Editor, w: *Windows.Window) void {
+    if (w == ed.window) return;
+    ed.window.view = ed.view;
+    ed.window.buffer = ed.buffer;
+    ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
+    ed.loadWindow(w);
+}
+
+fn loadWindow(ed: *Editor, w: *Windows.Window) void {
+    ed.window = w;
+    ed.cursors.clearRetainingCapacity();
+    ed.ghost = null;
+    if (ed.mode == .visual or ed.mode == .operator) ed.mode = .normal;
+    ed.op = null;
+    ed.buffer = w.buffer;
+    ed.view = w.view;
+    ed.use_counter += 1;
+    ed.buffer.last_used = ed.use_counter;
+    ed.placeCursor(@min(ed.view.cursor, ed.text().len()));
+    ed.scrollToCursor();
+}
+
+/// `SPC w s` + direction: a new window on that side, showing this buffer.
+pub fn splitWindow(ed: *Editor, dir: Windows.Dir) !void {
+    const nw = try ed.windows.split(ed.window, dir, ed.view, ed.buffer);
+    ed.refreshWindowList();
+    ed.focusWindow(nw);
+}
+
+/// `SPC w d`: closes the focused window (not the last one).
+pub fn closeWindow(ed: *Editor) void {
+    const closing = ed.window;
+    ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
+    const target = ed.windows.close(closing) orelse
+        return ed.setMessage(.info, "this is the last window (SPC q q quits)", .{});
+    ed.refreshWindowList();
+    ed.loadWindow(target);
+}
+
+/// `SPC w o`: closes every other window.
+pub fn onlyWindow(ed: *Editor) !void {
+    try ed.windows.only(ed.window);
+    ed.refreshWindowList();
+}
+
+/// `SPC w h/j/k/l`: focus the window on that side.
+pub fn focusDirection(ed: *Editor, dir: Windows.Dir) void {
+    const w = ed.windows.neighbor(ed.window, dir) orelse return;
+    ed.focusWindow(w);
+}
+
+/// `SPC w w`: the next window, wrapping around.
+pub fn focusNext(ed: *Editor) void {
+    ed.focusWindow(ed.windows.next(ed.window));
+}
+
+// ---------------------------------------------------------------------------
 // File operations (SPC f): each asks for a path in a boxed prompt.
 
 /// Opens the prompt for `kind`, prefilled with the current path (or, for a
@@ -2515,6 +2772,54 @@ fn findBuffer(ed: *Editor, path: []const u8) ?*Buffer {
     return null;
 }
 
+/// `SPC b N`: a new empty scratch buffer.
+pub fn newBuffer(ed: *Editor) !void {
+    const b = try ed.gpa.create(Buffer);
+    errdefer ed.gpa.destroy(b);
+    b.* = try Buffer.initEmpty(ed.gpa);
+    errdefer b.deinit(ed.gpa);
+    try ed.buffers.append(ed.gpa, b);
+    ed.switchTo(b);
+}
+
+/// `SPC b l`: back to the previous buffer (the most recently used other one).
+pub fn lastBuffer(ed: *Editor) !void {
+    const order = try ed.buffersByRecency(ed.gpa);
+    defer ed.gpa.free(order);
+    if (order.len < 2) return ed.setMessage(.info, "no other buffer", .{});
+    ed.switchTo(order[0]);
+}
+
+/// `SPC b O`: kills every other buffer without unsaved changes.
+pub fn killOtherBuffers(ed: *Editor) !void {
+    var kept: usize = 0;
+    var i: usize = 0;
+    while (i < ed.buffers.items.len) {
+        const b = ed.buffers.items[i];
+        if (b == ed.buffer) {
+            i += 1;
+        } else if (b.modified) {
+            kept += 1;
+            i += 1;
+        } else try ed.killBuffer(b);
+    }
+    if (kept > 0) ed.setMessage(.info, "kept {d} buffer(s) with unsaved changes", .{kept}) else ed.setMessage(.info, "killed other buffers", .{});
+}
+
+/// `SPC b S`: saves every modified buffer that has a file.
+pub fn saveAll(ed: *Editor) void {
+    var n: usize = 0;
+    for (ed.buffers.items) |b| if (b.modified and b.path != null) {
+        _ = b.save(ed.gpa, ed.io) catch |err| {
+            ed.setMessage(.err, "could not save \"{s}\": {s}", .{ b.displayName(), @errorName(err) });
+            return;
+        };
+        if (ed.lspFor(b)) |l| l.didSave(b);
+        n += 1;
+    };
+    ed.setMessage(.info, "saved {d} buffer(s)", .{n});
+}
+
 pub fn bufferIndex(ed: *const Editor, b: *const Buffer) usize {
     for (ed.buffers.items, 0..) |o, i| if (o == b) return i;
     unreachable;
@@ -2630,6 +2935,16 @@ pub fn acceptPicker(ed: *Editor) !void {
     const choice = try p.choice();
     defer choice.deinit(ed.gpa);
     ed.closePicker();
+    // Pickers that take you somewhere are jumps.
+    const kind: ?Picker.Kind = switch (choice) {
+        .none => null,
+        .item => |c| c.kind,
+        .create => |c| c.kind,
+    };
+    if (kind) |k| switch (k) {
+        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes => ed.pushJump(),
+        else => {},
+    };
     switch (choice) {
         .none => {},
         .item => |c| try @import("picker/sources.zig").accept(c.kind, ed, c.item),
@@ -2799,15 +3114,15 @@ test "prefix switches sources; Esc closes and resume restores" {
     defer ed.deinit();
     try ed.feed("<Space><Space>");
     try testing.expectEqual(.files, ed.picker.?.kind);
-    try ed.feed(">sav");
+    try ed.feed(">savefi");
     try testing.expectEqual(.commands, ed.picker.?.kind);
-    try testing.expectEqualStrings("sav", ed.picker.?.activeQuery());
+    try testing.expectEqualStrings("savefi", ed.picker.?.activeQuery());
     ed.picker.?.sync();
     try testing.expectEqualStrings("save_file", ed.picker.?.itemAt(0).?.text);
     try ed.feed("<Esc>");
     try testing.expectEqual(.normal, ed.mode);
     try ed.feed("<Space>'");
-    try testing.expectEqualStrings(">sav", ed.picker.?.query.items());
+    try testing.expectEqualStrings(">savefi", ed.picker.?.query.items());
 }
 
 test "buffers: open, switch back via picker, kill" {
@@ -3627,4 +3942,87 @@ test "multicursor: Tab in the snipe or search prompt makes cursors" {
     try testing.expectEqual(2, ed.cursors.items.len);
     try ed.feed("x"); // each cursor is on its match's last character
     try expectText(&ed, "uin a; uin b;\nfloat c; uin d;");
+}
+
+test "windows: split, move, edit in one shows in the other, close" {
+    var ed = try testEditor("one\ntwo\nthree");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.feed("<Space>wsl"); // split right: focus moves to the new window
+    try testing.expectEqual(2, ed.window_list.items.len);
+    const right = ed.window;
+    try ed.feed("G");
+    try ed.feed("<Space>wh");
+    try testing.expect(ed.window != right);
+    try testing.expectEqual(0, ed.cursorLine()); // each window has its own cursor
+    // Typing above shifts the other window's cursor with the text.
+    try ed.feed("Onew<Esc>");
+    try testing.expectEqual(3, right.view.cursor - ed.text().lineStart(3) + 3);
+    try ed.feed("<Space>wl");
+    try testing.expectEqual(right, ed.window);
+    try testing.expectEqual(3, ed.cursorLine()); // still on "three"
+    try ed.feed("<Space>ww"); // wraps to the first window
+    try testing.expect(ed.window != right);
+    try ed.feed("<Space>wsj<Space>wd<Space>wd");
+    try testing.expectEqual(1, ed.window_list.items.len);
+    try ed.feed("<Space>wd"); // the last window stays
+    try testing.expectEqual(1, ed.window_list.items.len);
+}
+
+test "windows: killing a buffer shown in another window" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.openFile("zile-test-a.txt");
+    try ed.feed("<Space>wsl");
+    try ed.openFile("zile-test-b.txt");
+    const b = ed.buffer;
+    try ed.feed("<Space>wh");
+    try ed.feed("<Space>bb"); // flip to the other buffer: b, here too
+    try testing.expectEqual(b, ed.buffer);
+    try ed.feed("<Space>bk");
+    // Both windows moved off the killed buffer.
+    for (ed.window_list.items) |w| try testing.expect(ed.windowBuffer(w) != b);
+}
+
+test "buffers: new, last, kill others" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("zile-test-a.txt");
+    const a = ed.buffer;
+    try ed.feed("<Space>bN");
+    try testing.expect(ed.buffer != a);
+    try ed.feed("<Space>bl");
+    try testing.expectEqual(a, ed.buffer);
+    try ed.feed("<Space>bN<Space>bN<Space>bO");
+    try testing.expectEqual(1, ed.buffers.items.len);
+}
+
+test "jumplist: C-o / C-i, one entry per line, the picker" {
+    var ed = try testEditor("a\nb\nc\nd\ne");
+    defer ed.deinit();
+    try ed.feed("jG"); // from line 2 to the end
+    try ed.feed("gg"); // from the end to the top
+    try ed.feed("/d<CR>"); // a search is a jump too
+    try testing.expectEqual(3, ed.cursorLine());
+    try ed.feed("<C-o>");
+    try testing.expectEqual(0, ed.cursorLine());
+    try ed.feed("<C-o>");
+    try testing.expectEqual(4, ed.cursorLine());
+    try ed.feed("<C-o>");
+    try testing.expectEqual(1, ed.cursorLine());
+    try ed.feed("<C-o>"); // nothing older
+    try testing.expectEqual(1, ed.cursorLine());
+    try ed.feed("<C-i><C-i><Tab>");
+    try testing.expectEqual(3, ed.cursorLine()); // back where we started
+    // Edits above keep entries on their text.
+    try ed.feed("ggOnew<Esc>");
+    try ed.feed("<C-o>");
+    try testing.expectEqual(4, ed.cursorLine()); // "d" moved down a line
+    // The picker lists newest first and goes where you pick.
+    try ed.feed("<Space>sj");
+    ed.picker.?.sync();
+    try testing.expectEqual(.jumps, ed.picker.?.kind);
+    try ed.feed("<CR>");
+    try testing.expect(ed.picker == null);
 }

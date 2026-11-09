@@ -22,6 +22,9 @@ pub const Layout = struct {
     cols: usize,
     status_y: f32,
     width: f32,
+    /// Screen position of this area (windows; 0 for the whole screen).
+    x0: f32 = 0,
+    y0: f32 = 0,
 
     /// Maps a pixel to a (row, col) cell of the text area, if inside it.
     pub fn cellAt(l: Layout, font: *const Font, x: f32, y: f32) ?struct { row: usize, col: usize } {
@@ -48,13 +51,61 @@ pub fn layout(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
     };
 }
 
+/// Lays out the windows for a `width` x `height` screen and sizes their
+/// views. Returns the whole-screen layout (status line, popups).
+pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
+    const screen = layout(ed, font, width, height);
+    ed.windows.layout(.{ .w = screen.width, .h = screen.status_y }, font.cell_w, font.cell_h);
+    for (ed.window_list.items) |w| {
+        const wl = windowLayout(ed, font, w);
+        if (w == ed.window) {
+            ed.setViewSize(wl.rows, wl.cols);
+        } else {
+            w.view.rows = wl.rows;
+            w.view.cols = wl.cols;
+        }
+    }
+    return screen;
+}
+
+/// The text area of window `w`: below its header (when there are several
+/// windows), in coordinates local to `x0`/`y0`.
+pub fn windowLayout(ed: *Editor, font: *const Font, w: *Editor.Windows.Window) Layout {
+    const header: f32 = if (ed.window_list.items.len > 1) font.cell_h else 0;
+    const lines = ed.windowBuffer(w).text.lineCount();
+    const gutter_cols = @max(std.math.log10_int(lines) + 1, 3) + 2;
+    const text_x = @as(f32, @floatFromInt(gutter_cols)) * font.cell_w;
+    const text_h = @max(w.rect.h - header, 0);
+    return .{
+        .gutter_cols = gutter_cols,
+        .text_x = text_x,
+        .rows = @max(@as(usize, @intFromFloat(text_h / font.cell_h)), 1),
+        .cols = @max(@as(usize, @intFromFloat(@max(w.rect.w - text_x, 0) / font.cell_w)), 1),
+        .status_y = text_h,
+        .width = w.rect.w,
+        .x0 = w.rect.x,
+        .y0 = w.rect.y + header,
+    };
+}
+
+// rlgl (part of raylib): a transform applied to everything drawn, so window
+// contents draw at their own origin.
+extern fn rlPushMatrix() void;
+extern fn rlPopMatrix() void;
+extern fn rlTranslatef(x: f32, y: f32, z: f32) void;
+
 pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
     rl.ClearBackground(theme.bg);
-    drawText(ed, font, theme, l);
+    for (ed.window_list.items) |w| drawWindow(ed, font, theme, w);
+    // Popups at the focused window's cursor.
+    const fl = windowLayout(ed, font, ed.window);
+    rlPushMatrix();
+    rlTranslatef(fl.x0, fl.y0, 0);
+    drawHover(ed, font, theme, fl);
+    drawCompletion(ed, font, theme, fl);
+    rlPopMatrix();
     drawWhichKey(ed, font, theme, l);
     drawStatus(ed, font, theme, l);
-    drawHover(ed, font, theme, l);
-    drawCompletion(ed, font, theme, l);
     if (ed.picker) |p| picker_view.draw(p, font, theme, l);
     if (ed.search_prompt) |*sp| if (sp.kind.boxed()) {
         picker_view.drawPromptBox(font, theme, l, sp.kind.title(), sp.input.items());
@@ -126,7 +177,34 @@ pub fn rect(x: f32, y: f32, w: f32, h: f32, color: rl.Color) void {
     rl.DrawRectangleRec(.{ .x = x, .y = y, .width = w, .height = h }, color);
 }
 
-fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
+/// One window: its header (when there are several), then its text, clipped
+/// to its rectangle.
+fn drawWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Windows.Window) void {
+    const focused = w == ed.window;
+    const wl = windowLayout(ed, font, w);
+    const r = w.rect;
+    rl.BeginScissorMode(@intFromFloat(r.x), @intFromFloat(r.y), @intFromFloat(@ceil(r.w)), @intFromFloat(@ceil(r.h)));
+    defer rl.EndScissorMode();
+
+    const peek: ?Editor.Peek = if (focused) null else ed.peekWindow(w);
+    defer if (peek) |p| ed.unpeekWindow(p);
+    ed.highlightView();
+
+    if (ed.window_list.items.len > 1) {
+        rect(r.x, r.y, r.w, font.cell_h, if (focused) theme.status_bg else theme.bg);
+        rect(r.x, r.y + font.cell_h - 1, r.w, 1, theme.popup_border);
+        var x = font.drawText(ed.buffer.displayName(), r.x + font.cell_w, r.y, if (focused) theme.status_fg else theme.status_dim);
+        if (ed.buffer.modified) x = font.drawText(" [+]", x, r.y, if (focused) theme.status_fg else theme.status_dim);
+    }
+    if (r.x > 0) rect(r.x, r.y, 1, r.h, theme.popup_border);
+
+    rlPushMatrix();
+    defer rlPopMatrix();
+    rlTranslatef(wl.x0, wl.y0, 0);
+    drawText(ed, font, theme, wl, focused);
+}
+
+fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focused: bool) void {
     const selection: ?operators.Range = if (ed.mode == .visual) ed.visualRange() else null;
     const syntax: ?*const Syntax = if (ed.buffer.syntax) |*s| s else null;
     const diags = ed.diagnostics(ed.buffer);
@@ -157,7 +235,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
         const is_current = line == cursor_line;
         if (fold != null) rect(0, y, l.width, font.cell_h, theme.fold_bg);
 
-        if (is_current) rect(0, y, l.width, font.cell_h, theme.cursorline_bg);
+        if (is_current and focused) rect(0, y, l.width, font.cell_h, theme.cursorline_bg);
         if (selection) |sel| drawSelection(ed, font, theme, l, sel, line, y);
         if (selection != null) for (ed.cursors.items) |c| {
             drawSelection(ed, font, theme, l, ed.selectionRange(c.anchor, c.pos), line, y);
@@ -213,7 +291,10 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     extra.a = 150;
     for (ed.cursors.items) |c| drawCursorAt(ed, font, theme, l, @min(c.pos, ed.text().len()), extra);
     if (ed.ghost) |g| return drawGhostCursor(ed, font, theme, l, g);
-    drawCursorAt(ed, font, theme, l, ed.view.cursor, theme.cursor);
+    // An unfocused window's cursor is a faint block.
+    var cursor_color = theme.cursor;
+    if (!focused) cursor_color.a = 70;
+    drawCursorAt(ed, font, theme, l, ed.view.cursor, cursor_color);
 }
 
 fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, pos: usize, color: rl.Color) void {

@@ -24,7 +24,7 @@ const languages = @import("../syntax/languages.zig");
 const motions = @import("../core/motions.zig");
 const Git = @import("../git/Git.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -41,6 +41,7 @@ fn Impl(comptime kind: Kind) type {
         .git_changes => GitChanges,
         .confirm_delete => ConfirmDelete,
         .browse => Browse,
+        .jumps => Jumps,
     };
 }
 
@@ -337,6 +338,44 @@ const Browse = struct {
             return;
         }
         try Files.previewPath(ed, path, out);
+    }
+};
+
+/// `SPC s j`: the jumplist, newest first, with the line each jump left.
+const Jumps = struct {
+    pub const title = "Jumplist";
+    pub const prefix: ?u8 = null;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var i = ed.jumps.items.len;
+        while (i > 0) {
+            i -= 1;
+            const j = ed.jumps.items[i];
+            var buf: [512]u8 = undefined;
+            const name = if (j.buffer) |b| b.displayName() else j.path orelse "?";
+            if (j.buffer) |b| {
+                const t = &b.text;
+                const line = t.lineOf(@min(j.pos, t.len()));
+                const detail = std.fmt.bufPrint(&buf, "{s}:{d}", .{ name, line + 1 }) catch name;
+                const text = std.mem.trim(u8, t.lineSlice(line), " \t");
+                try items.append(.{ .text = if (text.len > 0) text else "(blank line)", .detail = detail, .id = @intCast(i) });
+            } else {
+                try items.append(.{ .text = "(closed file)", .detail = name, .id = @intCast(i) });
+            }
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id < ed.jumps.items.len) try ed.goJump(item.id);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= ed.jumps.items.len) return;
+        const j = ed.jumps.items[item.id];
+        if (j.buffer) |b| {
+            try out.setCode(ed.gpa, b.text.slice(0, b.text.len()), b.path);
+            out.focus_line = b.text.lineOf(@min(j.pos, b.text.len()));
+        } else if (j.path) |p| try Files.previewPath(ed, p, out);
     }
 };
 
