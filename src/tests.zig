@@ -32,4 +32,5 @@ comptime {
     _ = @import("terminal/Pty.zig");
     _ = @import("terminal/RunMemory.zig");
     _ = @import("terminal/Terminal.zig");
+    _ = @import("terminal/errors.zig");
 }

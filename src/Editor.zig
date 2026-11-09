@@ -29,6 +29,7 @@ pub const Windows = @import("Windows.zig");
 pub const Terminal = @import("terminal/Terminal.zig");
 const Pty = @import("terminal/Pty.zig");
 const RunMemory = @import("terminal/RunMemory.zig");
+pub const run_errors_mod = @import("terminal/errors.zig");
 const textobjects = @import("core/textobjects.zig");
 
 const Editor = @This();
@@ -258,6 +259,8 @@ run_command: ?[]u8 = null,
 run_started: Io.Timestamp = .zero,
 /// The end of the run was reported (printed under its output).
 run_reported: bool = true,
+/// Errors found in the last run's output (`SPC r e`).
+run_errors: std.ArrayList(run_errors_mod.Error) = .empty,
 /// Which terminal the popup shows, if open. Keys go to it.
 popup: ?enum { shell, run } = null,
 /// The popup's size, kept current by the UI (new terminals start at it).
@@ -376,6 +379,8 @@ pub fn deinit(ed: *Editor) void {
     if (ed.shell) |t| t.destroy();
     if (ed.run) |t| t.destroy();
     if (ed.run_command) |cmd| ed.gpa.free(cmd);
+    for (ed.run_errors.items) |e| e.deinit(ed.gpa);
+    ed.run_errors.deinit(ed.gpa);
     if (ed.run_memory_path) |path| ed.gpa.free(path);
     for (ed.lsps) |maybe| if (maybe) |l| l.deinit();
     ed.clearLocations();
@@ -2592,6 +2597,10 @@ fn popupKey(ed: *Editor, ev: KeyEvent) bool {
         } else if (ev.key == .codepoint and !ev.mods.blocksText()) switch (ev.key.codepoint) {
             'q' => ed.popup = null,
             'r' => if (ed.popup == .run) ed.rerun() catch |err| ed.setMessage(.err, "could not run: {s}", .{@errorName(err)}),
+            'e' => if (ed.popup == .run) {
+                ed.popup = null;
+                ed.showRunErrors() catch |err| ed.setMessage(.err, "{s}", .{@errorName(err)});
+            },
             'k' => t.scroll(-1),
             'j' => t.scroll(1),
             else => {},
@@ -2667,6 +2676,27 @@ pub fn startRun(ed: *Editor, cmd: []const u8) !void {
     ed.popup = .run;
 }
 
+/// Finds `path:line:col` errors in the finished run's output.
+fn collectRunErrors(ed: *Editor, t: *Terminal) void {
+    for (ed.run_errors.items) |e| e.deinit(ed.gpa);
+    ed.run_errors.clearRetainingCapacity();
+    const out = t.copyOutput(ed.gpa) catch return;
+    defer ed.gpa.free(out);
+    const S = struct {
+        fn exists(e: *Editor, path: []const u8) bool {
+            return e.fileExists(path);
+        }
+    };
+    run_errors_mod.parse(ed.gpa, out, ed, S.exists, &ed.run_errors) catch {};
+}
+
+/// `SPC r e`: the last run's errors in a picker; <CR> jumps to one.
+pub fn showRunErrors(ed: *Editor) !void {
+    if (ed.run == null) return ed.setMessage(.info, "nothing has been run yet (SPC r r)", .{});
+    if (ed.run_errors.items.len == 0) return ed.setMessage(.info, "no errors in the last run", .{});
+    try ed.openPicker(.run_errors, "");
+}
+
 /// Seconds since the run started (or how long it took, once reported).
 pub fn runSeconds(ed: *Editor) f64 {
     const ns = ed.run_started.durationTo(Io.Timestamp.now(ed.io, .awake)).nanoseconds;
@@ -2679,13 +2709,21 @@ fn pollTerminals(ed: *Editor) void {
     if (ed.run) |t| if (!ed.run_reported and !t.isRunning()) {
         ed.run_reported = true;
         const secs = ed.runSeconds();
-        var buf: [96]u8 = undefined;
+        ed.collectRunErrors(t);
+        const n = ed.run_errors.items.len;
+        var buf: [160]u8 = undefined;
         const ok = t.exit_code == 0;
-        const line = std.fmt.bufPrint(&buf, "\r\n\x1b[1;{s}m{s} exited {d}\x1b[0;2m in {d:.2}s   r: run again   q: close\x1b[0m", .{
-            if (ok) "32" else "31", if (ok) "✓" else "✗", t.exit_code, secs,
+        var errs_buf: [48]u8 = undefined;
+        const errs: []const u8 = if (n > 0) std.fmt.bufPrint(&errs_buf, "   e: {d} error{s}", .{ n, if (n == 1) "" else "s" }) catch "" else "";
+        const line = std.fmt.bufPrint(&buf, "\r\n\x1b[1;{s}m{s} exited {d}\x1b[0;2m in {d:.2}s{s}   r: run again   q: close\x1b[0m", .{
+            if (ok) "32" else "31", if (ok) "✓" else "✗", t.exit_code, secs, errs,
         }) catch "";
         t.print(line);
-        ed.setMessage(if (ok) .info else .err, "{s}: exited {d} in {d:.2}s (SPC r o shows the output)", .{ ed.run_command orelse "", t.exit_code, secs });
+        if (n > 0) {
+            ed.setMessage(if (ok) .info else .err, "{s}: exited {d} in {d:.2}s, {d} error{s} (SPC r e lists them)", .{ ed.run_command orelse "", t.exit_code, secs, n, if (n == 1) "" else "s" });
+        } else {
+            ed.setMessage(if (ok) .info else .err, "{s}: exited {d} in {d:.2}s (SPC r o shows the output)", .{ ed.run_command orelse "", t.exit_code, secs });
+        }
     };
     if (ed.shell) |t| if (!t.isRunning()) {
         t.destroy();
@@ -4317,4 +4355,25 @@ test "terminal popup: keys go to the shell, Ctrl-\\ hides it and keeps it runnin
     ed.tick(); // an exited shell closes its popup
     try testing.expectEqual(null, ed.popup);
     try testing.expectEqual(null, ed.shell);
+}
+
+test "run errors: a failing run lists its errors; e and SPC r e open them; Enter jumps" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.git_checked = true;
+    ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
+    try ed.feed("<Space>rcprintf 'src/main.zig:4:7: error: boom\\nnot/a/file.zig:1:1: error: x\\n'; exit 1<CR>");
+    waitForRun(&ed);
+    try testing.expectEqual(1, ed.run_errors.items.len); // only real files count
+    try testing.expectEqual(.err, ed.message.kind);
+    try ed.feed("e"); // from the finished run's popup
+    try testing.expectEqual(.run_errors, ed.picker.?.kind);
+    ed.picker.?.sync();
+    try testing.expectEqualStrings("error: boom", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("<CR>");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
+    try testing.expectEqual(3, ed.cursorLine());
+    try testing.expectEqual(6, ed.view.cursor - ed.text().lineStart(3));
+    try ed.feed("<Space>re");
+    try testing.expectEqual(.run_errors, ed.picker.?.kind);
 }

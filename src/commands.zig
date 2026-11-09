@@ -251,6 +251,7 @@ const base = [_]Command{
     .{ .name = "run_command", .doc = "Run a command", .run = termCmd(.command), .once = true },
     .{ .name = "run_again", .doc = "Run the runner command again", .run = termCmd(.again), .once = true },
     .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
+    .{ .name = "run_errors", .doc = "Errors from the last run", .run = termCmd(.errors), .once = true },
     .{ .name = "jump_older", .doc = "Back (jumplist)", .run = jumpCmd(.older), .once = true },
     .{ .name = "jump_newer", .doc = "Forward (jumplist)", .run = jumpCmd(.newer), .once = true },
     .{ .name = "jump_list", .doc = "Jumplist", .run = openPicker(.jumps), .once = true },
@@ -1321,7 +1322,7 @@ fn surroundStep(comptime step: enum { add, delete, change_from, change_to, visua
     }.run;
 }
 
-fn termCmd(comptime action: enum { toggle, runner, command, again, output }) Handler {
+fn termCmd(comptime action: enum { toggle, runner, command, again, output, errors }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
@@ -1331,6 +1332,7 @@ fn termCmd(comptime action: enum { toggle, runner, command, again, output }) Han
                 .command => try ed.runPrompt(false),
                 .again => try ed.runAgain(),
                 .output => ed.showRunOutput(),
+                .errors => try ed.showRunErrors(),
             }
         }
     }.run;

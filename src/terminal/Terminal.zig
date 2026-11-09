@@ -43,6 +43,8 @@ exited: std.atomic.Value(bool) = .init(false),
 exit_code: u8 = 0,
 cols: u16,
 rows: u16,
+/// Everything the program printed (up to `max_output`), for finding errors.
+output: std.ArrayList(u8) = .empty,
 
 // UI-thread state for drawing and keys.
 render: c.GhosttyRenderState = null,
@@ -52,6 +54,7 @@ encoder: c.GhosttyKeyEncoder = null,
 key_event: c.GhosttyKeyEvent = null,
 
 const scrollback_bytes: usize = 16 << 20;
+const max_output: usize = 8 << 20;
 
 pub fn create(gpa: Allocator, io: Io, opts: Options) !*Terminal {
     const t = try gpa.create(Terminal);
@@ -111,6 +114,7 @@ pub fn destroy(t: *Terminal) void {
     c.ghostty_render_state_row_iterator_free(t.row_it);
     c.ghostty_render_state_free(t.render);
     c.ghostty_terminal_free(t.vt);
+    t.output.deinit(t.gpa);
     t.gpa.destroy(t);
 }
 
@@ -128,6 +132,7 @@ fn readLoop(t: *Terminal) void {
         }
         t.mutex.lockUncancelable(t.io);
         c.ghostty_terminal_vt_write(t.vt, &buf, n);
+        if (t.output.items.len + n <= max_output) t.output.appendSlice(t.gpa, buf[0..n]) catch {};
         t.mutex.unlock(t.io);
         t.wake();
     }
@@ -137,6 +142,13 @@ fn readLoop(t: *Terminal) void {
 fn onWritePty(_: c.GhosttyTerminal, userdata: ?*anyopaque, data: [*c]const u8, len: usize) callconv(.c) void {
     const t: *Terminal = @ptrCast(@alignCast(userdata.?));
     t.pty.write(data[0..len]);
+}
+
+/// A copy of everything printed so far. Caller frees.
+pub fn copyOutput(t: *Terminal, gpa: Allocator) ![]u8 {
+    t.mutex.lockUncancelable(t.io);
+    defer t.mutex.unlock(t.io);
+    return gpa.dupe(u8, t.output.items);
 }
 
 pub fn isRunning(t: *const Terminal) bool {

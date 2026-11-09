@@ -386,6 +386,7 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ N, leader ++ "rR", "run_again" },
     .{ N, leader ++ "rc", "run_command" },
     .{ N, leader ++ "ro", "run_output" },
+    .{ N, leader ++ "re", "run_errors" },
     .{ N, leader ++ "`", "last_buffer" },
     .{ N, leader ++ "bN", "new_buffer" },
     .{ N, leader ++ "bO", "kill_other_buffers" },

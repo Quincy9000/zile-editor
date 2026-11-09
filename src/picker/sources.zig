@@ -24,7 +24,7 @@ const languages = @import("../syntax/languages.zig");
 const motions = @import("../core/motions.zig");
 const Git = @import("../git/Git.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -42,6 +42,7 @@ fn Impl(comptime kind: Kind) type {
         .confirm_delete => ConfirmDelete,
         .browse => Browse,
         .jumps => Jumps,
+        .run_errors => RunErrors,
     };
 }
 
@@ -376,6 +377,42 @@ const Jumps = struct {
             try out.setCode(ed.gpa, b.text.slice(0, b.text.len()), b.path);
             out.focus_line = b.text.lineOf(@min(j.pos, b.text.len()));
         } else if (j.path) |p| try Files.previewPath(ed, p, out);
+    }
+};
+
+/// A path for display: relative inside `cwd`, else its last two parts.
+fn shortPath(cwd: []const u8, path: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, path, cwd) and path.len > cwd.len + 1 and path[cwd.len] == '/') return path[cwd.len + 1 ..];
+    if (!std.fs.path.isAbsolute(path)) return path;
+    const base_start = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    const parent_start = std.mem.lastIndexOfScalar(u8, path[0..base_start], '/') orelse return path;
+    return path[parent_start + 1 ..];
+}
+
+/// `SPC r e`: errors found in the last run's output.
+const RunErrors = struct {
+    pub const title = "Errors from the last run";
+    pub const prefix: ?u8 = null;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        for (ed.run_errors.items, 0..) |e, i| {
+            var buf: [512]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "{s}:{d}:{d}", .{ shortPath(ed.cwd, e.path), e.line, e.col }) catch e.path;
+            try items.append(.{ .text = e.message, .detail = detail, .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id >= ed.run_errors.items.len) return;
+        const e = ed.run_errors.items[item.id];
+        try ed.jumpTo(e.path, e.line - 1, e.col - 1);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= ed.run_errors.items.len) return;
+        const e = ed.run_errors.items[item.id];
+        try Files.previewPath(ed, e.path, out);
+        out.focus_line = e.line - 1;
     }
 };
 

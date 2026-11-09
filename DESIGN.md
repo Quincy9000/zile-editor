@@ -102,7 +102,8 @@ under it is a compile error.
 | `SPC o t`, `<C-\>` | terminal popup: your `$SHELL`, kept running while hidden; every key goes to it; `<C-\>` hides; `<S-PageUp/Down>` / wheel scroll back; `<C-S-v>` pastes | done |
 | `SPC r r` | code runner: prompt prefilled with this project's last command (remembered across restarts), so `<CR>` runs it again | done |
 | `SPC r c`, `SPC r R`, `SPC r o` | run any command (empty prompt); run the runner command again without asking; show the last run | done |
-| in a finished run | `r` run again, `q` / `<Esc>` close, `j` / `k` scroll | done |
+| in a finished run | `r` run again, `e` errors picker, `q` / `<Esc>` close, `j` / `k` scroll | done |
+| `SPC r e` | errors from the last run (`path:line:col` from zig/gcc/clang/go, rust `-->`, python `File "…", line N`), previewed; `<CR>` jumps | done |
 | `SPC h k` / `SPC h f` / `SPC h h` | describe key / command, search help | picker |
 
 ## Picker
@@ -357,8 +358,10 @@ bracketed paste, scrollback, a `draw(ctx)` walk of the render-state snapshot),
 through `$SHELL -c`; when one ends, "exited N in Ts" is printed under its
 output. Build: `dep.artifact("ghostty-vt-static")` + translate-c of `vt.h`
 with the artifact's emitted include tree and `GHOSTTY_STATIC`.
+`terminal/errors.zig` strips escapes from the run's captured output and keeps
+locations whose files exist.
 Not yet: terminals as split panes, terminal-normal mode (motions/yank over
-scrollback), an errors-from-last-run picker, CJK/emoji glyphs (atlas).
+scrollback), CJK/emoji glyphs (atlas).
 
 - Requires exactly Zig 0.17. Provides VT parsing, terminal state, a render-state
   API with per-row dirty tracking, key/mouse/focus/paste encoders (including the
@@ -410,8 +413,11 @@ src/terminal/
   shaping. An on-demand glyph cache is needed for CJK, emoji and Nerd Font icons
   (urgent once the terminal lands). HiDPI scaling is not handled yet.
 - **Package directory:** on a case-insensitive filesystem (NTFS), extracting
-  raylib into `./zig-pkg` fails. Set `ZIG_LOCAL_PKG_DIR` to a directory on a
-  case-sensitive filesystem.
+  packages into `./zig-pkg` fails. `zig-pkg` and `.zig-cache` are symlinks to
+  sibling directories on a case-sensitive filesystem (siblings, because some
+  build steps reach `../../.zig-cache` from inside a package). Don't use
+  `ZIG_LOCAL_PKG_DIR`: it makes package roots absolute, and Zig 0.17 then
+  rejects packages with relative path dependencies (libghostty-vt).
 
 ## Milestones
 

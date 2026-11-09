@@ -224,7 +224,10 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
     else if (t.exit_code == 0)
         .{ "done   r: again   q: close", theme.diff_add }
     else
-        .{ std.fmt.bufPrint(&right_buf, "failed ({d})   r: again   q: close", .{t.exit_code}) catch "", theme.diag_error };
+        .{ if (ed.run_errors.items.len > 0)
+            std.fmt.bufPrint(&right_buf, "failed ({d})   e: {d} errors   r: again   q: close", .{ t.exit_code, ed.run_errors.items.len }) catch ""
+        else
+            std.fmt.bufPrint(&right_buf, "failed ({d})   r: again   q: close", .{t.exit_code}) catch "", theme.diag_error };
     _ = font.drawText(right, r.x + r.w - @as(f32, @floatFromInt(cells(right) + 1)) * cw, r.y, right_color);
 
     // The screen, one cell of padding at the sides.
