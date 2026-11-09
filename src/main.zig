@@ -6,6 +6,7 @@ const glfw = @import("input/glfw.zig");
 const Font = @import("ui/Font.zig");
 const Theme = @import("ui/Theme.zig");
 const render = @import("ui/render.zig");
+const keys = @import("input/keys.zig");
 
 const usage =
     \\usage: zile [options] [file]
@@ -59,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
 
     var ed = try Editor.init(gpa, io);
     defer ed.deinit();
-    if (args.file) |path| try ed.openFile(path);
+    if (args.file) |path| ed.openArg(path);
 
     // raylib warns about every oversized box-drawing glyph; only show errors.
     rl.SetTraceLogLevel(rl.LOG_ERROR);
@@ -99,8 +100,13 @@ pub fn main(init: std.process.Init) !void {
                 next_segment_frame = frame + wait_frames;
             } else screenshot_frame = frame + 5;
         }
-        while (glfw.next()) |ev| ed.handleKey(ev);
+        while (glfw.next()) |ev| {
+            // Zoom works everywhere (pickers, terminals): the usual app keys.
+            if (zoomKey(&ed, ev)) continue;
+            ed.handleKey(ev);
+        }
         ed.tick();
+        applyZoom(&ed, gpa, io, &font, args);
 
         handleMouse(&ed, &font);
         const l = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
@@ -139,9 +145,43 @@ fn clipboardSet(gpa: std.mem.Allocator, text: []const u8) void {
 
 /// The wheel scrolls the window under the pointer; a click focuses that
 /// window and moves the cursor there.
+/// Ctrl+= / Ctrl+- / Ctrl+0: zoom. True when the key was one of them.
+fn zoomKey(ed: *Editor, ev: keys.KeyEvent) bool {
+    if (!ev.mods.ctrl or ev.mods.alt or ev.key != .codepoint) return false;
+    switch (ev.key.codepoint) {
+        '=', '+' => ed.zoom_request += 1,
+        '-' => ed.zoom_request -= 1,
+        '0' => ed.zoom_reset = true,
+        else => return false,
+    }
+    return true;
+}
+
+const min_font_size = 8;
+const max_font_size = 72;
+
+/// Reloads the font at the requested size (the glyph atlas is baked per size).
+fn applyZoom(ed: *Editor, gpa: std.mem.Allocator, io: std.Io, font: *Font, args: Args) void {
+    if (ed.zoom_request == 0 and !ed.zoom_reset) return;
+    const current: i32 = font.font.baseSize;
+    const size = if (ed.zoom_reset) args.font_size else std.math.clamp(current + 2 * ed.zoom_request, min_font_size, max_font_size);
+    ed.zoom_request = 0;
+    ed.zoom_reset = false;
+    if (size == current) return;
+    const fresh = Font.load(gpa, io, args.font, size) catch return;
+    font.deinit();
+    font.* = fresh;
+    ed.setMessage(.info, "text size {d}", .{size});
+}
+
 fn handleMouse(ed: *Editor, font: *const Font) void {
     const pos = rl.GetMousePosition();
     const wheel = rl.GetMouseWheelMove();
+    // Ctrl+wheel zooms.
+    if (wheel != 0 and (rl.IsKeyDown(rl.KEY_LEFT_CONTROL) or rl.IsKeyDown(rl.KEY_RIGHT_CONTROL))) {
+        ed.zoom_request += if (wheel > 0) 1 else -1;
+        return;
+    }
     const clicked = rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
     if (wheel == 0 and !clicked) return;
     // The command editor keeps focus while it is open.

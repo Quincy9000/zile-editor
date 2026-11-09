@@ -74,12 +74,18 @@ under it is a compile error.
 | `SPC w d` / `SPC w c`, `SPC w o`, `SPC w =` | close window, close the others, equal sizes | done |
 | `SPC w >` `<` `+` `-` | wider, narrower, taller, shorter | done |
 | `SPC b N`, `SPC b b` / `SPC b l` / ``SPC ` ``, `SPC b O`, `SPC b r`, `SPC b s` / `SPC b S` | new empty buffer, flip to the other buffer (picker: `SPC b B` / `SPC ,`), kill others (keeps unsaved), revert from disk, save / save all | done |
+| in pickers: `<Tab>`, `<C-v>`, `<C-s>` | "Open in..." menu (this window, split right/below/left/above); open in a split right / below. Works for files, buffers, grep, references, symbols, diagnostics, jumps, run errors, git changes, explorer files; on a project (`SPC p p`) the split opens once a file is picked | done |
+| `zile <path>` | a file (trailing `/` and `..` resolved); a folder opens the explorer there; a file that can't be opened leaves a message instead of not starting | done |
+| `SPC p p`, `SPC p f` | switch project (projects opened before, most recent first; picking one finds a file in it); find file in project | done |
+| completion → function | arguments arrive as snippet placeholders: the current one is highlighted and typing replaces it; `<Tab>` / `<S-Tab>` next / previous (a fresh one keeps its text), `<BS>` clears it, the last `<Tab>` goes to the server's final cursor | done |
+| signature help | `(` (the server's trigger characters) shows the call's signature above the cursor with the current parameter highlighted and its doc; `,` updates it, `)` / leaving insert mode closes it; it follows placeholder jumps | done |
 | `SPC t p` | toggle autopairs (on by default): `(` → `()`, closers and quotes step over, quotes skip word neighbors, `<CR>` in `{}` opens a block | done |
 | `SPC g g` | git menu (plain-English actions: commit, push, pull, branches, changed files, set remote, ...) | done |
 | `SPC g c` / `SPC g b` / `SPC g s` | commit all (saves, prompts for a message) / switch or create branch / changed files | done |
 | `SPC g r` / `SPC g n` / `SPC g p` / `SPC g R` | git: restore hunk / next / previous change / reload HEAD | done |
 | `SPC t g` / `SPC t r` / `SPC t d` | toggles: ghost lines / relative numbers / diagnostic messages (fields of `Editor.Options`, one comptime `toggle(field)` command each) | done |
-| `SPC q q` / `SPC q s` / `SPC q Q` | quit (refuses if any buffer is unsaved) / save all and quit / quit without saving | done |
+| `SPC q` | smart close: the focused window if there are several, else the current buffer if there are several (unsaved ones are kept, with a message), else quit (refuses if unsaved) | done |
+| `SPC Q s` / `SPC Q Q` | save all and quit / quit without saving | done |
 | `SPC SPC`, `SPC f f` | find file in project (fuzzy, + create) | done |
 | `SPC .`, `SPC f e` | explore files (browser): one folder at a time, starting at the current file's folder. `Enter`/`/` on a folder goes in, `Enter` on a file opens it, `<BS>` on an empty query goes up (selecting where you came from), `~` home, `/` on an empty query the root; a new name offers "Create" | done |
 | `SPC ,`, `SPC b B` / `SPC b k` | buffer picker / kill buffer | done |
@@ -103,8 +109,11 @@ under it is a compile error.
 | `SPC r r` | code runner: prompt prefilled with this project's last command (remembered across restarts), so `<CR>` runs it again | done |
 | `SPC r c` | command editor: a floating vim buffer (any number of lines, full editing: motions, operators, surround, multicursor, undo); starts in insert mode; in normal mode `<CR>` runs it via `$SHELL -c`, `<Esc>` cancels; leader menus wait until it closes | done |
 | `SPC r R`, `SPC r o` | run the runner command again without asking; show the last run | done |
-| in a finished run | `r` run again, `e` errors picker, `q` / `<Esc>` close, `j` / `k` scroll | done |
-| `SPC r e` | errors from the last run (`path:line:col` from zig/gcc/clang/go, rust `-->`, python `File "…", line N`), previewed; `<CR>` jumps | done |
+| in a finished run | `r` run again, `e` errors in the quickfix panel, `q` / `<Esc>` close, `j` / `k` scroll | done |
+| `SPC r e` | errors from the last run (`path:line:col` from zig/gcc/clang/go, rust `-->`, python `File "…", line N`) in the quickfix panel | done |
+| pickers: insert / normal mode | insert (typing filters) and normal (`j`/`k`, `gg`/`G`, `<C-d>`/`<C-u>`; `i`/`a`/`/` type; `q` / `<Esc>` close; `h`/`l` up/in in the explorer). `<Esc>` while typing goes to normal. Each source declares `start_mode`: searchable lists start typing, short step-through lists (quickfix, references, diagnostics, jumplist, git changes/menu, confirmations, "Open in") start in normal | done |
+| `SPC x x`, `]q` / `[q` | the quickfix picker, docked at the bottom (sources with `follow` dock: no preview, the editor shows the selection). Starts in normal mode at the current entry; `<CR>` keeps the place. `]q` / `[q` step through without it (jumps) | done |
+| in pickers: `<C-q>` | send every current match to the quickfix list and open it (grep, buffer lines, symbols, references, diagnostics, run errors) | done |
 | `SPC h k` / `SPC h f` / `SPC h h` | describe key / command, search help | picker |
 
 ## Picker
@@ -169,6 +178,17 @@ macros. Modern parts:
   their origin; `jumpTo` (definitions, locations) and pickers that navigate
   record too. Edits shift entries like cursors. `<C-o>` from the newest
   place first records it, so `<C-i>` comes back.
+- **Projects (done):** `core/Project.zig`: a file's project is the nearest
+  folder above it with `.git`, else with a build file (`build.zig`,
+  `Cargo.toml`, `go.mod`, `package.json`, ...). Projects are interned by the
+  editor; buffers point at theirs. The current project is the focused
+  buffer's (else the last one entered, else the cwd's): the file and grep
+  pickers list it (`picker_root`; results resolve against it), the runner
+  and shell start in it and the runner remembers per project, git (menu,
+  ghost lines, commits) uses its repo, and each language server runs per
+  (language, project) with that root. The status line and window headers
+  show "project  path/in/project". Opened projects are remembered in
+  `$XDG_STATE_HOME/zile/projects` for `SPC p p`.
 - **Windows (done):** `Windows.zig` is a tree of splits (side by side or
   stacked, with a ratio) whose leaves are windows, each with a buffer and its
   own `View`. The focused window's live state stays in `Editor.buffer`/`view`

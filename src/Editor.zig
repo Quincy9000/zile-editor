@@ -25,7 +25,9 @@ const Completion = @import("lsp/Completion.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
+const Snippet = @import("lsp/Snippet.zig");
 pub const Windows = @import("Windows.zig");
+pub const Project = @import("core/Project.zig");
 pub const Terminal = @import("terminal/Terminal.zig");
 const Pty = @import("terminal/Pty.zig");
 const RunMemory = @import("terminal/RunMemory.zig");
@@ -108,6 +110,68 @@ pub const Jump = struct {
     buffer: ?*Buffer,
     path: ?[]u8,
     pos: usize,
+};
+
+/// A quickfix entry: a place (0-based line/col) and what's there.
+pub const QuickfixItem = struct {
+    /// Owned. A buffer path (relative to the cwd, or absolute).
+    path: []u8,
+    line: usize,
+    col: usize,
+    /// Owned.
+    text: []u8,
+
+    pub fn deinit(q: QuickfixItem, gpa: Allocator) void {
+        gpa.free(q.path);
+        gpa.free(q.text);
+    }
+};
+
+/// Where a picker opens its choice: this window, or a new split on a side.
+pub const OpenTarget = enum {
+    here,
+    right,
+    below,
+    left,
+    above,
+
+    fn dir(t: OpenTarget) ?Windows.Dir {
+        return switch (t) {
+            .here => null,
+            .right => .right,
+            .below => .down,
+            .left => .left,
+            .above => .up,
+        };
+    }
+};
+
+/// A signature: its label and the active parameter's range in it.
+pub const SignatureHelp = struct {
+    label: []u8,
+    param_start: usize = 0,
+    param_end: usize = 0,
+    /// First line of the documentation (of the parameter, else the call).
+    doc: []u8,
+
+    fn deinit(s: SignatureHelp, gpa: Allocator) void {
+        gpa.free(s.label);
+        gpa.free(s.doc);
+    }
+};
+
+/// Filling in a snippet's placeholders: <Tab> / <S-Tab> move between them;
+/// typing over a fresh one replaces it.
+pub const SnippetSession = struct {
+    buffer: *Buffer,
+    /// Byte ranges, kept in place through edits; the last may be the final
+    /// cursor ($0).
+    stops: [][2]usize,
+    has_final: bool,
+    current: usize = 0,
+    /// The current placeholder still holds its default text: the first key
+    /// typed replaces it.
+    fresh: bool = false,
 };
 
 /// A cursor besides the primary one: position, visual anchor, wanted column.
@@ -257,8 +321,16 @@ shell: ?*Terminal = null,
 run: ?*Terminal = null,
 run_command: ?[]u8 = null,
 run_started: Io.Timestamp = .zero,
+/// Where the last run ran (its project root; borrowed).
+run_root: []const u8 = ".",
 /// The end of the run was reported (printed under its output).
 run_reported: bool = true,
+/// The quickfix list (`]q` / `[q`, `SPC x x`): places to step through,
+/// from a run's errors or a picker's results (`<C-q>`).
+quickfix: std.ArrayList(QuickfixItem) = .empty,
+quickfix_title: std.ArrayList(u8) = .empty,
+/// The entry last visited, if any.
+quickfix_index: ?usize = null,
 /// Errors found in the last run's output (`SPC r e`).
 run_errors: std.ArrayList(run_errors_mod.Error) = .empty,
 /// The command editor (`SPC r c`): a small floating window with its own
@@ -270,6 +342,10 @@ cmd_return: ?*Windows.Window = null,
 popup: ?enum { shell, run } = null,
 /// The popup's size, kept current by the UI (new terminals start at it).
 term_size: Pty.Size = .{ .cols = 80, .rows = 24 },
+/// Text size: a zoom step the UI applies by reloading the font (+1/-1 pt
+/// steps; `zoom_reset` back to the starting size).
+zoom_request: i32 = 0,
+zoom_reset: bool = false,
 /// Terminal default colors (the UI sets them from the theme).
 term_fg: ?Terminal.Rgb = null,
 term_bg: ?Terminal.Rgb = null,
@@ -313,7 +389,7 @@ last_search_whole_word: bool = false,
 search_highlight: bool = false,
 
 /// Running language servers, by index into `Lsp.servers`, started on demand.
-lsps: [Lsp.servers.len]?*Lsp = @splat(null),
+lsps: std.ArrayList(*Lsp) = .empty,
 /// A server could not be started or exited; don't keep retrying it.
 lsp_failed: [Lsp.servers.len]bool = @splat(false),
 /// The outline shown by the symbols picker (`SPC c l`).
@@ -325,12 +401,28 @@ locations: std.ArrayList(Lsp.Location) = .empty,
 /// Hover text shown near the cursor until the next key.
 hover: ?[]u8 = null,
 completion: ?Completion = null,
+/// The call the cursor is in (signature help), shown above it while typing.
+signature: ?SignatureHelp = null,
+/// Placeholders of an accepted snippet (function arguments) to fill in.
+snippet: ?SnippetSession = null,
 /// Word start a completion was last requested for (avoids re-asking per key).
 completion_asked: ?usize = null,
 
 /// Repository root (found the first time a file opens), and whether we looked.
-git_root: ?[]u8 = null,
-git_checked: bool = false,
+/// Every project seen (owned; buffers point into it).
+projects: std.ArrayList(*Project) = .empty,
+/// The project last worked in: the current one when the buffer has none.
+last_project: ?*const Project = null,
+/// Projects opened before, most recent first (`SPC p p`), loaded lazily.
+known_projects: ?std.ArrayList([]u8) = null,
+/// The folder the open picker lists (files, grep): its project root.
+picker_root: []const u8 = ".",
+/// Set to make the next picker list another project (`SPC p p`).
+next_picker_root: ?[]const u8 = null,
+/// A picker choice waiting for the "Open in..." menu (<Tab>) to say where.
+pending_choice: ?Picker.Choice = null,
+/// Where the file picked next opens (a project opened into a split).
+deferred_target: ?OpenTarget = null,
 /// Set while the cursor is on a ghost line.
 ghost: ?GhostCursor = null,
 /// The git command running in the background, if any.
@@ -365,7 +457,7 @@ pub fn init(gpa: Allocator, io: Io) !Editor {
     errdefer windows.deinit();
     var window_list: std.ArrayList(*Windows.Window) = .empty;
     try window_list.append(gpa, windows.root.kind.window);
-    return .{
+    var ed: Editor = .{
         .windows = windows,
         .window = windows.root.kind.window,
         .window_list = window_list,
@@ -377,10 +469,14 @@ pub fn init(gpa: Allocator, io: Io) !Editor {
         .keymap = keymap,
         .registers = .init(gpa),
     };
+    // Until a file says otherwise, the project is where we started.
+    if (Project.detect(io, cwd)) |f| ed.last_project = ed.internProject(f.root, f.git);
+    return ed;
 }
 
 pub fn deinit(ed: *Editor) void {
     if (ed.picker) |p| p.destroy();
+    if (ed.pending_choice) |c| c.deinit(ed.gpa);
     if (ed.cmd_float) |w| {
         // Its buffer isn't in `buffers`.
         if (w != ed.window) w.buffer.deinit(ed.gpa) else ed.buffer.deinit(ed.gpa);
@@ -392,14 +488,20 @@ pub fn deinit(ed: *Editor) void {
     if (ed.run_command) |cmd| ed.gpa.free(cmd);
     for (ed.run_errors.items) |e| e.deinit(ed.gpa);
     ed.run_errors.deinit(ed.gpa);
+    ed.clearQuickfix();
+    ed.quickfix.deinit(ed.gpa);
+    ed.quickfix_title.deinit(ed.gpa);
     if (ed.run_memory_path) |path| ed.gpa.free(path);
-    for (ed.lsps) |maybe| if (maybe) |l| l.deinit();
+    for (ed.lsps.items) |l| l.deinit();
+    ed.lsps.deinit(ed.gpa);
     ed.clearLocations();
     ed.locations.deinit(ed.gpa);
     ed.clearSymbols();
     ed.symbols.deinit(ed.gpa);
     if (ed.hover) |h| ed.gpa.free(h);
     ed.closeCompletion();
+    ed.closeSignature();
+    ed.endSnippet();
     for (ed.buffers.items) |b| {
         b.deinit(ed.gpa);
         ed.gpa.destroy(b);
@@ -412,7 +514,15 @@ pub fn deinit(ed: *Editor) void {
     ed.browse_label.deinit(ed.gpa);
     ed.registers.deinit();
     if (ed.git_job) |j| j.destroy();
-    if (ed.git_root) |r| ed.gpa.free(r);
+    for (ed.projects.items) |p| {
+        ed.gpa.free(p.root);
+        ed.gpa.destroy(p);
+    }
+    ed.projects.deinit(ed.gpa);
+    if (ed.known_projects) |*k| {
+        for (k.items) |r| ed.gpa.free(r);
+        k.deinit(ed.gpa);
+    }
     if (ed.search_prompt) |*sp| sp.input.deinit(ed.gpa);
     ed.last_search.deinit(ed.gpa);
     ed.change_keys.deinit(ed.gpa);
@@ -568,7 +678,7 @@ fn processKey(ed: *Editor, ev: KeyEvent) void {
         ed.gpa.free(h);
         ed.hover = null;
     }
-    if (ed.mode != .insert and ed.mode != .picker and ed.mode != .search and ed.showcmd_len < ed.showcmd.len) {
+    if (ed.mode != .insert and ed.mode != .picker and ed.mode != .picker_normal and ed.mode != .search and ed.showcmd_len < ed.showcmd.len) {
         ed.showcmd[ed.showcmd_len] = ev;
         ed.showcmd_len += 1;
     }
@@ -590,7 +700,11 @@ fn processKey(ed: *Editor, ev: KeyEvent) void {
     // Typing text (insert mode, a prompt) isn't a pending command.
     if (ed.mode == .insert or ed.mode == .search) ed.showcmd_len = 0;
     if (ed.completion != null) ed.refreshCompletion() catch ed.closeCompletion();
-    if (ed.mode != .insert) ed.completion_asked = null;
+    if (ed.mode != .insert) {
+        ed.completion_asked = null;
+        ed.closeSignature();
+        ed.endSnippet();
+    }
     ed.scrollToCursor();
 }
 
@@ -631,7 +745,7 @@ pub fn resetCommand(ed: *Editor) void {
 
 fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
     // A message stays up until the next command starts.
-    if (ed.isIdle() and ed.mode != .picker) ed.clearMessage();
+    if (ed.isIdle() and ed.mode != .picker and ed.mode != .picker_normal) ed.clearMessage();
 
     // `"x`: the register for the next command.
     if (ed.awaiting_register) {
@@ -736,9 +850,12 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 .normal, .visual => ed.register = null,
                 .operator => ed.resetCommand(),
                 .insert => for (seq) |k| if (k.text()) |cp| {
+                    try ed.snippetTypeOver();
                     if (!try pairs.typed(ed, cp)) try ed.insertCodepoint(cp);
                     ed.afterTyped(cp);
                 },
+                // Unbound keys while moving through results do nothing.
+                .picker_normal => {},
                 .picker, .search => {
                     const input = ed.activeInput() orelse return;
                     for (seq) |k| if (k.text()) |cp| try input.insert(ed.gpa, cp);
@@ -753,32 +870,38 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
 // Language server
 
 fn tickLsp(ed: *Editor) void {
-    // Start each server the first time a file of its language is open.
+    // Start each language's server for each project, the first time one of
+    // its files is open there.
     for (ed.buffers.items) |b| {
         const i = Lsp.serverFor(b) orelse continue;
-        if (ed.lsps[i] != null or ed.lsp_failed[i]) continue;
-        ed.lsps[i] = Lsp.start(ed, i) catch |err| blk: {
+        if (ed.lsp_failed[i] or ed.lspFor(b) != null) continue;
+        const l = Lsp.start(ed, i, Lsp.bufferRoot(b, ed.cwd)) catch |err| {
             ed.lsp_failed[i] = true;
             ed.setMessage(.err, "could not start {s}: {s}", .{ Lsp.servers[i].name, @errorName(err) });
-            break :blk null;
+            continue;
         };
+        ed.lsps.append(ed.gpa, l) catch l.deinit();
     }
-    for (&ed.lsps, 0..) |*slot, i| {
-        const l = slot.* orelse continue;
+    var k = ed.lsps.items.len;
+    while (k > 0) {
+        k -= 1;
+        const l = ed.lsps.items[k];
         l.sync(ed) catch {};
         if (!l.poll(ed)) {
+            const i = l.index;
             l.deinit();
-            slot.* = null;
+            _ = ed.lsps.orderedRemove(k);
             ed.lsp_failed[i] = true;
             ed.setMessage(.err, "{s} exited", .{Lsp.servers[i].name});
         }
     }
 }
 
-/// The running server for `b`'s language, if any.
+/// The running server for `b` (its language, in its project), if any.
 pub fn lspFor(ed: *const Editor, b: *const Buffer) ?*Lsp {
-    const i = Lsp.serverFor(b) orelse return null;
-    return ed.lsps[i];
+    _ = Lsp.serverFor(b) orelse return null;
+    for (ed.lsps.items) |l| if (l.wants(b)) return l;
+    return null;
 }
 
 /// The current buffer's server, or a message saying why there is none.
@@ -787,7 +910,7 @@ pub fn languageServer(ed: *Editor) ?*Lsp {
         ed.setMessage(.err, "no language server for this file", .{});
         return null;
     };
-    if (ed.lsps[i]) |l| return l;
+    if (ed.lspFor(ed.buffer)) |l| return l;
     const name = Lsp.servers[i].name;
     if (ed.lsp_failed[i]) ed.setMessage(.err, "{s} is not running", .{name}) else ed.setMessage(.info, "{s} is starting...", .{name});
     return null;
@@ -800,7 +923,7 @@ pub fn diagnostics(ed: *const Editor, b: *const Buffer) []const Lsp.Diagnostic {
 
 /// Tells every running server that `b` is going away.
 fn lspCloseBuffer(ed: *Editor, b: *Buffer) void {
-    for (ed.lsps) |maybe| if (maybe) |l| l.closeBuffer(b);
+    for (ed.lsps.items) |l| l.closeBuffer(b);
 }
 
 fn clearLocations(ed: *Editor) void {
@@ -873,7 +996,10 @@ fn wordStart(ed: *Editor) usize {
 /// server's trigger characters (`.`, `::`, `->`...) or two identifier chars.
 fn afterTyped(ed: *Editor, cp: u21) void {
     if (ed.cursors.items.len > 0 or ed.replaying) return; // completion is single-cursor
+    // Signature help: `(` opens it, `,` updates it, `)` closes it.
+    if (cp == ')') ed.closeSignature();
     const l = ed.lspFor(ed.buffer) orelse return;
+    if (l.isSignatureTrigger(cp, ed.signature != null)) l.requestSignature(ed) catch {};
     const trigger = l.isTrigger(cp);
     // A trigger starts a new list even if a popup is open.
     if (trigger) ed.closeCompletion();
@@ -922,10 +1048,142 @@ pub fn acceptCompletion(ed: *Editor) !void {
     const item = c.current() orelse return ed.closeCompletion();
     const insert = try ed.gpa.dupe(u8, item.insert);
     defer ed.gpa.free(insert);
+    const is_snippet = item.snippet;
     const start = c.word_start;
     ed.closeCompletion();
     try ed.deleteRange(start, ed.view.cursor);
-    try ed.insertText(insert);
+    if (!is_snippet) return ed.insertText(insert);
+    // A snippet: insert its text, then fill in the placeholders.
+    const snip = try Snippet.parse(ed.gpa, insert);
+    defer snip.deinit(ed.gpa);
+    try ed.insertText(snip.text);
+    try ed.startSnippet(start, snip);
+}
+
+// Snippets: function arguments as placeholders.
+
+fn startSnippet(ed: *Editor, at: usize, snip: Snippet) !void {
+    ed.endSnippet();
+    if (snip.stops.len == 0) return;
+    const stops = try ed.gpa.alloc([2]usize, snip.stops.len);
+    for (snip.stops, stops) |st, *r| r.* = .{ at + st.start, at + st.end };
+    const has_final = snip.stops[snip.stops.len - 1].index == 0;
+    ed.snippet = .{ .buffer = ed.buffer, .stops = stops, .has_final = has_final };
+    ed.goSnippetStop(0);
+}
+
+pub fn endSnippet(ed: *Editor) void {
+    const s = ed.snippet orelse return;
+    ed.gpa.free(s.stops);
+    ed.snippet = null;
+}
+
+/// Puts the cursor at stop `i`; the final cursor ($0) ends the session.
+fn goSnippetStop(ed: *Editor, i: usize) void {
+    const s = &(ed.snippet orelse return);
+    const r = s.stops[i];
+    const last = i == s.stops.len - 1;
+    ed.view.cursor = @min(r[0], ed.text().len());
+    ed.view.want_col = null;
+    if (last and s.has_final) {
+        ed.endSnippet();
+        return;
+    }
+    s.current = i;
+    s.fresh = r[1] > r[0];
+    // The signature popup follows to this argument.
+    if (ed.lspFor(ed.buffer)) |l| l.requestSignature(ed) catch {};
+}
+
+/// <Tab> / <S-Tab> in insert mode. False when there is no session.
+pub fn snippetStep(ed: *Editor, forward: bool) bool {
+    const s = &(ed.snippet orelse return false);
+    if (s.buffer != ed.buffer) {
+        ed.endSnippet();
+        return false;
+    }
+    if (forward) {
+        if (s.current + 1 >= s.stops.len) {
+            // Past the last placeholder (no $0): after it.
+            ed.view.cursor = s.stops[s.current][1];
+            ed.endSnippet();
+            return true;
+        }
+        ed.goSnippetStop(s.current + 1);
+    } else if (s.current > 0) ed.goSnippetStop(s.current - 1);
+    return true;
+}
+
+/// The current placeholder, if it still holds its default and the cursor is
+/// at its start (where typing replaces it).
+fn freshPlaceholder(ed: *Editor) ?[2]usize {
+    const s = ed.snippet orelse return null;
+    if (!s.fresh or s.buffer != ed.buffer) return null;
+    const r = s.stops[s.current];
+    if (ed.view.cursor != r[0]) return null;
+    return r;
+}
+
+/// Before typing: a fresh placeholder is replaced by what is typed.
+fn snippetTypeOver(ed: *Editor) !void {
+    const r = ed.freshPlaceholder() orelse return;
+    ed.snippet.?.fresh = false;
+    try ed.deleteRange(r[0], r[1]);
+}
+
+/// <BS> on a fresh placeholder removes it whole. True when it did.
+pub fn snippetBackspace(ed: *Editor) !bool {
+    if (ed.freshPlaceholder() == null) return false;
+    try ed.snippetTypeOver();
+    return true;
+}
+
+// Signature help.
+
+pub fn closeSignature(ed: *Editor) void {
+    const s = ed.signature orelse return;
+    s.deinit(ed.gpa);
+    ed.signature = null;
+}
+
+/// A `textDocument/signatureHelp` reply: the active signature and
+/// parameter, or nothing (closes the popup).
+pub fn showSignature(ed: *Editor, b: *Buffer, result: std.json.Value) !void {
+    ed.closeSignature();
+    if (b != ed.buffer or ed.mode != .insert) return;
+    const sigs = Lsp.field(result, "signatures") orelse return;
+    if (sigs != .array or sigs.array.items.len == 0) return;
+    const active_sig: usize = if (Lsp.field(result, "activeSignature")) |v| (if (v == .integer) @intCast(@max(v.integer, 0)) else 0) else 0;
+    const sig = sigs.array.items[@min(active_sig, sigs.array.items.len - 1)];
+    const label = Lsp.str(Lsp.field(sig, "label")) orelse return;
+    const active_param: ?usize = blk: {
+        const v = Lsp.field(sig, "activeParameter") orelse Lsp.field(result, "activeParameter") orelse break :blk 0;
+        break :blk if (v == .integer and v.integer >= 0) @intCast(v.integer) else null;
+    };
+    var help: SignatureHelp = .{ .label = try ed.gpa.dupe(u8, label), .doc = &.{} };
+    errdefer help.deinit(ed.gpa);
+    var doc_src: ?std.json.Value = Lsp.field(sig, "documentation");
+    if (Lsp.field(sig, "parameters")) |params| if (params == .array and active_param != null and active_param.? < params.array.items.len) {
+        const param = params.array.items[active_param.?];
+        if (Lsp.field(param, "label")) |v| switch (v) {
+            // Offsets into the label (UTF-16 by the spec; ASCII in practice).
+            .array => |a| if (a.items.len == 2 and a.items[0] == .integer and a.items[1] == .integer) {
+                help.param_start = @min(@as(usize, @intCast(@max(a.items[0].integer, 0))), label.len);
+                help.param_end = @min(@as(usize, @intCast(@max(a.items[1].integer, 0))), label.len);
+            },
+            .string => |param_text| if (std.mem.indexOf(u8, label, param_text)) |at| {
+                help.param_start = at;
+                help.param_end = at + param_text.len;
+            },
+            else => {},
+        };
+        if (Lsp.field(param, "documentation")) |d| doc_src = d;
+    };
+    if (doc_src) |d| {
+        const doc_text = Lsp.str(d) orelse Lsp.str(Lsp.field(d, "value")) orelse "";
+        help.doc = try ed.gpa.dupe(u8, std.mem.trim(u8, std.mem.sliceTo(doc_text, '\n'), " \t"));
+    }
+    ed.signature = help;
 }
 
 // ---------------------------------------------------------------------------
@@ -934,11 +1192,9 @@ pub fn acceptCompletion(ed: *Editor) !void {
 /// Loads `b`'s HEAD version for diffing, if it is tracked in a repository.
 fn loadGitBase(ed: *Editor, b: *Buffer) void {
     const path = b.path orelse return;
-    if (!ed.git_checked) {
-        ed.git_checked = true;
-        ed.git_root = Git.repoRoot(ed.gpa, ed.io, ed.cwd);
-    }
-    const root = ed.git_root orelse return;
+    const proj = b.project orelse return;
+    if (!proj.git) return;
+    const root = proj.root;
     const abs = ed.absolutePath(path) catch return;
     defer ed.gpa.free(abs);
     const raw = Git.headVersion(ed.gpa, ed.io, root, abs) orelse return;
@@ -954,11 +1210,7 @@ fn loadGitBase(ed: *Editor, b: *Buffer) void {
 
 /// Whether we are in a repository (says so if not).
 pub fn inRepo(ed: *Editor) bool {
-    if (!ed.git_checked) {
-        ed.git_checked = true;
-        ed.git_root = Git.repoRoot(ed.gpa, ed.io, ed.cwd);
-    }
-    if (ed.git_root != null) return true;
+    if (ed.gitRoot() != null) return true;
     ed.setMessage(.info, "not in a git repository", .{});
     return false;
 }
@@ -966,7 +1218,7 @@ pub fn inRepo(ed: *Editor) bool {
 fn startGitJob(ed: *Editor, kind: GitJob.Kind, busy: []const u8, steps: []const []const []const u8) !void {
     if (!ed.inRepo()) return;
     if (ed.git_job != null) return ed.setMessage(.info, "git is still busy...", .{});
-    ed.git_job = try GitJob.start(ed.gpa, ed.io, kind, ed.git_root.?, steps, ed.wake_fn);
+    ed.git_job = try GitJob.start(ed.gpa, ed.io, kind, ed.gitRoot().?, steps, ed.wake_fn);
     ed.setMessage(.info, "git: {s}...", .{busy});
 }
 
@@ -1014,6 +1266,7 @@ pub fn reloadBuffer(ed: *Editor, b: *Buffer) !void {
     b.deinit(ed.gpa);
     fresh.saved = saved;
     fresh.last_used = last_used;
+    fresh.project = b.project;
     b.* = fresh;
     ed.loadGitBase(b);
     for (ed.window_list.items) |w| if (w != ed.window and w.buffer == b) {
@@ -1067,7 +1320,7 @@ pub fn gitSwitch(ed: *Editor, name: []const u8, create: bool) !void {
 pub fn gitRemotePrompt(ed: *Editor) !void {
     if (!ed.inRepo()) return;
     ed.startSearch(true, .git_remote);
-    if (Git.originUrl(ed.gpa, ed.io, ed.git_root.?)) |url| {
+    if (Git.originUrl(ed.gpa, ed.io, ed.gitRoot().?)) |url| {
         defer ed.gpa.free(url);
         try ed.search_prompt.?.input.set(ed.gpa, url);
     }
@@ -1078,7 +1331,7 @@ fn finishGitRemote(ed: *Editor) !void {
     defer ed.gpa.free(url);
     const trimmed = std.mem.trim(u8, url, " ");
     if (trimmed.len == 0) return;
-    const has_origin = if (Git.originUrl(ed.gpa, ed.io, ed.git_root.?)) |u| blk: {
+    const has_origin = if (Git.originUrl(ed.gpa, ed.io, ed.gitRoot().?)) |u| blk: {
         ed.gpa.free(u);
         break :blk true;
     } else false;
@@ -2166,6 +2419,8 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
     }
 
     var loaded = try Buffer.load(ed.gpa, ed.io, norm);
+    loaded.project = ed.projectOf(norm);
+    ed.enterProject(loaded.project);
     // Replace an untouched scratch buffer instead of keeping it around, like vim.
     const cur = ed.buffer;
     if (cur.path == null and !cur.modified and cur.text.len() == 0) {
@@ -2194,13 +2449,19 @@ pub fn relativePath(ed: *Editor, path: []const u8) Allocator.Error![]u8 {
 
 /// An owned absolute path for a buffer path.
 pub fn absolutePath(ed: *Editor, path: []const u8) Allocator.Error![]u8 {
-    if (std.fs.path.isAbsolute(path)) return ed.gpa.dupe(u8, path);
-    return std.fs.path.join(ed.gpa, &.{ ed.cwd, path });
+    // Resolved: no "..", "." or trailing "/" (so "../x" isn't taken to be
+    // inside the cwd's project).
+    return std.fs.path.resolve(ed.gpa, &.{ ed.cwd, path });
 }
 
 /// Opens `path` and puts the cursor at (`line`, `col`), both 0-based.
 pub fn jumpTo(ed: *Editor, path: []const u8, line: usize, col: usize) !void {
     ed.pushJump();
+    try ed.moveTo(path, line, col);
+}
+
+/// `jumpTo` without recording a jump.
+pub fn moveTo(ed: *Editor, path: []const u8, line: usize, col: usize) !void {
     try ed.openFile(path);
     const t = ed.text();
     const l = @min(line, t.lineCount() - 1);
@@ -2209,15 +2470,30 @@ pub fn jumpTo(ed: *Editor, path: []const u8, line: usize, col: usize) !void {
 }
 
 /// Paths inside the cwd are stored relative to it, without "./".
+/// Paths outside it are absolute; "..", "." and trailing "/" are resolved.
 fn normalizePath(ed: *Editor, path: []const u8) Allocator.Error![]u8 {
-    var p = path;
-    if (std.fs.path.isAbsolute(p) and std.mem.startsWith(u8, p, ed.cwd) and
-        p.len > ed.cwd.len and p[ed.cwd.len] == '/')
-    {
-        p = p[ed.cwd.len + 1 ..];
+    const abs = try ed.absolutePath(path);
+    if (abs.len > ed.cwd.len and std.mem.startsWith(u8, abs, ed.cwd) and abs[ed.cwd.len] == '/') {
+        defer ed.gpa.free(abs);
+        return ed.gpa.dupe(u8, abs[ed.cwd.len + 1 ..]);
     }
-    while (std.mem.startsWith(u8, p, "./")) p = p[2..];
-    return ed.gpa.dupe(u8, p);
+    return abs;
+}
+
+/// The file named on the command line: a folder opens the explorer there;
+/// a file that can't be opened leaves an empty editor with a message
+/// (instead of not starting at all).
+pub fn openArg(ed: *Editor, path: []const u8) void {
+    const abs = ed.absolutePath(path) catch return;
+    defer ed.gpa.free(abs);
+    const st = Io.Dir.cwd().statFile(ed.io, abs, .{}) catch null;
+    if (st != null and st.?.kind == .directory) {
+        if (Project.detect(ed.io, abs)) |f| ed.enterProject(ed.internProject(f.root, f.git));
+        ed.setBrowseDir(abs) catch return;
+        ed.openPicker(.browse, "") catch {};
+        return;
+    }
+    ed.openFile(abs) catch |err| ed.setMessage(.err, "could not open {s}: {s}", .{ path, @errorName(err) });
 }
 
 pub fn switchTo(ed: *Editor, b: *Buffer) void {
@@ -2231,6 +2507,7 @@ pub fn switchTo(ed: *Editor, b: *Buffer) void {
 /// Shows `b` with its saved view, without saving the current one.
 fn activate(ed: *Editor, b: *Buffer) void {
     ed.cursors.clearRetainingCapacity();
+    ed.enterProject(b.project);
     if (ed.mode == .visual or ed.mode == .operator) ed.mode = .normal;
     ed.op = null;
     ed.buffer = b;
@@ -2290,7 +2567,7 @@ fn multiAfterKey(ed: *Editor) void {
     const done = ed.mode == .insert or ed.isIdle();
     if (!done) return;
     defer ed.multi_keys.clearRetainingCapacity();
-    if (ed.multi_once or ed.mode == .picker or ed.cursors.items.len == 0) return;
+    if (ed.multi_once or ed.mode == .picker or ed.mode == .picker_normal or ed.cursors.items.len == 0) return;
     ed.replayAtCursors(ed.multi_keys.items);
 }
 
@@ -2365,6 +2642,16 @@ fn shiftCursors(ed: *Editor, start: usize, end: usize, inserted: usize) void {
         S.shift(&c.anchor, start, end, inserted);
     }
     for (ed.jumps.items) |*j| if (j.buffer == ed.buffer) S.shift(&j.pos, start, end, inserted);
+    // Placeholders grow with typing at their end, not their start.
+    if (ed.snippet) |sn| if (sn.buffer == ed.buffer) for (sn.stops) |*r| {
+        if (start == end and inserted > 0) {
+            if (r[0] > start) r[0] += inserted;
+            if (r[1] >= start) r[1] += inserted;
+        } else {
+            S.shift(&r[0], start, end, inserted);
+            S.shift(&r[1], start, end, inserted);
+        }
+    };
     // Other windows on this buffer keep their place too.
     for (ed.window_list.items) |w| if (w != ed.window and w.buffer == ed.buffer) {
         S.shift(&w.view.cursor, start, end, inserted);
@@ -2540,11 +2827,12 @@ pub fn cursorsFromPrompt(ed: *Editor) !void {
 // program, except <C-\> (hide) and, once a run has finished, q/<Esc>
 // (close) and r (run again).
 
+/// Starts `argv` in a terminal, in the current project's root.
 fn spawnTerminal(ed: *Editor, argv: []const []const u8) !*Terminal {
     const sz = ed.term_size;
     return Terminal.create(ed.gpa, ed.io, .{
         .argv = argv,
-        .cwd = ed.cwd,
+        .cwd = ed.projectRoot(),
         .cols = sz.cols,
         .rows = sz.rows,
         .cell_w = sz.cell_w,
@@ -2708,7 +2996,7 @@ fn runMemoryPath(ed: *Editor) ?[]const u8 {
 }
 
 fn projectDir(ed: *Editor) []const u8 {
-    return ed.git_root orelse ed.cwd;
+    return ed.projectRoot();
 }
 
 /// This project's remembered runner command. Caller frees.
@@ -2753,6 +3041,7 @@ pub fn startRun(ed: *Editor, cmd: []const u8) !void {
     if (ed.run_command) |old| ed.gpa.free(old);
     ed.run = t;
     ed.run_command = owned;
+    ed.run_root = ed.projectRoot();
     ed.run_started = Io.Timestamp.now(ed.io, .awake);
     ed.run_reported = false;
     ed.popup = .run;
@@ -2764,19 +3053,127 @@ fn collectRunErrors(ed: *Editor, t: *Terminal) void {
     ed.run_errors.clearRetainingCapacity();
     const out = t.copyOutput(ed.gpa) catch return;
     defer ed.gpa.free(out);
+    // Paths in the output are relative to where the command ran.
     const S = struct {
         fn exists(e: *Editor, path: []const u8) bool {
-            return e.fileExists(path);
+            if (std.fs.path.isAbsolute(path)) return e.fileExists(path);
+            var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+            const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ e.run_root, path }) catch return false;
+            return e.fileExists(full);
         }
     };
     run_errors_mod.parse(ed.gpa, out, ed, S.exists, &ed.run_errors) catch {};
+    for (ed.run_errors.items) |*e| if (!std.fs.path.isAbsolute(e.path)) {
+        const full = std.fs.path.join(ed.gpa, &.{ ed.run_root, e.path }) catch continue;
+        ed.gpa.free(e.path);
+        e.path = full;
+    };
 }
 
-/// `SPC r e`: the last run's errors in a picker; <CR> jumps to one.
+// Quickfix: one list of places, filled by runs and pickers, stepped
+// through with ]q / [q, listed with SPC x x.
+
+pub fn clearQuickfix(ed: *Editor) void {
+    for (ed.quickfix.items) |q| q.deinit(ed.gpa);
+    ed.quickfix.clearRetainingCapacity();
+    ed.quickfix_title.clearRetainingCapacity();
+    ed.quickfix_index = null;
+}
+
+/// Starts a new list named `title` (add entries with `addQuickfix`).
+pub fn newQuickfix(ed: *Editor, title: []const u8) !void {
+    ed.clearQuickfix();
+    try ed.quickfix_title.appendSlice(ed.gpa, title);
+}
+
+/// Adds a place; `path` and `text` are copied.
+pub fn addQuickfix(ed: *Editor, path: []const u8, line: usize, col: usize, message: []const u8) !void {
+    const p = try ed.normalizePath(path);
+    errdefer ed.gpa.free(p);
+    const t = try ed.gpa.dupe(u8, std.mem.trim(u8, message, " \t"));
+    errdefer ed.gpa.free(t);
+    try ed.quickfix.append(ed.gpa, .{ .path = p, .line = line, .col = col, .text = t });
+}
+
+fn quickfixFromRunErrors(ed: *Editor) void {
+    ed.newQuickfix(ed.run_command orelse "run") catch return;
+    for (ed.run_errors.items) |e| ed.addQuickfix(e.path, e.line - 1, e.col - 1, e.message) catch return;
+}
+
+/// Goes to quickfix entry `i` (a jump, unless moving within the panel).
+pub fn goQuickfix(ed: *Editor, i: usize) !void {
+    if (i >= ed.quickfix.items.len) return;
+    const q = ed.quickfix.items[i];
+    ed.quickfix_index = i;
+    try ed.jumpTo(q.path, q.line, q.col);
+    ed.setMessage(.info, "({d}/{d}) {s}", .{ i + 1, ed.quickfix.items.len, q.text });
+}
+
+/// `]q` / `[q`: the next / previous entry (`count` of them).
+pub fn stepQuickfix(ed: *Editor, forward: bool, count: usize) !void {
+    const n = ed.quickfix.items.len;
+    if (n == 0) return ed.setMessage(.info, "the quickfix list is empty (Ctrl-q in a picker fills it)", .{});
+    const i: usize = if (ed.quickfix_index) |cur| blk: {
+        if (forward) {
+            if (cur + 1 >= n) return ed.setMessage(.info, "last quickfix entry ({d}/{d})", .{ n, n });
+            break :blk @min(cur + count, n - 1);
+        }
+        if (cur == 0) return ed.setMessage(.info, "first quickfix entry (1/{d})", .{n});
+        break :blk cur -| count;
+    } else if (forward) @min(count - 1, n - 1) else n - 1;
+    try ed.goQuickfix(i);
+}
+
+/// `SPC x x`: the quickfix picker, docked at the bottom in normal mode at
+/// the current entry; moving through it moves the editor (where you were
+/// goes on the jumplist, so <C-o> comes back after closing).
+pub fn showQuickfix(ed: *Editor) !void {
+    if (ed.quickfix.items.len == 0) return ed.setMessage(.info, "the quickfix list is empty (Ctrl-q in a picker fills it)", .{});
+    ed.closePicker();
+    ed.popup = null;
+    ed.pushJump();
+    try ed.openPicker(.quickfix, "");
+    ed.picker.?.want_id = @intCast(ed.quickfix_index orelse 0);
+}
+
+/// Moving through the quickfix picker: the editor shows each entry.
+pub fn followQuickfix(ed: *Editor, i: usize) !void {
+    if (i >= ed.quickfix.items.len) return;
+    const q = ed.quickfix.items[i];
+    ed.quickfix_index = i;
+    try ed.moveTo(q.path, q.line, q.col);
+}
+
+/// `<C-q>` in a picker of places: every current match becomes the list.
+pub fn pickerToQuickfix(ed: *Editor) !void {
+    const sources = @import("picker/sources.zig");
+    const p = ed.picker orelse return;
+    if (!sources.hasLocations(p.kind)) return ed.setMessage(.info, "these results aren't places", .{});
+    p.sync();
+    var title_buf: [128]u8 = undefined;
+    const q = p.activeQuery();
+    const title = if (q.len > 0) std.fmt.bufPrint(&title_buf, "{s}: {s}", .{ sources.title(p.kind), q }) catch sources.title(p.kind) else sources.title(p.kind);
+    try ed.newQuickfix(title);
+    var row: usize = 0;
+    while (row < p.snap.len) : (row += 1) {
+        const item = p.itemAt(row) orelse continue;
+        const loc = (try sources.location(p.kind, ed, item.*)) orelse continue;
+        defer ed.gpa.free(loc.path);
+        try ed.addQuickfix(loc.path, loc.line, loc.col, item.text);
+    }
+    const n = ed.quickfix.items.len;
+    ed.closePicker();
+    if (n == 0) return ed.setMessage(.info, "no places to add", .{});
+    try ed.showQuickfix();
+}
+
+/// `SPC r e` (or `e` in a finished run): the last run's errors in the
+/// quickfix panel.
 pub fn showRunErrors(ed: *Editor) !void {
     if (ed.run == null) return ed.setMessage(.info, "nothing has been run yet (SPC r r)", .{});
     if (ed.run_errors.items.len == 0) return ed.setMessage(.info, "no errors in the last run", .{});
-    try ed.openPicker(.run_errors, "");
+    ed.quickfixFromRunErrors();
+    try ed.showQuickfix();
 }
 
 /// Seconds since the run started (or how long it took, once reported).
@@ -2793,6 +3190,7 @@ fn pollTerminals(ed: *Editor) void {
         const secs = ed.runSeconds();
         ed.collectRunErrors(t);
         const n = ed.run_errors.items.len;
+        if (n > 0) ed.quickfixFromRunErrors();
         var buf: [160]u8 = undefined;
         const ok = t.exit_code == 0;
         var errs_buf: [48]u8 = undefined;
@@ -2906,6 +3304,128 @@ fn forgetJumps(ed: *Editor, b: *Buffer) void {
 }
 
 // ---------------------------------------------------------------------------
+// Projects: the git repo (or build-file folder) a file is in. Pickers, the
+// runner, the shell, git and language servers work in the current window's
+// project, not wherever the editor was started.
+
+/// The project for `root`, shared by every buffer in it.
+fn internProject(ed: *Editor, root: []const u8, git: bool) ?*const Project {
+    for (ed.projects.items) |p| if (std.mem.eql(u8, p.root, root)) return p;
+    const p = ed.gpa.create(Project) catch return null;
+    p.* = .{ .root = ed.gpa.dupe(u8, root) catch {
+        ed.gpa.destroy(p);
+        return null;
+    }, .git = git };
+    ed.projects.append(ed.gpa, p) catch {
+        ed.gpa.free(p.root);
+        ed.gpa.destroy(p);
+        return null;
+    };
+    return p;
+}
+
+/// The project a buffer path (relative to the cwd, or absolute) belongs to.
+fn projectOf(ed: *Editor, path: []const u8) ?*const Project {
+    const abs = ed.absolutePath(path) catch return null;
+    defer ed.gpa.free(abs);
+    const f = Project.detect(ed.io, std.fs.path.dirname(abs) orelse return null) orelse return null;
+    return ed.internProject(f.root, f.git);
+}
+
+/// The current project: the focused buffer's, else the last one used.
+pub fn project(ed: *const Editor) ?*const Project {
+    return ed.buffer.project orelse ed.last_project;
+}
+
+/// Where project-wide things happen: the current project, else the cwd.
+pub fn projectRoot(ed: *const Editor) []const u8 {
+    return if (ed.project()) |p| p.root else ed.cwd;
+}
+
+/// The current project's repository root, if it is one.
+pub fn gitRoot(ed: *const Editor) ?[]const u8 {
+    const p = ed.project() orelse return null;
+    return if (p.git) p.root else null;
+}
+
+/// A path from a picker (relative to the folder it listed) as a buffer path.
+/// Caller frees.
+pub fn pickerPath(ed: *Editor, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return ed.normalizePath(path);
+    const abs = try std.fs.path.join(ed.gpa, &.{ ed.picker_root, path });
+    defer ed.gpa.free(abs);
+    return ed.normalizePath(abs);
+}
+
+/// A buffer's project becomes the one we're in (and is remembered for
+/// `SPC p p`).
+fn enterProject(ed: *Editor, p: ?*const Project) void {
+    const proj = p orelse return;
+    if (ed.last_project == proj) return;
+    ed.last_project = proj;
+    ed.rememberProject(proj.root);
+}
+
+fn knownProjectsPath(ed: *Editor) ?[]u8 {
+    return RunMemory.statePath(ed.gpa, "projects");
+}
+
+/// Projects opened before, most recent first.
+pub fn knownProjects(ed: *Editor) []const []u8 {
+    if (ed.known_projects == null) {
+        ed.known_projects = .empty;
+        if (@import("builtin").is_test) return ed.known_projects.?.items;
+        const path = ed.knownProjectsPath() orelse return &.{};
+        defer ed.gpa.free(path);
+        const data = Io.Dir.cwd().readFileAlloc(ed.io, path, ed.gpa, .limited(1 << 20)) catch return &.{};
+        defer ed.gpa.free(data);
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| if (line.len > 0) {
+            const owned = ed.gpa.dupe(u8, line) catch break;
+            ed.known_projects.?.append(ed.gpa, owned) catch ed.gpa.free(owned);
+        };
+    }
+    return ed.known_projects.?.items;
+}
+
+const max_known_projects = 50;
+
+fn rememberProject(ed: *Editor, root: []const u8) void {
+    _ = ed.knownProjects();
+    const list = &ed.known_projects.?;
+    for (list.items, 0..) |r, i| if (std.mem.eql(u8, r, root)) {
+        if (i == 0) return;
+        const owned = list.orderedRemove(i);
+        list.insert(ed.gpa, 0, owned) catch ed.gpa.free(owned);
+        return ed.saveKnownProjects();
+    };
+    const owned = ed.gpa.dupe(u8, root) catch return;
+    list.insert(ed.gpa, 0, owned) catch return ed.gpa.free(owned);
+    while (list.items.len > max_known_projects) ed.gpa.free(list.pop().?);
+    ed.saveKnownProjects();
+}
+
+fn saveKnownProjects(ed: *Editor) void {
+    if (@import("builtin").is_test) return;
+    const path = ed.knownProjectsPath() orelse return;
+    defer ed.gpa.free(path);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(ed.gpa);
+    for (ed.known_projects.?.items) |r| out.print(ed.gpa, "{s}\n", .{r}) catch return;
+    if (std.fs.path.dirname(path)) |dir| Io.Dir.cwd().createDirPath(ed.io, dir) catch return;
+    Io.Dir.cwd().writeFile(ed.io, .{ .sub_path = path, .data = out.items }) catch {};
+}
+
+/// `SPC p p` picked a project: find a file in it.
+pub fn switchProject(ed: *Editor, root: []const u8) !void {
+    const f = Project.detect(ed.io, root) orelse Project.Found{ .root = root, .git = false };
+    const p = ed.internProject(f.root, f.git) orelse return;
+    ed.enterProject(p);
+    ed.next_picker_root = p.root;
+    try ed.openPicker(.files, "");
+}
+
+// ---------------------------------------------------------------------------
 // Windows (SPC w): splits showing buffers, each with its own view.
 
 fn refreshWindowList(ed: *Editor) void {
@@ -2938,6 +3458,7 @@ fn loadWindow(ed: *Editor, w: *Windows.Window) void {
     ed.op = null;
     ed.buffer = w.buffer;
     ed.view = w.view;
+    ed.enterProject(ed.buffer.project);
     ed.use_counter += 1;
     ed.buffer.last_used = ed.use_counter;
     ed.placeCursor(@min(ed.view.cursor, ed.text().len()));
@@ -2956,7 +3477,7 @@ pub fn closeWindow(ed: *Editor) void {
     const closing = ed.window;
     ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
     const target = ed.windows.close(closing) orelse
-        return ed.setMessage(.info, "this is the last window (SPC q q quits)", .{});
+        return ed.setMessage(.info, "this is the last window (SPC q closes the buffer, then quits)", .{});
     ed.refreshWindowList();
     ed.loadWindow(target);
 }
@@ -3066,6 +3587,7 @@ fn setBufferPath(ed: *Editor, b: *Buffer, path: []const u8) !void {
     b.syntax = @import("syntax/Syntax.zig").forPath(path);
     if (b.git) |*g| g.deinit(ed.gpa);
     b.git = null;
+    b.project = ed.projectOf(path);
     ed.loadGitBase(b);
     if (b == ed.buffer) ed.updateGit();
 }
@@ -3201,12 +3723,16 @@ pub fn cursorOf(ed: *const Editor, b: *const Buffer) usize {
 
 pub fn openPicker(ed: *Editor, kind: Picker.Kind, query: []const u8) !void {
     ed.closePicker();
+    ed.picker_root = ed.next_picker_root orelse ed.projectRoot();
+    ed.next_picker_root = null;
     ed.picker = try Picker.create(ed, kind, query);
-    ed.mode = .picker;
+    ed.mode = if (@import("picker/sources.zig").startsNormal(kind)) .picker_normal else .picker;
 }
 
 pub fn closePicker(ed: *Editor) void {
     const p = ed.picker orelse return;
+    // Closing without picking cancels a split waiting for a file.
+    ed.deferred_target = null;
     ed.resume_kind = p.base;
     ed.resume_query.clearRetainingCapacity();
     ed.resume_query.appendSlice(ed.gpa, p.query.items()) catch {};
@@ -3276,20 +3802,75 @@ fn setBrowseDir(ed: *Editor, dir: []const u8) !void {
 /// Accepts the selected row: closes the picker, then acts on the choice
 /// (which may open another picker).
 pub fn acceptPicker(ed: *Editor) !void {
+    return ed.acceptPickerAs(.here);
+}
+
+/// Accepts the selection, opening it in `target` (<C-v>: a split to the
+/// right, <C-s>: below).
+pub fn acceptPickerAs(ed: *Editor, target: OpenTarget) !void {
     const p = ed.picker orelse return;
     const choice = try p.choice();
     defer choice.deinit(ed.gpa);
+    const deferred = ed.deferred_target;
+    ed.deferred_target = null;
     ed.closePicker();
-    // Pickers that take you somewhere are jumps.
+    try ed.runChoice(choice, if (target == .here) deferred orelse .here else target);
+}
+
+/// Sources whose choices open something somewhere (files, places).
+pub fn opensPlaces(kind: Picker.Kind) bool {
+    return switch (kind) {
+        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes, .browse, .jumps, .run_errors, .projects => true,
+        else => false,
+    };
+}
+
+/// <Tab> in a picker: asks where to open the selection.
+pub fn pickerOpenMenu(ed: *Editor) !void {
+    const p = ed.picker orelse return;
+    if (!opensPlaces(p.kind)) return;
+    const choice = try p.choice();
+    if (choice == .none) return;
+    if (ed.pending_choice) |old| old.deinit(ed.gpa);
+    ed.pending_choice = choice;
+    ed.closePicker();
+    try ed.openPicker(.open_in, "");
+}
+
+/// The "Open in..." menu picked `target` for the waiting choice.
+pub fn openPendingIn(ed: *Editor, target: OpenTarget) !void {
+    const choice = ed.pending_choice orelse return;
+    ed.pending_choice = null;
+    defer choice.deinit(ed.gpa);
+    try ed.runChoice(choice, target);
+}
+
+fn runChoice(ed: *Editor, choice: Picker.Choice, target_in: OpenTarget) anyerror!void {
     const kind: ?Picker.Kind = switch (choice) {
         .none => null,
         .item => |c| c.kind,
         .create => |c| c.kind,
     };
+    var target = target_in;
+    if (kind) |k| {
+        if (!opensPlaces(k)) target = .here;
+        // A project opens into a split once a file is picked in it.
+        if (k == .projects and target != .here) {
+            ed.deferred_target = target;
+            target = .here;
+        }
+        // Entering a folder in the explorer isn't opening anything yet.
+        if (k == .browse and choice == .item and std.mem.endsWith(u8, choice.item.item.text, "/")) {
+            if (target != .here) ed.deferred_target = target;
+            target = .here;
+        }
+    }
+    // Pickers that take you somewhere are jumps.
     if (kind) |k| switch (k) {
         .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes => ed.pushJump(),
         else => {},
     };
+    if (target.dir()) |d| try ed.splitWindow(d);
     switch (choice) {
         .none => {},
         .item => |c| try @import("picker/sources.zig").accept(c.kind, ed, c.item),
@@ -3409,16 +3990,33 @@ test "gg and G with counts" {
     try testing.expectEqual(0, ed.cursorLine());
 }
 
-test "leader menus: quit refuses unsaved changes, SPC q Q forces" {
+test "leader menus: quit refuses unsaved changes, SPC Q Q forces" {
     var ed = try testEditor("x");
     defer ed.deinit();
-    try ed.feed("ia<Esc><Space>q");
+    try ed.feed("ia<Esc><Space>Q");
     var out: [16]km.Continuation = undefined;
     try testing.expect(ed.whichKey(&out).len >= 2); // menu is open
-    try ed.feed("q");
+    try ed.feed("<Esc><Space>q"); // smart close, last buffer: quit, but it's unsaved
     try testing.expect(!ed.should_quit);
     try testing.expectEqual(.err, ed.message.kind);
-    try ed.feed("<Space>qQ");
+    try ed.feed("<Space>QQ");
+    try testing.expect(ed.should_quit);
+}
+
+test "SPC q: closes the window, then buffers, then the editor" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.openFile("zile-test-a.txt");
+    try ed.openFile("zile-test-b.txt");
+    try ed.feed("<Space>wsl");
+    try ed.feed("<Space>q"); // two windows: the focused one goes
+    try testing.expectEqual(1, ed.window_list.items.len);
+    try testing.expectEqual(2, ed.buffers.items.len);
+    try ed.feed("<Space>q"); // one window, two buffers: the buffer goes
+    try testing.expectEqual(1, ed.buffers.items.len);
+    try testing.expect(!ed.should_quit);
+    try ed.feed("<Space>q"); // last of everything: quit
     try testing.expect(ed.should_quit);
 }
 
@@ -3464,7 +4062,7 @@ test "prefix switches sources; Esc closes and resume restores" {
     try testing.expectEqualStrings("savefi", ed.picker.?.activeQuery());
     ed.picker.?.sync();
     try testing.expectEqualStrings("save_file", ed.picker.?.itemAt(0).?.text);
-    try ed.feed("<Esc>");
+    try ed.feed("<Esc><Esc>");
     try testing.expectEqual(.normal, ed.mode);
     try ed.feed("<Space>'");
     try testing.expectEqualStrings(">savefi", ed.picker.?.query.items());
@@ -3757,7 +4355,7 @@ test "applyEdits: a rename's edits land bottom-up as one undo step" {
     try expectText(&ed, "const foo = 1;\nconst bar = foo + foo;");
 }
 
-test "SPC q s saves every modified buffer, then quits; SPC q q checks all buffers" {
+test "SPC Q s saves every modified buffer, then quits; SPC q checks all buffers" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -3775,9 +4373,9 @@ test "SPC q s saves every modified buffer, then quits; SPC q q checks all buffer
     try ed.feed("ialpha<Esc>");
     try ed.openFile(b);
     try ed.feed("ibeta<Esc><Space>bp"); // back to a.txt, which is saved? no: both modified
-    try ed.feed("<Space>qq");
-    try testing.expect(!ed.should_quit); // b.txt is unsaved even though a.txt is current
-    try ed.feed("<Space>qs");
+    try ed.feed("<Space>q");
+    try testing.expect(!ed.should_quit); // a.txt is unsaved: not closed
+    try ed.feed("<Space>Qs");
     try testing.expect(ed.should_quit);
 
     const saved_a = try tmp.dir.readFileAlloc(io, "a.txt", gpa, .limited(64));
@@ -3910,7 +4508,6 @@ fn ghostEditor(head: []const u8, current: []const u8) !Editor {
 test "ghost lines: j/k walk onto them, yy yanks, edits are refused, SPC g r restores" {
     var ed = try ghostEditor("a\nold b\nc\ngone\nd", "a\nnew b\nc\nd");
     defer ed.deinit();
-    ed.git_root = try ed.gpa.dupe(u8, "/repo"); // pretend we're in a repo
     // Rows: a, new b, [old b], c, [gone], d
     try ed.feed("jj");
     try testing.expect(ed.ghost != null);
@@ -4031,8 +4628,6 @@ test "git: commit from the editor in a real repository" {
 
     var ed = try testEditor("");
     defer ed.deinit();
-    ed.git_checked = true;
-    ed.git_root = try gpa.dupe(u8, dir);
     const file = try std.fmt.allocPrint(gpa, "{s}/a.txt", .{dir});
     defer gpa.free(file);
     try ed.openFile(file);
@@ -4072,7 +4667,6 @@ test "files: save as, rename, copy, delete, new" {
 
     var ed = try testEditor("");
     defer ed.deinit();
-    ed.git_checked = true; // no repository
 
     // A scratch buffer: SPC f s asks for a name, then saves there.
     try ed.feed("ihello<Esc><Space>fs");
@@ -4114,7 +4708,7 @@ test "files: save as, rename, copy, delete, new" {
     // Delete: "No" keeps it, "Yes" removes it and closes the buffer.
     try ed.feed("<Space>fD<CR>");
     try tmp.dir.access(io, "c.zig", .{});
-    try ed.feed("<Space>fDyes<CR>");
+    try ed.feed("<Space>fDj<CR>"); // the confirmation starts in normal mode: j to "Yes"
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "c.zig", .{}));
     try testing.expectEqual(1, ed.buffers.items.len);
     try testing.expect(std.mem.endsWith(u8, b, ed.buffer.path.?));
@@ -4140,7 +4734,6 @@ test "file browser: into folders, up, open, create" {
 
     var ed = try testEditor("");
     defer ed.deinit();
-    ed.git_checked = true;
     const readme = try std.fmt.allocPrint(gpa, "{s}/readme.txt", .{dir});
     defer gpa.free(readme);
     try ed.openFile(readme);
@@ -4172,7 +4765,7 @@ test "file browser: into folders, up, open, create" {
     try ed.feed("<Down><BS>");
     ed.picker.?.sync();
     // Up from tmp dir; then back down via <CR> on a folder.
-    try ed.feed("<Esc><Space>.<CR>ma<CR>");
+    try ed.feed("<Esc><Esc><Space>.<CR>ma<CR>");
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
     try testing.expect(ed.picker == null);
 
@@ -4386,7 +4979,6 @@ test "run: SPC r c shows output and how it ended; SPC r r remembers its command"
 
     var ed = try testEditor("");
     defer ed.deinit();
-    ed.git_checked = true;
     ed.run_memory_path = try std.fs.path.join(gpa, &.{ dir, "run-commands" });
 
     try ed.feed("<Space>rcecho hi; exit 4<Esc><CR>");
@@ -4439,31 +5031,93 @@ test "terminal popup: keys go to the shell, Ctrl-\\ hides it and keeps it runnin
     try testing.expectEqual(null, ed.shell);
 }
 
-test "run errors: a failing run lists its errors; e and SPC r e open them; Enter jumps" {
+/// Lets the picker catch up (results, then a frame: the docked quickfix
+/// picker moves the editor on the frame after a key).
+fn settlePicker(ed: *Editor) void {
+    if (ed.picker) |p| p.sync();
+    ed.tick();
+}
+
+test "run errors: a failing run fills the quickfix picker; j/k follow, Enter closes" {
     var ed = try testEditor("");
     defer ed.deinit();
-    ed.git_checked = true;
     ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
-    try ed.feed("<Space>rcprintf 'src/main.zig:4:7: error: boom\\nnot/a/file.zig:1:1: error: x\\n'; exit 1<Esc><CR>");
+    try ed.feed("<Space>rcprintf 'src/main.zig:4:7: error: boom\\nsrc/Editor.zig:2:1: error: two\\nnot/a/file.zig:1:1: error: x\\n'; exit 1<Esc><CR>");
     waitForRun(&ed);
-    try testing.expectEqual(1, ed.run_errors.items.len); // only real files count
+    try testing.expectEqual(2, ed.run_errors.items.len); // only real files count
+    try testing.expectEqual(2, ed.quickfix.items.len); // and they're the quickfix list
     try testing.expectEqual(.err, ed.message.kind);
     try ed.feed("e"); // from the finished run's popup
-    try testing.expectEqual(.run_errors, ed.picker.?.kind);
-    ed.picker.?.sync();
-    try testing.expectEqualStrings("error: boom", ed.picker.?.itemAt(0).?.text);
-    try ed.feed("<CR>");
+    try testing.expectEqual(.quickfix, ed.picker.?.kind);
+    try testing.expectEqual(.picker_normal, ed.mode); // quickfix starts in normal mode
+    try testing.expectEqual(null, ed.popup);
+    settlePicker(&ed);
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
     try testing.expectEqual(3, ed.cursorLine());
     try testing.expectEqual(6, ed.view.cursor - ed.text().lineStart(3));
-    try ed.feed("<Space>re");
-    try testing.expectEqual(.run_errors, ed.picker.?.kind);
+    try ed.feed("j"); // the editor follows the list
+    settlePicker(&ed);
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/Editor.zig"));
+    try testing.expectEqual(1, ed.cursorLine());
+    try ed.feed("k");
+    settlePicker(&ed);
+    try ed.feed("<CR>");
+    try testing.expectEqual(null, ed.picker);
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
+    try ed.feed("j"); // a normal j again
+    try testing.expectEqual(4, ed.cursorLine());
+    // ]q / [q without the picker.
+    try ed.feed("]q");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/Editor.zig"));
+    try ed.feed("[q");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
+    // SPC x x reopens at the current entry; i types to filter; q closes.
+    try ed.feed("<Space>xx");
+    settlePicker(&ed);
+    try testing.expectEqual(0, ed.picker.?.selected);
+    try ed.feed("itwo");
+    settlePicker(&ed);
+    try testing.expectEqual(1, ed.picker.?.rowCount());
+    try ed.feed("<Esc>q");
+    try testing.expectEqual(null, ed.picker);
+}
+
+test "pickers: Esc moves from typing to normal mode, j/k move, q closes" {
+    var ed = try testEditor("alpha\nbeta\ngamma");
+    defer ed.deinit();
+    try ed.feed("<Space>ss");
+    try testing.expectEqual(.picker, ed.mode); // buffer lines start typing
+    try ed.feed("a<Esc>");
+    try testing.expectEqual(.picker_normal, ed.mode);
+    settlePicker(&ed);
+    try ed.feed("jjk"); // moving, not typing
+    try testing.expectEqualStrings("a", ed.picker.?.query.items());
+    try testing.expectEqual(1, ed.picker.?.selected);
+    try ed.feed("Gi"); // back to typing
+    try testing.expectEqual(.picker, ed.mode);
+    try ed.feed("<Esc><Esc>");
+    try testing.expectEqual(null, ed.picker);
+    try testing.expectEqual(.normal, ed.mode);
+}
+
+test "quickfix: Ctrl-q sends a picker's results" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("src/pairs.zig");
+    try ed.feed("<Space>sssurround");
+    ed.picker.?.sync();
+    const n = ed.picker.?.snap.len;
+    try testing.expect(n > 1);
+    try ed.feed("<C-q>");
+    try testing.expectEqual(.quickfix, ed.picker.?.kind);
+    try testing.expectEqual(n, ed.quickfix.items.len);
+    try ed.feed("q");
+    try testing.expectEqual(null, ed.picker);
 }
 
 test "command editor: multi-line with vim editing; Enter runs, Esc cancels" {
     var ed = try testEditor("main text");
     defer ed.deinit();
-    ed.git_checked = true;
     ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
     const main_buffer = ed.buffer;
 
@@ -4487,4 +5141,196 @@ test "command editor: multi-line with vim editing; Enter runs, Esc cancels" {
     try ed.feed("q<Space>rcecho nope<Esc><Esc>"); // Esc in normal mode cancels
     try testing.expectEqual(null, ed.cmd_float);
     try testing.expectEqualStrings("echo one; echo three\necho two", ed.run_command.?);
+}
+
+test "projects: each window's pickers, git and runner use its file's project" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "alpha/.git");
+    try tmp.dir.createDirPath(io, "alpha/src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "alpha/src/a.txt", .data = "a\n" });
+    try tmp.dir.createDirPath(io, "beta/.git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beta/b.txt", .data = "b\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const a = try std.fmt.allocPrint(gpa, "{s}/alpha/src/a.txt", .{base});
+    defer gpa.free(a);
+    const b = try std.fmt.allocPrint(gpa, "{s}/beta/b.txt", .{base});
+    defer gpa.free(b);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.run_memory_path = try std.fs.path.join(gpa, &.{ base, "run-commands" });
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+
+    try ed.openFile(a);
+    try testing.expectEqualStrings("alpha", ed.project().?.name());
+    try testing.expect(std.mem.endsWith(u8, ed.gitRoot().?, "/alpha"));
+    // The file picker lists alpha, relative to its root, and opens from there.
+    try ed.feed("<Space><Space>");
+    try testing.expect(std.mem.endsWith(u8, ed.picker_root, "/alpha"));
+    ed.picker.?.sync();
+    try testing.expectEqualStrings("src/a.txt", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("<Esc><Esc>");
+
+    // The runner remembers per project.
+    try ed.feed("<Space>rrecho alpha<CR>");
+    waitForRun(&ed);
+    try ed.feed("q");
+
+    try ed.feed("<Space>wsl");
+    try ed.openFile(b);
+    try testing.expectEqualStrings("beta", ed.project().?.name());
+    try ed.feed("<Space><Space>");
+    try testing.expect(std.mem.endsWith(u8, ed.picker_root, "/beta"));
+    try ed.feed("<Esc><Esc><Space>rr");
+    try testing.expectEqualStrings("", ed.search_prompt.?.input.items());
+    try ed.feed("<Esc><Space>wh<Space>rr"); // back in alpha's window
+    try testing.expectEqualStrings("echo alpha", ed.search_prompt.?.input.items());
+    try ed.feed("<Esc>");
+}
+
+test "open in: Ctrl-v / Ctrl-s / Tab menu split; SPC p p into a split" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "proj/.git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/xx.txt", .data = "x\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/yy.txt", .data = "y\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const x = try std.fmt.allocPrint(gpa, "{s}/proj/xx.txt", .{base});
+    defer gpa.free(x);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.openFile(x);
+    const x_buffer = ed.buffer;
+
+    try ed.feed("<Space><Space>yy");
+    ed.picker.?.sync();
+    try ed.feed("<C-v>"); // split right
+    try testing.expectEqual(2, ed.window_list.items.len);
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "yy.txt"));
+    try testing.expectEqual(x_buffer, ed.window_list.items[0].buffer); // the old window keeps xx
+
+    try ed.feed("<Space><Space>xx");
+    ed.picker.?.sync();
+    try ed.feed("<Tab>");
+    try testing.expectEqual(.open_in, ed.picker.?.kind);
+    ed.picker.?.sync();
+    try ed.feed("<Down><Down><CR>"); // "Split below"
+    try testing.expectEqual(3, ed.window_list.items.len);
+    try testing.expectEqual(x_buffer, ed.buffer);
+
+    // A project into a split: the split waits for the file.
+    try ed.feed("<Space>pp");
+    ed.picker.?.sync();
+    try ed.feed("<C-v>");
+    try testing.expectEqual(.files, ed.picker.?.kind);
+    try testing.expectEqual(3, ed.window_list.items.len);
+    try ed.feed("<Esc><Esc>"); // changed our mind: no split
+    try testing.expectEqual(3, ed.window_list.items.len);
+    try ed.feed("<Space>pp");
+    ed.picker.?.sync();
+    try ed.feed("<C-s>yy");
+    ed.picker.?.sync();
+    try ed.feed("<CR>");
+    try testing.expectEqual(4, ed.window_list.items.len);
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "yy.txt"));
+}
+
+test "paths: trailing slashes and .. resolve; a folder argument opens the explorer" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    const inside = try ed.normalizePath("./src/../src/main.zig/");
+    defer gpa.free(inside);
+    try testing.expectEqualStrings("src/main.zig", inside);
+    const outside = try ed.normalizePath("../elsewhere/x.zig");
+    defer gpa.free(outside);
+    try testing.expect(std.fs.path.isAbsolute(outside));
+    try testing.expect(std.mem.indexOf(u8, outside, "..") == null);
+
+    ed.openArg("src/main.zig/");
+    try testing.expectEqualStrings("src/main.zig", ed.buffer.path.?);
+    ed.openArg("src");
+    try testing.expectEqual(.browse, ed.picker.?.kind);
+    try testing.expect(std.mem.endsWith(u8, ed.browse_dir.items, "/src"));
+}
+
+test "picker normal mode: j reaches the create row" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("<Space><Space>render<Esc>");
+    settlePicker(&ed);
+    const rows = ed.picker.?.rowCount();
+    try ed.feed("j");
+    try testing.expectEqual(@min(1, rows - 1), ed.picker.?.selected);
+    try ed.feed("<Esc>");
+}
+
+test "snippet completion: placeholders, typing over, Tab / Shift-Tab, Backspace" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ido");
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"doThing","insertText":"doThing(${1:path}, ${2:opts})$0","insertTextFormat":2}]}
+    , .{});
+    defer reply.deinit();
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try ed.feed("<Tab>"); // accept
+    try expectText(&ed, "doThing(path, opts)");
+    try testing.expectEqual(8, ed.view.cursor); // on "path", which typing replaces
+    try ed.feed("src");
+    try expectText(&ed, "doThing(src, opts)");
+    try ed.feed("<Tab>"); // on to "opts"
+    try testing.expectEqual(13, ed.view.cursor);
+    try ed.feed("<S-Tab><Tab>"); // back and forth keeps what was typed
+    try expectText(&ed, "doThing(src, opts)");
+    try ed.feed("<BS>"); // a fresh placeholder goes whole
+    try expectText(&ed, "doThing(src, )");
+    try ed.feed("o<Tab>"); // the last Tab lands on $0, after the call
+    try expectText(&ed, "doThing(src, o)");
+    try testing.expectEqual(15, ed.view.cursor);
+    try testing.expectEqual(null, ed.snippet);
+    try ed.feed("<Esc>");
+}
+
+test "signature help: the active parameter, closed by )" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ifoo(a, ");
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"signatures":[{"label":"fn foo(a: u8, b: []const u8) void","documentation":"Does foo.\nMore.",
+        \\ "parameters":[{"label":[7,12]},{"label":"b: []const u8","documentation":{"kind":"markdown","value":"The bytes."}}],
+        \\ "activeParameter":1}]}
+    , .{});
+    defer reply.deinit();
+    try ed.showSignature(ed.buffer, reply.value);
+    const sig = ed.signature.?;
+    try testing.expectEqualStrings("b: []const u8", sig.label[sig.param_start..sig.param_end]);
+    try testing.expectEqualStrings("The bytes.", sig.doc);
+    try ed.feed("b)");
+    try testing.expectEqual(null, ed.signature);
+    try ed.feed("<Esc>");
+}
+
+test "zoom keys request a size change" {
+    var ed = try testEditor("abc");
+    defer ed.deinit();
+    try ed.feed("<Space>t+");
+    try testing.expectEqual(1, ed.zoom_request);
+    try ed.feed("<Space>t-<Space>t-");
+    try testing.expectEqual(-1, ed.zoom_request);
+    try ed.feed("<Space>t0");
+    try testing.expect(ed.zoom_reset);
+    try expectText(&ed, "abc");
+    try testing.expectEqual(.normal, ed.mode);
 }

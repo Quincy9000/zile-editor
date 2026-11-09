@@ -2,6 +2,7 @@
 //! dispatched at comptime by `Kind`:
 //!
 //!   title:   []const u8           prompt label
+//!   start_mode: StartMode          typing (.insert) or moving (.normal) first
 //!   prefix:  ?u8                  typing this first switches any picker here
 //!   fill:    fn (*Editor, *Items)  static items, filled on the main thread
 //!   produce: Engine.Producer      dynamic items, produced on the worker thread
@@ -24,7 +25,7 @@ const languages = @import("../syntax/languages.zig");
 const motions = @import("../core/motions.zig");
 const Git = @import("../git/Git.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -43,6 +44,9 @@ fn Impl(comptime kind: Kind) type {
         .browse => Browse,
         .jumps => Jumps,
         .run_errors => RunErrors,
+        .projects => Projects,
+        .open_in => OpenIn,
+        .quickfix => Quickfix,
     };
 }
 
@@ -129,6 +133,59 @@ pub fn create(kind: Kind, ed: *Editor, query: []const u8) !void {
     }
 }
 
+/// Docked sources show as a panel at the bottom (no preview pane): moving
+/// through them moves the editor instead (`follow`).
+pub fn docked(kind: Kind) bool {
+    return switch (kind) {
+        inline else => |k| @hasDecl(Impl(k), "follow"),
+    };
+}
+
+/// The mode a picker opens in: `.insert` (typing the query) for ones you
+/// search, `.normal` (moving with j/k) for short lists you step through.
+/// Every source must choose.
+pub const StartMode = enum { insert, normal };
+
+pub fn startsNormal(kind: Kind) bool {
+    return switch (kind) {
+        inline else => |k| blk: {
+            if (!@hasDecl(Impl(k), "start_mode")) @compileError("picker source " ++ @tagName(k) ++ " must declare start_mode");
+            break :blk Impl(k).start_mode == .normal;
+        },
+    };
+}
+
+pub fn follow(kind: Kind, ed: *Editor, item: Item) !void {
+    switch (kind) {
+        inline else => |k| if (@hasDecl(Impl(k), "follow")) try Impl(k).follow(ed, item),
+    }
+}
+
+/// A place an item stands for (path owned by the caller, 0-based
+/// line/col), for sources whose items are places (`<C-q>` to quickfix).
+pub const Location = struct { path: []u8, line: usize, col: usize };
+
+pub fn hasLocations(kind: Kind) bool {
+    return switch (kind) {
+        inline else => |k| @hasDecl(Impl(k), "location"),
+    };
+}
+
+pub fn location(kind: Kind, ed: *Editor, item: Item) !?Location {
+    switch (kind) {
+        inline else => |k| {
+            if (@hasDecl(Impl(k), "location")) return Impl(k).location(ed, item);
+            return null;
+        },
+    }
+}
+
+/// `location` for items whose detail is "path:line[:col]".
+fn detailLocation(ed: *Editor, item: Item) !?Location {
+    const loc = parseLocation(item.detail) orelse return null;
+    return .{ .path = try ed.gpa.dupe(u8, loc.path), .line = loc.line, .col = loc.col };
+}
+
 pub fn preview(kind: Kind, ed: *Editor, item: *const Item, out: *Preview) !void {
     out.clear();
     switch (kind) {
@@ -141,6 +198,7 @@ pub fn preview(kind: Kind, ed: *Editor, item: *const Item, out: *Preview) !void 
 const Files = struct {
     pub const title = "Find file";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
 
     /// Directories never worth listing when walking without git.
     const skip_dirs = std.StaticStringMap(void).initComptime(.{
@@ -180,6 +238,7 @@ const Files = struct {
     /// Inside a git repo, git knows exactly which files matter (.gitignore etc).
     fn gitFiles(e: *Engine, ctx: anytype, comptime onFile: anytype) !bool {
         const result = std.process.run(e.gpa, e.io, .{
+            .cwd = .{ .path = e.root },
             .argv = &.{ "git", "ls-files", "-z", "--cached", "--others", "--exclude-standard" },
         }) catch return false;
         defer e.gpa.free(result.stdout);
@@ -197,7 +256,7 @@ const Files = struct {
 
     fn walk(e: *Engine, ctx: anytype, comptime onFile: anytype) !void {
         const io = e.io;
-        var root = try Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+        var root = try Io.Dir.cwd().openDir(io, e.root, .{ .iterate = true });
         defer root.close(io);
         var w = try root.walkSelectively(e.gpa);
         defer {
@@ -226,18 +285,24 @@ const Files = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        try ed.openFile(item.text);
+        const path = try ed.pickerPath(item.text);
+        defer ed.gpa.free(path);
+        try ed.openFile(path);
     }
 
     pub fn create(ed: *Editor, query: []const u8) !void {
-        try ed.openFile(query);
-        ed.setMessage(.info, "new file \"{s}\" (SPC f s to create it on disk)", .{query});
+        const path = try ed.pickerPath(query);
+        defer ed.gpa.free(path);
+        try ed.openFile(path);
+        ed.setMessage(.info, "new file \"{s}\" (SPC f s to create it on disk)", .{ed.buffer.displayName()});
     }
 
     pub const preview_limit = 1024 * 1024;
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        try previewPath(ed, item.text, out);
+        const path = try ed.pickerPath(item.text);
+        defer ed.gpa.free(path);
+        try previewPath(ed, path, out);
     }
 
     fn previewPath(ed: *Editor, path: []const u8, out: *Preview) !void {
@@ -264,6 +329,7 @@ const Files = struct {
 const Browse = struct {
     pub const title = "Browse";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
 
     const Entry = struct {
         name: []const u8,
@@ -346,6 +412,7 @@ const Browse = struct {
 const Jumps = struct {
     pub const title = "Jumplist";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         var i = ed.jumps.items.len;
@@ -380,6 +447,114 @@ const Jumps = struct {
     }
 };
 
+/// `SPC x x`: the quickfix list, docked at the bottom; moving through it
+/// shows each entry in the editor.
+const Quickfix = struct {
+    pub const title = "Quickfix";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        for (ed.quickfix.items, 0..) |q, i| {
+            var buf: [512]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "{s}:{d}", .{ shortPath(ed.projectRoot(), q.path), q.line + 1 }) catch q.path;
+            try items.append(.{ .text = q.text, .detail = detail, .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try ed.goQuickfix(item.id);
+    }
+
+    pub fn follow(ed: *Editor, item: Item) !void {
+        try ed.followQuickfix(item.id);
+    }
+
+    pub fn location(ed: *Editor, item: Item) !?Location {
+        if (item.id >= ed.quickfix.items.len) return null;
+        const q = ed.quickfix.items[item.id];
+        return .{ .path = try ed.gpa.dupe(u8, q.path), .line = q.line, .col = q.col };
+    }
+
+    pub fn preview(_: *Editor, _: *const Item, _: *Preview) !void {}
+};
+
+/// <Tab> in a picker: where to open the selection.
+const OpenIn = struct {
+    pub const title = "Open in";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    const targets = [_]struct { Editor.OpenTarget, []const u8, []const u8 }{
+        .{ .here, "This window", "Enter" },
+        .{ .right, "Split right", "Ctrl-v" },
+        .{ .below, "Split below", "Ctrl-s" },
+        .{ .left, "Split left", "" },
+        .{ .above, "Split above", "" },
+    };
+
+    pub fn fill(_: *Editor, items: *Items) !void {
+        for (targets, 0..) |t, i| try items.append(.{ .text = t[1], .detail = t[2], .id = @intCast(i) });
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id < targets.len) try ed.openPendingIn(targets[item.id][0]);
+    }
+
+    pub fn preview(ed: *Editor, _: *const Item, out: *Preview) !void {
+        const c = ed.pending_choice orelse return;
+        const what = switch (c) {
+            .none => "",
+            .item => |i| if (i.item.detail.len > 0 and i.kind != .files) i.item.detail else i.item.text,
+            .create => |cr| cr.query,
+        };
+        try out.text.print(ed.gpa, "Opens {s}", .{what});
+    }
+};
+
+/// `SPC p p`: projects opened before, most recent first; picking one finds
+/// a file in it.
+const Projects = struct {
+    pub const title = "Switch project";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "";
+        for (ed.knownProjects(), 0..) |root, i| {
+            var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+            const shown = if (home.len > 1 and std.mem.startsWith(u8, root, home))
+                std.fmt.bufPrint(&buf, "~{s}", .{root[home.len..]}) catch root
+            else
+                root;
+            try items.append(.{ .text = std.fs.path.basename(root), .detail = shown, .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        const known = ed.knownProjects();
+        if (item.id >= known.len) return;
+        const root = try ed.gpa.dupe(u8, known[item.id]);
+        defer ed.gpa.free(root);
+        try ed.switchProject(root);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const known = ed.knownProjects();
+        if (item.id >= known.len) return;
+        // Its top-level entries.
+        var dir = Io.Dir.cwd().openDir(ed.io, known[item.id], .{ .iterate = true }) catch |err|
+            return out.text.print(ed.gpa, "({s})", .{@errorName(err)});
+        defer dir.close(ed.io);
+        var it = dir.iterate();
+        var n: usize = 0;
+        while (it.next(ed.io) catch null) |e| : (n += 1) {
+            if (n == 200) break;
+            try out.text.print(ed.gpa, "{s}{s}\n", .{ e.name, if (e.kind == .directory) "/" else "" });
+        }
+    }
+};
+
 /// A path for display: relative inside `cwd`, else its last two parts.
 fn shortPath(cwd: []const u8, path: []const u8) []const u8 {
     if (std.mem.startsWith(u8, path, cwd) and path.len > cwd.len + 1 and path[cwd.len] == '/') return path[cwd.len + 1 ..];
@@ -393,11 +568,12 @@ fn shortPath(cwd: []const u8, path: []const u8) []const u8 {
 const RunErrors = struct {
     pub const title = "Errors from the last run";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         for (ed.run_errors.items, 0..) |e, i| {
             var buf: [512]u8 = undefined;
-            const detail = std.fmt.bufPrint(&buf, "{s}:{d}:{d}", .{ shortPath(ed.cwd, e.path), e.line, e.col }) catch e.path;
+            const detail = std.fmt.bufPrint(&buf, "{s}:{d}:{d}", .{ shortPath(ed.run_root, e.path), e.line, e.col }) catch e.path;
             try items.append(.{ .text = e.message, .detail = detail, .id = @intCast(i) });
         }
     }
@@ -406,6 +582,12 @@ const RunErrors = struct {
         if (item.id >= ed.run_errors.items.len) return;
         const e = ed.run_errors.items[item.id];
         try ed.jumpTo(e.path, e.line - 1, e.col - 1);
+    }
+
+    pub fn location(ed: *Editor, item: Item) !?Location {
+        if (item.id >= ed.run_errors.items.len) return null;
+        const e = ed.run_errors.items[item.id];
+        return .{ .path = try ed.gpa.dupe(u8, e.path), .line = e.line - 1, .col = e.col - 1 };
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -419,6 +601,7 @@ const RunErrors = struct {
 const Buffers = struct {
     pub const title = "Switch buffer";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         const order = try ed.buffersByRecency(ed.gpa);
@@ -446,6 +629,7 @@ const Buffers = struct {
 const Commands = struct {
     pub const title = "Command";
     pub const prefix: ?u8 = '>';
+    pub const start_mode: StartMode = .insert;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         for (&commands.all, 0..) |*c, i| {
@@ -472,6 +656,7 @@ const Commands = struct {
 const Lines = struct {
     pub const title = "Search buffer";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         const t = ed.text();
@@ -487,6 +672,11 @@ const Lines = struct {
     pub fn accept(ed: *Editor, item: Item) !void {
         const t = ed.text();
         ed.setCursor(motions.firstNonBlank(t, @min(item.id, t.lineCount() - 1)));
+    }
+
+    pub fn location(ed: *Editor, item: Item) !?Location {
+        const path = ed.buffer.path orelse return null;
+        return .{ .path = try ed.gpa.dupe(u8, path), .line = item.id, .col = 0 };
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -549,6 +739,7 @@ fn previewDetail(ed: *Editor, item: *const Item, out: *Preview) !void {
 const Grep = struct {
     pub const title = "Search project";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
 
     /// Files larger than this are skipped, and lines are capped at `max_line`.
     const max_file = 1024 * 1024;
@@ -598,7 +789,9 @@ const Grep = struct {
     }
 
     fn addLines(_: void, e: *Engine, path: []const u8, _: usize) !void {
-        const data = Io.Dir.cwd().readFileAlloc(e.io, path, e.gpa, .limited(max_file)) catch return;
+        var full_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ e.root, path }) catch return;
+        const data = Io.Dir.cwd().readFileAlloc(e.io, full, e.gpa, .limited(max_file)) catch return;
         defer e.gpa.free(data);
         if (std.mem.indexOfScalar(u8, data[0..@min(data.len, 8192)], 0) != null) return; // binary
         var detail: [std.fs.max_path_bytes + 16]u8 = undefined;
@@ -614,14 +807,32 @@ const Grep = struct {
         }
     }
 
-    pub const accept = jumpToDetail;
-    pub const preview = previewDetail;
+    pub fn location(ed: *Editor, item: Item) !?Location {
+        const loc = parseLocation(item.detail) orelse return null;
+        return .{ .path = try ed.pickerPath(loc.path), .line = loc.line, .col = loc.col };
+    }
+
+    // Paths are relative to the project searched.
+    pub fn accept(ed: *Editor, item: Item) !void {
+        const loc = parseLocation(item.detail) orelse return;
+        const path = try ed.pickerPath(loc.path);
+        defer ed.gpa.free(path);
+        try ed.jumpTo(path, loc.line, loc.col);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const loc = parseLocation(item.detail) orelse return;
+        const path = try ed.pickerPath(loc.path);
+        defer ed.gpa.free(path);
+        try previewAt(ed, path, loc.line, out);
+    }
 };
 
 /// Definitions / references from the language server (`ed.locations`).
 const Locations = struct {
     pub const title = "Locations";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         var detail: [std.fs.max_path_bytes + 32]u8 = undefined;
@@ -652,17 +863,18 @@ const Locations = struct {
 
     pub const accept = jumpToDetail;
     pub const preview = previewDetail;
+    pub const location = detailLocation;
 };
 
 /// `SPC c x`: language server diagnostics for all files.
 const Diagnostics = struct {
     pub const title = "Diagnostics";
     pub const prefix: ?u8 = '!';
+    pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         var detail: [std.fs.max_path_bytes + 32]u8 = undefined;
-        for (ed.lsps) |maybe| {
-            const l = maybe orelse continue;
+        for (ed.lsps.items) |l| {
             for (l.diagnostics.keys(), l.diagnostics.values()) |path, list| {
                 for (list) |d| {
                     const where = std.fmt.bufPrint(&detail, "{s}:{d}:{d}", .{ path, d.line + 1, d.col + 1 }) catch continue;
@@ -675,6 +887,7 @@ const Diagnostics = struct {
 
     pub const accept = jumpToDetail;
     pub const preview = previewDetail;
+    pub const location = detailLocation;
 };
 
 test "location details" {
@@ -717,7 +930,7 @@ fn onPath(io: Io, name: []const u8) bool {
 /// false to stop early). The process is registered with the engine so closing
 /// or re-querying the picker kills it. Returns false if it could not start.
 fn streamCommand(e: *Engine, argv: []const []const u8, sep: u8, ctx: anytype, comptime onRecord: anytype) !bool {
-    var child = std.process.spawn(e.io, .{ .argv = argv, .stdin = .ignore, .stdout = .pipe, .stderr = .ignore }) catch return false;
+    var child = std.process.spawn(e.io, .{ .argv = argv, .cwd = .{ .path = e.root }, .stdin = .ignore, .stdout = .pipe, .stderr = .ignore }) catch return false;
     e.child_pid.store(child.id.?, .release);
     defer {
         e.child_pid.store(0, .release);
@@ -755,6 +968,7 @@ test "fuzzy regex for rg" {
 const Symbols = struct {
     pub const title = "Symbols";
     pub const prefix: ?u8 = '@';
+    pub const start_mode: StartMode = .insert;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         var detail: [64]u8 = undefined;
@@ -762,6 +976,13 @@ const Symbols = struct {
             const label = std.fmt.bufPrint(&detail, "{s}  {d}", .{ sym.kind, sym.line + 1 }) catch sym.kind;
             try items.append(.{ .text = sym.name, .detail = label, .id = @intCast(i) });
         }
+    }
+
+    pub fn location(ed: *Editor, item: Item) !?Location {
+        if (item.id >= ed.symbols.items.len) return null;
+        const path = ed.buffer.path orelse return null;
+        const sym = ed.symbols.items[item.id];
+        return .{ .path = try ed.gpa.dupe(u8, path), .line = sym.line, .col = sym.col };
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
@@ -787,6 +1008,7 @@ const Symbols = struct {
 const ConfirmDelete = struct {
     pub const title = "Delete file?";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         const b = ed.confirm_target orelse return;
@@ -817,6 +1039,7 @@ const ConfirmDelete = struct {
 const GitActions = struct {
     pub const title = "Git";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
 
     const actions = [_]struct { []const u8, []const u8 }{
         .{ "Commit all changes...", "SPC g c" },
@@ -866,10 +1089,11 @@ const GitActions = struct {
 const GitBranches = struct {
     pub const title = "Branches";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         if (!ed.inRepo()) return;
-        const list = Git.branches(ed.gpa, ed.io, ed.git_root.?) orelse return;
+        const list = Git.branches(ed.gpa, ed.io, ed.gitRoot().?) orelse return;
         defer list.deinit(ed.gpa);
         var it = list.iterator();
         while (it.next()) |line| {
@@ -895,10 +1119,11 @@ const GitBranches = struct {
 const GitChanges = struct {
     pub const title = "Changed files";
     pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         if (!ed.inRepo()) return;
-        const out = Git.status(ed.gpa, ed.io, ed.git_root.?) orelse return;
+        const out = Git.status(ed.gpa, ed.io, ed.gitRoot().?) orelse return;
         defer ed.gpa.free(out);
         var it = std.mem.splitScalar(u8, out, '\n');
         while (it.next()) |line| {
@@ -906,7 +1131,7 @@ const GitChanges = struct {
             var path = line[3..];
             // Renames: "old -> new"
             if (std.mem.indexOf(u8, path, " -> ")) |arrow| path = path[arrow + 4 ..];
-            const abs = try std.fs.path.join(ed.gpa, &.{ ed.git_root.?, path });
+            const abs = try std.fs.path.join(ed.gpa, &.{ ed.gitRoot().?, path });
             defer ed.gpa.free(abs);
             const rel = try ed.relativePath(abs);
             defer ed.gpa.free(rel);

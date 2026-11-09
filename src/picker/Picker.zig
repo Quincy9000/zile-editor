@@ -43,6 +43,9 @@ pos_scratch: fuzzy.PositionScratch = .{},
 /// Item text to select once the results arrive (owned), e.g. the folder the
 /// file browser just came up from.
 want_select: ?[]u8 = null,
+/// Item id to select once the results arrive (e.g. the current quickfix
+/// entry).
+want_id: ?u32 = null,
 
 pub fn create(ed: *Editor, kind: Kind, query: []const u8) !*Picker {
     const gpa = ed.gpa;
@@ -71,6 +74,7 @@ pub fn destroy(p: *Picker) void {
 fn startEngine(p: *Picker, kind: Kind, query: []const u8) !*Engine {
     const e = try Engine.create(p.ed.gpa, p.ed.io, p.ed.wake_fn);
     errdefer e.destroy();
+    e.root = p.ed.picker_root;
     const producer = try sources.setup(kind, p.ed, e);
     p.want_gen = e.setQuery(query);
     try e.start(producer);
@@ -113,6 +117,15 @@ pub fn restart(p: *Picker, select: ?[]const u8) !void {
 }
 
 fn applyWantSelect(p: *Picker) void {
+    if (p.want_id) |id| if (p.isCurrent() and p.snap.done) {
+        p.want_id = null;
+        for (p.snap.slice(), 0..) |r, row| {
+            if (p.shown.items.get(r.index).id == id) {
+                p.selected = row;
+                break;
+            }
+        }
+    };
     const want = p.want_select orelse return;
     if (!p.isCurrent() or !p.snap.done) return;
     for (p.snap.slice(), 0..) |r, row| {
@@ -231,6 +244,11 @@ pub fn updatePreview(p: *Picker) void {
     const index = p.snap.results[p.selected].index;
     if (p.preview_for == index) return;
     p.preview_for = index;
+    // Docked pickers move the editor instead of previewing.
+    if (sources.docked(p.kind)) {
+        sources.follow(p.kind, p.ed, item.*) catch |err| p.ed.setMessage(.err, "{s}", .{@errorName(err)});
+        return;
+    }
     sources.preview(p.kind, p.ed, item, &p.preview) catch |err| {
         p.preview.clear();
         p.preview.text.print(p.ed.gpa, "(preview failed: {s})", .{@errorName(err)}) catch {};

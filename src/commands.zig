@@ -113,7 +113,8 @@ const base = [_]Command{
     .{ .name = "completion_previous", .doc = "Previous completion", .run = completionKey(.previous, null), .hidden = true },
     .{ .name = "completion_down", .doc = "Next completion or down", .run = completionKey(.next, motion(down, .linewise, .keep)), .hidden = true },
     .{ .name = "completion_up", .doc = "Previous completion or up", .run = completionKey(.previous, motion(up, .linewise, .keep)), .hidden = true },
-    .{ .name = "completion_accept_or_tab", .doc = "Accept completion or tab", .run = completionKey(.accept, insertTab), .hidden = true },
+    .{ .name = "completion_accept_or_tab", .doc = "Accept completion, next placeholder, or tab", .run = completionKey(.accept, snippetOrTab), .hidden = true },
+    .{ .name = "snippet_previous", .doc = "Previous placeholder", .run = snippetPrevious, .hidden = true },
     .{ .name = "completion_accept_or_newline", .doc = "Accept completion or newline", .run = completionKey(.accept, insertNewline), .hidden = true },
     .{ .name = "completion_accept", .doc = "Accept completion", .run = completionKey(.accept, null), .hidden = true },
 
@@ -210,6 +211,9 @@ const base = [_]Command{
     .{ .name = "surround_change_from", .doc = "Change surrounding", .run = surroundStep(.change_from), .takes_char = true, .hidden = true },
     .{ .name = "surround_change_to", .doc = "Change surrounding to", .run = surroundStep(.change_to), .takes_char = true, .hidden = true },
     .{ .name = "surround_visual", .doc = "Surround selection", .run = surroundStep(.visual), .takes_char = true, .repeat = true },
+    .{ .name = "zoom_in", .doc = "Bigger text", .run = zoom(.in), .once = true },
+    .{ .name = "zoom_out", .doc = "Smaller text", .run = zoom(.out), .once = true },
+    .{ .name = "zoom_reset", .doc = "Normal text size", .run = zoom(.reset), .once = true },
     .{ .name = "toggle_auto_pairs", .doc = "Auto pairs", .run = toggle("auto_pairs", "auto pairs") },
     // Multicursor (Doom's evil-mc keys: gz...).
     .{ .name = "cursor_next_match", .doc = "Cursor + next match", .run = cursorCmd(.next), .once = true },
@@ -226,7 +230,7 @@ const base = [_]Command{
     .{ .name = "append_line_ends", .doc = "Append at each line's end", .run = cursorCmd(.insert_ends), .once = true },
     .{ .name = "cursors_from_matches", .doc = "Cursors on every match", .run = cursorCmd(.from_prompt), .once = true, .hidden = true },
     .{ .name = "insert_newline", .doc = "New line, keeping indentation", .run = insertNewline },
-    .{ .name = "delete_backward", .doc = "Delete previous character", .run = deleteBy(motions.prevChar) },
+    .{ .name = "delete_backward", .doc = "Delete previous character", .run = deleteBackward },
     .{ .name = "delete_forward", .doc = "Delete next character", .run = deleteBy(motions.nextChar) },
     .{ .name = "delete_word_backward", .doc = "Delete previous word", .run = deleteBy(wordBackwardInLine) },
     .{ .name = "insert_tab", .doc = "Insert tab", .run = insertTab },
@@ -246,12 +250,16 @@ const base = [_]Command{
     .{ .name = "kill_buffer", .doc = "Kill buffer", .run = killBuffer },
     .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) , .jump = true },
     .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) , .jump = true },
+    .{ .name = "switch_project", .doc = "Switch project", .run = openPicker(.projects), .once = true },
     .{ .name = "terminal_toggle", .doc = "Terminal popup", .run = termCmd(.toggle), .once = true },
     .{ .name = "run_runner", .doc = "Code runner (repeat with Enter)", .run = termCmd(.runner), .once = true },
     .{ .name = "run_command", .doc = "Run a command (multi-line editor)", .run = termCmd(.command), .once = true },
     .{ .name = "run_again", .doc = "Run the runner command again", .run = termCmd(.again), .once = true },
     .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
     .{ .name = "run_errors", .doc = "Errors from the last run", .run = termCmd(.errors), .once = true },
+    .{ .name = "quickfix_next", .doc = "Next quickfix entry", .run = qfCmd(.next), .once = true, .jump = true },
+    .{ .name = "quickfix_previous", .doc = "Previous quickfix entry", .run = qfCmd(.previous), .once = true, .jump = true },
+    .{ .name = "quickfix_list", .doc = "Quickfix list (j/k, Enter)", .run = qfCmd(.list), .once = true },
     .{ .name = "jump_older", .doc = "Back (jumplist)", .run = jumpCmd(.older), .once = true },
     .{ .name = "jump_newer", .doc = "Forward (jumplist)", .run = jumpCmd(.newer), .once = true },
     .{ .name = "jump_list", .doc = "Jumplist", .run = openPicker(.jumps), .once = true },
@@ -279,6 +287,7 @@ const base = [_]Command{
     .{ .name = "window_shorter", .doc = "Shorter", .run = windowCmd(.{ .resize = .{ .vertical, -0.05 } }), .once = true },
     .{ .name = "command_picker", .doc = "Run a command", .run = openPicker(.commands) },
     .{ .name = "resume_picker", .doc = "Resume last picker", .run = resumePicker },
+    .{ .name = "smart_close", .doc = "Close (window, else buffer, else quit)", .run = smartClose, .once = true },
     .{ .name = "quit", .doc = "Quit", .run = quit },
     .{ .name = "save_and_quit", .doc = "Save all and quit", .run = saveAndQuit },
     .{ .name = "quit_without_saving", .doc = "Quit without saving", .run = quitWithoutSaving },
@@ -288,9 +297,19 @@ const base = [_]Command{
     .{ .name = "picker_previous", .doc = "Previous result", .run = pickerMove(-1, .wrap), .hidden = true },
     .{ .name = "picker_page_down", .doc = "Page down", .run = pickerMove(10, .clamp), .hidden = true },
     .{ .name = "picker_page_up", .doc = "Page up", .run = pickerMove(-10, .clamp), .hidden = true },
+    .{ .name = "picker_to_quickfix", .doc = "Send results to quickfix", .run = qfCmd(.from_picker), .hidden = true },
     .{ .name = "picker_accept", .doc = "Open the selection", .run = pickerAccept, .hidden = true },
+    .{ .name = "picker_open_menu", .doc = "Open in... (split)", .run = pickerOpen(null), .hidden = true },
+    .{ .name = "picker_open_right", .doc = "Open in a split to the right", .run = pickerOpen(.right), .hidden = true },
+    .{ .name = "picker_open_below", .doc = "Open in a split below", .run = pickerOpen(.below), .hidden = true },
     .{ .name = "picker_slash", .doc = "Browser: enter folder", .run = browserKey('/'), .hidden = true },
     .{ .name = "picker_tilde", .doc = "Browser: home folder", .run = browserKey('~'), .hidden = true },
+    .{ .name = "picker_normal_mode", .doc = "Picker: move through results", .run = pickerMode(.normal), .hidden = true },
+    .{ .name = "picker_insert_mode", .doc = "Picker: type the query", .run = pickerMode(.insert), .hidden = true },
+    .{ .name = "picker_first", .doc = "First result", .run = pickerMove(-1_000_000, .clamp), .hidden = true },
+    .{ .name = "picker_last", .doc = "Last result", .run = pickerMove(1_000_000, .clamp), .hidden = true },
+    .{ .name = "picker_browse_up", .doc = "Explorer: up a folder", .run = browseStep(.up), .hidden = true },
+    .{ .name = "picker_browse_in", .doc = "Explorer: into the folder / open", .run = browseStep(.in), .hidden = true },
     .{ .name = "picker_close", .doc = "Close the picker", .run = pickerClose, .hidden = true },
 
     // Text inputs (picker query, search prompt)
@@ -1034,7 +1053,7 @@ fn gitCmd(comptime action: enum { restore, next, previous, reload }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            if (ed.git_root == null) return ed.setMessage(.info, "not in a git repository", .{});
+            if (ed.gitRoot() == null) return ed.setMessage(.info, "not in a git repository", .{});
             switch (action) {
                 .restore => {
                     const h = ed.hunkAtCursor() orelse return ed.setMessage(.info, "no change here", .{});
@@ -1259,6 +1278,34 @@ fn insertNewline(c: Context) !void {
     try c.ed.insertText(indent);
 }
 
+/// <Tab> without a completion popup: the next placeholder, else a tab.
+fn zoom(comptime how: enum { in, out, reset }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            switch (how) {
+                .in => c.ed.zoom_request += @intCast(c.count),
+                .out => c.ed.zoom_request -= @intCast(c.count),
+                .reset => c.ed.zoom_reset = true,
+            }
+        }
+    }.run;
+}
+
+fn snippetOrTab(c: Context) !void {
+    if (c.ed.snippetStep(true)) return;
+    try insertTab(c);
+}
+
+fn snippetPrevious(c: Context) !void {
+    _ = c.ed.snippetStep(false);
+}
+
+/// <BS>: a fresh placeholder goes whole, else one character.
+fn deleteBackward(c: Context) !void {
+    if (try c.ed.snippetBackspace()) return;
+    try deleteBy(motions.prevChar)(c);
+}
+
 fn insertTab(c: Context) !void {
     const ed = c.ed;
     if (!ed.options.expand_tab) return ed.insertText("\t");
@@ -1333,6 +1380,19 @@ fn termCmd(comptime action: enum { toggle, runner, command, again, output, error
                 .again => try ed.runAgain(),
                 .output => ed.showRunOutput(),
                 .errors => try ed.showRunErrors(),
+            }
+        }
+    }.run;
+}
+
+fn qfCmd(comptime action: enum { next, previous, list, from_picker }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            switch (action) {
+                .next => try c.ed.stepQuickfix(true, c.count),
+                .previous => try c.ed.stepQuickfix(false, c.count),
+                .list => try c.ed.showQuickfix(),
+                .from_picker => try c.ed.pickerToQuickfix(),
             }
         }
     }.run;
@@ -1419,10 +1479,26 @@ fn fileCmd(comptime action: enum { new, save_as, rename, copy, delete, yank_path
     }.run;
 }
 
+/// `SPC q`: closes the focused window if there are several, else the
+/// current buffer if there are several, else the editor.
+fn smartClose(c: Context) !void {
+    const ed = c.ed;
+    if (ed.window_list.items.len > 1) return ed.closeWindow();
+    if (ed.buffers.items.len > 1) {
+        const name = try ed.gpa.dupe(u8, ed.buffer.displayName());
+        defer ed.gpa.free(name);
+        const before = ed.buffers.items.len;
+        try ed.killBuffer(ed.buffer);
+        if (ed.buffers.items.len < before) ed.setMessage(.info, "closed {s}", .{name});
+        return;
+    }
+    try quit(c);
+}
+
 fn quit(c: Context) !void {
     const ed = c.ed;
     for (ed.buffers.items) |b| if (b.modified) {
-        ed.setMessage(.err, "\"{s}\" has unsaved changes: SPC q s saves all and quits, SPC q Q discards", .{b.displayName()});
+        ed.setMessage(.err, "\"{s}\" has unsaved changes: SPC Q s saves all and quits, SPC Q Q discards", .{b.displayName()});
         return;
     };
     ed.should_quit = true;
@@ -1481,10 +1557,44 @@ fn cycleBuffer(comptime delta: isize) Handler {
     }.run;
 }
 
+fn pickerMode(comptime m: enum { normal, insert }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            if (c.ed.picker == null) return;
+            c.ed.mode = if (m == .normal) .picker_normal else .picker;
+        }
+    }.run;
+}
+
+fn browseStep(comptime dir: enum { up, in }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const p = c.ed.picker orelse return;
+            if (p.kind != .browse) return;
+            switch (dir) {
+                .up => try c.ed.browseUp(),
+                .in => {
+                    // Folders: go in, staying in normal mode. Files: open.
+                    p.sync();
+                    if (p.itemAt(p.selected)) |item| if (std.mem.endsWith(u8, item.text, "/")) {
+                        const name = try c.ed.gpa.dupe(u8, item.text);
+                        defer c.ed.gpa.free(name);
+                        return c.ed.browseInto(name);
+                    };
+                    try c.ed.acceptPicker();
+                },
+            }
+        }
+    }.run;
+}
+
 fn pickerMove(comptime delta: isize, comptime how: enum { wrap, clamp }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const p = c.ed.picker orelse return;
+            // Move through the results of what was typed, even if the key
+            // came before they were shown (the match pass is quick).
+            p.sync();
             switch (how) {
                 .wrap => p.move(delta),
                 .clamp => p.moveClamped(delta),
@@ -1661,6 +1771,16 @@ fn searchCancel(c: Context) !void {
 
 fn pickerAccept(c: Context) !void {
     try c.ed.acceptPicker();
+}
+
+/// <Tab>: the "Open in..." menu; <C-v> / <C-s>: straight into a split.
+fn pickerOpen(comptime target: ?Editor.OpenTarget) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            if (target) |t| return c.ed.acceptPickerAs(t);
+            try c.ed.pickerOpenMenu();
+        }
+    }.run;
 }
 
 fn pickerClose(c: Context) !void {

@@ -56,6 +56,9 @@ items: Items,
 wake: *const fn () void,
 producer: ?Producer = null,
 thread: ?std.Thread = null,
+/// The folder producers list and search (a project root); results are
+/// relative to it. Borrowed: outlives the engine.
+root: []const u8 = ".",
 
 /// A child process the producer is reading from (e.g. rg), killed on destroy
 /// so the worker's read ends promptly. 0 when none.

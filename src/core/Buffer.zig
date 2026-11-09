@@ -7,6 +7,7 @@ const Io = std.Io;
 const Text = @import("Text.zig");
 const History = @import("History.zig");
 const Syntax = @import("../syntax/Syntax.zig");
+const Project = @import("Project.zig");
 const Folds = @import("Folds.zig");
 const diff = @import("../git/diff.zig");
 
@@ -16,6 +17,8 @@ text: Text,
 history: History,
 /// Null for files without a known language.
 syntax: ?Syntax = null,
+/// The project the file belongs to (owned by the editor), if any.
+project: ?*const Project = null,
 /// Bumped on every edit (for syncing with the language server).
 edit_version: u64 = 0,
 /// Closed folds.

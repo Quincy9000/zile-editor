@@ -7,6 +7,7 @@ comptime {
     _ = @import("core/motions.zig");
     _ = @import("core/Buffer.zig");
     _ = @import("core/Folds.zig");
+    _ = @import("core/Project.zig");
     _ = @import("git/diff.zig");
     _ = @import("git/Git.zig");
     _ = @import("core/History.zig");
@@ -21,6 +22,7 @@ comptime {
     _ = @import("core/search.zig");
     _ = @import("lsp/Client.zig");
     _ = @import("lsp/Completion.zig");
+    _ = @import("lsp/Snippet.zig");
     _ = @import("picker/sources.zig");
     _ = @import("picker/fuzzy.zig");
     _ = @import("picker/Items.zig");

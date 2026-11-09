@@ -4,6 +4,8 @@
 const std = @import("std");
 const rl = @import("raylib");
 const Picker = @import("../picker/Picker.zig");
+const sources = @import("../picker/sources.zig");
+const Editor = @import("../Editor.zig");
 const Engine = @import("../picker/Engine.zig");
 const fuzzy = @import("../picker/fuzzy.zig");
 const Font = @import("Font.zig");
@@ -16,7 +18,32 @@ const cells = render.cells;
 /// Below this many columns the preview pane is hidden.
 const preview_min_cols = 90;
 
+/// Rows a docked picker shows at most (plus its query line).
+const docked_rows = 10;
+
+/// The height a docked picker (quickfix) takes at the bottom, or 0.
+pub fn dockedHeight(ed: *Editor, font: *const Font) f32 {
+    const p = ed.picker orelse return 0;
+    if (!sources.docked(p.kind)) return 0;
+    const rows = @min(@max(p.rowCount(), 1), docked_rows) + 1;
+    return @as(f32, @floatFromInt(rows)) * font.cell_h;
+}
+
+/// A docked picker: a panel above the status line, full width, no preview
+/// (the editor above shows the selection instead), no backdrop.
+fn drawDocked(p: *Picker, font: *const Font, theme: *const Theme, l: render.Layout) void {
+    const ch = font.cell_h;
+    const h = dockedHeight(p.ed, font);
+    const y0 = l.status_y - h;
+    const cols: usize = @intFromFloat(l.width / font.cell_w);
+    rect(0, y0, l.width, h, theme.popup_bg);
+    rect(0, y0, l.width, 1, theme.popup_border);
+    drawQueryLine(p, font, theme, 0, y0, cols);
+    drawList(p, font, theme, 0, y0 + ch, cols, @as(usize, @intFromFloat(h / ch)) - 1);
+}
+
 pub fn draw(p: *Picker, font: *const Font, theme: *const Theme, l: render.Layout) void {
+    if (sources.docked(p.kind)) return drawDocked(p, font, theme, l);
     const cw = font.cell_w;
     const ch = font.cell_h;
     const total_cols: usize = @intFromFloat(l.width / cw);
@@ -55,7 +82,12 @@ fn drawQueryLine(p: *Picker, font: *const Font, theme: *const Theme, bx: f32, y:
     x = font.drawText(p.title(), x, y, theme.mode_picker);
     x = font.drawText(" › ", x, y, theme.status_dim);
     x = font.drawText(p.query.items(), x, y, theme.fg);
-    rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
+    // Typing shows a cursor; moving through results shows the keys instead.
+    if (p.ed.mode == .picker) {
+        rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
+    } else {
+        _ = font.drawText("  j/k move · Enter open · i type · q close", x, y, theme.status_dim);
+    }
 
     // "matched/total", with an ellipsis while the source is still producing.
     var buf: [48]u8 = undefined;

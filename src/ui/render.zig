@@ -55,7 +55,8 @@ pub fn layout(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
 /// views. Returns the whole-screen layout (status line, popups).
 pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
     const screen = layout(ed, font, width, height);
-    ed.windows.layout(.{ .w = screen.width, .h = screen.status_y }, font.cell_w, font.cell_h);
+    // A docked picker (quickfix) takes the bottom rows; windows get the rest.
+    ed.windows.layout(.{ .w = screen.width, .h = screen.status_y - picker_view.dockedHeight(ed, font) }, font.cell_w, font.cell_h);
     // The terminal popup's grid; the shown terminal follows its size.
     const pr = popupRect(font, screen);
     ed.term_size = .{
@@ -120,6 +121,7 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     rlPushMatrix();
     rlTranslatef(fl.x0, fl.y0, 0);
     drawHover(ed, font, theme, fl);
+    drawSignature(ed, font, theme, fl);
     drawCompletion(ed, font, theme, fl);
     rlPopMatrix();
     drawPopup(ed, font, theme, l);
@@ -194,6 +196,17 @@ fn keyCells(k: keys.KeyEvent) usize {
 
 pub fn rect(x: f32, y: f32, w: f32, h: f32, color: rl.Color) void {
     rl.DrawRectangleRec(.{ .x = x, .y = y, .width = w, .height = h }, color);
+}
+
+/// A path for lists: relative inside the current project, else its last
+/// two parts.
+fn shortPath(ed: *Editor, path: []const u8) []const u8 {
+    const root = ed.projectRoot();
+    if (path.len > root.len + 1 and std.mem.startsWith(u8, path, root) and path[root.len] == '/') return path[root.len + 1 ..];
+    if (!std.fs.path.isAbsolute(path)) return path;
+    const base = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    const parent = std.mem.lastIndexOfScalar(u8, path[0..base], '/') orelse return path;
+    return path[parent + 1 ..];
 }
 
 /// The command editor: a box growing with its text (3 to 16 lines), at the
@@ -344,7 +357,16 @@ fn drawWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Wi
     if (ed.window_list.items.len > 1) {
         rect(r.x, r.y, r.w, font.cell_h, if (focused) theme.status_bg else theme.bg);
         rect(r.x, r.y + font.cell_h - 1, r.w, 1, theme.popup_border);
-        var x = font.drawText(ed.buffer.displayName(), r.x + font.cell_w, r.y, if (focused) theme.status_fg else theme.status_dim);
+        var x = r.x + font.cell_w;
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (ed.buffer.project) |p| {
+            // Name the project when it isn't the one we started in.
+            if (!std.mem.eql(u8, p.root, ed.cwd)) {
+                x = font.drawText(p.name(), x, r.y, theme.whichkey_group);
+                x += font.cell_w * 2;
+            }
+        }
+        x = font.drawText(projectPath(ed, &path_buf), x, r.y, if (focused) theme.status_fg else theme.status_dim);
         if (ed.buffer.modified) x = font.drawText(" [+]", x, r.y, if (focused) theme.status_fg else theme.status_dim);
     }
     if (r.x > 0) rect(r.x, r.y, 1, r.h, theme.popup_border);
@@ -390,6 +412,16 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         if (selection) |sel| drawSelection(ed, font, theme, l, sel, line, y);
         if (selection != null) for (ed.cursors.items) |c| {
             drawSelection(ed, font, theme, l, ed.selectionRange(c.anchor, c.pos), line, y);
+        };
+        // Snippet placeholders: the current one (typing replaces it) like a
+        // selection, the ones still ahead faintly.
+        if (focused) if (ed.snippet) |sn| if (sn.buffer == ed.buffer) {
+            for (sn.stops, 0..) |stop, i| {
+                if (stop[1] <= stop[0] or i < sn.current) continue;
+                const current = i == sn.current;
+                if (current and !sn.fresh) continue;
+                drawRange(ed, font, l, .{ .start = stop[0], .end = stop[1] }, line, y, if (current) theme.selection_bg else theme.fold_bg);
+            }
         };
 
         // Line number, right-aligned in the gutter with one cell of padding.
@@ -462,7 +494,7 @@ fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
         .insert => rect(x, y, 2, font.cell_h, color),
         // Half block: an operator is waiting for its motion.
         .operator => rect(x, y + font.cell_h / 2, font.cell_w, font.cell_h / 2, color),
-        .normal, .picker, .visual, .search => {
+        .normal, .picker, .picker_normal, .visual, .search => {
             rect(x, y, font.cell_w, font.cell_h, color);
             // Redraw the character under the block in the contrasting color.
             const t = ed.text();
@@ -488,6 +520,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
         .normal => .{ " NORMAL ", theme.mode_normal },
         .insert => .{ " INSERT ", theme.mode_insert },
         .picker => .{ " PICKER ", theme.mode_picker },
+        .picker_normal => .{ " PICKER ", theme.mode_normal },
         .visual => if (ed.visual_line) .{ " V-LINE ", theme.mode_visual } else .{ " VISUAL ", theme.mode_visual },
         .operator => .{ " NORMAL ", theme.mode_normal },
         .search => switch (if (ed.search_prompt) |sp| sp.kind else .search) {
@@ -518,7 +551,13 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
         const color = if (ed.message.kind == .err) theme.message_err else theme.message_info;
         _ = font.drawText(ed.message.text(), x, y, color);
     } else {
-        x = font.drawText(ed.buffer.displayName(), x, y, theme.status_fg);
+        // "project  path/in/project"
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (ed.buffer.project) |p| {
+            x = font.drawText(p.name(), x, y, theme.whichkey_group);
+            x += font.cell_w * 2;
+        }
+        x = font.drawText(projectPath(ed, &path_buf), x, y, theme.status_fg);
         if (ed.buffer.modified) _ = font.drawText(" [+]", x, y, theme.status_fg);
     }
 
@@ -529,6 +568,16 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
     const right = w.buffered();
     const right_x = l.width - @as(f32, @floatFromInt(std.unicode.utf8CountCodepoints(right) catch right.len + 1)) * font.cell_w;
     _ = font.drawText(right, right_x, y, theme.status_dim);
+}
+
+/// The current file's path inside its project (else as the buffer has it).
+fn projectPath(ed: *Editor, buf: []u8) []const u8 {
+    const b = ed.buffer;
+    const path = b.path orelse return b.displayName();
+    const p = b.project orelse return path;
+    const abs = if (std.fs.path.isAbsolute(path)) path else std.fmt.bufPrint(buf, "{s}/{s}", .{ ed.cwd, path }) catch return path;
+    if (abs.len > p.root.len + 1 and std.mem.startsWith(u8, abs, p.root) and abs[p.root.len] == '/') return abs[p.root.len + 1 ..];
+    return path;
 }
 
 fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -551,6 +600,11 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 /// Highlights the part of `line` inside the visual selection.
 fn drawSelection(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, sel: operators.Range, line: usize, y: f32) void {
+    drawRange(ed, font, l, sel, line, y, theme.selection_bg);
+}
+
+/// Colors the part of `line` inside `sel`.
+fn drawRange(ed: *Editor, font: *const Font, l: Layout, sel: operators.Range, line: usize, y: f32, color: rl.Color) void {
     const t = ed.text();
     const ls = t.lineStart(line);
     const le = t.lineEnd(line);
@@ -566,7 +620,7 @@ fn drawSelection(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout,
     if (c1 <= left) return;
     const x0 = l.text_x + @as(f32, @floatFromInt(@max(c0, left) - left)) * font.cell_w;
     const w = @as(f32, @floatFromInt(c1 - @max(c0, left))) * font.cell_w;
-    rect(x0, y, w, font.cell_h, theme.selection_bg);
+    rect(x0, y, w, font.cell_h, color);
 }
 
 /// Background for every match of the active search on `line`; the match
@@ -702,6 +756,47 @@ fn drawHover(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) voi
     for (lines[0..n], 0..) |line, i| {
         _ = font.drawText(clip(line, cols - 2), box.x + font.cell_w, box.y + @as(f32, @floatFromInt(i)) * font.cell_h, theme.fg);
     }
+}
+
+/// Signature help: the call's signature above the cursor with the current
+/// parameter highlighted, and its documentation's first line.
+fn drawSignature(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
+    const sig = ed.signature orelse return;
+    const at = cellPos(ed, font, l, ed.view.cursor) orelse return;
+    const max_cols: usize = @min(@as(usize, @intFromFloat(l.width / font.cell_w)) -| 4, 100);
+    const label_cells = cells(sig.label);
+    // Long signatures: show the window around the current parameter.
+    var skip: usize = 0;
+    if (label_cells > max_cols) {
+        const param_end_cells = cells(sig.label[0..sig.param_end]);
+        if (param_end_cells + 2 > max_cols) skip = param_end_cells + 2 - max_cols;
+    }
+    const shown_cells = @min(label_cells - skip, max_cols);
+    const doc_cells = @min(cells(sig.doc), max_cols);
+    const cols = @max(shown_cells, doc_cells) + 2;
+    const rows: usize = if (sig.doc.len > 0) 2 else 1;
+    const w = @as(f32, @floatFromInt(cols)) * font.cell_w;
+    const h = @as(f32, @floatFromInt(rows)) * font.cell_h;
+    // Above the cursor line (completion uses below), else below.
+    const y = if (at.y - h >= 0) at.y - h else at.y + font.cell_h;
+    const x = @max(@min(at.x - font.cell_w, l.width - w - 1), 0);
+    rect(x - 1, y - 1, w + 2, h + 2, theme.popup_border);
+    rect(x, y, w, h, theme.popup_bg);
+
+    var cx = x + font.cell_w;
+    var it = Font.Utf8Lossy{ .bytes = sig.label };
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        const offset = it.i;
+        const cp = it.next() orelse break;
+        if (n < skip) continue;
+        if (n - skip >= shown_cells) break;
+        const in_param = offset >= sig.param_start and offset < sig.param_end;
+        if (in_param) rect(cx, y + font.cell_h - 2, font.cell_w, 1, theme.whichkey_key);
+        if (cp != ' ') font.drawCodepoint(cp, cx, y, if (in_param) theme.whichkey_key else theme.fg);
+        cx += font.cell_w;
+    }
+    if (sig.doc.len > 0) _ = font.drawText(clip(sig.doc, max_cols), x + font.cell_w, y + font.cell_h, theme.status_dim);
 }
 
 fn drawCompletion(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {

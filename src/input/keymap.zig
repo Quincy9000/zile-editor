@@ -19,7 +19,10 @@ const Command = commands.Command;
 pub const Mode = enum {
     normal,
     insert,
+    /// Typing a picker's query (its insert mode).
     picker,
+    /// Moving through a picker's results with vim keys (<Esc> from typing).
+    picker_normal,
     visual,
     /// After an operator, waiting for its motion or text object (`d` in `dw`).
     operator,
@@ -184,12 +187,14 @@ const group_table = [_]struct { []const u8, []const u8 }{
     .{ leader ++ "c", "code" },
     .{ leader ++ "f", "file" },
     .{ leader ++ "g", "git" },
-    .{ leader ++ "q", "quit" },
+    .{ leader ++ "Q", "quit" },
     .{ leader ++ "s", "search" },
     .{ leader ++ "t", "toggle" },
     .{ leader ++ "w", "window" },
     .{ leader ++ "o", "open" },
     .{ leader ++ "r", "run" },
+    .{ leader ++ "p", "project" },
+    .{ leader ++ "x", "quickfix" },
     .{ leader ++ "ws", "split" },
     .{ "q", "cursors" },
 };
@@ -204,6 +209,9 @@ const NV = &[_]Mode{ .normal, .visual };
 const NVO = &[_]Mode{ .normal, .visual, .operator };
 const S = &[_]Mode{.search};
 const PS = &[_]Mode{ .picker, .search };
+const PN = &[_]Mode{.picker_normal};
+/// A picker, typing or not.
+const PA = &[_]Mode{ .picker, .picker_normal };
 
 const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     // Motions: move in normal/visual mode, give an operator its range.
@@ -382,6 +390,11 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ N, "<Tab>", "jump_newer" },
     .{ N, leader ++ "sj", "jump_list" },
     .{ N, leader ++ "ot", "terminal_toggle" },
+    .{ N, leader ++ "pp", "switch_project" },
+    .{ N, leader ++ "xx", "quickfix_list" },
+    .{ N, "]q", "quickfix_next" },
+    .{ N, "[q", "quickfix_previous" },
+    .{ N, leader ++ "pf", "find_file" },
     .{ N, leader ++ "rr", "run_runner" },
     .{ N, leader ++ "rR", "run_again" },
     .{ N, leader ++ "rc", "run_command" },
@@ -435,14 +448,21 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ N, leader ++ "tr", "toggle_relative_numbers" },
     .{ N, leader ++ "td", "toggle_diagnostic_text" },
     .{ N, leader ++ "tp", "toggle_auto_pairs" },
-    .{ N, leader ++ "qq", "quit" },
-    .{ N, leader ++ "qs", "save_and_quit" },
-    .{ N, leader ++ "qQ", "quit_without_saving" },
+    .{ N, leader ++ "t+", "zoom_in" },
+    .{ N, leader ++ "t=", "zoom_in" },
+    .{ N, leader ++ "t-", "zoom_out" },
+    .{ N, leader ++ "t0", "zoom_reset" },
+    // SPC q closes whatever is in front: the window, else the buffer, else
+    // the editor. SPC Q is for quitting with everything else open.
+    .{ N, leader ++ "q", "smart_close" },
+    .{ N, leader ++ "Qs", "save_and_quit" },
+    .{ N, leader ++ "QQ", "quit_without_saving" },
 
     // Insert mode: unbound keys type.
     .{ I, "<Esc>", "normal_mode" },
     .{ I, "<CR>", "completion_accept_or_newline" },
     .{ I, "<Tab>", "completion_accept_or_tab" },
+    .{ I, "<S-Tab>", "snippet_previous" },
     .{ I, "<C-y>", "completion_accept" },
     .{ I, "<C-n>", "completion_next" },
     .{ I, "<C-p>", "completion_previous" },
@@ -458,20 +478,42 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ I, "<End>", "line_end" },
 
     // Picker: unbound keys type into the query.
-    .{ P, "<Esc>", "picker_close" },
-    .{ P, "<C-g>", "picker_close" },
-    .{ P, "<C-c>", "picker_close" },
-    .{ P, "<CR>", "picker_accept" },
+    // Pickers have two modes: typing the query (insert), and moving through
+    // the results with vim keys (normal, <Esc> from typing).
+    .{ P, "<Esc>", "picker_normal_mode" },
+    .{ PN, "<Esc>", "picker_close" },
+    .{ PN, "q", "picker_close" },
+    .{ PA, "<C-g>", "picker_close" },
+    .{ PA, "<C-c>", "picker_close" },
+    .{ PA, "<CR>", "picker_accept" },
+    .{ PA, "<Tab>", "picker_open_menu" },
+    .{ PA, "<C-q>", "picker_to_quickfix" },
+    .{ PA, "<C-v>", "picker_open_right" },
+    .{ PA, "<C-s>", "picker_open_below" },
     .{ P, "/", "picker_slash" },
     .{ P, "~", "picker_tilde" },
-    .{ P, "<Down>", "picker_next" },
-    .{ P, "<C-n>", "picker_next" },
-    .{ P, "<C-j>", "picker_next" },
-    .{ P, "<Up>", "picker_previous" },
-    .{ P, "<C-p>", "picker_previous" },
-    .{ P, "<C-k>", "picker_previous" },
-    .{ P, "<PageDown>", "picker_page_down" },
-    .{ P, "<PageUp>", "picker_page_up" },
+    .{ PA, "<Down>", "picker_next" },
+    .{ PA, "<C-n>", "picker_next" },
+    .{ PA, "<C-j>", "picker_next" },
+    .{ PN, "j", "picker_next" },
+    .{ PA, "<Up>", "picker_previous" },
+    .{ PA, "<C-p>", "picker_previous" },
+    .{ PA, "<C-k>", "picker_previous" },
+    .{ PN, "k", "picker_previous" },
+    .{ PA, "<PageDown>", "picker_page_down" },
+    .{ PA, "<PageUp>", "picker_page_up" },
+    .{ PN, "<C-d>", "picker_page_down" },
+    .{ PN, "<C-u>", "picker_page_up" },
+    .{ PN, "gg", "picker_first" },
+    .{ PN, "G", "picker_last" },
+    .{ PN, "i", "picker_insert_mode" },
+    .{ PN, "a", "picker_insert_mode" },
+    .{ PN, "I", "picker_insert_mode" },
+    .{ PN, "A", "picker_insert_mode" },
+    .{ PN, "/", "picker_insert_mode" },
+    // In the explorer: h goes up a folder, l goes in (or opens).
+    .{ PN, "h", "picker_browse_up" },
+    .{ PN, "l", "picker_browse_in" },
     .{ PS, "<BS>", "input_delete_char" },
     .{ PS, "<C-w>", "input_delete_word" },
     .{ PS, "<C-u>", "input_clear" },
@@ -568,10 +610,9 @@ test "which-key continuations" {
     }
     try testing.expect(found_file);
 
-    const quit = km.continuations(.normal, try keys.parseSequence(leader ++ "q", &buf), &out);
-    try testing.expectEqual(3, quit.len);
-    try testing.expect(quit[0].key.eql(KeyEvent.char('q'))); // lowercase sorts first
-    try testing.expect(quit[1].key.eql(KeyEvent.char('Q')));
-    try testing.expect(quit[2].key.eql(KeyEvent.char('s')));
-    try testing.expectEqual(.command, quit[1].kind);
+    const quit = km.continuations(.normal, try keys.parseSequence(leader ++ "Q", &buf), &out);
+    try testing.expectEqual(2, quit.len);
+    try testing.expect(quit[0].key.eql(KeyEvent.char('Q')));
+    try testing.expect(quit[1].key.eql(KeyEvent.char('s')));
+    try testing.expectEqual(.command, quit[0].kind);
 }

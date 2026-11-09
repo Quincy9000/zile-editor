@@ -18,8 +18,14 @@ gpa: Allocator,
 client: *Client,
 /// Index into `servers`.
 index: usize,
+/// The project root this server works in (borrowed from the editor's
+/// project list), and the editor's cwd for buffers without a project.
+root: []const u8 = "",
+cwd: []const u8 = "",
 /// Characters that should pop up completion (from the server's capabilities).
 triggers: std.ArrayList(u8) = .empty,
+sig_triggers: std.ArrayList(u8) = .empty,
+sig_retriggers: std.ArrayList(u8) = .empty,
 pending: std.AutoHashMapUnmanaged(i64, Pending) = .empty,
 /// Open documents.
 docs: std.AutoHashMapUnmanaged(*Buffer, Doc) = .empty,
@@ -52,6 +58,7 @@ const Pending = union(enum) {
     rename,
     symbols,
     completion: struct { buffer: *Buffer, word_start: usize },
+    signature: *Buffer,
 };
 
 /// One edit of a WorkspaceEdit, by file (0-based positions).
@@ -99,33 +106,54 @@ pub fn server(l: *const Lsp) *const Server {
     return &servers[l.index];
 }
 
-/// Whether `b` belongs to this server.
+/// Whether `b` belongs to this server: its language, in its project.
 pub fn wants(l: *const Lsp, b: *const Buffer) bool {
-    return serverFor(b) == l.index;
+    return serverFor(b) == l.index and std.mem.eql(u8, bufferRoot(b, l.cwd), l.root);
+}
+
+/// The project root a buffer's server works in.
+pub fn bufferRoot(b: *const Buffer, cwd: []const u8) []const u8 {
+    return if (b.project) |p| p.root else cwd;
 }
 
 pub fn isTrigger(l: *const Lsp, cp: u21) bool {
     return cp < 0x80 and std.mem.indexOfScalar(u8, l.triggers.items, @intCast(cp)) != null;
 }
 
-pub fn start(ed: *Editor, index: usize) !*Lsp {
+/// Characters that open signature help (`(`), and ones that update it while
+/// open (`,`), from the server's capabilities.
+pub fn isSignatureTrigger(l: *const Lsp, cp: u21, open: bool) bool {
+    if (cp >= 0x80) return false;
+    const c: u8 = @intCast(cp);
+    if (std.mem.indexOfScalar(u8, l.sig_triggers.items, c) != null) return true;
+    return open and std.mem.indexOfScalar(u8, l.sig_retriggers.items, c) != null;
+}
+
+/// Starts server `index` for the project at `root_path` (which must outlive it).
+pub fn start(ed: *Editor, index: usize, root_path: []const u8) !*Lsp {
     const gpa = ed.gpa;
     const client = try Client.start(gpa, ed.io, servers[index].command, ed.wake_fn);
     errdefer client.deinit();
     const l = try gpa.create(Lsp);
-    l.* = .{ .gpa = gpa, .client = client, .index = index };
+    l.* = .{ .gpa = gpa, .client = client, .index = index, .root = root_path, .cwd = ed.cwd };
     errdefer gpa.destroy(l);
 
-    const root = try Client.uriFromPath(gpa, ed.cwd);
+    const root = try Client.uriFromPath(gpa, root_path);
     defer gpa.free(root);
     const id = try client.request("initialize", .{
         .rootUri = root,
-        .workspaceFolders = &[_]struct { uri: []const u8, name: []const u8 }{.{ .uri = root, .name = std.fs.path.basename(ed.cwd) }},
+        .workspaceFolders = &[_]struct { uri: []const u8, name: []const u8 }{.{ .uri = root, .name = std.fs.path.basename(root_path) }},
         .capabilities = .{
             .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} },
             .textDocument = .{
                 .synchronization = .{ .didSave = true },
-                .completion = .{ .completionItem = .{ .snippetSupport = false } },
+                // Snippets: function arguments arrive as placeholders.
+                .completion = .{ .completionItem = .{ .snippetSupport = true } },
+                .signatureHelp = .{ .signatureInformation = .{
+                    .documentationFormat = &[_][]const u8{ "plaintext", "markdown" },
+                    .parameterInformation = .{ .labelOffsetSupport = true },
+                    .activeParameterSupport = true,
+                } },
                 .hover = .{ .contentFormat = &[_][]const u8{ "plaintext", "markdown" } },
                 .publishDiagnostics = .{ .relatedInformation = false },
                 .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true },
@@ -140,6 +168,8 @@ pub fn deinit(l: *Lsp) void {
     const gpa = l.gpa;
     l.client.deinit();
     l.triggers.deinit(gpa);
+    l.sig_triggers.deinit(gpa);
+    l.sig_retriggers.deinit(gpa);
     l.pending.deinit(gpa);
     var docs = l.docs.valueIterator();
     while (docs.next()) |d| gpa.free(d.uri);
@@ -216,6 +246,9 @@ pub fn closeBuffer(l: *Lsp, b: *Buffer) void {
         .completion => |cp| if (cp.buffer == b) {
             stale = e.key_ptr.*;
         },
+        .signature => |sb| if (sb == b) {
+            stale = e.key_ptr.*;
+        },
         else => {},
     };
     if (stale) |k| _ = l.pending.remove(k);
@@ -280,6 +313,14 @@ pub fn requestRename(l: *Lsp, ed: *Editor, pos: usize, new_name: []const u8) !vo
     try l.pending.put(l.gpa, id, .rename);
 }
 
+/// Asks what call the cursor is in, and which argument.
+pub fn requestSignature(l: *Lsp, ed: *Editor) !void {
+    const doc = l.docs.get(ed.buffer) orelse return;
+    try l.sync(ed);
+    const id = try l.client.request("textDocument/signatureHelp", .{ .textDocument = .{ .uri = doc.uri }, .position = position(ed) });
+    try l.pending.put(l.gpa, id, .{ .signature = ed.buffer });
+}
+
 pub fn requestCompletion(l: *Lsp, ed: *Editor, word_start: usize) !void {
     const doc = l.docs.get(ed.buffer) orelse return;
     // Send pending edits first so the server sees what was just typed.
@@ -331,6 +372,12 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                     try l.triggers.append(l.gpa, chars[chars.len - 1]);
                 };
             };
+            const sig = field(caps, "signatureHelpProvider");
+            inline for (.{ .{ "triggerCharacters", &l.sig_triggers }, .{ "retriggerCharacters", &l.sig_retriggers } }) |f| {
+                if (field(sig, f[0])) |tc| if (tc == .array) {
+                    for (tc.array.items) |x| if (str(x)) |chars| if (chars.len > 0) try f[1].append(l.gpa, chars[0]);
+                };
+            }
             // `.{}` would serialize as `[]` (an empty tuple); the spec wants `{}`.
             try l.client.notifyNow("initialized", struct {}{});
             try l.client.markReady();
@@ -350,6 +397,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             try ed.showHover(text);
         },
         .completion => |cp| try ed.showCompletion(cp.buffer, cp.word_start, result),
+        .signature => |b| try ed.showSignature(b, result),
         .symbols => {
             var list: std.ArrayList(Symbol) = .empty;
             errdefer {

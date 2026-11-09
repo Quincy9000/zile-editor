@@ -8,12 +8,18 @@ const Io = std.Io;
 
 /// The state file's path, or null without $HOME. Caller frees.
 pub fn defaultPath(gpa: Allocator) ?[]u8 {
+    return statePath(gpa, "run-commands");
+}
+
+/// `$XDG_STATE_HOME/zile/<name>` (default `~/.local/state/zile/<name>`).
+/// Caller frees.
+pub fn statePath(gpa: Allocator, name: []const u8) ?[]u8 {
     if (std.c.getenv("XDG_STATE_HOME")) |s| {
         const dir = std.mem.span(s);
-        if (dir.len > 0) return std.fs.path.join(gpa, &.{ dir, "zile", "run-commands" }) catch null;
+        if (dir.len > 0) return std.fs.path.join(gpa, &.{ dir, "zile", name }) catch null;
     }
     const home = std.mem.span(std.c.getenv("HOME") orelse return null);
-    return std.fs.path.join(gpa, &.{ home, ".local", "state", "zile", "run-commands" }) catch null;
+    return std.fs.path.join(gpa, &.{ home, ".local", "state", "zile", name }) catch null;
 }
 
 /// The command last run in `project`, if any. Caller frees.
