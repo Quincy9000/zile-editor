@@ -22,8 +22,9 @@ const keys = @import("../input/keys.zig");
 const Syntax = @import("../syntax/Syntax.zig");
 const languages = @import("../syntax/languages.zig");
 const motions = @import("../core/motions.zig");
+const Git = @import("../git/Git.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -35,6 +36,11 @@ fn Impl(comptime kind: Kind) type {
         .locations => Locations,
         .diagnostics => Diagnostics,
         .symbols => Symbols,
+        .git_actions => GitActions,
+        .git_branches => GitBranches,
+        .git_changes => GitChanges,
+        .confirm_delete => ConfirmDelete,
+        .browse => Browse,
     };
 }
 
@@ -229,7 +235,11 @@ const Files = struct {
     pub const preview_limit = 1024 * 1024;
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        const data = Io.Dir.cwd().readFileAlloc(ed.io, item.text, ed.gpa, .limited(preview_limit)) catch |err| {
+        try previewPath(ed, item.text, out);
+    }
+
+    fn previewPath(ed: *Editor, path: []const u8, out: *Preview) !void {
+        const data = Io.Dir.cwd().readFileAlloc(ed.io, path, ed.gpa, .limited(preview_limit)) catch |err| {
             const why = switch (err) {
                 error.StreamTooLong => "file too large to preview",
                 error.IsDir => "directory",
@@ -243,7 +253,90 @@ const Files = struct {
             try out.text.appendSlice(ed.gpa, "(binary file)");
             return;
         }
-        try out.setCode(ed.gpa, data, item.text);
+        try out.setCode(ed.gpa, data, path);
+    }
+};
+
+/// `SPC .`: one folder's contents (folders first, as "name/"). Enter or `/`
+/// goes into a folder, <BS> on an empty query goes up (see `Editor.browse*`).
+const Browse = struct {
+    pub const title = "Browse";
+    pub const prefix: ?u8 = null;
+
+    const Entry = struct {
+        name: []const u8,
+        is_dir: bool,
+
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            if (a.is_dir != b.is_dir) return a.is_dir;
+            // Hidden entries after the rest.
+            const ah = a.name[0] == '.';
+            const bh = b.name[0] == '.';
+            if (ah != bh) return bh;
+            return std.ascii.lessThanIgnoreCase(a.name, b.name);
+        }
+    };
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var arena: std.heap.ArenaAllocator = .init(ed.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var dir = Io.Dir.cwd().openDir(ed.io, ed.browse_dir.items, .{ .iterate = true }) catch return;
+        defer dir.close(ed.io);
+        var entries: std.ArrayList(Entry) = .empty;
+        var it = dir.iterate();
+        while (it.next(ed.io) catch null) |e| {
+            const is_dir = switch (e.kind) {
+                .directory => true,
+                // A link counts as what it points to.
+                .sym_link => if (dir.statFile(ed.io, e.name, .{})) |st| st.kind == .directory else |_| false,
+                else => false,
+            };
+            try entries.append(a, .{ .name = try a.dupe(u8, e.name), .is_dir = is_dir });
+        }
+        std.mem.sort(Entry, entries.items, {}, Entry.lessThan);
+        for (entries.items) |e| {
+            const text = if (e.is_dir) try std.fmt.allocPrint(a, "{s}/", .{e.name}) else e.name;
+            try items.append(.{ .text = text });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (std.mem.endsWith(u8, item.text, "/")) return ed.browseInto(item.text);
+        const path = try ed.browsePath(item.text);
+        defer ed.gpa.free(path);
+        try ed.openFile(path);
+    }
+
+    /// A new file in this folder ("sub/name" makes the folder on save).
+    pub fn create(ed: *Editor, query: []const u8) !void {
+        const path = try ed.browsePath(query);
+        defer ed.gpa.free(path);
+        try ed.openFile(path);
+        ed.setMessage(.info, "new file \"{s}\" (SPC f s to create it on disk)", .{ed.buffer.displayName()});
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const path = try ed.browsePath(item.text);
+        defer ed.gpa.free(path);
+        if (std.mem.endsWith(u8, item.text, "/")) {
+            // A folder: its first entries.
+            var dir = Io.Dir.cwd().openDir(ed.io, path, .{ .iterate = true }) catch |err|
+                return out.text.print(ed.gpa, "({s})", .{@errorName(err)});
+            defer dir.close(ed.io);
+            var it = dir.iterate();
+            var n: usize = 0;
+            while (it.next(ed.io) catch null) |e| : (n += 1) {
+                if (n == 200) {
+                    try out.text.appendSlice(ed.gpa, "...\n");
+                    break;
+                }
+                try out.text.print(ed.gpa, "{s}{s}\n", .{ e.name, if (e.kind == .directory) "/" else "" });
+            }
+            if (n == 0) try out.text.appendSlice(ed.gpa, "(empty folder)");
+            return;
+        }
+        try Files.previewPath(ed, path, out);
     }
 };
 
@@ -608,5 +701,150 @@ const Symbols = struct {
         const b = ed.buffer;
         try out.setCode(ed.gpa, b.text.slice(0, b.text.len()), b.path);
         out.focus_line = ed.symbols.items[item.id].line;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Confirmations: a two-row Yes/No picker.
+
+/// `SPC f D`: delete `ed.confirm_target`'s file?
+const ConfirmDelete = struct {
+    pub const title = "Delete file?";
+    pub const prefix: ?u8 = null;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const b = ed.confirm_target orelse return;
+        try items.append(.{ .text = "No, keep it", .detail = "", .id = 0 });
+        try items.append(.{ .text = "Yes, delete it", .detail = b.displayName(), .id = 1 });
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        const b = ed.confirm_target orelse return;
+        ed.confirm_target = null;
+        if (item.id != 1) return ed.setMessage(.info, "kept \"{s}\"", .{b.displayName()});
+        // The buffer may have been closed while the picker was open.
+        for (ed.buffers.items) |o| if (o == b) return ed.deleteFile(b);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const b = ed.confirm_target orelse return;
+        if (item.id == 1) {
+            try out.text.print(ed.gpa, "Removes \"{s}\" from disk and closes it.\nThis cannot be undone.", .{b.displayName()});
+        } else try out.text.appendSlice(ed.gpa, "Leaves the file alone.");
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Git: a small menu of plain actions, branches, changed files.
+
+/// `SPC g g`: everything git, in words.
+const GitActions = struct {
+    pub const title = "Git";
+    pub const prefix: ?u8 = null;
+
+    const actions = [_]struct { []const u8, []const u8 }{
+        .{ "Commit all changes...", "SPC g c" },
+        .{ "Push", "" },
+        .{ "Pull", "" },
+        .{ "Switch branch / new branch...", "SPC g b" },
+        .{ "Changed files", "SPC g s" },
+        .{ "Set remote URL...", "" },
+        .{ "Restore change at cursor", "SPC g r" },
+        .{ "Reload HEAD", "SPC g R" },
+    };
+
+    pub fn fill(_: *Editor, items: *Items) !void {
+        for (actions, 0..) |a, i| try items.append(.{ .text = a[0], .detail = a[1], .id = @intCast(i) });
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        switch (item.id) {
+            0 => ed.gitCommitPrompt(),
+            1 => try ed.gitPush(),
+            2 => try ed.gitPull(),
+            3 => try ed.openPicker(.git_branches, ""),
+            4 => try ed.openPicker(.git_changes, ""),
+            5 => try ed.gitRemotePrompt(),
+            6 => if (ed.hunkAtCursor()) |h| try ed.restoreHunk(h) else ed.setMessage(.info, "no change here", .{}),
+            7 => ed.reloadGit(),
+            else => {},
+        }
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const help = [_][]const u8{
+            "Saves your open files, asks for a message,\nthen stages everything and commits.",
+            "Sends your commits to the remote (origin).\nThe first push sets up tracking automatically.",
+            "Gets new commits from the remote.\nOnly fast-forwards, so it never makes a surprise merge.",
+            "Lists your branches. Type a new name to create one.",
+            "Lists files with uncommitted changes.",
+            "Sets where Push and Pull go (the 'origin' remote).",
+            "Puts the HEAD version of the change under the cursor back.",
+            "Re-reads HEAD (after committing outside the editor).",
+        };
+        if (item.id < help.len) try out.text.appendSlice(ed.gpa, help[item.id]);
+    }
+};
+
+/// Branches; typing a new name offers to create it.
+const GitBranches = struct {
+    pub const title = "Branches";
+    pub const prefix: ?u8 = null;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        if (!ed.inRepo()) return;
+        const list = Git.branches(ed.gpa, ed.io, ed.git_root.?) orelse return;
+        defer list.deinit(ed.gpa);
+        var it = list.iterator();
+        while (it.next()) |line| {
+            if (line.len < 2) continue;
+            const current = line[0] == '*';
+            try items.append(.{ .text = line[1..], .detail = if (current) "current" else "" });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (std.mem.eql(u8, item.detail, "current")) return ed.setMessage(.info, "already on {s}", .{item.text});
+        try ed.gitSwitch(item.text, false);
+    }
+
+    pub fn create(ed: *Editor, name: []const u8) !void {
+        try ed.gitSwitch(name, true);
+    }
+
+    pub fn preview(_: *Editor, _: *const Item, _: *Preview) !void {}
+};
+
+/// Files with uncommitted changes (`git status`).
+const GitChanges = struct {
+    pub const title = "Changed files";
+    pub const prefix: ?u8 = null;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        if (!ed.inRepo()) return;
+        const out = Git.status(ed.gpa, ed.io, ed.git_root.?) orelse return;
+        defer ed.gpa.free(out);
+        var it = std.mem.splitScalar(u8, out, '\n');
+        while (it.next()) |line| {
+            if (line.len < 4) continue;
+            var path = line[3..];
+            // Renames: "old -> new"
+            if (std.mem.indexOf(u8, path, " -> ")) |arrow| path = path[arrow + 4 ..];
+            const abs = try std.fs.path.join(ed.gpa, &.{ ed.git_root.?, path });
+            defer ed.gpa.free(abs);
+            const rel = try ed.relativePath(abs);
+            defer ed.gpa.free(rel);
+            try items.append(.{ .text = rel, .detail = Git.describeStatus(line[0..2]) });
+        }
+        if (items.count() == 0) ed.setMessage(.info, "no changes", .{});
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (std.mem.eql(u8, item.detail, "deleted")) return ed.setMessage(.info, "{s} was deleted", .{item.text});
+        try ed.openFile(item.text);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        try previewAt(ed, item.text, 0, out);
     }
 };

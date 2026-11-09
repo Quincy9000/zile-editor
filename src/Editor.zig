@@ -17,10 +17,15 @@ const Registers = @import("Registers.zig");
 const LineInput = @import("input/LineInput.zig");
 const search = @import("core/search.zig");
 const Folds = @import("core/Folds.zig");
+const diff = @import("git/diff.zig");
+const Git = @import("git/Git.zig");
+const GitJob = @import("git/Job.zig");
 const Lsp = @import("lsp/Lsp.zig");
 const Completion = @import("lsp/Completion.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
+const pairs = @import("pairs.zig");
+const textobjects = @import("core/textobjects.zig");
 
 const Editor = @This();
 
@@ -32,6 +37,15 @@ pub const Options = struct {
     expand_tab: bool = true,
     /// Lines kept visible above/below the cursor.
     scrolloff: usize = 4,
+    // Toggles (SPC t ...):
+    /// Show deleted/changed HEAD lines as ghost lines.
+    ghost_lines: bool = true,
+    /// Line numbers relative to the cursor line.
+    relative_numbers: bool = false,
+    /// Diagnostic messages after the end of lines.
+    diagnostic_text: bool = true,
+    /// Close brackets and quotes as they are typed.
+    auto_pairs: bool = true,
 };
 
 pub const View = struct {
@@ -48,6 +62,46 @@ pub const View = struct {
     cols: usize = 80,
     /// The other end of the visual selection.
     anchor: usize = 0,
+    /// When set, the top row is this ghost line shown before line `top`.
+    top_ghost: ?u32 = null,
+};
+
+/// A screen row: a text line (a closed fold counts as one), or one of the
+/// ghost lines (old HEAD lines of a git hunk) shown before text line `line`.
+pub const Row = struct {
+    line: usize,
+    ghost: ?u32 = null,
+
+    pub fn eql(a: Row, b: Row) bool {
+        return a.line == b.line and a.ghost == b.ghost;
+    }
+
+    /// Whether `a` is above `b` on screen.
+    pub fn before(a: Row, b: Row) bool {
+        if (a.line != b.line) return a.line < b.line;
+        const ka = a.ghost orelse return false;
+        const kb = b.ghost orelse return true;
+        return ka < kb;
+    }
+};
+
+/// The cursor while it is on a ghost line (read-only; yankable).
+pub const GhostCursor = struct {
+    /// The text line the ghost lines are shown before.
+    line: usize,
+    /// Which ghost line.
+    k: u32,
+    /// Byte column in the ghost line.
+    col: usize,
+    /// Visual selection over ghost lines: the anchor's index.
+    anchor: ?u32 = null,
+};
+
+/// A cursor besides the primary one: position, visual anchor, wanted column.
+pub const Cursor = struct {
+    pos: usize,
+    anchor: usize,
+    want_col: ?usize = null,
 };
 
 /// An operator waiting for its motion (`d` in `dw`).
@@ -64,6 +118,8 @@ pub const SearchPrompt = struct {
     /// Where the cursor and view were, restored on <Esc>.
     origin: usize,
     origin_top: usize,
+    /// Where the cursor was if that was a ghost line.
+    origin_ghost: ?GhostCursor = null,
     return_mode: Mode,
     had_highlight: bool,
     kind: PromptKind = .search,
@@ -74,8 +130,35 @@ pub const PromptKind = enum {
     search,
     /// `s`: jump as soon as only one match is left on screen.
     snipe,
-    /// `SPC c .`: the new name for the symbol at `origin`.
+    /// `SPC c r`: the new name for the symbol at `origin`.
     rename,
+    /// Git: the commit message (commits all changes).
+    git_commit,
+    /// Git: the URL for remote `origin`.
+    git_remote,
+    /// File operations (`SPC f`): the path to open, save to, move to, copy to.
+    new_file,
+    save_as,
+    rename_file,
+    copy_file,
+
+    /// One-line prompts shown in a centered box (not incremental searches).
+    pub fn boxed(k: PromptKind) bool {
+        return k != .search and k != .snipe;
+    }
+
+    pub fn title(k: PromptKind) []const u8 {
+        return switch (k) {
+            .search, .snipe => "",
+            .rename => "Rename symbol",
+            .git_commit => "Commit message (commits all changes)",
+            .git_remote => "Remote URL (origin)",
+            .new_file => "New file (path)",
+            .save_as => "Save as",
+            .rename_file => "Rename / move file to",
+            .copy_file => "Copy file to",
+        };
+    }
 };
 
 /// A command waiting for a character argument (`f` in `fx`, `r`, `q`, `@`).
@@ -115,6 +198,10 @@ picker: ?*Picker = null,
 /// The last closed picker, for `resume_picker`.
 resume_kind: ?Picker.Kind = null,
 resume_query: std.ArrayList(u8) = .empty,
+/// The folder the file browser (`SPC .`) shows: absolute, no trailing slash
+/// (except the root), and its display form ("~/src/").
+browse_dir: std.ArrayList(u8) = .empty,
+browse_label: std.ArrayList(u8) = .empty,
 /// Wakes the UI loop from worker threads (glfw.wake in the app, no-op in tests).
 wake_fn: *const fn () void = noWake,
 
@@ -128,6 +215,21 @@ registers: Registers,
 register: ?u8 = null,
 awaiting_register: bool = false,
 awaiting_char: ?AwaitingChar = null,
+/// Extra cursors (multicursor); the primary one is `view`. Each command
+/// typed at the primary is replayed at each of these (see `replayAtCursors`).
+cursors: std.ArrayList(Cursor) = .empty,
+/// Keys of the command in progress at the primary, and the mode it began in.
+multi_keys: std.ArrayList(KeyEvent) = .empty,
+multi_start: struct { mode: Mode = .normal, visual_line: bool = false } = .{},
+/// The command in progress runs at the primary only (undo, pickers, ...).
+multi_once: bool = false,
+/// Replaying a command at the extra cursors.
+replaying: bool = false,
+/// The primary cursor, set aside while replaying (edits still shift it).
+primary_saved: ?Cursor = null,
+/// Surround in progress: the range `ys` will wrap, the pair `cs` replaces.
+surround_range: operators.Range = .{ .start = 0, .end = 0 },
+surround_from: u21 = 0,
 op: ?PendingOp = null,
 /// Visual mode selects whole lines (`V`).
 visual_line: bool = false,
@@ -163,6 +265,8 @@ lsps: [Lsp.servers.len]?*Lsp = @splat(null),
 lsp_failed: [Lsp.servers.len]bool = @splat(false),
 /// The outline shown by the symbols picker (`SPC c l`).
 symbols: std.ArrayList(syntax_objects.Symbol) = .empty,
+/// The buffer a Yes/No confirmation (`SPC f D`) is about.
+confirm_target: ?*Buffer = null,
 /// Results of the last definition/references request, for the picker.
 locations: std.ArrayList(Lsp.Location) = .empty,
 /// Hover text shown near the cursor until the next key.
@@ -170,6 +274,14 @@ hover: ?[]u8 = null,
 completion: ?Completion = null,
 /// Word start a completion was last requested for (avoids re-asking per key).
 completion_asked: ?usize = null,
+
+/// Repository root (found the first time a file opens), and whether we looked.
+git_root: ?[]u8 = null,
+git_checked: bool = false,
+/// Set while the cursor is on a ghost line.
+ghost: ?GhostCursor = null,
+/// The git command running in the background, if any.
+git_job: ?*GitJob = null,
 
 /// Keys of the command being typed, for the status line (vim's showcmd).
 showcmd: [16]KeyEvent = undefined,
@@ -222,10 +334,16 @@ pub fn deinit(ed: *Editor) void {
     }
     ed.buffers.deinit(ed.gpa);
     ed.resume_query.deinit(ed.gpa);
+    ed.browse_dir.deinit(ed.gpa);
+    ed.browse_label.deinit(ed.gpa);
     ed.registers.deinit();
+    if (ed.git_job) |j| j.destroy();
+    if (ed.git_root) |r| ed.gpa.free(r);
     if (ed.search_prompt) |*sp| sp.input.deinit(ed.gpa);
     ed.last_search.deinit(ed.gpa);
     ed.change_keys.deinit(ed.gpa);
+    ed.cursors.deinit(ed.gpa);
+    ed.multi_keys.deinit(ed.gpa);
     ed.last_change.deinit(ed.gpa);
     ed.macro_keys.deinit(ed.gpa);
     ed.queue.deinit(ed.gpa);
@@ -238,6 +356,8 @@ pub fn deinit(ed: *Editor) void {
 /// picks up picker results from the worker.
 pub fn tick(ed: *Editor) void {
     ed.tickLsp();
+    ed.pollGitJob();
+    ed.updateGit();
     if (ed.buffer.syntax) |*s| {
         const t = ed.text();
         s.update(t);
@@ -326,6 +446,9 @@ fn queueNotation(ed: *Editor, notation: []const u8, count: usize) !void {
 }
 
 fn processKey(ed: *Editor, ev: KeyEvent) void {
+    // Ghost rows must reflect the latest edits (macros and `.` replay many
+    // keys between frames). Cheap when nothing changed.
+    ed.updateGit();
     // Hover text disappears on the next key.
     if (ed.hover) |h| {
         ed.gpa.free(h);
@@ -335,10 +458,19 @@ fn processKey(ed: *Editor, ev: KeyEvent) void {
         ed.showcmd[ed.showcmd_len] = ev;
         ed.showcmd_len += 1;
     }
+    const multi = ed.cursors.items.len > 0;
+    if (multi) {
+        if (ed.multi_keys.items.len == 0) {
+            ed.multi_start = .{ .mode = ed.mode, .visual_line = ed.visual_line };
+            ed.multi_once = false;
+        }
+        ed.multi_keys.append(ed.gpa, ev) catch {};
+    }
     ed.handleKeyInner(ev) catch |err| {
         ed.setMessage(.err, "error: {s}", .{@errorName(err)});
         ed.resetCommand();
     };
+    if (multi) ed.multiAfterKey();
     ed.afterKey();
     ed.clampToFolds();
     // Typing text (insert mode, a prompt) isn't a pending command.
@@ -419,12 +551,12 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
             ed.awaiting_register = true;
             return;
         }
-        // `q` while recording stops the recording.
-        if (cp == 'q' and ed.mode == .normal and ed.macro_register != null) return ed.stopMacro();
+        // `Q` while recording stops the recording.
+        if (cp == 'Q' and ed.mode == .normal and ed.macro_register != null) return ed.stopMacro();
     }
 
     // Start capturing a possible change for `.`.
-    if (ed.mode == .normal and !ed.capturing and ed.pending_len == 0) {
+    if (ed.mode == .normal and !ed.capturing and !ed.replaying and ed.pending_len == 0) {
         ed.capturing = true;
         ed.capture_repeatable = false;
         ed.capture_count = ed.count;
@@ -448,9 +580,20 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 has_count = true;
             };
             const register = ed.register;
+            // Leader menus, undo, `.` and the like act once, not per cursor.
+            if (cmd.once or (seq.len > 1 and seq[0].key == .codepoint and seq[0].key.codepoint == ' ')) ed.multi_once = true;
             ed.pending_len = 0;
             ed.count = 0;
             ed.register = null;
+            if (ed.ghost != null and !cmd.ghost) {
+                // Ghost lines are read-only; other commands act on the text.
+                if (cmd.repeat or ed.mode == .operator) {
+                    ed.resetCommand();
+                    return ed.setMessage(.err, "ghost lines are read-only: yy copies, SPC g r restores", .{});
+                }
+                ed.ghost = null;
+                if (ed.mode == .visual) ed.exitVisual();
+            }
             if (cmd.repeat) ed.capture_repeatable = true;
             if (cmd.takes_char) {
                 ed.awaiting_char = .{ .cmd = cmd, .count = @max(count, 1), .has_count = has_count, .register = register };
@@ -472,7 +615,7 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 .normal, .visual => ed.register = null,
                 .operator => ed.resetCommand(),
                 .insert => for (seq) |k| if (k.text()) |cp| {
-                    try ed.insertCodepoint(cp);
+                    if (!try pairs.typed(ed, cp)) try ed.insertCodepoint(cp);
                     ed.afterTyped(cp);
                 },
                 .picker, .search => {
@@ -608,6 +751,7 @@ fn wordStart(ed: *Editor) usize {
 /// After typing in insert mode: asks for completions after one of the
 /// server's trigger characters (`.`, `::`, `->`...) or two identifier chars.
 fn afterTyped(ed: *Editor, cp: u21) void {
+    if (ed.cursors.items.len > 0 or ed.replaying) return; // completion is single-cursor
     const l = ed.lspFor(ed.buffer) orelse return;
     const trigger = l.isTrigger(cp);
     // A trigger starts a new list even if a popup is open.
@@ -664,6 +808,261 @@ pub fn acceptCompletion(ed: *Editor) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Git
+
+/// Loads `b`'s HEAD version for diffing, if it is tracked in a repository.
+fn loadGitBase(ed: *Editor, b: *Buffer) void {
+    const path = b.path orelse return;
+    if (!ed.git_checked) {
+        ed.git_checked = true;
+        ed.git_root = Git.repoRoot(ed.gpa, ed.io, ed.cwd);
+    }
+    const root = ed.git_root orelse return;
+    const abs = ed.absolutePath(path) catch return;
+    defer ed.gpa.free(abs);
+    const raw = Git.headVersion(ed.gpa, ed.io, root, abs) orelse return;
+    defer ed.gpa.free(raw);
+    const norm = Git.normalize(ed.gpa, raw) catch return;
+    defer ed.gpa.free(norm);
+    const base = Text.init(ed.gpa, norm) catch return;
+    if (b.git) |*g| g.deinit(ed.gpa);
+    b.git = .{ .base = base };
+}
+
+// Simple git actions (SPC g g): each runs in the background.
+
+/// Whether we are in a repository (says so if not).
+pub fn inRepo(ed: *Editor) bool {
+    if (!ed.git_checked) {
+        ed.git_checked = true;
+        ed.git_root = Git.repoRoot(ed.gpa, ed.io, ed.cwd);
+    }
+    if (ed.git_root != null) return true;
+    ed.setMessage(.info, "not in a git repository", .{});
+    return false;
+}
+
+fn startGitJob(ed: *Editor, kind: GitJob.Kind, busy: []const u8, steps: []const []const []const u8) !void {
+    if (!ed.inRepo()) return;
+    if (ed.git_job != null) return ed.setMessage(.info, "git is still busy...", .{});
+    ed.git_job = try GitJob.start(ed.gpa, ed.io, kind, ed.git_root.?, steps, ed.wake_fn);
+    ed.setMessage(.info, "git: {s}...", .{busy});
+}
+
+/// Reports a finished job and refreshes what it changed.
+fn pollGitJob(ed: *Editor) void {
+    const job = ed.git_job orelse return;
+    if (!job.done.load(.acquire)) return;
+    ed.git_job = null;
+    defer job.destroy();
+    if (!job.ok) {
+        const hint: []const u8 = if (job.kind == .push and std.mem.indexOf(u8, job.message, "origin") != null)
+            "  (set one with SPC g g > Set remote URL)"
+        else
+            "";
+        return ed.setMessage(.err, "git: {s}{s}", .{ job.message, hint });
+    }
+    switch (job.kind) {
+        .commit => ed.setMessage(.info, "committed: {s}", .{job.message}),
+        .push => ed.setMessage(.info, "pushed", .{}),
+        .pull => ed.setMessage(.info, "pulled: {s}", .{job.message}),
+        .switch_branch, .create_branch => ed.setMessage(.info, "{s}", .{job.message}),
+        .set_remote => ed.setMessage(.info, "remote origin set", .{}),
+    }
+    // Files may have changed on disk; HEAD has moved.
+    if (job.kind == .pull or job.kind == .switch_branch or job.kind == .create_branch) ed.reloadFromDisk();
+    ed.reloadGit();
+}
+
+/// Re-reads every unmodified buffer from disk (after a pull or branch switch).
+fn reloadFromDisk(ed: *Editor) void {
+    for (ed.buffers.items) |b| {
+        const path = b.path orelse continue;
+        if (b.modified) continue;
+        var fresh = Buffer.load(ed.gpa, ed.io, path) catch continue;
+        const cursor = if (b == ed.buffer) ed.view.cursor else b.saved.cursor;
+        ed.lspCloseBuffer(b);
+        const saved = b.saved;
+        const last_used = b.last_used;
+        b.deinit(ed.gpa);
+        fresh.saved = saved;
+        fresh.last_used = last_used;
+        b.* = fresh;
+        if (b == ed.buffer) ed.setCursor(@min(cursor, b.text.len()));
+    }
+}
+
+/// Commit: asks for a message (saving open files first).
+pub fn gitCommitPrompt(ed: *Editor) void {
+    if (!ed.inRepo()) return;
+    ed.startSearch(true, .git_commit);
+}
+
+fn finishGitCommit(ed: *Editor) !void {
+    const message = try ed.takePromptText() orelse return;
+    defer ed.gpa.free(message);
+    if (std.mem.trim(u8, message, " ").len == 0) return ed.setMessage(.info, "commit cancelled: empty message", .{});
+    // Commit what you see: save modified files first.
+    for (ed.buffers.items) |b| if (b.modified and b.path != null) {
+        _ = b.save(ed.gpa, ed.io) catch {};
+        if (ed.lspFor(b)) |l| l.didSave(b);
+    };
+    try ed.startGitJob(.commit, "committing", &.{
+        &.{ "git", "add", "-A" },
+        &.{ "git", "commit", "-m", message },
+    });
+}
+
+pub fn gitPush(ed: *Editor) !void {
+    try ed.startGitJob(.push, "pushing", &.{&.{ "git", "push", "-u", "origin", "HEAD" }});
+}
+
+pub fn gitPull(ed: *Editor) !void {
+    try ed.startGitJob(.pull, "pulling", &.{&.{ "git", "pull", "--ff-only" }});
+}
+
+pub fn gitSwitch(ed: *Editor, name: []const u8, create: bool) !void {
+    if (create) {
+        try ed.startGitJob(.create_branch, "creating branch", &.{&.{ "git", "switch", "-c", name }});
+    } else {
+        try ed.startGitJob(.switch_branch, "switching branch", &.{&.{ "git", "switch", name }});
+    }
+}
+
+/// Set remote: asks for the URL, prefilled with the current one.
+pub fn gitRemotePrompt(ed: *Editor) !void {
+    if (!ed.inRepo()) return;
+    ed.startSearch(true, .git_remote);
+    if (Git.originUrl(ed.gpa, ed.io, ed.git_root.?)) |url| {
+        defer ed.gpa.free(url);
+        try ed.search_prompt.?.input.set(ed.gpa, url);
+    }
+}
+
+fn finishGitRemote(ed: *Editor) !void {
+    const url = try ed.takePromptText() orelse return;
+    defer ed.gpa.free(url);
+    const trimmed = std.mem.trim(u8, url, " ");
+    if (trimmed.len == 0) return;
+    const has_origin = if (Git.originUrl(ed.gpa, ed.io, ed.git_root.?)) |u| blk: {
+        ed.gpa.free(u);
+        break :blk true;
+    } else false;
+    if (has_origin) {
+        try ed.startGitJob(.set_remote, "setting remote", &.{&.{ "git", "remote", "set-url", "origin", trimmed }});
+    } else {
+        try ed.startGitJob(.set_remote, "adding remote", &.{&.{ "git", "remote", "add", "origin", trimmed }});
+    }
+}
+
+/// Closes a boxed prompt and returns its text (owned), restoring the mode.
+fn takePromptText(ed: *Editor) !?[]u8 {
+    var sp = ed.search_prompt orelse return null;
+    ed.search_prompt = null;
+    defer sp.input.deinit(ed.gpa);
+    ed.mode = sp.return_mode;
+    ed.view.cursor = sp.origin;
+    return try ed.gpa.dupe(u8, sp.input.items());
+}
+
+/// Re-reads HEAD for every buffer (after committing outside the editor).
+pub fn reloadGit(ed: *Editor) void {
+    for (ed.buffers.items) |b| {
+        if (b.git) |*g| g.deinit(ed.gpa);
+        b.git = null;
+        ed.loadGitBase(b);
+    }
+    ed.updateGit();
+}
+
+/// Recomputes the current buffer's diff if it changed.
+pub fn updateGit(ed: *Editor) void {
+    const b = ed.buffer;
+    if (b.git) |*g| g.update(ed.gpa, &b.text, b.edit_version) catch {};
+    ed.validateGhost();
+}
+
+/// The hunk at the cursor: the one whose ghost line it is on, whose new lines
+/// contain its line, or a deletion right next to it.
+pub fn hunkAtCursor(ed: *Editor) ?diff.Hunk {
+    if (ed.ghost) |g| return ed.ghostHunk(g.line);
+    const g = ed.buffer.git orelse return null;
+    const line = ed.cursorLine();
+    for (g.hunks.items) |h| {
+        if (h.new_count > 0 and line >= h.new_start and line < h.new_start + h.new_count) return h;
+        if (h.new_count == 0 and (line == h.new_start or line + 1 == h.new_start)) return h;
+    }
+    return null;
+}
+
+/// Puts a hunk's HEAD text back in place of the buffer's version (undoable).
+pub fn restoreHunk(ed: *Editor, h: diff.Hunk) !void {
+    const g = &(ed.buffer.git orelse return);
+    var old: std.ArrayList(u8) = .empty;
+    defer old.deinit(ed.gpa);
+    for (0..h.old_count) |i| {
+        if (i > 0) try old.append(ed.gpa, '\n');
+        try old.appendSlice(ed.gpa, g.baseLine(h.old_start + i));
+    }
+    ed.ghost = null;
+    const t = ed.text();
+    if (h.new_count > 0) {
+        var start = t.lineStart(h.new_start);
+        var end = t.lineEnd(h.new_start + h.new_count - 1);
+        if (h.old_count == 0) {
+            // Pure addition: remove the lines and one line break.
+            if (end < t.len()) end += 1 else if (start > 0) start -= 1;
+            try ed.deleteRange(start, end);
+        } else {
+            try ed.deleteRange(start, end);
+            try ed.insertAt(start, old.items);
+        }
+    } else if (h.new_start < t.lineCount() and t.len() > 0) {
+        try old.append(ed.gpa, '\n');
+        try ed.insertAt(t.lineStart(h.new_start), old.items);
+    } else {
+        const at = t.len();
+        if (at > 0) try old.insert(ed.gpa, 0, '\n');
+        try ed.insertAt(at, old.items);
+    }
+    ed.setCursor(motions.firstNonBlank(t, @min(h.new_start, t.lineCount() - 1)));
+    ed.updateGit();
+}
+
+/// Jumps to the next/previous hunk's first line.
+pub fn jumpHunk(ed: *Editor, forward: bool) void {
+    const g = ed.buffer.git orelse return ed.setMessage(.info, "not in a git repository", .{});
+    const line = ed.cursorLine();
+    var target: ?usize = null;
+    for (g.hunks.items) |h| {
+        const at: usize = h.new_start;
+        if (forward and at > line) {
+            target = at;
+            break;
+        }
+        if (!forward and at < line) target = at;
+    }
+    const t = ed.text();
+    const l = @min(target orelse return ed.setMessage(.info, "no more changes", .{}), t.lineCount() - 1);
+    ed.ghost = null;
+    ed.revealLine(l);
+    ed.setCursor(motions.firstNonBlank(t, l));
+}
+
+/// Yanks ghost lines `from..to` (inclusive) before `line`, linewise.
+pub fn yankGhostLines(ed: *Editor, line: usize, from: u32, to: u32, register: ?u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(ed.gpa);
+    var k = @min(from, to);
+    while (k <= @max(from, to)) : (k += 1) {
+        try buf.appendSlice(ed.gpa, ed.ghostText(line, k));
+        try buf.append(ed.gpa, '\n');
+    }
+    try ed.registers.store(register, .yank, buf.items, true);
+    ed.setMessage(.info, "yanked {d} ghost line(s)", .{@max(from, to) - @min(from, to) + 1});
+}
+
+// ---------------------------------------------------------------------------
 // Prompts and search
 
 /// The text input that has focus (picker query or search prompt).
@@ -691,6 +1090,7 @@ pub fn startSearch(ed: *Editor, forward: bool, kind: PromptKind) void {
         .forward = forward,
         .origin = ed.view.cursor,
         .origin_top = ed.view.top,
+        .origin_ghost = ed.ghost,
         .return_mode = ed.mode,
         .had_highlight = ed.search_highlight,
         .kind = kind,
@@ -777,10 +1177,21 @@ fn searchIncremental(ed: *Editor) !void {
     const sp = &(ed.search_prompt orelse return);
     const t = ed.text();
     const hay = t.slice(0, t.len());
-    if (sp.kind == .rename) return;
+    if (sp.kind.boxed()) return;
     ed.view.cursor = sp.origin;
     ed.view.top = sp.origin_top;
+    ed.ghost = sp.origin_ghost;
     const pattern = search.Pattern.init(sp.input.items(), false);
+    if (ed.promptUsesRows(sp)) {
+        // Ghost lines on screen: matches in them count too.
+        if (sp.kind == .snipe) {
+            if (ed.onlyVisibleRowMatch(pattern)) |rp| return ed.finishSearchRow(rp);
+        }
+        const m = ed.searchRows(pattern, ed.promptOrigin(sp), sp.forward) orelse return;
+        ed.setRowPos(m.pos);
+        ed.search_highlight = true;
+        return;
+    }
     if (sp.kind == .snipe) {
         if (ed.onlyVisibleMatch(pattern)) |pos| return ed.finishSearch(pos);
     }
@@ -829,13 +1240,27 @@ fn finishSearch(ed: *Editor, pos: usize) !void {
 /// repeats the last search, like vim).
 pub fn acceptSearch(ed: *Editor) !void {
     const sp = &(ed.search_prompt orelse return);
-    if (sp.kind == .rename) return ed.finishRename();
+    switch (sp.kind) {
+        .rename => return ed.finishRename(),
+        .git_commit => return ed.finishGitCommit(),
+        .git_remote => return ed.finishGitRemote(),
+        .new_file, .save_as, .rename_file, .copy_file => |k| return ed.finishFilePrompt(k),
+        .search, .snipe => {},
+    }
     if (sp.input.items().len > 0) {
         try ed.last_search.resize(ed.gpa, 0);
         try ed.last_search.appendSlice(ed.gpa, sp.input.items());
         ed.last_search_whole_word = false;
     }
     ed.last_search_forward = sp.forward;
+    if (ed.promptUsesRows(sp)) {
+        const pattern = search.Pattern.init(ed.last_search.items, false);
+        const m = ed.searchRows(pattern, ed.promptOrigin(sp), sp.forward) orelse {
+            ed.setMessage(.err, "pattern not found: {s}", .{ed.last_search.items});
+            return ed.cancelSearch();
+        };
+        return ed.finishSearchRow(m.pos);
+    }
     const pos = ed.searchNext(sp.origin, false, 1) orelse return ed.cancelSearch();
     try ed.finishSearch(pos);
 }
@@ -847,14 +1272,186 @@ pub fn cancelSearch(ed: *Editor) void {
     ed.mode = sp.return_mode;
     ed.view.cursor = sp.origin;
     ed.view.top = sp.origin_top;
+    ed.ghost = sp.origin_ghost;
     ed.search_highlight = sp.had_highlight;
     if (sp.return_mode == .operator) ed.resetCommand();
+}
+
+// Search over rows (text and ghost lines), used when ghost lines are shown.
+
+pub const RowPos = struct { row: Row, col: usize };
+
+/// Whether search should include ghost lines: from normal mode, with ghost
+/// lines present or the cursor on one (after an operator, text only).
+pub fn usesRows(ed: *const Editor) bool {
+    return ed.ghost != null or ed.hasGhosts();
+}
+
+fn promptUsesRows(ed: *const Editor, sp: *const SearchPrompt) bool {
+    return sp.return_mode == .normal and (sp.origin_ghost != null or ed.hasGhosts());
+}
+
+fn promptOrigin(ed: *const Editor, sp: *const SearchPrompt) RowPos {
+    if (sp.origin_ghost) |g| return .{ .row = .{ .line = g.line, .ghost = g.k }, .col = g.col };
+    const t = &ed.buffer.text;
+    const line = t.lineOf(sp.origin);
+    return .{ .row = .{ .line = line }, .col = sp.origin - t.lineStart(line) };
+}
+
+/// The text of a row.
+pub fn rowText(ed: *const Editor, r: Row) []const u8 {
+    if (r.ghost) |k| return ed.ghostText(r.line, k);
+    return ed.buffer.text.lineSlice(@min(r.line, ed.buffer.text.lineCount() - 1));
+}
+
+/// Rows in file order including lines inside closed folds (search looks there).
+fn nextRowAll(ed: *const Editor, r: Row) Row {
+    const n = ed.buffer.text.lineCount();
+    if (r.ghost) |k| {
+        const h = ed.ghostHunk(r.line) orelse return .{ .line = @min(r.line, n - 1) };
+        if (k + 1 < h.old_count) return .{ .line = r.line, .ghost = k + 1 };
+        return if (r.line < n) .{ .line = r.line } else r;
+    }
+    if (ed.ghostHunk(r.line + 1) != null) return .{ .line = r.line + 1, .ghost = 0 };
+    return if (r.line + 1 < n) .{ .line = r.line + 1 } else r;
+}
+
+fn prevRowAll(ed: *const Editor, r: Row) Row {
+    if (r.ghost) |k| {
+        if (k > 0) return .{ .line = r.line, .ghost = k - 1 };
+        return if (r.line == 0) r else .{ .line = r.line - 1 };
+    }
+    if (ed.ghostHunk(r.line)) |h| return .{ .line = r.line, .ghost = h.old_count - 1 };
+    return if (r.line == 0) r else .{ .line = r.line - 1 };
+}
+
+fn firstRowAll(ed: *const Editor) Row {
+    return if (ed.ghostHunk(0) != null) .{ .line = 0, .ghost = 0 } else .{ .line = 0 };
+}
+
+fn lastRowAll(ed: *const Editor) Row {
+    const n = ed.buffer.text.lineCount();
+    if (ed.ghostHunk(n)) |h| return .{ .line = n, .ghost = h.old_count - 1 };
+    return .{ .line = n - 1 };
+}
+
+/// The next match of `p` from `from` over rows in file order, wrapping.
+pub fn searchRows(ed: *const Editor, p: search.Pattern, from: RowPos, forward: bool) ?struct { pos: RowPos, wrapped: bool } {
+    if (p.needle.len == 0) return null;
+    var ghost_total: usize = 0;
+    if (ed.buffer.git) |g| for (g.hunks.items) |h| {
+        ghost_total += h.old_count;
+    };
+    const limit = 2 * (ed.buffer.text.lineCount() + ghost_total) + 4;
+    var r = from.row;
+    var first = true;
+    var wrapped = false;
+    for (0..limit) |_| {
+        const line = ed.rowText(r);
+        const m = if (forward)
+            (if (first) p.forward(line, from.col + 1) else p.forward(line, 0))
+        else
+            (if (first) p.backward(line, from.col) else p.backward(line, line.len));
+        if (m) |col| return .{ .pos = .{ .row = r, .col = col }, .wrapped = wrapped };
+        first = false;
+        const next = if (forward) ed.nextRowAll(r) else ed.prevRowAll(r);
+        if (next.eql(r)) {
+            r = if (forward) ed.firstRowAll() else ed.lastRowAll();
+            wrapped = true;
+        } else r = next;
+    }
+    return null;
+}
+
+/// The cursor as a row position.
+pub fn rowPos(ed: *const Editor) RowPos {
+    if (ed.ghost) |g| return .{ .row = .{ .line = g.line, .ghost = g.k }, .col = g.col };
+    const t = &ed.buffer.text;
+    const line = t.lineOf(ed.view.cursor);
+    return .{ .row = .{ .line = line }, .col = ed.view.cursor - t.lineStart(line) };
+}
+
+/// Moves the cursor to a row position (opening folds around it).
+pub fn setRowPos(ed: *Editor, rp: RowPos) void {
+    if (rp.row.ghost) |k| {
+        if (rp.row.line > 0) ed.revealLine(rp.row.line - 1);
+        const anchor = if (ed.ghost) |g| (if (g.line == rp.row.line) g.anchor else null) else null;
+        ed.ghost = .{ .line = rp.row.line, .k = k, .col = rp.col, .anchor = anchor };
+        ed.view.want_col = rp.col;
+        return;
+    }
+    ed.ghost = null;
+    const t = ed.text();
+    ed.revealLine(rp.row.line);
+    ed.setCursor(t.lineStart(rp.row.line) + @min(rp.col, t.lineLen(rp.row.line)));
+}
+
+/// `n`/`N` over rows: the [count]th match of the last search.
+pub fn searchNextRows(ed: *Editor, reverse: bool, count: usize) ?RowPos {
+    if (ed.last_search.items.len == 0) {
+        ed.setMessage(.err, "no previous search", .{});
+        return null;
+    }
+    const pattern = search.Pattern.init(ed.last_search.items, ed.last_search_whole_word);
+    const forward = ed.last_search_forward != reverse;
+    var pos = ed.rowPos();
+    var wrapped = false;
+    for (0..count) |_| {
+        const m = ed.searchRows(pattern, pos, forward) orelse {
+            ed.setMessage(.err, "pattern not found: {s}", .{ed.last_search.items});
+            return null;
+        };
+        pos = m.pos;
+        wrapped = wrapped or m.wrapped;
+    }
+    ed.search_highlight = true;
+    const prefix: u8 = if (ed.last_search_forward) '/' else '?';
+    ed.setMessage(.info, "{c}{s}{s}", .{ prefix, ed.last_search.items, if (wrapped) "  search wrapped" else "" });
+    return pos;
+}
+
+/// The only match of `p` on screen (text and ghost rows), if exactly one.
+fn onlyVisibleRowMatch(ed: *const Editor, p: search.Pattern) ?RowPos {
+    if (p.needle.len == 0) return null;
+    var found: ?RowPos = null;
+    var r = ed.topRow();
+    for (0..ed.view.rows) |i| {
+        if (i > 0) {
+            const next = ed.nextRow(r);
+            if (next.eql(r)) break;
+            r = next;
+        }
+        const line = ed.rowText(r);
+        var at: usize = 0;
+        while (p.forward(line, at)) |m| : (at = m + 1) {
+            if (found != null) return null;
+            found = .{ .row = r, .col = m };
+        }
+    }
+    return found;
+}
+
+/// Like `finishSearch`, landing on a row position (possibly a ghost line).
+fn finishSearchRow(ed: *Editor, rp: RowPos) !void {
+    var sp = ed.search_prompt orelse return;
+    ed.search_prompt = null;
+    defer sp.input.deinit(ed.gpa);
+    if (sp.input.items().len > 0) {
+        try ed.last_search.resize(ed.gpa, 0);
+        try ed.last_search.appendSlice(ed.gpa, sp.input.items());
+        ed.last_search_whole_word = false;
+    }
+    ed.last_search_forward = sp.forward;
+    ed.search_highlight = true;
+    ed.mode = sp.return_mode;
+    ed.view.top = sp.origin_top;
+    ed.setRowPos(rp);
 }
 
 /// The pattern to highlight: the prompt while typing, else the last search.
 pub fn searchPattern(ed: *const Editor) ?search.Pattern {
     if (ed.search_prompt) |*sp| {
-        if (sp.kind == .rename) return null;
+        if (sp.kind.boxed()) return null;
         return search.Pattern.init(sp.input.items(), false);
     }
     if (!ed.search_highlight or ed.last_search.items.len == 0) return null;
@@ -923,6 +1520,19 @@ pub fn applyPending(ed: *Editor, r: operators.Range) !void {
     try operators.apply(ed, op.op, r, op.register);
 }
 
+/// Waits for the character naming the next step of a surround (`ys`, `ds`,
+/// `cs`, visual `S`): runs command `name` with it.
+pub fn awaitChar(ed: *Editor, comptime name: []const u8, count: usize) void {
+    const cmd = comptime commands.find(name) orelse @compileError("no command " ++ name);
+    ed.awaiting_char = .{ .cmd = cmd, .count = count, .has_count = false, .register = null };
+}
+
+/// `ys{motion}`: the range is known; the pair character comes next.
+pub fn awaitSurroundChar(ed: *Editor, r: operators.Range) void {
+    ed.surround_range = r;
+    ed.awaitChar("surround_add", 1);
+}
+
 pub fn pendingOperator(ed: *const Editor) ?operators.Operator {
     return if (ed.op) |o| o.op else null;
 }
@@ -935,14 +1545,18 @@ pub fn enterVisual(ed: *Editor, line: bool) void {
 
 pub fn exitVisual(ed: *Editor) void {
     ed.mode = .normal;
+    if (ed.ghost) |*g| g.anchor = null;
     ed.placeCursor(ed.view.cursor);
 }
 
 /// The visual selection as an operator range (inclusive of the cursor char).
 pub fn visualRange(ed: *Editor) operators.Range {
+    return ed.selectionRange(ed.view.anchor, ed.view.cursor);
+}
+
+/// The visual selection between anchor `a` and cursor `c`.
+pub fn selectionRange(ed: *Editor, a: usize, c: usize) operators.Range {
     const t = ed.text();
-    const a = ed.view.anchor;
-    const c = ed.view.cursor;
     if (ed.visual_line) return operators.linesRange(t, t.lineOf(@min(a, c)), t.lineOf(@max(a, c)));
     const last = @max(a, c);
     return .{ .start = @min(a, c), .end = if (last < t.len()) motions.nextChar(t, last) else last };
@@ -980,7 +1594,7 @@ pub fn startMacro(ed: *Editor, register: u21) void {
 fn stopMacro(ed: *Editor) !void {
     const r = ed.macro_register orelse return;
     ed.macro_register = null;
-    // Drop the `q` that stopped the recording.
+    // Drop the `Q` that stopped the recording.
     const recorded = ed.macro_keys.items[0..ed.macro_keys.items.len -| 1];
     var out: std.Io.Writer.Allocating = .init(ed.gpa);
     defer out.deinit();
@@ -998,6 +1612,7 @@ pub fn playMacro(ed: *Editor, register: u21, count: usize) !void {
 }
 
 pub fn undo(ed: *Editor, count: usize) !void {
+    ed.cursors.clearRetainingCapacity(); // their positions no longer apply
     const b = ed.buffer;
     try b.history.commit(ed.gpa);
     for (0..count) |_| {
@@ -1010,6 +1625,7 @@ pub fn undo(ed: *Editor, count: usize) !void {
 }
 
 pub fn redo(ed: *Editor, count: usize) !void {
+    ed.cursors.clearRetainingCapacity();
     const b = ed.buffer;
     for (0..count) |_| {
         const cursor = try b.history.redo(ed.gpa, b) orelse {
@@ -1074,7 +1690,7 @@ pub fn gotoLine(ed: *Editor, line: usize) void {
 }
 
 pub fn moveLines(ed: *Editor, delta: isize) void {
-    ed.gotoLine(ed.stepVisible(ed.cursorLine(), delta));
+    ed.setCursorRow(ed.stepRows(ed.cursorRow(), delta));
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,27 +1729,141 @@ pub fn stepVisible(ed: *const Editor, line: usize, delta: isize) usize {
     return l;
 }
 
-/// Screen rows from line `a` down to line `b`, counting at most `cap`.
-pub fn rowsBetween(ed: *const Editor, a: usize, b: usize, cap: usize) usize {
-    if (b <= a) return 0;
-    if (ed.buffer.folds.isEmpty()) return @min(b - a, cap);
-    var l = ed.visibleLine(a);
-    const target = ed.visibleLine(b);
+// Rows: text lines plus ghost lines.
+
+/// The git hunk whose old lines show as ghost lines before text line `line`.
+pub fn ghostHunk(ed: *const Editor, line: usize) ?diff.Hunk {
+    if (!ed.options.ghost_lines) return null;
+    const g = ed.buffer.git orelse return null;
+    for (g.hunks.items) |h| {
+        if (h.old_count == 0) continue;
+        const at = h.new_start + h.new_count;
+        if (at == line) return h;
+        if (at > line) break;
+    }
+    return null;
+}
+
+pub fn hasGhosts(ed: *const Editor) bool {
+    if (!ed.options.ghost_lines) return false;
+    const g = ed.buffer.git orelse return false;
+    for (g.hunks.items) |h| if (h.old_count > 0) return true;
+    return false;
+}
+
+/// The text of ghost line `k` before text line `line`.
+pub fn ghostText(ed: *const Editor, line: usize, k: u32) []const u8 {
+    const h = ed.ghostHunk(line) orelse return "";
+    return ed.buffer.git.?.baseLine(h.old_start + k);
+}
+
+pub fn nextRow(ed: *const Editor, r: Row) Row {
+    const n = ed.buffer.text.lineCount();
+    if (r.ghost) |k| {
+        const h = ed.ghostHunk(r.line) orelse return .{ .line = @min(r.line, n - 1) };
+        if (k + 1 < h.old_count) return .{ .line = r.line, .ghost = k + 1 };
+        return if (r.line < n) .{ .line = r.line } else r;
+    }
+    const after = (if (ed.foldAt(r.line)) |f| f.last else r.line) + 1;
+    if (ed.ghostHunk(after) != null) return .{ .line = after, .ghost = 0 };
+    return if (after < n) .{ .line = after } else r;
+}
+
+pub fn prevRow(ed: *const Editor, r: Row) Row {
+    if (r.ghost) |k| {
+        if (k > 0) return .{ .line = r.line, .ghost = k - 1 };
+        return if (r.line == 0) r else .{ .line = ed.visibleLine(r.line - 1) };
+    }
+    if (ed.ghostHunk(r.line)) |h| return .{ .line = r.line, .ghost = h.old_count - 1 };
+    return if (r.line == 0) r else .{ .line = ed.visibleLine(r.line - 1) };
+}
+
+/// The row `delta` rows away from `r` (stops at the ends).
+pub fn stepRows(ed: *const Editor, r: Row, delta: isize) Row {
+    if (ed.buffer.folds.isEmpty() and !ed.hasGhosts() and r.ghost == null) {
+        return .{ .line = ed.stepVisible(r.line, delta) };
+    }
+    var cur = r;
+    var n = @abs(delta);
+    while (n > 0) : (n -= 1) {
+        const next = if (delta > 0) ed.nextRow(cur) else ed.prevRow(cur);
+        if (next.eql(cur)) break;
+        cur = next;
+    }
+    return cur;
+}
+
+/// Screen rows from `a` down to `b`, counting at most `cap`.
+pub fn rowsFrom(ed: *const Editor, a: Row, b: Row, cap: usize) usize {
+    if (!a.before(b)) return 0;
+    if (ed.buffer.folds.isEmpty() and !ed.hasGhosts() and a.ghost == null and b.ghost == null) {
+        return @min(b.line - a.line, cap);
+    }
+    var cur = a;
     var rows: usize = 0;
-    while (l < target and rows < cap) : (rows += 1) {
-        const next = ed.stepVisible(l, 1);
-        if (next == l) break;
-        l = next;
+    while (cur.before(b) and rows < cap) : (rows += 1) {
+        const next = ed.nextRow(cur);
+        if (next.eql(cur)) break;
+        cur = next;
     }
     return rows;
 }
 
-/// The screen row of `line`, if it is on screen.
-pub fn screenRow(ed: *const Editor, line: usize) ?usize {
-    const l = ed.visibleLine(line);
-    if (l < ed.view.top) return null;
-    const row = ed.rowsBetween(ed.view.top, l, ed.view.rows);
+/// Screen rows from line `a` down to line `b`, counting at most `cap`.
+pub fn rowsBetween(ed: *const Editor, a: usize, b: usize, cap: usize) usize {
+    return ed.rowsFrom(.{ .line = a }, .{ .line = b }, cap);
+}
+
+pub fn topRow(ed: *const Editor) Row {
+    return .{ .line = ed.view.top, .ghost = ed.view.top_ghost };
+}
+
+pub fn setTop(ed: *Editor, r: Row) void {
+    ed.view.top = r.line;
+    ed.view.top_ghost = r.ghost;
+}
+
+pub fn cursorRow(ed: *const Editor) Row {
+    if (ed.ghost) |g| return .{ .line = g.line, .ghost = g.k };
+    return .{ .line = ed.visibleLine(ed.buffer.text.lineOf(ed.view.cursor)) };
+}
+
+/// The screen row of `r`, if it is on screen.
+pub fn rowOnScreen(ed: *const Editor, r: Row) ?usize {
+    const top = ed.topRow();
+    if (r.before(top)) return null;
+    const row = ed.rowsFrom(top, r, ed.view.rows);
     return if (row < ed.view.rows) row else null;
+}
+
+/// The screen row of text `line`, if it is on screen.
+pub fn screenRow(ed: *const Editor, line: usize) ?usize {
+    return ed.rowOnScreen(.{ .line = ed.visibleLine(line) });
+}
+
+/// Moves the cursor to a row: a ghost row puts it on that ghost line.
+pub fn setCursorRow(ed: *Editor, r: Row) void {
+    const col = ed.view.want_col orelse (if (ed.ghost) |g| g.col else ed.cursorCol());
+    if (r.ghost) |k| {
+        const len = ed.ghostText(r.line, k).len;
+        const anchor = if (ed.ghost) |g| (if (g.line == r.line) g.anchor else null) else null;
+        ed.ghost = .{ .line = r.line, .k = k, .col = @min(col, len -| 1), .anchor = anchor };
+        ed.view.want_col = col;
+    } else {
+        ed.ghost = null;
+        ed.gotoLine(r.line);
+        ed.view.want_col = col;
+    }
+}
+
+/// Drops the ghost cursor if its hunk went away (edits, restore, toggle).
+fn validateGhost(ed: *Editor) void {
+    const g = ed.ghost orelse return;
+    const h = ed.ghostHunk(g.line) orelse {
+        ed.ghost = null;
+        return;
+    };
+    if (g.k >= h.old_count) ed.ghost = null;
 }
 
 /// Opens the folds hiding `line` (jumps land on visible text).
@@ -1165,9 +1895,14 @@ pub fn extendToFolds(ed: *const Editor, r: operators.Range) operators.Range {
 /// Places the cursor at a cell of the text area (mouse click).
 pub fn clickCell(ed: *Editor, row: usize, col: usize) void {
     const t = ed.text();
-    const line = ed.stepVisible(ed.view.top, @intCast(row));
-    const off = motions.byteAtCol(t.lineSlice(line), ed.view.left + col, ed.options.tab_width);
-    ed.setCursor(t.lineStart(line) + off);
+    const r = ed.stepRows(ed.topRow(), @intCast(row));
+    if (r.ghost != null) {
+        ed.view.want_col = ed.view.left + col;
+        return ed.setCursorRow(r);
+    }
+    ed.ghost = null;
+    const off = motions.byteAtCol(t.lineSlice(r.line), ed.view.left + col, ed.options.tab_width);
+    ed.setCursor(t.lineStart(r.line) + off);
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,16 +1921,23 @@ pub fn effectiveScrolloff(ed: *const Editor) usize {
 /// Adjusts the viewport so the cursor is visible with `scrolloff` margin.
 pub fn scrollToCursor(ed: *Editor) void {
     const v = &ed.view;
-    const line = ed.visibleLine(ed.cursorLine());
+    const cur = ed.cursorRow();
     const so = ed.effectiveScrolloff();
-    v.top = ed.visibleLine(@min(v.top, ed.text().lineCount() -| 1));
-    if (line < v.top or ed.rowsBetween(v.top, line, so) < so) {
-        v.top = ed.stepVisible(line, -@as(isize, @intCast(so)));
-    } else if (ed.rowsBetween(v.top, line, v.rows) + so >= v.rows) {
-        v.top = ed.stepVisible(line, -@as(isize, @intCast(v.rows -| (so + 1))));
+    // Keep `top` on a row that exists (folds and hunks change).
+    var top = ed.topRow();
+    top.line = ed.visibleLine(@min(top.line, ed.text().lineCount() -| 1));
+    if (top.ghost) |k| {
+        const h = ed.ghostHunk(top.line);
+        if (h == null or k >= h.?.old_count) top.ghost = null;
+    }
+    ed.setTop(top);
+    if (cur.before(top) or ed.rowsFrom(top, cur, so) < so) {
+        ed.setTop(ed.stepRows(cur, -@as(isize, @intCast(so))));
+    } else if (ed.rowsFrom(top, cur, v.rows) + so >= v.rows) {
+        ed.setTop(ed.stepRows(cur, -@as(isize, @intCast(v.rows -| (so + 1)))));
     }
 
-    const col = ed.cursorCol();
+    const col = if (ed.ghost) |g| g.col else ed.cursorCol();
     if (col < v.left) v.left = col;
     if (col >= v.left + v.cols) v.left = col + 1 - v.cols;
 }
@@ -1204,13 +1946,17 @@ pub fn scrollToCursor(ed: *Editor) void {
 /// would leave the screen (vim's <C-e>/<C-y> and mouse wheel behavior).
 pub fn scrollLines(ed: *Editor, delta: isize) void {
     const v = &ed.view;
-    v.top = ed.stepVisible(v.top, delta);
+    const top = ed.stepRows(ed.topRow(), delta);
+    ed.setTop(top);
 
     const so = ed.effectiveScrolloff();
-    const line = ed.visibleLine(ed.cursorLine());
-    const lo = if (v.top == 0) 0 else ed.stepVisible(v.top, @intCast(so));
-    const hi = ed.stepVisible(v.top, @intCast(v.rows -| (so + 1)));
-    if (line < lo) ed.gotoLine(lo) else if (line > hi and hi >= lo) ed.gotoLine(hi);
+    const cur = ed.cursorRow();
+    const at_start = ed.prevRow(top).eql(top);
+    const lo = if (at_start) top else ed.stepRows(top, @intCast(so));
+    const hi = ed.stepRows(top, @intCast(v.rows -| (so + 1)));
+    if (cur.before(lo)) {
+        ed.setCursorRow(lo);
+    } else if (hi.before(cur) and !hi.before(lo)) ed.setCursorRow(hi);
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1968,7 @@ pub fn insertAt(ed: *Editor, pos: usize, bytes: []const u8) !void {
     try ed.buffer.history.recordInsert(ed.gpa, pos, bytes, ed.view.cursor);
     try ed.buffer.insert(ed.gpa, pos, bytes);
     ed.buffer.modified = true;
+    ed.shiftCursors(pos, pos, bytes.len);
 }
 
 /// Inserts at the cursor and moves the cursor past the text.
@@ -1252,6 +1999,7 @@ pub fn deleteRangeKeepCursor(ed: *Editor, start: usize, end: usize) !void {
     try ed.buffer.history.recordDelete(ed.gpa, start, t.slice(start, end), ed.view.cursor);
     ed.buffer.delete(start, end);
     ed.buffer.modified = true;
+    ed.shiftCursors(start, end, 0);
     const c = ed.view.cursor;
     if (c >= end) ed.view.cursor = c - (end - start) else if (c > start) ed.view.cursor = start;
 }
@@ -1282,6 +2030,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
         cur.* = loaded;
         ed.use_counter += 1;
         cur.last_used = ed.use_counter;
+        ed.loadGitBase(cur);
         ed.activate(cur);
         return;
     }
@@ -1290,6 +2039,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
     errdefer ed.gpa.destroy(b);
     b.* = loaded;
     try ed.buffers.append(ed.gpa, b);
+    ed.loadGitBase(b);
     ed.switchTo(b);
 }
 
@@ -1335,6 +2085,7 @@ pub fn switchTo(ed: *Editor, b: *Buffer) void {
 
 /// Shows `b` with its saved view, without saving the current one.
 fn activate(ed: *Editor, b: *Buffer) void {
+    ed.cursors.clearRetainingCapacity();
     if (ed.mode == .visual or ed.mode == .operator) ed.mode = .normal;
     ed.op = null;
     ed.buffer = b;
@@ -1372,6 +2123,396 @@ pub fn killBuffer(ed: *Editor, b: *Buffer) !void {
     }
     b.deinit(ed.gpa);
     ed.gpa.destroy(b);
+}
+
+// ---------------------------------------------------------------------------
+// Multicursor: commands typed at the primary cursor are replayed at the others.
+//
+// A command's keys are collected until it completes (the editor is idle
+// again, or in insert mode), then fed again at every extra cursor with that
+// cursor's position and the mode the command began in. In insert mode each
+// key is a command of its own, so typing shows up everywhere as you type.
+// Edits shift every stored cursor, so they stay put as text moves.
+
+/// After each key: replays the command once it is complete.
+fn multiAfterKey(ed: *Editor) void {
+    if (ed.replaying) return;
+    const done = ed.mode == .insert or ed.isIdle();
+    if (!done) return;
+    defer ed.multi_keys.clearRetainingCapacity();
+    if (ed.multi_once or ed.mode == .picker or ed.cursors.items.len == 0) return;
+    ed.replayAtCursors(ed.multi_keys.items);
+}
+
+fn saveCursor(ed: *const Editor) Cursor {
+    return .{ .pos = ed.view.cursor, .anchor = ed.view.anchor, .want_col = ed.view.want_col };
+}
+
+fn replayAtCursors(ed: *Editor, keys_: []const KeyEvent) void {
+    const final_mode = ed.mode;
+    const final_visual_line = ed.visual_line;
+    const final_highlight = ed.search_highlight;
+    // `.` should repeat the primary's change, recorded once.
+    const capturing = ed.capturing;
+    const capture_repeatable = ed.capture_repeatable;
+    ed.capturing = false;
+
+    ed.primary_saved = ed.saveCursor();
+    ed.replaying = true;
+    for (0..ed.cursors.items.len) |i| {
+        const c = ed.cursors.items[i];
+        const len = ed.text().len();
+        ed.view.cursor = @min(c.pos, len);
+        ed.view.anchor = @min(c.anchor, len);
+        ed.view.want_col = c.want_col;
+        ed.mode = ed.multi_start.mode;
+        ed.visual_line = ed.multi_start.visual_line;
+        ed.op = null;
+        ed.count = 0;
+        ed.pending_len = 0;
+        ed.register = null;
+        ed.awaiting_register = false;
+        ed.awaiting_char = null;
+        for (keys_) |k| ed.handleKeyInner(k) catch {
+            ed.resetCommand();
+            break;
+        };
+        if (ed.search_prompt != null) ed.cancelSearch();
+        ed.cursors.items[i] = ed.saveCursor();
+    }
+    ed.replaying = false;
+    const p = ed.primary_saved.?;
+    ed.primary_saved = null;
+    ed.view.cursor = p.pos;
+    ed.view.anchor = p.anchor;
+    ed.view.want_col = p.want_col;
+    ed.mode = final_mode;
+    ed.visual_line = final_visual_line;
+    ed.search_highlight = final_highlight;
+    ed.op = null;
+    ed.awaiting_char = null;
+    ed.capturing = capturing;
+    ed.capture_repeatable = capture_repeatable;
+    ed.mergeCursors();
+}
+
+/// Keeps stored cursors on the same text when `[start, end)` is replaced by
+/// `inserted` bytes (an insert has start == end, a delete inserted == 0).
+fn shiftCursors(ed: *Editor, start: usize, end: usize, inserted: usize) void {
+    const S = struct {
+        fn shift(p: *usize, s: usize, e: usize, n: usize) void {
+            if (p.* >= e and (p.* > s or n > 0)) {
+                p.* = p.* - (e - s) + n;
+            } else if (p.* > s) p.* = s;
+        }
+    };
+    for (ed.cursors.items) |*c| {
+        S.shift(&c.pos, start, end, inserted);
+        S.shift(&c.anchor, start, end, inserted);
+    }
+    if (ed.primary_saved) |*c| {
+        S.shift(&c.pos, start, end, inserted);
+        S.shift(&c.anchor, start, end, inserted);
+    }
+}
+
+/// Drops cursors that landed on the primary or on each other.
+fn mergeCursors(ed: *Editor) void {
+    const len = ed.text().len();
+    var out: usize = 0;
+    outer: for (ed.cursors.items) |c| {
+        var cc = c;
+        cc.pos = @min(cc.pos, len);
+        cc.anchor = @min(cc.anchor, len);
+        if (cc.pos == ed.view.cursor) continue;
+        for (ed.cursors.items[0..out]) |o| if (o.pos == cc.pos) continue :outer;
+        ed.cursors.items[out] = cc;
+        out += 1;
+    }
+    ed.cursors.items.len = out;
+}
+
+/// Leaves a cursor where the primary is (before the primary moves on).
+pub fn addCursorHere(ed: *Editor) !void {
+    try ed.cursors.append(ed.gpa, ed.saveCursor());
+}
+
+pub fn clearCursors(ed: *Editor) void {
+    ed.cursors.clearRetainingCapacity();
+}
+
+pub fn removeLastCursor(ed: *Editor) void {
+    if (ed.cursors.pop()) |c| {
+        ed.view.cursor = c.pos;
+        ed.view.anchor = c.anchor;
+        ed.placeCursor(c.pos);
+    }
+}
+
+fn reportCursors(ed: *Editor) void {
+    ed.setMessage(.info, "{d} cursors (qq or Esc removes them)", .{ed.cursors.items.len + 1});
+}
+
+/// What `gzn`/`gzm` look for: the charwise selection, else the word under
+/// the cursor (whole words only).
+fn matchTarget(ed: *Editor) ?struct { start: usize, end: usize, whole: bool } {
+    const t = ed.text();
+    if (ed.mode == .visual and !ed.visual_line) {
+        const r = ed.visualRange();
+        if (r.end > r.start) return .{ .start = r.start, .end = r.end, .whole = false };
+        return null;
+    }
+    const r = textobjects.word(t, ed.view.cursor, .inner, false, 1) orelse return null;
+    if (r.end == r.start or !search.isWord(t.byteAt(r.start))) return null;
+    return .{ .start = r.start, .end = r.end, .whole = true };
+}
+
+/// `qn` / `qN` / `qs` / `qa`: a cursor on the next/previous match of the
+/// word (or selection), skipping one, or on every match.
+pub fn cursorAtMatch(ed: *Editor, how: enum { next, previous, skip, all }) !void {
+    const target = ed.matchTarget() orelse return ed.setMessage(.info, "no word under the cursor", .{});
+    const t = ed.text();
+    const hay = t.slice(0, t.len());
+    const needle = try ed.gpa.dupe(u8, hay[target.start..target.end]);
+    defer ed.gpa.free(needle);
+    const pattern = search.Pattern.init(needle, target.whole);
+    const visual = ed.mode == .visual;
+    // Where the primary sits inside the match (kept at each new cursor).
+    const offset = ed.view.cursor - target.start;
+    const anchor_offset = ed.view.anchor -| target.start;
+    const place = struct {
+        fn at(m: usize, off: usize, aoff: usize, vis: bool) Cursor {
+            return .{ .pos = m + off, .anchor = if (vis) m + aoff else m + off };
+        }
+    }.at;
+
+    if (how == .all) {
+        var from: usize = 0;
+        while (pattern.forward(hay, from)) |m| : (from = m + 1) {
+            if (m == target.start) continue;
+            try ed.cursors.append(ed.gpa, place(m, offset, anchor_offset, visual));
+        }
+        ed.mergeCursors();
+        return ed.reportCursors();
+    }
+    const m = pattern.next(hay, target.start, how != .previous) orelse return;
+    if (m.pos == target.start) return ed.setMessage(.info, "no other match", .{});
+    if (how != .skip) try ed.addCursorHere();
+    const c = place(m.pos, offset, anchor_offset, visual);
+    ed.view.cursor = c.pos;
+    ed.view.anchor = c.anchor;
+    ed.view.want_col = null;
+    ed.revealLine(t.lineOf(c.pos));
+    ed.mergeCursors();
+    ed.reportCursors();
+}
+
+/// Visual `I` / `A` (and `qI` / `qA`): a cursor at the start (first
+/// non-blank) or end of every selected line. `insert` starts typing there.
+pub fn cursorsOnLines(ed: *Editor, at_end: bool, insert: bool) !void {
+    if (ed.mode != .visual) return;
+    const t = ed.text();
+    const first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
+    const last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
+    ed.exitVisual();
+    ed.clearCursors();
+    var line = last;
+    while (true) : (line -= 1) {
+        const ls = t.lineStart(line);
+        const le = t.lineEnd(line);
+        const pos = if (!at_end) motions.firstNonBlank(t, line) else if (insert or le == ls) le else motions.prevChar(t, le);
+        if (line == first) {
+            ed.view.cursor = pos;
+            ed.view.anchor = pos;
+            break;
+        }
+        try ed.cursors.append(ed.gpa, .{ .pos = pos, .anchor = pos });
+    }
+    if (insert) ed.setMode(.insert) else ed.placeCursor(ed.view.cursor);
+    ed.reportCursors();
+}
+
+/// <Tab> in the snipe (`s`) or search (`/`) prompt: a cursor on every match
+/// (on screen for snipe, in the file for search), each match selected, so
+/// `c` changes them all and <Esc> leaves plain cursors.
+pub fn cursorsFromPrompt(ed: *Editor) !void {
+    const sp = ed.search_prompt orelse return;
+    if (sp.kind != .search and sp.kind != .snipe) return;
+    const needle = try ed.gpa.dupe(u8, sp.input.items());
+    defer ed.gpa.free(needle);
+    if (needle.len == 0) return;
+    const t = ed.text();
+    var from: usize = 0;
+    var to = t.len();
+    if (sp.kind == .snipe) {
+        from = t.lineStart(@min(sp.origin_top, t.lineCount() - 1));
+        to = t.lineEnd(@min(sp.origin_top + ed.view.rows, t.lineCount()) - 1);
+    }
+    ed.cancelSearch();
+    const hay = t.slice(0, to);
+    const pattern = search.Pattern.init(needle, false);
+    var matches: std.ArrayList(usize) = .empty;
+    defer matches.deinit(ed.gpa);
+    var i = from;
+    while (pattern.forward(hay, i)) |m| : (i = m + needle.len) try matches.append(ed.gpa, m);
+    if (matches.items.len == 0) return ed.setMessage(.info, "no matches", .{});
+
+    // The primary takes the match nearest the cursor.
+    var primary: usize = 0;
+    for (matches.items, 0..) |m, k| {
+        if (m <= ed.view.cursor) primary = k;
+    }
+    ed.clearCursors();
+    if (ed.mode != .visual) ed.enterVisual(false);
+    ed.visual_line = false;
+    const last_off = motions.prevChar(t, matches.items[0] + needle.len) - matches.items[0];
+    for (matches.items, 0..) |m, k| {
+        const c: Cursor = .{ .pos = m + last_off, .anchor = m };
+        if (k == primary) {
+            ed.view.cursor = c.pos;
+            ed.view.anchor = c.anchor;
+        } else try ed.cursors.append(ed.gpa, c);
+    }
+    ed.reportCursors();
+}
+
+// ---------------------------------------------------------------------------
+// File operations (SPC f): each asks for a path in a boxed prompt.
+
+/// Opens the prompt for `kind`, prefilled with the current path (or, for a
+/// new file, the current file's folder) so it only needs editing.
+pub fn filePrompt(ed: *Editor, kind: PromptKind) !void {
+    const path = ed.buffer.path;
+    if (path == null and (kind == .rename_file or kind == .copy_file))
+        return ed.setMessage(.info, "this buffer has no file yet: SPC f S saves it as one", .{});
+    ed.startSearch(true, kind);
+    const prefill: []const u8 = if (path) |p| switch (kind) {
+        .new_file => p[0 .. if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| i + 1 else 0],
+        else => p,
+    } else "";
+    try ed.search_prompt.?.input.set(ed.gpa, prefill);
+}
+
+fn finishFilePrompt(ed: *Editor, kind: PromptKind) !void {
+    const raw = try ed.takePromptText() orelse return;
+    defer ed.gpa.free(raw);
+    const typed = std.mem.trim(u8, raw, " ");
+    if (typed.len == 0 or typed[typed.len - 1] == '/') return ed.setMessage(.info, "cancelled: no file name", .{});
+    const path = try ed.normalizePath(typed);
+    defer ed.gpa.free(path);
+    if (kind == .new_file) {
+        try ed.openFile(path);
+        if (!ed.fileExists(path)) ed.setMessage(.info, "new file \"{s}\" (created when saved)", .{path});
+        return;
+    }
+    const b = ed.buffer;
+    if (b.path) |p| if (std.mem.eql(u8, p, path)) {
+        if (kind == .save_as) return ed.saveCurrent();
+        return ed.setMessage(.info, "that is already its name", .{});
+    };
+    // Never clobber another file (or an open buffer that will become one).
+    if (ed.fileExists(path) or ed.findBuffer(path) != null)
+        return ed.setMessage(.err, "\"{s}\" already exists", .{path});
+    switch (kind) {
+        .save_as => {
+            const n = ed.writeBufferTo(b, path) orelse return;
+            try ed.setBufferPath(b, path);
+            ed.setMessage(.info, "saved as \"{s}\" ({d}B)", .{ path, n });
+        },
+        .rename_file => {
+            const old = b.path.?;
+            if (ed.fileExists(old)) {
+                if (std.fs.path.dirname(path)) |dir| Io.Dir.cwd().createDirPath(ed.io, dir) catch {};
+                Io.Dir.rename(Io.Dir.cwd(), old, Io.Dir.cwd(), path, ed.io) catch |err|
+                    return ed.setMessage(.err, "could not rename: {s}", .{@errorName(err)});
+            }
+            ed.setMessage(.info, "renamed \"{s}\" -> \"{s}\"", .{ old, path });
+            try ed.setBufferPath(b, path); // frees `old`, so after the message
+        },
+        .copy_file => {
+            _ = ed.writeBufferTo(b, path) orelse return;
+            try ed.openFile(path);
+            ed.setMessage(.info, "copied to \"{s}\"", .{path});
+        },
+        else => unreachable,
+    }
+}
+
+/// Writes `b`'s text to `path` without changing which file it belongs to.
+/// Null (with a message) on failure.
+fn writeBufferTo(ed: *Editor, b: *Buffer, path: []const u8) ?usize {
+    const prev_path = b.path;
+    const prev_modified = b.modified;
+    b.path = @constCast(path); // restored below; save only reads it
+    defer b.path = prev_path;
+    const n = b.save(ed.gpa, ed.io) catch |err| {
+        ed.setMessage(.err, "could not write \"{s}\": {s}", .{ path, @errorName(err) });
+        return null;
+    };
+    // Saving a copy leaves the buffer as modified as it was.
+    if (prev_path != null and !std.mem.eql(u8, prev_path.?, path)) b.modified = prev_modified;
+    return n;
+}
+
+/// Points `b` at another file: the language, LSP and git follow.
+fn setBufferPath(ed: *Editor, b: *Buffer, path: []const u8) !void {
+    const owned = try ed.gpa.dupe(u8, path);
+    ed.lspCloseBuffer(b);
+    if (b.path) |p| ed.gpa.free(p);
+    b.path = owned;
+    if (b.syntax) |*s| s.deinit(ed.gpa);
+    b.syntax = @import("syntax/Syntax.zig").forPath(path);
+    if (b.git) |*g| g.deinit(ed.gpa);
+    b.git = null;
+    ed.loadGitBase(b);
+    if (b == ed.buffer) ed.updateGit();
+}
+
+/// `SPC f D`: asks (in a Yes/No picker) before deleting the current file.
+pub fn deleteFilePrompt(ed: *Editor) !void {
+    const path = ed.buffer.path orelse return ed.setMessage(.info, "this buffer has no file", .{});
+    if (!ed.fileExists(path)) return ed.setMessage(.info, "\"{s}\" is not on disk", .{path});
+    ed.confirm_target = ed.buffer;
+    try ed.openPicker(.confirm_delete, "");
+}
+
+/// Deletes `b`'s file from disk and closes it (after the confirmation).
+pub fn deleteFile(ed: *Editor, b: *Buffer) !void {
+    const path = b.path orelse return;
+    Io.Dir.cwd().deleteFile(ed.io, path) catch |err|
+        return ed.setMessage(.err, "could not delete \"{s}\": {s}", .{ path, @errorName(err) });
+    ed.setMessage(.info, "deleted \"{s}\"", .{path});
+    b.modified = false;
+    try ed.killBuffer(b);
+}
+
+/// `SPC f y` / `SPC f Y`: the file's path, relative or absolute, to the clipboard.
+pub fn yankPath(ed: *Editor, absolute: bool) !void {
+    const path = ed.buffer.path orelse return ed.setMessage(.info, "this buffer has no file", .{});
+    const out = if (absolute) try ed.absolutePath(path) else try ed.gpa.dupe(u8, path);
+    defer ed.gpa.free(out);
+    try ed.registers.store(null, .yank, out, false);
+    ed.setMessage(.info, "yanked \"{s}\"", .{out});
+}
+
+/// `SPC f s`: writes the current buffer; one without a file asks for a name.
+pub fn saveCurrent(ed: *Editor) !void {
+    const b = ed.buffer;
+    if (b.path == null) return ed.filePrompt(.save_as);
+    const n = b.save(ed.gpa, ed.io) catch |err|
+        return ed.setMessage(.err, "could not save \"{s}\": {s}", .{ b.displayName(), @errorName(err) });
+    ed.setMessage(.info, "\"{s}\" {d}L, {d}B written", .{ b.displayName(), b.text.lineCount(), n });
+    if (ed.lspFor(b)) |l| l.didSave(b);
+}
+
+fn fileExists(ed: *Editor, path: []const u8) bool {
+    Io.Dir.cwd().access(ed.io, path, .{}) catch return false;
+    return true;
+}
+
+fn findBuffer(ed: *Editor, path: []const u8) ?*Buffer {
+    for (ed.buffers.items) |b| if (b.path) |p| if (std.mem.eql(u8, p, path)) return b;
+    return null;
 }
 
 pub fn bufferIndex(ed: *const Editor, b: *const Buffer) usize {
@@ -1422,6 +2563,64 @@ pub fn closePicker(ed: *Editor) void {
     p.destroy();
     ed.picker = null;
     ed.mode = .normal;
+}
+
+// File browser: the picker on one folder at a time.
+
+/// `SPC .`: browses the current file's folder (else the working directory).
+pub fn browse(ed: *Editor) !void {
+    const start = if (ed.buffer.path) |p| blk: {
+        const abs = try ed.absolutePath(p);
+        defer ed.gpa.free(abs);
+        break :blk try ed.gpa.dupe(u8, std.fs.path.dirname(abs) orelse "/");
+    } else try ed.gpa.dupe(u8, ed.cwd);
+    defer ed.gpa.free(start);
+    try ed.setBrowseDir(start);
+    try ed.openPicker(.browse, "");
+}
+
+/// Enters folder `name` (relative to the browsed one, or absolute).
+pub fn browseInto(ed: *Editor, name: []const u8) !void {
+    const target = try std.fs.path.resolve(ed.gpa, &.{ ed.browse_dir.items, name });
+    defer ed.gpa.free(target);
+    var dir = Io.Dir.cwd().openDir(ed.io, target, .{ .iterate = true }) catch |err|
+        return ed.setMessage(.err, "can't open {s}: {s}", .{ target, @errorName(err) });
+    dir.close(ed.io);
+    try ed.setBrowseDir(target);
+    if (ed.picker) |p| if (p.base == .browse) return p.restart(null);
+    try ed.openPicker(.browse, "");
+}
+
+/// Goes up one folder, selecting the one we came from.
+pub fn browseUp(ed: *Editor) !void {
+    const cur = ed.browse_dir.items;
+    const parent = std.fs.path.dirname(cur) orelse return; // at the root
+    var came_from: [Io.Dir.max_name_bytes + 1]u8 = undefined;
+    const sel = try std.fmt.bufPrint(&came_from, "{s}/", .{std.fs.path.basename(cur)});
+    const up = try ed.gpa.dupe(u8, parent);
+    defer ed.gpa.free(up);
+    try ed.setBrowseDir(up);
+    if (ed.picker) |p| try p.restart(sel);
+}
+
+/// An owned absolute path for `name` inside the browsed folder.
+pub fn browsePath(ed: *Editor, name: []const u8) ![]u8 {
+    return std.fs.path.join(ed.gpa, &.{ ed.browse_dir.items, name });
+}
+
+fn setBrowseDir(ed: *Editor, dir: []const u8) !void {
+    ed.browse_dir.clearRetainingCapacity();
+    try ed.browse_dir.appendSlice(ed.gpa, dir);
+    // The display form: "~" for home, always ending in "/".
+    ed.browse_label.clearRetainingCapacity();
+    const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "";
+    if (home.len > 1 and std.mem.startsWith(u8, dir, home) and
+        (dir.len == home.len or dir[home.len] == '/'))
+    {
+        try ed.browse_label.append(ed.gpa, '~');
+        try ed.browse_label.appendSlice(ed.gpa, dir[home.len..]);
+    } else try ed.browse_label.appendSlice(ed.gpa, dir);
+    if (ed.browse_label.items[ed.browse_label.items.len - 1] != '/') try ed.browse_label.append(ed.gpa, '/');
 }
 
 /// Accepts the selected row: closes the picker, then acts on the choice
@@ -1770,7 +2969,7 @@ test "registers: named, append, black hole" {
 test "macros" {
     var ed = try testEditor("1\n2\n3\n4");
     defer ed.deinit();
-    try ed.feed("qaA.<Esc>jq");
+    try ed.feed("QaA.<Esc>jQ");
     try testing.expectEqual(null, ed.macro_register);
     try ed.feed("2@a");
     try expectText(&ed, "1.\n2.\n3.\n4");
@@ -1868,8 +3067,9 @@ test "snipe: jumps when one match is left, RET takes the first, n continues" {
 test "snipe and / work after an operator" {
     var ed = try testEditor("alpha beta gamma");
     defer ed.deinit();
-    try ed.feed("dsg");
-    try expectText(&ed, "gamma");
+    // (`ds`/`cs`/`ys` are surround; other operators take the snipe motion.)
+    try ed.feed("gUsg");
+    try expectText(&ed, "ALPHA BETA gamma");
     try ed.feed("u0d/mm<CR>");
     try expectText(&ed, "mma");
 }
@@ -2035,4 +3235,396 @@ test "zc on a struct's first line folds the struct" {
     try testing.expectEqual(Folds.Lines{ .first = 2, .last = 4 }, ed.foldAt(3).?);
     try ed.feed("zc"); // again: the next level out, the struct
     try testing.expectEqual(Folds.Lines{ .first = 0, .last = 5 }, ed.foldAt(3).?);
+}
+
+/// An editor whose buffer is diffed against `head` (as if from git).
+fn ghostEditor(head: []const u8, current: []const u8) !Editor {
+    var ed = try testEditor(current);
+    errdefer ed.deinit();
+    ed.buffer.git = .{ .base = try Text.init(ed.gpa, head) };
+    ed.buffer.edit_version += 1;
+    ed.updateGit();
+    return ed;
+}
+
+test "ghost lines: j/k walk onto them, yy yanks, edits are refused, SPC g r restores" {
+    var ed = try ghostEditor("a\nold b\nc\ngone\nd", "a\nnew b\nc\nd");
+    defer ed.deinit();
+    ed.git_root = try ed.gpa.dupe(u8, "/repo"); // pretend we're in a repo
+    // Rows: a, new b, [old b], c, [gone], d
+    try ed.feed("jj");
+    try testing.expect(ed.ghost != null);
+    try testing.expectEqualStrings("old b", ed.ghostText(ed.ghost.?.line, ed.ghost.?.k));
+    try ed.feed("yy");
+    try testing.expectEqualStrings("old b\n", ed.registers.get(null).?.text);
+    try ed.feed("x"); // read-only
+    try expectText(&ed, "a\nnew b\nc\nd");
+    try testing.expectEqual(.err, ed.message.kind);
+    try ed.feed("jj");
+    try testing.expectEqualStrings("gone", ed.ghostText(ed.ghost.?.line, ed.ghost.?.k));
+    try ed.feed("j");
+    try testing.expectEqual(null, ed.ghost);
+    try testing.expectEqual(3, ed.cursorLine()); // "d"
+
+    // Restore the changed line, then the deleted one.
+    try ed.feed("gg<Space>gn<Space>gr");
+    try expectText(&ed, "a\nold b\nc\nd");
+    try ed.feed("<Space>gn<Space>gr");
+    try expectText(&ed, "a\nold b\nc\ngone\nd");
+    try ed.feed("u");
+    try expectText(&ed, "a\nold b\nc\nd");
+
+    try ed.feed("<Space>tg"); // ghost lines off: j skips them
+    try ed.feed("ggjj");
+    try testing.expectEqual(null, ed.ghost);
+    try testing.expectEqual(2, ed.cursorLine());
+}
+
+test "ghost lines: V selects several, y yanks them" {
+    var ed = try ghostEditor("x\nold1\nold2\nold3\ny", "x\ny");
+    defer ed.deinit();
+    try ed.feed("jVjjy");
+    try testing.expectEqualStrings("old1\nold2\nold3\n", ed.registers.get(null).?.text);
+    try testing.expectEqual(.normal, ed.mode);
+}
+
+test "ghost lines: w / e / b move word by word through them" {
+    var ed = try ghostEditor("a\nold one two\nc", "a\nnew\nc");
+    defer ed.deinit();
+    // Rows: a, new, [old one two], c
+    try ed.feed("jw"); // from "new": into the ghost line's first word
+    try testing.expect(ed.ghost != null);
+    try testing.expectEqual(0, ed.ghost.?.col);
+    try ed.feed("w");
+    try testing.expectEqual(4, ed.ghost.?.col); // "one"
+    try ed.feed("e");
+    try testing.expectEqual(6, ed.ghost.?.col); // end of "one"
+    try ed.feed("w");
+    try testing.expectEqual(8, ed.ghost.?.col); // "two"
+    try ed.feed("w"); // past the end: on to the text line "c"
+    try testing.expectEqual(null, ed.ghost);
+    try testing.expectEqual(2, ed.cursorLine());
+    try ed.feed("b"); // back into the ghost line's last word
+    try testing.expectEqual(8, ed.ghost.?.col);
+    try ed.feed("bb");
+    try testing.expectEqual(0, ed.ghost.?.col);
+    try ed.feed("b"); // back out to "new"
+    try testing.expectEqual(null, ed.ghost);
+    try testing.expectEqual(1, ed.cursorLine());
+    // With an operator, w stays on text.
+    try ed.feed("ggdw");
+    try expectText(&ed, "\nnew\nc");
+}
+
+test "ghost lines: /, n, N, f and snipe reach into them" {
+    var ed = try ghostEditor("x = 1\nold needle here\ny = 2", "x = 1\ny = 2");
+    defer ed.deinit();
+    // Rows: "x = 1", [old needle here], "y = 2"
+    try ed.feed("/needle<CR>");
+    try testing.expect(ed.ghost != null);
+    try testing.expectEqual(4, ed.ghost.?.col);
+    try ed.feed("fh"); // f within the ghost line
+    try testing.expectEqual(11, ed.ghost.?.col);
+    try ed.feed("gg/=<CR>"); // the "=" later on the same text line
+    try testing.expectEqual(null, ed.ghost);
+    try testing.expectEqual(0, ed.cursorLine());
+    try testing.expectEqual(2, ed.cursorCol());
+    try ed.feed("gg");
+    try ed.feed("/e<CR>"); // first 'e' after line 0's start: the ghost line
+    try testing.expect(ed.ghost != null);
+    try ed.feed("n");
+    try testing.expect(ed.ghost != null); // more e's in the ghost line
+    try ed.feed("N");
+    try testing.expect(ed.ghost != null);
+    try ed.feed("<Esc>gg");
+    try ed.feed("sh"); // the only 'h' on screen is in the ghost line: jumps
+    try testing.expectEqual(.normal, ed.mode);
+    try testing.expectEqual(11, ed.ghost.?.col);
+    try ed.feed("<Esc>gg/zzz<Esc>"); // Esc returns to where we were
+    try testing.expectEqual(null, ed.ghost);
+    try testing.expectEqual(0, ed.cursorLine());
+}
+
+test "git: commit from the editor in a real repository" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const git = struct {
+        fn run(d: []const u8, args: []const []const u8) ![]u8 {
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(testing.allocator);
+            try argv.appendSlice(testing.allocator, &.{ "git", "-C", d });
+            try argv.appendSlice(testing.allocator, args);
+            const r = try std.process.run(testing.allocator, testing.io, .{ .argv = argv.items });
+            testing.allocator.free(r.stderr);
+            return r.stdout;
+        }
+    }.run;
+    for ([_][]const []const u8{
+        &.{ "init", "-q", "-b", "main" },
+        &.{ "config", "user.email", "test@example.com" },
+        &.{ "config", "user.name", "Test" },
+    }) |args| gpa.free(try git(dir, args));
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.git_checked = true;
+    ed.git_root = try gpa.dupe(u8, dir);
+    const file = try std.fmt.allocPrint(gpa, "{s}/a.txt", .{dir});
+    defer gpa.free(file);
+    try ed.openFile(file);
+    try ed.feed("ihello<Esc>");
+
+    try ed.feed("<Space>gcfirst commit<CR>");
+    try testing.expect(!ed.buffer.modified); // saved before committing
+    while (ed.git_job) |job| {
+        if (job.done.load(.acquire)) break;
+        std.Thread.yield() catch {};
+    }
+    ed.tick();
+    try testing.expectEqual(.info, ed.message.kind);
+    const log = try git(dir, &.{ "log", "--format=%s" });
+    defer gpa.free(log);
+    try testing.expectEqualStrings("first commit\n", log);
+}
+
+test "files: save as, rename, copy, delete, new" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const at = struct {
+        fn path(d: []const u8, name: []const u8) ![]u8 {
+            return std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ d, name });
+        }
+    }.path;
+    const a = try at(dir, "a.txt");
+    defer gpa.free(a);
+    const b = try at(dir, "sub/b.zig");
+    defer gpa.free(b);
+    const c = try at(dir, "c.zig");
+    defer gpa.free(c);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.git_checked = true; // no repository
+
+    // A scratch buffer: SPC f s asks for a name, then saves there.
+    try ed.feed("ihello<Esc><Space>fs");
+    try testing.expectEqual(PromptKind.save_as, ed.search_prompt.?.kind);
+    try ed.search_prompt.?.input.set(gpa, a);
+    try ed.feed("<CR>");
+    try testing.expect(std.mem.endsWith(u8, a, ed.buffer.path.?));
+    try testing.expect(!ed.buffer.modified);
+    const saved = try tmp.dir.readFileAlloc(io, "a.txt", gpa, .limited(1024));
+    defer gpa.free(saved);
+    try testing.expectEqualStrings("hello\n", saved);
+
+    // Rename into a new folder: the file moves and the language follows.
+    try ed.feed("<Space>fR");
+    try testing.expect(std.mem.endsWith(u8, a, ed.search_prompt.?.input.items())); // prefilled
+    try ed.search_prompt.?.input.set(gpa, b);
+    try ed.feed("<CR>");
+    try testing.expect(std.mem.endsWith(u8, b, ed.buffer.path.?));
+    try testing.expect(ed.buffer.syntax != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "a.txt", .{}));
+    try tmp.dir.access(io, "sub/b.zig", .{});
+
+    // Copy: writes a copy (unsaved edits included) and opens it; the
+    // original keeps its unsaved state.
+    try ed.feed("A!<Esc><Space>fC");
+    try ed.search_prompt.?.input.set(gpa, c);
+    try ed.feed("<CR>");
+    try testing.expect(std.mem.endsWith(u8, c, ed.buffer.path.?));
+    try testing.expectEqualStrings("hello!", ed.text().slice(0, ed.text().len()));
+    try testing.expect(ed.buffers.items[0].modified);
+
+    // Refuses to overwrite an existing file.
+    try ed.feed("<Space>fS");
+    try ed.search_prompt.?.input.set(gpa, b);
+    try ed.feed("<CR>");
+    try testing.expectEqual(.err, ed.message.kind);
+    try testing.expect(std.mem.endsWith(u8, c, ed.buffer.path.?));
+
+    // Delete: "No" keeps it, "Yes" removes it and closes the buffer.
+    try ed.feed("<Space>fD<CR>");
+    try tmp.dir.access(io, "c.zig", .{});
+    try ed.feed("<Space>fDyes<CR>");
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "c.zig", .{}));
+    try testing.expectEqual(1, ed.buffers.items.len);
+    try testing.expect(std.mem.endsWith(u8, b, ed.buffer.path.?));
+
+    // New file: prefilled with the current folder; created on first save.
+    try ed.feed("<Space>fn");
+    try testing.expect(std.mem.endsWith(u8, ed.search_prompt.?.input.items(), "sub/"));
+    try ed.feed("new.txt<CR>");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "sub/new.txt"));
+    try testing.expectEqual(2, ed.buffers.items.len);
+}
+
+test "file browser: into folders, up, open, create" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src/deep");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/main.zig", .data = "const x = 1;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "readme.txt", .data = "hi\n" });
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.git_checked = true;
+    const readme = try std.fmt.allocPrint(gpa, "{s}/readme.txt", .{dir});
+    defer gpa.free(readme);
+    try ed.openFile(readme);
+
+    const rows = struct {
+        fn get(e: *Editor, i: usize) []const u8 {
+            e.picker.?.sync();
+            return e.picker.?.itemAt(i).?.text;
+        }
+    }.get;
+
+    // Opens in the file's folder: folders first.
+    try ed.feed("<Space>.");
+    try testing.expectEqualStrings(dir, ed.browse_dir.items);
+    try testing.expectEqualStrings("src/", rows(&ed, 0));
+    try testing.expectEqualStrings("readme.txt", rows(&ed, 1));
+
+    // `/` on a folder goes in; typing filters; <BS> edits, then goes up and
+    // selects the folder we came from.
+    try ed.feed("/");
+    try testing.expect(std.mem.endsWith(u8, ed.browse_dir.items, "/src"));
+    try testing.expectEqualStrings("deep/", rows(&ed, 0));
+    try ed.feed("ma");
+    try testing.expectEqualStrings("main.zig", rows(&ed, 0));
+    try ed.feed("<BS><BS><BS>");
+    try testing.expectEqualStrings(dir, ed.browse_dir.items);
+    ed.picker.?.sync();
+    try testing.expectEqual(0, ed.picker.?.selected); // "src/"
+    try ed.feed("<Down><BS>");
+    ed.picker.?.sync();
+    // Up from tmp dir; then back down via <CR> on a folder.
+    try ed.feed("<Esc><Space>.<CR>ma<CR>");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
+    try testing.expect(ed.picker == null);
+
+    // A new name offers to create it in the browsed folder.
+    try ed.feed("<Space>.new.zig<CR>");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/new.zig"));
+}
+
+test "dib / ci\" jump to the nearest pair ahead" {
+    var ed = try testEditor("let v = foo(a, b);\nprint(\"old\")");
+    defer ed.deinit();
+    try ed.feed("dib");
+    try expectText(&ed, "let v = foo();\nprint(\"old\")");
+    try testing.expectEqual(12, ed.view.cursor);
+    try ed.feed("ciqnew<Esc>");
+    try expectText(&ed, "let v = foo();\nprint(\"new\")");
+    try ed.feed("gg0va[");
+    try testing.expectEqual(.visual, ed.mode); // no [] anywhere: nothing selected, no crash
+}
+
+test "autopairs: pair, step over, quotes, split blocks" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ifoo(a<Esc>");
+    try expectText(&ed, "foo(a)");
+    try ed.feed("cc<Esc>ifoo(a, \"x\")<Esc>"); // `"` pairs, then steps over; `)` steps over
+    try expectText(&ed, "foo(a, \"x\")");
+    try ed.feed("odon't (x<Esc>"); // no pair inside a word
+    try expectText(&ed, "foo(a, \"x\")\ndon't (x)");
+    try ed.feed("ofn f() {<CR>body<Esc>");
+    try expectText(&ed, "foo(a, \"x\")\ndon't (x)\nfn f() {\n    body\n}");
+    try ed.feed("<Space>tpGo(<Esc>"); // toggled off
+    try expectText(&ed, "foo(a, \"x\")\ndon't (x)\nfn f() {\n    body\n}\n(");
+}
+
+test "surround: ys, yss, ds, cs, visual S, and dot" {
+    var ed = try testEditor("say hello world");
+    defer ed.deinit();
+    try ed.feed("wysiw)");
+    try expectText(&ed, "say (hello) world");
+    try ed.feed("cs)]");
+    try expectText(&ed, "say [hello] world");
+    try ed.feed("cs]{");
+    try expectText(&ed, "say { hello } world");
+    try ed.feed("ds{");
+    try expectText(&ed, "say hello world");
+    try ed.feed("0ysiw\"3w."); // the cursor lands on the new opening quote
+    try expectText(&ed, "\"say\" \"hello\" world");
+    try ed.feed("0ds\"");
+    try expectText(&ed, "say \"hello\" world");
+    try ed.feed("0ds\""); // seeks the next pair
+    try expectText(&ed, "say hello world");
+    try ed.feed("yssb");
+    try expectText(&ed, "(say hello world)");
+    try ed.feed("0wviwS*");
+    try expectText(&ed, "(*say* hello world)");
+    try ed.feed("0d/hel<CR>");
+    try expectText(&ed, "hello world)");
+    try ed.feed("VS{");
+    try expectText(&ed, "{\nhello world)\n}");
+}
+
+test "multicursor: visual I/A types on every line" {
+    var ed = try testEditor("a\n  b\nc");
+    defer ed.deinit();
+    try ed.feed("VjjA,<Esc>");
+    try expectText(&ed, "a,\n  b,\nc,");
+    try testing.expectEqual(2, ed.cursors.items.len);
+    try ed.feed("<Esc>"); // removes the extra cursors
+    try testing.expectEqual(0, ed.cursors.items.len);
+    try ed.feed("ggVjjI- <Esc>");
+    try expectText(&ed, "- a,\n  - b,\n- c,");
+    // One undo step for the whole multi-cursor change.
+    try ed.feed("u");
+    try expectText(&ed, "a,\n  b,\nc,");
+}
+
+test "multicursor: normal-mode commands run at every cursor" {
+    var ed = try testEditor("foo: u32,\nbarbaz: u8,\nx: bool,");
+    defer ed.deinit();
+    try ed.feed("qjqj"); // three cursors down the column
+    try testing.expectEqual(2, ed.cursors.items.len);
+    try ed.feed("0i.<Esc>f:C = 0,<Esc>");
+    try expectText(&ed, ".foo = 0,\n.barbaz = 0,\n.x = 0,");
+    try ed.feed("<Esc>dd");
+    try testing.expectEqual(0, ed.cursors.items.len);
+}
+
+test "multicursor: gzn adds the next match, then ciw changes all" {
+    var ed = try testEditor("let a = old; old(old_x); old");
+    defer ed.deinit();
+    try ed.feed("foqnqn");
+    try testing.expectEqual(2, ed.cursors.items.len);
+    try ed.feed("ciwnew<Esc>");
+    try expectText(&ed, "let a = new; new(old_x); new");
+    try ed.feed("<Esc>uggfoqa");
+    try testing.expectEqual(2, ed.cursors.items.len); // old_x is not the word
+    try ed.feed("<Esc>");
+}
+
+test "multicursor: Tab in the snipe or search prompt makes cursors" {
+    var ed = try testEditor("int a; int b;\nfloat c; int d;");
+    defer ed.deinit();
+    ed.view.rows = 10;
+    try ed.feed("sint<Tab>");
+    try testing.expectEqual(.visual, ed.mode);
+    try testing.expectEqual(2, ed.cursors.items.len);
+    try ed.feed("cuint<Esc>");
+    try expectText(&ed, "uint a; uint b;\nfloat c; uint d;");
+    try ed.feed("<Esc>gg/uint<Tab><Esc>");
+    try testing.expectEqual(.normal, ed.mode);
+    try testing.expectEqual(2, ed.cursors.items.len);
+    try ed.feed("x"); // each cursor is on its match's last character
+    try expectText(&ed, "uin a; uin b;\nfloat c; uin d;");
 }

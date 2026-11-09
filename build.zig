@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     addSyntax(b, exe_mod, target, optimize);
 
     const exe = b.addExecutable(.{
-        .name = "edit",
+        .name = "zile",
         .root_module = exe_mod,
     });
     b.installArtifact(exe);

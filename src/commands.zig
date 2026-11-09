@@ -16,6 +16,7 @@ const motions = @import("core/motions.zig");
 const textobjects = @import("core/textobjects.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
+const pairs = @import("pairs.zig");
 const Picker = @import("picker/Picker.zig");
 
 const Operator = operators.Operator;
@@ -45,41 +46,47 @@ pub const Command = struct {
     repeat: bool = false,
     /// Reads one more key into `Context.char` (f, t, r, q, @).
     takes_char: bool = false,
+    /// With several cursors, runs at the primary only instead of at each one
+    /// (undo, `.`, macros, cursor management). Leader commands always are.
+    once: bool = false,
+    /// Works while the cursor is on a ghost line (otherwise the cursor
+    /// returns to the text first, or the command is refused if it edits).
+    ghost: bool = false,
 };
 
 pub const all = base ++ text_object_commands;
 
 const base = [_]Command{
     // Motions: normal and visual mode, and as an operator's range.
-    .{ .name = "move_left", .doc = "Left", .run = motion(left, .exclusive, .reset) },
-    .{ .name = "move_right", .doc = "Right", .run = motion(right, .exclusive, .reset) },
-    .{ .name = "move_down", .doc = "Down", .run = motion(down, .linewise, .keep) },
-    .{ .name = "move_up", .doc = "Up", .run = motion(up, .linewise, .keep) },
-    .{ .name = "word_forward", .doc = "Next word", .run = wordMotion(.forward, false) },
-    .{ .name = "word_backward", .doc = "Previous word", .run = wordMotion(.backward, false) },
-    .{ .name = "word_end", .doc = "End of word", .run = wordMotion(.end, false) },
-    .{ .name = "big_word_forward", .doc = "Next WORD", .run = wordMotion(.forward, true) },
-    .{ .name = "big_word_backward", .doc = "Previous WORD", .run = wordMotion(.backward, true) },
-    .{ .name = "big_word_end", .doc = "End of WORD", .run = wordMotion(.end, true) },
-    .{ .name = "line_start", .doc = "Start of line", .run = motion(lineStart, .exclusive, .reset) },
-    .{ .name = "first_non_blank", .doc = "First non-blank", .run = motion(firstNonBlank, .exclusive, .reset) },
-    .{ .name = "line_end", .doc = "End of line", .run = motion(lineEnd, .inclusive, .eol) },
+    .{ .name = "move_left", .doc = "Left", .run = ghostCol(.left, motion(left, .exclusive, .reset)), .ghost = true },
+    .{ .name = "move_right", .doc = "Right", .run = ghostCol(.right, motion(right, .exclusive, .reset)), .ghost = true },
+    .{ .name = "move_down", .doc = "Down", .run = verticalRow(1), .ghost = true },
+    .{ .name = "move_up", .doc = "Up", .run = verticalRow(-1), .ghost = true },
+    .{ .name = "word_forward", .doc = "Next word", .run = wordMotion(.forward, false), .ghost = true },
+    .{ .name = "word_backward", .doc = "Previous word", .run = wordMotion(.backward, false), .ghost = true },
+    .{ .name = "word_end", .doc = "End of word", .run = wordMotion(.end, false), .ghost = true },
+    .{ .name = "big_word_forward", .doc = "Next WORD", .run = wordMotion(.forward, true), .ghost = true },
+    .{ .name = "big_word_backward", .doc = "Previous WORD", .run = wordMotion(.backward, true), .ghost = true },
+    .{ .name = "big_word_end", .doc = "End of WORD", .run = wordMotion(.end, true), .ghost = true },
+    .{ .name = "line_start", .doc = "Start of line", .run = ghostCol(.start, motion(lineStart, .exclusive, .reset)), .ghost = true },
+    .{ .name = "first_non_blank", .doc = "First non-blank", .run = ghostCol(.first_non_blank, motion(firstNonBlank, .exclusive, .reset)), .ghost = true },
+    .{ .name = "line_end", .doc = "End of line", .run = ghostCol(.end, motion(lineEnd, .inclusive, .eol)), .ghost = true },
     .{ .name = "goto_first_line", .doc = "First line (or line [count])", .run = motion(firstLine, .linewise, .reset) },
     .{ .name = "goto_last_line", .doc = "Last line (or line [count])", .run = motion(lastLine, .linewise, .reset) },
-    .{ .name = "find_char", .doc = "Find character", .run = motion(findChar(true, false), .inclusive, .reset), .takes_char = true },
-    .{ .name = "find_char_backward", .doc = "Find character backward", .run = motion(findChar(false, false), .exclusive, .reset), .takes_char = true },
-    .{ .name = "till_char", .doc = "Till character", .run = motion(findChar(true, true), .inclusive, .reset), .takes_char = true },
-    .{ .name = "till_char_backward", .doc = "Till character backward", .run = motion(findChar(false, true), .exclusive, .reset), .takes_char = true },
-    .{ .name = "repeat_find", .doc = "Repeat f/t", .run = repeatFind(false) },
-    .{ .name = "repeat_find_reverse", .doc = "Repeat f/t backward", .run = repeatFind(true) },
+    .{ .name = "find_char", .doc = "Find character", .run = ghostFind(.{ .forward = true, .till = false }, motion(findChar(true, false), .inclusive, .reset)), .takes_char = true, .ghost = true },
+    .{ .name = "find_char_backward", .doc = "Find character backward", .run = ghostFind(.{ .forward = false, .till = false }, motion(findChar(false, false), .exclusive, .reset)), .takes_char = true, .ghost = true },
+    .{ .name = "till_char", .doc = "Till character", .run = ghostFind(.{ .forward = true, .till = true }, motion(findChar(true, true), .inclusive, .reset)), .takes_char = true, .ghost = true },
+    .{ .name = "till_char_backward", .doc = "Till character backward", .run = ghostFind(.{ .forward = false, .till = true }, motion(findChar(false, true), .exclusive, .reset)), .takes_char = true, .ghost = true },
+    .{ .name = "repeat_find", .doc = "Repeat f/t", .run = ghostFind(.repeat, repeatFind(false)), .ghost = true },
+    .{ .name = "repeat_find_reverse", .doc = "Repeat f/t backward", .run = ghostFind(.repeat_reverse, repeatFind(true)), .ghost = true },
     .{ .name = "match_bracket", .doc = "Matching bracket", .run = motion(matchBracket, .inclusive, .reset) },
     .{ .name = "paragraph_forward", .doc = "Next paragraph", .run = motion(paragraphForward, .exclusive, .reset) },
     .{ .name = "paragraph_backward", .doc = "Previous paragraph", .run = motion(paragraphBackward, .exclusive, .reset) },
     .{ .name = "screen_top", .doc = "Top of screen", .run = motion(screenLine(.top), .linewise, .reset) },
     .{ .name = "screen_middle", .doc = "Middle of screen", .run = motion(screenLine(.middle), .linewise, .reset) },
     .{ .name = "screen_bottom", .doc = "Bottom of screen", .run = motion(screenLine(.bottom), .linewise, .reset) },
-    .{ .name = "search_next", .doc = "Next match", .run = motion(searchNext(false), .exclusive, .reset) },
-    .{ .name = "search_previous", .doc = "Previous match", .run = motion(searchNext(true), .exclusive, .reset) },
+    .{ .name = "search_next", .doc = "Next match", .run = searchNextCmd(false), .ghost = true },
+    .{ .name = "search_previous", .doc = "Previous match", .run = searchNextCmd(true), .ghost = true },
 
     // Search
     .{ .name = "search_forward", .doc = "Search forward", .run = startSearch(true, .search) },
@@ -87,7 +94,7 @@ const base = [_]Command{
     .{ .name = "snipe", .doc = "Jump to text on screen", .run = startSearch(true, .snipe) },
     .{ .name = "search_word_forward", .doc = "Search word under cursor", .run = searchWord(true) },
     .{ .name = "search_word_backward", .doc = "Search word under cursor backward", .run = searchWord(false) },
-    .{ .name = "clear_search_highlight", .doc = "Clear search highlight", .run = clearSearchHighlight },
+    .{ .name = "clear_search_highlight", .doc = "Clear search highlight", .run = clearSearchHighlight , .once = true },
     .{ .name = "search_accept", .doc = "Go to the match", .run = searchAccept, .hidden = true },
     .{ .name = "search_cancel", .doc = "Cancel the search", .run = searchCancel, .hidden = true },
     .{ .name = "search_buffer", .doc = "Search buffer lines", .run = openPicker(.lines) },
@@ -109,12 +116,12 @@ const base = [_]Command{
     .{ .name = "completion_accept", .doc = "Accept completion", .run = completionKey(.accept, null), .hidden = true },
 
     // Scrolling
-    .{ .name = "half_page_down", .doc = "Half page down", .run = scroll(.half_page, 1) },
-    .{ .name = "half_page_up", .doc = "Half page up", .run = scroll(.half_page, -1) },
-    .{ .name = "page_down", .doc = "Page down", .run = scroll(.page, 1) },
-    .{ .name = "page_up", .doc = "Page up", .run = scroll(.page, -1) },
-    .{ .name = "scroll_down", .doc = "Scroll down", .run = scroll(.line, 1) },
-    .{ .name = "scroll_up", .doc = "Scroll up", .run = scroll(.line, -1) },
+    .{ .name = "half_page_down", .doc = "Half page down", .run = scroll(.half_page, 1), .ghost = true },
+    .{ .name = "half_page_up", .doc = "Half page up", .run = scroll(.half_page, -1), .ghost = true },
+    .{ .name = "page_down", .doc = "Page down", .run = scroll(.page, 1), .ghost = true },
+    .{ .name = "page_up", .doc = "Page up", .run = scroll(.page, -1), .ghost = true },
+    .{ .name = "scroll_down", .doc = "Scroll down", .run = scroll(.line, 1), .ghost = true },
+    .{ .name = "scroll_up", .doc = "Scroll up", .run = scroll(.line, -1), .ghost = true },
     .{ .name = "fold_close", .doc = "Close fold", .run = foldCmd(.close) },
     .{ .name = "fold_open", .doc = "Open fold", .run = foldCmd(.open) },
     .{ .name = "fold_open_recursive", .doc = "Open all folds here", .run = foldCmd(.open_all_here) },
@@ -122,9 +129,9 @@ const base = [_]Command{
     .{ .name = "fold_open_all", .doc = "Open all folds", .run = foldCmd(.open_everything) },
     .{ .name = "fold_close_all", .doc = "Close all folds", .run = foldCmd(.close_everything) },
     .{ .name = "fold_create", .doc = "Create fold", .run = operator(.fold) },
-    .{ .name = "view_center", .doc = "Center line", .run = placeLine(.center, false) },
-    .{ .name = "view_top", .doc = "Line to top", .run = placeLine(.top, false) },
-    .{ .name = "view_bottom", .doc = "Line to bottom", .run = placeLine(.bottom, false) },
+    .{ .name = "view_center", .doc = "Center line", .run = placeLine(.center, false), .ghost = true },
+    .{ .name = "view_top", .doc = "Line to top", .run = placeLine(.top, false), .ghost = true },
+    .{ .name = "view_bottom", .doc = "Line to bottom", .run = placeLine(.bottom, false), .ghost = true },
     .{ .name = "view_center_first_non_blank", .doc = "Center line, to first non-blank", .run = placeLine(.center, true) },
     .{ .name = "view_top_first_non_blank", .doc = "Line to top, to first non-blank", .run = placeLine(.top, true) },
     .{ .name = "view_bottom_first_non_blank", .doc = "Line to bottom, to first non-blank", .run = placeLine(.bottom, true) },
@@ -132,21 +139,21 @@ const base = [_]Command{
     // Operators: wait for a motion or text object (or act on the selection).
     .{ .name = "delete", .doc = "Delete", .run = operator(.delete), .repeat = true },
     .{ .name = "change", .doc = "Change", .run = operator(.change), .repeat = true },
-    .{ .name = "yank", .doc = "Yank", .run = operator(.yank) },
+    .{ .name = "yank", .doc = "Yank", .run = yankCmd, .ghost = true },
     .{ .name = "indent", .doc = "Indent", .run = operator(.indent), .repeat = true },
     .{ .name = "outdent", .doc = "Outdent", .run = operator(.outdent), .repeat = true },
     .{ .name = "lowercase", .doc = "Lowercase", .run = operator(.lowercase), .repeat = true },
     .{ .name = "uppercase", .doc = "Uppercase", .run = operator(.uppercase), .repeat = true },
     .{ .name = "toggle_case", .doc = "Toggle case", .run = operator(.toggle_case), .repeat = true },
-    .{ .name = "operate_line", .doc = "Whole line", .run = operateLine, .hidden = true },
-    .{ .name = "cancel", .doc = "Cancel", .run = cancel, .hidden = true },
+    .{ .name = "operate_line", .doc = "Whole line", .run = operateLine, .hidden = true, .ghost = true },
+    .{ .name = "cancel", .doc = "Cancel", .run = cancel, .hidden = true, .ghost = true },
 
     // Operator + motion shortcuts
     .{ .name = "delete_char", .doc = "Delete character", .run = opMotion(.delete, right, .exclusive), .repeat = true },
     .{ .name = "delete_char_before", .doc = "Delete character before", .run = opMotion(.delete, left, .exclusive), .repeat = true },
     .{ .name = "delete_to_line_end", .doc = "Delete to end of line", .run = opMotion(.delete, lineEnd, .inclusive), .repeat = true },
     .{ .name = "change_to_line_end", .doc = "Change to end of line", .run = opMotion(.change, lineEnd, .inclusive), .repeat = true },
-    .{ .name = "yank_to_line_end", .doc = "Yank to end of line", .run = opMotion(.yank, lineEnd, .inclusive) },
+    .{ .name = "yank_to_line_end", .doc = "Yank to end of line", .run = yankToLineEnd, .ghost = true },
     .{ .name = "substitute_line", .doc = "Substitute line", .run = opLines(.change), .repeat = true },
 
     // Editing
@@ -155,17 +162,35 @@ const base = [_]Command{
     .{ .name = "replace_char", .doc = "Replace character", .run = replaceChar, .repeat = true, .takes_char = true },
     .{ .name = "join_lines", .doc = "Join lines", .run = joinLines, .repeat = true },
     .{ .name = "toggle_case_char", .doc = "Toggle case of character", .run = toggleCaseChar, .repeat = true },
-    .{ .name = "undo", .doc = "Undo", .run = undo },
-    .{ .name = "redo", .doc = "Redo", .run = redo },
-    .{ .name = "repeat_change", .doc = "Repeat last change", .run = repeatChange },
-    .{ .name = "record_macro", .doc = "Record macro (q again to stop)", .run = recordMacro, .takes_char = true },
-    .{ .name = "play_macro", .doc = "Play macro (@@ for the last one)", .run = playMacro, .takes_char = true },
+    .{ .name = "undo", .doc = "Undo", .run = undo , .once = true },
+    .{ .name = "redo", .doc = "Redo", .run = redo , .once = true },
+    .{ .name = "repeat_change", .doc = "Repeat last change", .run = repeatChange , .once = true },
+    .{ .name = "record_macro", .doc = "Record macro (Q again to stop)", .run = recordMacro, .takes_char = true, .once = true },
+    .{ .name = "play_macro", .doc = "Play macro (@@ for the last one)", .run = playMacro, .takes_char = true , .once = true },
 
     // Visual mode
-    .{ .name = "visual_mode", .doc = "Visual mode", .run = visualMode(false) },
-    .{ .name = "visual_line_mode", .doc = "Visual line mode", .run = visualMode(true) },
+    .{ .name = "visual_mode", .doc = "Visual mode", .run = visualMode(false), .ghost = true },
+    .{ .name = "visual_line_mode", .doc = "Visual line mode", .run = visualMode(true), .ghost = true },
     .{ .name = "visual_swap_ends", .doc = "Other end of selection", .run = visualSwap },
-    .{ .name = "exit_visual", .doc = "Leave visual mode", .run = exitVisual, .hidden = true },
+    .{ .name = "exit_visual", .doc = "Leave visual mode", .run = exitVisual, .hidden = true, .ghost = true },
+
+    // Toggles (SPC t)
+    .{ .name = "toggle_ghost_lines", .doc = "Ghost lines", .run = toggle("ghost_lines", "ghost lines"), .ghost = true },
+    .{ .name = "toggle_relative_numbers", .doc = "Relative numbers", .run = toggle("relative_numbers", "relative line numbers"), .ghost = true },
+    .{ .name = "toggle_diagnostic_text", .doc = "Diagnostic messages", .run = toggle("diagnostic_text", "diagnostic messages"), .ghost = true },
+
+    // Git (in a repository)
+    .{ .name = "git_menu", .doc = "Git menu", .run = openPicker(.git_actions) },
+    .{ .name = "git_commit", .doc = "Commit all changes", .run = gitAction(.commit) },
+    .{ .name = "git_push", .doc = "Push", .run = gitAction(.push) },
+    .{ .name = "git_pull", .doc = "Pull", .run = gitAction(.pull) },
+    .{ .name = "git_branches", .doc = "Switch / new branch", .run = openPicker(.git_branches) },
+    .{ .name = "git_changed_files", .doc = "Changed files", .run = openPicker(.git_changes) },
+    .{ .name = "git_set_remote", .doc = "Set remote URL", .run = gitAction(.remote) },
+    .{ .name = "git_restore_hunk", .doc = "Restore hunk from HEAD", .run = gitCmd(.restore), .ghost = true },
+    .{ .name = "git_next_hunk", .doc = "Next change", .run = gitCmd(.next), .ghost = true },
+    .{ .name = "git_previous_hunk", .doc = "Previous change", .run = gitCmd(.previous), .ghost = true },
+    .{ .name = "git_reload", .doc = "Reload HEAD", .run = gitCmd(.reload), .ghost = true },
 
     // Entering insert mode
     .{ .name = "insert_before", .doc = "Insert before cursor", .run = insertAt(cursorPos), .repeat = true },
@@ -177,6 +202,27 @@ const base = [_]Command{
     .{ .name = "normal_mode", .doc = "Normal mode", .run = normalMode },
 
     // Insert-mode editing
+    .{ .name = "surround_or_snipe", .doc = "Surround (after y/d/c), else snipe", .run = surroundOrSnipe },
+    .{ .name = "surround_add", .doc = "Surround with", .run = surroundStep(.add), .takes_char = true, .hidden = true },
+    .{ .name = "surround_delete", .doc = "Delete surrounding", .run = surroundStep(.delete), .takes_char = true, .hidden = true },
+    .{ .name = "surround_change_from", .doc = "Change surrounding", .run = surroundStep(.change_from), .takes_char = true, .hidden = true },
+    .{ .name = "surround_change_to", .doc = "Change surrounding to", .run = surroundStep(.change_to), .takes_char = true, .hidden = true },
+    .{ .name = "surround_visual", .doc = "Surround selection", .run = surroundStep(.visual), .takes_char = true, .repeat = true },
+    .{ .name = "toggle_auto_pairs", .doc = "Auto pairs", .run = toggle("auto_pairs", "auto pairs") },
+    // Multicursor (Doom's evil-mc keys: gz...).
+    .{ .name = "cursor_next_match", .doc = "Cursor + next match", .run = cursorCmd(.next), .once = true },
+    .{ .name = "cursor_previous_match", .doc = "Cursor + previous match", .run = cursorCmd(.previous), .once = true },
+    .{ .name = "cursor_skip_match", .doc = "Skip to next match", .run = cursorCmd(.skip), .once = true },
+    .{ .name = "cursor_all_matches", .doc = "Cursors on all matches", .run = cursorCmd(.all), .once = true },
+    .{ .name = "cursor_down", .doc = "Cursor + move down", .run = cursorCmd(.down), .once = true },
+    .{ .name = "cursor_up", .doc = "Cursor + move up", .run = cursorCmd(.up), .once = true },
+    .{ .name = "cursor_undo", .doc = "Remove last cursor", .run = cursorCmd(.undo), .once = true },
+    .{ .name = "cursor_clear", .doc = "Remove all cursors", .run = cursorCmd(.clear), .once = true },
+    .{ .name = "cursors_line_starts", .doc = "Cursors at line starts", .run = cursorCmd(.line_starts), .once = true },
+    .{ .name = "cursors_line_ends", .doc = "Cursors at line ends", .run = cursorCmd(.line_ends), .once = true },
+    .{ .name = "insert_line_starts", .doc = "Insert at each line's start", .run = cursorCmd(.insert_starts), .once = true },
+    .{ .name = "append_line_ends", .doc = "Append at each line's end", .run = cursorCmd(.insert_ends), .once = true },
+    .{ .name = "cursors_from_matches", .doc = "Cursors on every match", .run = cursorCmd(.from_prompt), .once = true, .hidden = true },
     .{ .name = "insert_newline", .doc = "New line, keeping indentation", .run = insertNewline },
     .{ .name = "delete_backward", .doc = "Delete previous character", .run = deleteBy(motions.prevChar) },
     .{ .name = "delete_forward", .doc = "Delete next character", .run = deleteBy(motions.nextChar) },
@@ -185,6 +231,14 @@ const base = [_]Command{
 
     // Files, buffers and session
     .{ .name = "save_file", .doc = "Save file", .run = saveFile },
+    .{ .name = "browse_files", .doc = "Explore files (current folder)", .run = browseFiles },
+    .{ .name = "new_file", .doc = "New file...", .run = fileCmd(.new) },
+    .{ .name = "save_file_as", .doc = "Save file as...", .run = fileCmd(.save_as) },
+    .{ .name = "rename_file", .doc = "Rename / move file...", .run = fileCmd(.rename) },
+    .{ .name = "copy_file", .doc = "Copy file to...", .run = fileCmd(.copy) },
+    .{ .name = "delete_file", .doc = "Delete file from disk", .run = fileCmd(.delete) },
+    .{ .name = "yank_file_path", .doc = "Copy file path", .run = fileCmd(.yank_path) },
+    .{ .name = "yank_absolute_path", .doc = "Copy absolute file path", .run = fileCmd(.yank_absolute_path) },
     .{ .name = "find_file", .doc = "Find file", .run = openPicker(.files) },
     .{ .name = "switch_buffer", .doc = "Switch buffer", .run = openPicker(.buffers) },
     .{ .name = "kill_buffer", .doc = "Kill buffer", .run = killBuffer },
@@ -202,6 +256,8 @@ const base = [_]Command{
     .{ .name = "picker_page_down", .doc = "Page down", .run = pickerMove(10, .clamp), .hidden = true },
     .{ .name = "picker_page_up", .doc = "Page up", .run = pickerMove(-10, .clamp), .hidden = true },
     .{ .name = "picker_accept", .doc = "Open the selection", .run = pickerAccept, .hidden = true },
+    .{ .name = "picker_slash", .doc = "Browser: enter folder", .run = browserKey('/'), .hidden = true },
+    .{ .name = "picker_tilde", .doc = "Browser: home folder", .run = browserKey('~'), .hidden = true },
     .{ .name = "picker_close", .doc = "Close the picker", .run = pickerClose, .hidden = true },
 
     // Text inputs (picker query, search prompt)
@@ -217,7 +273,9 @@ const base = [_]Command{
 pub const ObjectKind = union(enum) {
     word: bool, // big
     quote: u8,
+    any_quote,
     bracket: [2]u8,
+    any_bracket,
     paragraph,
     line,
     tag,
@@ -241,7 +299,9 @@ pub const text_object_specs = [_]ObjectSpec{
     .{ .name = "double_quotes", .doc = "\"quotes\"", .keys = "\"", .kind = .{ .quote = '"' } },
     .{ .name = "single_quotes", .doc = "'quotes'", .keys = "'", .kind = .{ .quote = '\'' } },
     .{ .name = "backticks", .doc = "`backticks`", .keys = "`", .kind = .{ .quote = '`' } },
-    .{ .name = "parens", .doc = "(parens)", .keys = "()b", .kind = .{ .bracket = .{ '(', ')' } } },
+    .{ .name = "any_quotes", .doc = "nearest quotes", .keys = "q", .kind = .any_quote },
+    .{ .name = "any_brackets", .doc = "nearest ([{ brackets", .keys = "b", .kind = .any_bracket },
+    .{ .name = "parens", .doc = "(parens)", .keys = "()", .kind = .{ .bracket = .{ '(', ')' } } },
     .{ .name = "brackets", .doc = "[brackets]", .keys = "[]", .kind = .{ .bracket = .{ '[', ']' } } },
     .{ .name = "braces", .doc = "{braces}", .keys = "{}B", .kind = .{ .bracket = .{ '{', '}' } } },
     .{ .name = "angles", .doc = "<angles>", .keys = "<>", .kind = .{ .bracket = .{ '<', '>' } } },
@@ -277,6 +337,8 @@ fn textObject(comptime kind: ObjectKind, comptime scope: textobjects.Scope) Hand
             const r = switch (kind) {
                 .word => |big| textobjects.word(t, pos, scope, big, c.count),
                 .quote => |q| textobjects.quote(t, pos, q, scope),
+                .any_quote => textobjects.anyQuote(t, pos, scope),
+                .any_bracket => textobjects.anyBracket(t, pos, scope, c.count),
                 .bracket => |b| textobjects.bracket(t, pos, b[0], b[1], scope, c.count),
                 .paragraph => textobjects.paragraph(t, pos, scope),
                 .line => textobjects.lineObject(t, pos, scope),
@@ -407,6 +469,10 @@ fn wordMotion(comptime which: enum { forward, backward, end }, comptime big: boo
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
+            // Across ghost lines (on one, or with some on screen) words are
+            // found row by row, so they reach into and through ghost lines.
+            const row_mode = ed.mode == .normal or (ed.mode == .visual and ed.ghost != null);
+            if (row_mode and (ed.ghost != null or ed.hasGhosts())) return rowWords(ed, which, big, c.count);
             const t = ed.text();
             const from = ed.view.cursor;
             // vim's special case: `cw` on a word changes to its end, not up to
@@ -421,6 +487,164 @@ fn wordMotion(comptime which: enum { forward, backward, end }, comptime big: boo
             try finishMotion(ed, from, to, kind, .reset);
         }
     }.run;
+}
+
+// Word motions over screen rows (text and ghost lines), one line at a time.
+
+const WordClass = enum { space, word, punct };
+
+fn wordClass(b: u8, big: bool) WordClass {
+    if (b == ' ' or b == '\t') return .space;
+    if (big) return .word;
+    if (b >= 0x80 or b == '_' or std.ascii.isAlphanumeric(b)) return .word;
+    return .punct;
+}
+
+/// Start of the next word after `col` in `line`, if any.
+fn nextWordIn(line: []const u8, col: usize, big: bool) ?usize {
+    var i = col;
+    if (i < line.len) {
+        const cls = wordClass(line[i], big);
+        if (cls != .space) while (i < line.len and wordClass(line[i], big) == cls) : (i += 1) {};
+    }
+    while (i < line.len and wordClass(line[i], big) == .space) i += 1;
+    return if (i < line.len) i else null;
+}
+
+/// End of the next word ending after `col` in `line`, if any.
+fn nextWordEndIn(line: []const u8, col: usize, big: bool) ?usize {
+    var i = col + 1;
+    while (i < line.len and wordClass(line[i], big) == .space) i += 1;
+    if (i >= line.len) return null;
+    const cls = wordClass(line[i], big);
+    while (i + 1 < line.len and wordClass(line[i + 1], big) == cls) i += 1;
+    return i;
+}
+
+/// Start of the word before `col` in `line`, if any.
+fn prevWordIn(line: []const u8, col: usize, big: bool) ?usize {
+    if (col == 0) return null;
+    var i = @min(col, line.len) - 1;
+    while (i > 0 and wordClass(line[i], big) == .space) i -= 1;
+    if (wordClass(line[i], big) == .space) return null;
+    const cls = wordClass(line[i], big);
+    while (i > 0 and wordClass(line[i - 1], big) == cls) i -= 1;
+    return i;
+}
+
+fn firstWordIn(line: []const u8) usize {
+    return std.mem.indexOfNone(u8, line, " \t") orelse 0;
+}
+
+fn rowText(ed: *Editor, r: Editor.Row) []const u8 {
+    return ed.rowText(r);
+}
+
+/// n / N: over ghost lines too (from normal mode), else the text motion.
+fn searchNextCmd(comptime reverse: bool) Handler {
+    const text_motion = motion(searchNext(reverse), .exclusive, .reset);
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            if (ed.mode == .normal and ed.usesRows()) {
+                if (ed.searchNextRows(reverse, c.count)) |rp| ed.setRowPos(rp);
+                return;
+            }
+            return text_motion(c);
+        }
+    }.run;
+}
+
+const FindKind = union(enum) {
+    find: struct { forward: bool, till: bool },
+    repeat,
+    repeat_reverse,
+};
+
+/// f / F / t / T and ; / , within a ghost line; elsewhere `normal`.
+fn ghostFind(comptime kind: anytype, comptime normal: Handler) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const g = &(ed.ghost orelse return normal(c));
+            var f: motions.Find = undefined;
+            var repeat = false;
+            if (@TypeOf(kind) == @TypeOf(.repeat)) {
+                f = ed.last_find orelse return;
+                if (kind == .repeat_reverse) f.forward = !f.forward;
+                repeat = true;
+            } else {
+                f = motions.Find.init(c.char, kind.forward, kind.till) orelse return;
+                ed.last_find = f;
+            }
+            // Search the ghost line as a one-line text.
+            var tmp = try Text.init(ed.gpa, ed.ghostText(g.line, g.k));
+            defer tmp.deinit(ed.gpa);
+            if (motions.findInLine(&tmp, @min(g.col, tmp.len()), f, c.count, repeat)) |col| {
+                g.col = col;
+                ed.view.want_col = col;
+            }
+        }
+    }.run;
+}
+
+/// w / b / e over rows: within the current line, then on to the next/previous
+/// row (ghost or text). Empty lines count as words, like vim.
+fn rowWords(ed: *Editor, which: anytype, big: bool, count: usize) void {
+    var r = ed.cursorRow();
+    var col = if (ed.ghost) |g| g.col else ed.view.cursor - ed.text().lineStart(ed.cursorLine());
+    for (0..count) |_| {
+        const line = rowText(ed, r);
+        switch (which) {
+            .forward => if (nextWordIn(line, col, big)) |c| {
+                col = c;
+            } else {
+                const next = ed.nextRow(r);
+                if (next.eql(r)) break;
+                r = next;
+                col = firstWordIn(rowText(ed, r));
+            },
+            .end => if (nextWordEndIn(line, col, big)) |c| {
+                col = c;
+            } else {
+                // The first word end on a following non-empty row.
+                var n = r;
+                while (true) {
+                    const next = ed.nextRow(n);
+                    if (next.eql(n)) break;
+                    n = next;
+                    const text = rowText(ed, n);
+                    const start = firstWordIn(text);
+                    if (start < text.len) {
+                        r = n;
+                        col = if (start + 1 < text.len and wordClass(text[start + 1], big) == wordClass(text[start], big))
+                            nextWordEndIn(text, start, big) orelse start
+                        else
+                            start;
+                        break;
+                    }
+                }
+            },
+            .backward => if (prevWordIn(line, col, big)) |c| {
+                col = c;
+            } else {
+                const prev = ed.prevRow(r);
+                if (prev.eql(r)) break;
+                r = prev;
+                const text = rowText(ed, r);
+                col = prevWordIn(text, text.len, big) orelse 0;
+            },
+        }
+    }
+    if (r.ghost) |k| {
+        const anchor = if (ed.ghost) |g| (if (g.line == r.line) g.anchor else null) else null;
+        ed.ghost = .{ .line = r.line, .k = k, .col = col, .anchor = anchor };
+        ed.view.want_col = col;
+    } else {
+        ed.ghost = null;
+        const t = ed.text();
+        ed.setCursor(t.lineStart(r.line) + @min(col, t.lineLen(r.line)));
+    }
 }
 
 fn lineStart(ed: *Editor, from: usize, _: Context) ?usize {
@@ -588,9 +812,11 @@ fn placeLine(comptime where: enum { center, top, bottom }, comptime first_non_bl
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             const t = ed.text();
-            if (c.has_count) ed.gotoLine(@min(c.count - 1, t.lineCount() - 1));
-            if (first_non_blank) ed.setCursor(motions.firstNonBlank(t, ed.cursorLine()));
-            const line = ed.cursorLine();
+            if (c.has_count) {
+                ed.ghost = null;
+                ed.gotoLine(@min(c.count - 1, t.lineCount() - 1));
+            }
+            if (first_non_blank and ed.ghost == null) ed.setCursor(motions.firstNonBlank(t, ed.cursorLine()));
             const rows = ed.view.rows;
             const so = ed.effectiveScrolloff();
             const up_rows: usize = switch (where) {
@@ -598,7 +824,7 @@ fn placeLine(comptime where: enum { center, top, bottom }, comptime first_non_bl
                 .top => so,
                 .bottom => rows -| (so + 1),
             };
-            ed.view.top = ed.stepVisible(line, -@as(isize, @intCast(up_rows)));
+            ed.setTop(ed.stepRows(ed.cursorRow(), -@as(isize, @intCast(up_rows))));
         }
     }.run;
 }
@@ -627,6 +853,15 @@ fn operator(comptime op: Operator) Handler {
 fn operateLine(c: Context) !void {
     const ed = c.ed;
     if (ed.mode != .operator) return;
+    if (ed.ghost) |g| {
+        // `yy` on a ghost line yanks [count] ghost lines of its hunk.
+        const op = ed.op orelse return;
+        ed.op = null;
+        ed.mode = .normal;
+        const h = ed.ghostHunk(g.line) orelse return;
+        const last: u32 = @intCast(@min(g.k + c.count - 1, h.old_count - 1));
+        return ed.yankGhostLines(g.line, g.k, last, op.register);
+    }
     const t = ed.text();
     const first = ed.cursorLine();
     try ed.applyPending(operators.linesRange(t, first, @min(first + c.count - 1, t.lineCount() - 1)));
@@ -657,6 +892,128 @@ fn opLines(comptime op: Operator) Handler {
             const first = ed.cursorLine();
             const r = operators.linesRange(t, first, @min(first + c.count - 1, t.lineCount() - 1));
             try operators.apply(ed, op, r, c.register);
+        }
+    }.run;
+}
+
+// ---------------------------------------------------------------------------
+// Ghost lines (old HEAD lines shown inline; read-only, yankable)
+
+/// j/k: step screen rows, onto and through ghost lines. With an operator, or in
+/// visual mode on text, they move over text lines only.
+fn verticalRow(comptime dir: isize) Handler {
+    const text_motion = motion(if (dir > 0) down else up, .linewise, .keep);
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            if (ed.mode == .operator or ed.mode == .insert or (ed.mode == .visual and ed.ghost == null)) {
+                return text_motion(c);
+            }
+            const delta = dir * @as(isize, @intCast(c.count));
+            var target = ed.stepRows(ed.cursorRow(), delta);
+            if (ed.mode == .visual) {
+                // A selection of ghost lines stays within its hunk.
+                const g = ed.ghost.?;
+                const h = ed.ghostHunk(g.line) orelse return;
+                if (target.line != g.line or target.ghost == null) {
+                    const k = std.math.clamp(@as(isize, g.k) + delta, 0, @as(isize, h.old_count) - 1);
+                    target = .{ .line = g.line, .ghost = @intCast(k) };
+                }
+            }
+            ed.setCursorRow(target);
+        }
+    }.run;
+}
+
+/// h / l / 0 / ^ / $ move within a ghost line; elsewhere they are `normal`.
+fn ghostCol(comptime action: enum { left, right, start, first_non_blank, end }, comptime normal: Handler) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const g = &(ed.ghost orelse return normal(c));
+            const text = ed.ghostText(g.line, g.k);
+            g.col = switch (action) {
+                .left => g.col -| c.count,
+                .right => @min(g.col + c.count, text.len -| 1),
+                .start => 0,
+                .first_non_blank => std.mem.indexOfNone(u8, text, " \t") orelse 0,
+                .end => text.len -| 1,
+            };
+            ed.view.want_col = if (action == .end) std.math.maxInt(usize) else g.col;
+        }
+    }.run;
+}
+
+/// `y`: on ghost lines, yanks the selection (visual) or waits for `y` (`yy`).
+fn yankCmd(c: Context) !void {
+    const ed = c.ed;
+    if (ed.ghost) |g| {
+        if (ed.mode == .visual) {
+            try ed.yankGhostLines(g.line, g.anchor orelse g.k, g.k, c.register);
+            ed.exitVisual();
+            return;
+        }
+        if (ed.mode == .normal) return ed.beginOperator(.yank, c);
+        return;
+    }
+    try operator(.yank)(c);
+}
+
+/// `Y`: yank to the end of the line (also on a ghost line).
+fn yankToLineEnd(c: Context) !void {
+    const ed = c.ed;
+    if (ed.ghost) |g| {
+        const text = ed.ghostText(g.line, g.k);
+        try ed.registers.store(c.register, .yank, text[@min(g.col, text.len)..], false);
+        return;
+    }
+    try opMotion(.yank, lineEnd, .inclusive)(c);
+}
+
+fn gitAction(comptime action: enum { commit, push, pull, remote }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            switch (action) {
+                .commit => c.ed.gitCommitPrompt(),
+                .push => try c.ed.gitPush(),
+                .pull => try c.ed.gitPull(),
+                .remote => try c.ed.gitRemotePrompt(),
+            }
+        }
+    }.run;
+}
+
+/// Flips the boolean `Options` field `name` and reports it.
+fn toggle(comptime name: []const u8, comptime label: []const u8) Handler {
+    if (@FieldType(Editor.Options, name) != bool) @compileError("not a boolean option: " ++ name);
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const on = !@field(ed.options, name);
+            @field(ed.options, name) = on;
+            if (!ed.options.ghost_lines) ed.ghost = null;
+            ed.setMessage(.info, label ++ " {s}", .{if (on) "on" else "off"});
+        }
+    }.run;
+}
+
+fn gitCmd(comptime action: enum { restore, next, previous, reload }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            if (ed.git_root == null) return ed.setMessage(.info, "not in a git repository", .{});
+            switch (action) {
+                .restore => {
+                    const h = ed.hunkAtCursor() orelse return ed.setMessage(.info, "no change here", .{});
+                    try ed.restoreHunk(h);
+                },
+                .next => ed.jumpHunk(true),
+                .previous => ed.jumpHunk(false),
+                .reload => {
+                    ed.reloadGit();
+                    ed.setMessage(.info, "reloaded HEAD", .{});
+                },
+            }
         }
     }.run;
 }
@@ -740,6 +1097,14 @@ fn visualMode(comptime line: bool) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
+            if (ed.ghost) |*g| {
+                // Selections on ghost lines are always whole lines.
+                if (ed.mode == .visual) return ed.exitVisual();
+                ed.mode = .visual;
+                ed.visual_line = true;
+                g.anchor = g.k;
+                return;
+            }
             if (ed.mode != .visual) return ed.enterVisual(line);
             // Same key leaves visual mode; the other switches kind.
             if (ed.visual_line == line) ed.exitVisual() else ed.visual_line = line;
@@ -854,6 +1219,7 @@ fn wordBackwardInLine(t: *const Text, p: usize) usize {
 }
 
 fn insertNewline(c: Context) !void {
+    if (try pairs.splitPair(c.ed)) return;
     var indent_buf: [256]u8 = undefined;
     const indent = copyIndent(c.ed, c.ed.cursorLine(), &indent_buf);
     try c.ed.insertText("\n");
@@ -872,17 +1238,80 @@ fn insertTab(c: Context) !void {
 // ---------------------------------------------------------------------------
 // Files, buffers, pickers
 
-fn saveFile(c: Context) !void {
+/// `s` after an operator: `ys` starts a surround (`ysiw)`, `yss)`), `ds` and
+/// `cs` read the pair to delete or change. After other operators it is still
+/// the snipe motion (`gUs...`).
+fn surroundOrSnipe(c: Context) !void {
     const ed = c.ed;
-    const n = ed.buffer.save(ed.gpa, ed.io) catch |err| switch (err) {
-        error.NoPath => {
-            ed.setMessage(.err, "no file name (save-as arrives with the picker)", .{});
-            return;
+    const op = ed.op orelse return;
+    switch (op.op) {
+        .yank => ed.op.?.op = .surround, // still waiting for a motion
+        .surround => {
+            // `yss`: [count] lines.
+            const t = ed.text();
+            const first = ed.cursorLine();
+            const r = operators.linesRange(t, first, @min(first + op.count * c.count - 1, t.lineCount() - 1));
+            ed.op = null;
+            ed.setMode(.normal);
+            ed.awaitSurroundChar(r);
         },
-        else => return err,
-    };
-    ed.setMessage(.info, "\"{s}\" {d}L, {d}B written", .{ ed.buffer.displayName(), ed.text().lineCount(), n });
-    if (ed.lspFor(ed.buffer)) |l| l.didSave(ed.buffer);
+        .delete, .change => {
+            ed.op = null;
+            ed.setMode(.normal);
+            if (op.op == .delete) ed.awaitChar("surround_delete", op.count) else ed.awaitChar("surround_change_from", op.count);
+        },
+        else => try startSearch(true, .snipe)(c),
+    }
+}
+
+fn surroundStep(comptime step: enum { add, delete, change_from, change_to, visual }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            // These finish a change that `.` repeats.
+            if (step != .change_from) ed.capture_repeatable = true;
+            switch (step) {
+                .add => try pairs.add(ed, ed.surround_range, c.char, false),
+                .delete => try pairs.delete(ed, c.char, c.count),
+                .change_from => {
+                    ed.surround_from = c.char;
+                    ed.awaitChar("surround_change_to", c.count);
+                },
+                .change_to => try pairs.change(ed, ed.surround_from, c.char, c.count),
+                .visual => {
+                    if (ed.mode != .visual) return;
+                    const r = ed.visualRange();
+                    ed.exitVisual();
+                    try pairs.add(ed, r, c.char, r.linewise);
+                },
+            }
+        }
+    }.run;
+}
+
+fn browseFiles(c: Context) !void {
+    try c.ed.browse();
+}
+
+fn saveFile(c: Context) !void {
+    try c.ed.saveCurrent();
+}
+
+fn fileCmd(comptime action: enum { new, save_as, rename, copy, delete, yank_path, yank_absolute_path }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            switch (action) {
+                .new => try ed.filePrompt(.new_file),
+                .save_as => try ed.filePrompt(.save_as),
+                .rename => try ed.filePrompt(.rename_file),
+                .copy => try ed.filePrompt(.copy_file),
+                .delete => try ed.deleteFilePrompt(),
+                .yank_path => try ed.yankPath(false),
+                .yank_absolute_path => try ed.yankPath(true),
+            }
+        }
+    }.run;
 }
 
 fn quit(c: Context) !void {
@@ -959,13 +1388,49 @@ fn pickerMove(comptime delta: isize, comptime how: enum { wrap, clamp }) Handler
     }.run;
 }
 
+/// Keys that navigate in the file browser and are plain text elsewhere:
+/// `/` enters the selected folder (or the root, on an empty query), `~` on an
+/// empty query goes home.
+fn browserKey(comptime char: u8) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const p = ed.picker orelse return;
+            if (p.kind == .browse) {
+                const empty = p.query.items().len == 0;
+                switch (char) {
+                    '/' => {
+                        p.sync();
+                        if (p.itemAt(p.selected)) |item| if (std.mem.endsWith(u8, item.text, "/")) {
+                            const name = try ed.gpa.dupe(u8, item.text);
+                            defer ed.gpa.free(name);
+                            return ed.browseInto(name);
+                        };
+                        if (empty) return ed.browseInto("/");
+                    },
+                    '~' => if (empty) {
+                        if (std.c.getenv("HOME")) |h| return ed.browseInto(std.mem.span(h));
+                    },
+                    else => comptime unreachable,
+                }
+            }
+            try p.query.insert(ed.gpa, char);
+            try ed.inputChanged();
+        }
+    }.run;
+}
+
 fn inputEdit(comptime what: enum { char, word, all }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             const input = ed.activeInput() orelse return;
-            // <BS> on an empty search prompt cancels it, like vim.
-            if (what == .char and ed.mode == .search and input.items().len == 0) return ed.cancelSearch();
+            if (what == .char and input.items().len == 0) {
+                // <BS> on an empty search prompt cancels it, like vim; in the
+                // file browser it goes up a folder.
+                if (ed.mode == .search) return ed.cancelSearch();
+                if (ed.picker) |p| if (p.kind == .browse) return ed.browseUp();
+            }
             switch (what) {
                 .char => input.deleteChar(),
                 .word => input.deleteWord(),
@@ -1047,7 +1512,38 @@ fn completionKey(comptime action: enum { next, previous, accept }, comptime fall
 }
 
 fn clearSearchHighlight(c: Context) !void {
+    // With extra cursors, <Esc> removes them first.
+    if (c.ed.cursors.items.len > 0) return c.ed.clearCursors();
     c.ed.search_highlight = false;
+}
+
+fn cursorCmd(comptime action: enum { next, previous, skip, all, down, up, undo, clear, line_starts, line_ends, insert_starts, insert_ends, from_prompt }) Handler {
+    return &struct {
+        const move = verticalRow(if (action == .up) -1 else 1);
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            switch (action) {
+                .next => try ed.cursorAtMatch(.next),
+                .previous => try ed.cursorAtMatch(.previous),
+                .skip => try ed.cursorAtMatch(.skip),
+                .all => try ed.cursorAtMatch(.all),
+                .down, .up => {
+                    for (0..c.count) |_| {
+                        try ed.addCursorHere();
+                        try move(.{ .ed = ed, .count = 1, .has_count = false });
+                    }
+                    ed.setMessage(.info, "{d} cursors", .{ed.cursors.items.len + 1});
+                },
+                .undo => ed.removeLastCursor(),
+                .clear => ed.clearCursors(),
+                .line_starts => try ed.cursorsOnLines(false, false),
+                .line_ends => try ed.cursorsOnLines(true, false),
+                .insert_starts => try ed.cursorsOnLines(false, true),
+                .insert_ends => try ed.cursorsOnLines(true, true),
+                .from_prompt => try ed.cursorsFromPrompt(),
+            }
+        }
+    }.run;
 }
 
 fn searchAccept(c: Context) !void {

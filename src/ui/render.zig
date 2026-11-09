@@ -56,8 +56,8 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     drawHover(ed, font, theme, l);
     drawCompletion(ed, font, theme, l);
     if (ed.picker) |p| picker_view.draw(p, font, theme, l);
-    if (ed.search_prompt) |*sp| if (sp.kind == .rename) {
-        picker_view.drawPromptBox(font, theme, l, "Rename symbol", sp.input.items());
+    if (ed.search_prompt) |*sp| if (sp.kind.boxed()) {
+        picker_view.drawPromptBox(font, theme, l, sp.kind.title(), sp.input.items());
     };
 }
 
@@ -137,27 +137,46 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
 
     // Rows walk visible lines: a closed fold is drawn as its first line plus a
     // marker, and the lines it hides are skipped.
+    // Rows: text lines (a closed fold is one) and ghost lines (old HEAD text).
     var row: usize = 0;
-    var next_line: usize = v.top;
+    var r = ed.topRow();
     while (row < l.rows) : (row += 1) {
-        const line = next_line;
+        if (row > 0) {
+            const next = ed.nextRow(r);
+            if (next.eql(r)) break;
+            r = next;
+        }
+        const y = @as(f32, @floatFromInt(row)) * font.cell_h;
+        if (r.ghost) |k| {
+            drawGhostRow(ed, font, theme, l, r.line, k, y);
+            continue;
+        }
+        const line = r.line;
         if (line >= t.lineCount()) break;
         const fold = ed.foldAt(line);
-        next_line = if (fold) |f| f.last + 1 else line + 1;
-        const y = @as(f32, @floatFromInt(row)) * font.cell_h;
         const is_current = line == cursor_line;
         if (fold != null) rect(0, y, l.width, font.cell_h, theme.fold_bg);
 
         if (is_current) rect(0, y, l.width, font.cell_h, theme.cursorline_bg);
         if (selection) |sel| drawSelection(ed, font, theme, l, sel, line, y);
+        if (selection != null) for (ed.cursors.items) |c| {
+            drawSelection(ed, font, theme, l, ed.selectionRange(c.anchor, c.pos), line, y);
+        };
 
         // Line number, right-aligned in the gutter with one cell of padding.
         var num_buf: [24]u8 = undefined;
-        const num = std.fmt.bufPrint(&num_buf, "{d}", .{line + 1}) catch unreachable;
+        // Relative numbers: distance to the cursor line (the cursor line keeps
+        // its absolute number).
+        const shown = if (ed.options.relative_numbers and !is_current)
+            (if (line > cursor_line) line - cursor_line else cursor_line - line)
+        else
+            line + 1;
+        const num = std.fmt.bufPrint(&num_buf, "{d}", .{shown}) catch unreachable;
         const num_x = @as(f32, @floatFromInt(l.gutter_cols - 1 - num.len)) * font.cell_w;
         const line_diag = firstDiagnostic(diags, line);
         const num_color = if (line_diag) |d| diagColor(theme, d.severity) else if (fold != null) theme.fold_fg else if (is_current) theme.gutter_current_fg else theme.gutter_fg;
         _ = font.drawText(num, num_x, y, num_color);
+        drawGitSign(ed, theme, line, y, font.cell_h);
 
         if (ed.search_highlight) drawSearchMatches(ed, font, theme, l, line, y);
 
@@ -189,28 +208,34 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
         } else if (line_diag != null) drawDiagnostics(ed, font, theme, l, diags, line, y);
     }
 
-    drawCursor(ed, font, theme, l);
+    // Extra cursors: the same shape, a little dimmer.
+    var extra = theme.cursor;
+    extra.a = 150;
+    for (ed.cursors.items) |c| drawCursorAt(ed, font, theme, l, @min(c.pos, ed.text().len()), extra);
+    if (ed.ghost) |g| return drawGhostCursor(ed, font, theme, l, g);
+    drawCursorAt(ed, font, theme, l, ed.view.cursor, theme.cursor);
 }
 
-fn drawCursor(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
+fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, pos: usize, color: rl.Color) void {
     const v = &ed.view;
-    const line = ed.cursorLine();
+    const t0 = ed.text();
+    const line = t0.lineOf(pos);
     const row = ed.screenRow(line) orelse return;
-    const col = ed.cursorCol();
+    const col = motions.displayCol(t0.lineSlice(line), pos - t0.lineStart(line), ed.options.tab_width);
     if (col < v.left or col >= v.left + l.cols) return;
 
     const x = l.text_x + @as(f32, @floatFromInt(col - v.left)) * font.cell_w;
     const y = @as(f32, @floatFromInt(row)) * font.cell_h;
     switch (ed.mode) {
-        .insert => rect(x, y, 2, font.cell_h, theme.cursor),
+        .insert => rect(x, y, 2, font.cell_h, color),
         // Half block: an operator is waiting for its motion.
-        .operator => rect(x, y + font.cell_h / 2, font.cell_w, font.cell_h / 2, theme.cursor),
+        .operator => rect(x, y + font.cell_h / 2, font.cell_w, font.cell_h / 2, color),
         .normal, .picker, .visual, .search => {
-            rect(x, y, font.cell_w, font.cell_h, theme.cursor);
+            rect(x, y, font.cell_w, font.cell_h, color);
             // Redraw the character under the block in the contrasting color.
             const t = ed.text();
-            if (v.cursor < t.lineEnd(line)) {
-                var it = Font.Utf8Lossy{ .bytes = t.slice(v.cursor, @min(v.cursor + 4, t.len())) };
+            if (pos < t.lineEnd(line)) {
+                var it = Font.Utf8Lossy{ .bytes = t.slice(pos, @min(pos + 4, t.len())) };
                 if (it.next()) |cp| {
                     if (cp != '\t' and cp != ' ') font.drawCodepoint(cp, x, y, theme.cursor_text);
                 }
@@ -234,6 +259,8 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
             .search => .{ " SEARCH ", theme.mode_visual },
             .snipe => .{ " SNIPE ", theme.mode_visual },
             .rename => .{ " RENAME ", theme.mode_insert },
+            .git_commit, .git_remote => .{ " GIT ", theme.mode_insert },
+            .new_file, .save_as, .rename_file, .copy_file => .{ " FILE ", theme.mode_insert },
         },
     };
     rect(0, y, @as(f32, @floatFromInt(mode_name.len)) * font.cell_w, font.cell_h, mode_color);
@@ -241,12 +268,12 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
 
     // The search prompt, the latest message, or the file name.
     x += font.cell_w;
-    if (ed.search_prompt != null and ed.search_prompt.?.kind != .rename) {
+    if (ed.search_prompt != null and !ed.search_prompt.?.kind.boxed()) {
         const sp = &ed.search_prompt.?;
         const label = switch (sp.kind) {
             .search => if (sp.forward) "/" else "?",
             .snipe => "snipe › ",
-            .rename => "rename to › ",
+            else => "",
         };
         x = font.drawText(label, x, y, theme.status_dim);
         x = font.drawText(sp.input.items(), x, y, theme.fg);
@@ -270,6 +297,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
 
 fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (ed.macro_register) |r| try w.print("recording @{c}   ", .{r});
+    if (ed.cursors.items.len > 0) try w.print("{d} cursors   ", .{ed.cursors.items.len + 1});
     const typed = ed.showcmdKeys();
     try keys.formatSequenceDisplay(typed, w);
     if (typed.len > 0) try w.writeAll("-   ");
@@ -277,6 +305,10 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
 
     const line = ed.cursorLine();
     const total = ed.text().lineCount();
+    if (ed.ghost) |g| {
+        const h = ed.ghostHunk(g.line);
+        if (h) |hh| try w.print("HEAD:{d}  ", .{hh.old_start + g.k + 1});
+    }
     try w.print("{d}:{d}  ", .{ line + 1, ed.cursorCol() + 1 });
     if (total <= 1) try w.writeAll("All ") else try w.print("{d: >3}% ", .{line * 100 / (total - 1)});
 }
@@ -304,11 +336,17 @@ fn drawSelection(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout,
 /// Background for every match of the active search on `line`; the match
 /// under the cursor is brighter.
 fn drawSearchMatches(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, line: usize, y: f32) void {
-    const pattern = ed.searchPattern() orelse return;
-    if (pattern.needle.len == 0) return;
     const t = ed.text();
     const ls = t.lineStart(line);
-    const bytes = t.lineSlice(line);
+    const at_cursor: ?usize = if (ed.ghost == null and ed.view.cursor >= ls) ed.view.cursor - ls else null;
+    drawMatchesIn(ed, font, theme, l, t.lineSlice(line), at_cursor, y);
+}
+
+/// Search match backgrounds in `bytes` (a text or ghost line); the match
+/// starting at `cursor_col` is brighter.
+fn drawMatchesIn(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, bytes: []const u8, cursor_col: ?usize, y: f32) void {
+    const pattern = ed.searchPattern() orelse return;
+    if (pattern.needle.len == 0) return;
     const tab = ed.options.tab_width;
     var i: usize = 0;
     while (pattern.forward(bytes, i)) |m| : (i = m + 1) {
@@ -318,7 +356,7 @@ fn drawSearchMatches(ed: *Editor, font: *const Font, theme: *const Theme, l: Lay
         const start = @max(c0, ed.view.left);
         const x = l.text_x + @as(f32, @floatFromInt(start - ed.view.left)) * font.cell_w;
         const w = @as(f32, @floatFromInt(c1 - start)) * font.cell_w;
-        const current = ls + m == ed.view.cursor;
+        const current = cursor_col != null and cursor_col.? == m;
         rect(x, y, w, font.cell_h, if (current) theme.search_current else theme.search_match);
     }
 }
@@ -359,6 +397,7 @@ fn drawDiagnostics(ed: *Editor, font: *const Font, theme: *const Theme, l: Layou
         rect(x, y + font.cell_h - 2, w, 2, diagColor(theme, d.severity));
     }
     // Virtual text: the first (most severe) message, after the line.
+    if (!ed.options.diagnostic_text) return;
     const d = firstDiagnostic(diags, line).?;
     const end_col = motions.displayCol(bytes, bytes.len, tab) + 3;
     if (end_col >= left + l.cols) return;
@@ -456,6 +495,68 @@ fn drawCompletion(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout
         if (item.detail.len > 0) {
             const dx = box.x + @as(f32, @floatFromInt(label_w + 3)) * font.cell_w;
             _ = font.drawText(clip(item.detail, detail_w), dx, y, theme.status_dim);
+        }
+    }
+}
+
+/// A ghost line: an old HEAD line of a git hunk, shown inline (read-only).
+fn drawGhostRow(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, line: usize, k: u32, y: f32) void {
+    rect(0, y, l.width, font.cell_h, theme.ghost_bg);
+    if (ed.ghost) |g| {
+        // A visual selection of ghost lines.
+        if (ed.mode == .visual and g.line == line) if (g.anchor) |a| {
+            if (k >= @min(a, g.k) and k <= @max(a, g.k)) rect(l.text_x, y, l.width - l.text_x, font.cell_h, theme.selection_bg);
+        };
+        if (g.line == line and g.k == k and ed.mode != .visual) rect(0, y, l.width, font.cell_h, theme.ghost_current_bg);
+    }
+    const sign_x = @as(f32, @floatFromInt(l.gutter_cols - 2)) * font.cell_w;
+    _ = font.drawText("-", sign_x, y, theme.ghost_fg);
+    if (ed.search_highlight) {
+        const on_it: ?usize = if (ed.ghost) |g| (if (g.line == line and g.k == k) g.col else null) else null;
+        drawMatchesIn(ed, font, theme, l, ed.ghostText(line, k), on_it, y);
+    }
+    rect(0, y, 3, font.cell_h, theme.diff_delete);
+    const text = ed.ghostText(line, k);
+    var it = Font.Utf8Lossy{ .bytes = text };
+    var col: usize = 0;
+    const left = ed.view.left;
+    while (it.next()) |cp| {
+        const next_col = if (cp == '\t') motions.nextTabStop(col, ed.options.tab_width) else col + 1;
+        defer col = next_col;
+        if (next_col <= left) continue;
+        if (col >= left + l.cols) break;
+        if (cp == '\t' or cp == ' ') continue;
+        font.drawCodepoint(cp, l.text_x + @as(f32, @floatFromInt(col - left)) * font.cell_w, y, theme.ghost_fg);
+    }
+}
+
+fn drawGhostCursor(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, g: Editor.GhostCursor) void {
+    const row = ed.rowOnScreen(.{ .line = g.line, .ghost = g.k }) orelse return;
+    const text = ed.ghostText(g.line, g.k);
+    const col = motions.displayCol(text, @min(g.col, text.len), ed.options.tab_width);
+    if (col < ed.view.left or col >= ed.view.left + l.cols) return;
+    const x = l.text_x + @as(f32, @floatFromInt(col - ed.view.left)) * font.cell_w;
+    const y = @as(f32, @floatFromInt(row)) * font.cell_h;
+    rect(x, y, font.cell_w, font.cell_h, theme.cursor);
+    if (g.col < text.len) {
+        var it = Font.Utf8Lossy{ .bytes = text[g.col..] };
+        if (it.next()) |cp| if (cp != ' ' and cp != '\t') font.drawCodepoint(cp, x, y, theme.cursor_text);
+    }
+}
+
+/// Gutter bar for git changes: green added, yellow changed; with ghost lines
+/// off, a red tick where lines were deleted.
+fn drawGitSign(ed: *Editor, theme: *const Theme, line: usize, y: f32, h: f32) void {
+    const g = ed.buffer.git orelse return;
+    for (g.hunks.items) |hunk| {
+        if (hunk.new_start > line + 1) break;
+        if (hunk.new_count > 0 and line >= hunk.new_start and line < hunk.new_start + hunk.new_count) {
+            rect(0, y, 3, h, if (hunk.old_count == 0) theme.diff_add else theme.diff_change);
+            return;
+        }
+        if (hunk.new_count == 0 and !ed.options.ghost_lines and hunk.new_start == line) {
+            rect(0, y, 8, 3, theme.diff_delete);
+            return;
         }
     }
 }

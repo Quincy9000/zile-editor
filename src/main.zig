@@ -8,7 +8,7 @@ const Theme = @import("ui/Theme.zig");
 const render = @import("ui/render.zig");
 
 const usage =
-    \\usage: edit [options] [file]
+    \\usage: zile [options] [file]
     \\
     \\options:
     \\  --font <path>       TTF/OTF font file (default: discovered monospace font)
@@ -16,8 +16,8 @@ const usage =
     \\  -h, --help          show this help
     \\
     \\debug environment variables:
-    \\  EDIT_TEST_KEYS=<keys>         feed key notation at startup, e.g. "ihello<Esc>"
-    \\  EDIT_TEST_SCREENSHOT=<path>   save a PNG of the first frames, then exit
+    \\  ZILE_TEST_KEYS=<keys>         feed key notation at startup, e.g. "ihello<Esc>"
+    \\  ZILE_TEST_SCREENSHOT=<path>   save a PNG of the first frames, then exit
     \\
 ;
 
@@ -54,8 +54,8 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const args = try parseArgs(init);
-    const test_keys = init.environ_map.get("EDIT_TEST_KEYS");
-    const test_screenshot = init.environ_map.get("EDIT_TEST_SCREENSHOT");
+    const test_keys = init.environ_map.get("ZILE_TEST_KEYS");
+    const test_screenshot = init.environ_map.get("ZILE_TEST_SCREENSHOT");
 
     var ed = try Editor.init(gpa, io);
     defer ed.deinit();
@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
     // raylib warns about every oversized box-drawing glyph; only show errors.
     rl.SetTraceLogLevel(rl.LOG_ERROR);
     rl.SetConfigFlags(rl.FLAG_WINDOW_RESIZABLE | rl.FLAG_VSYNC_HINT);
-    rl.InitWindow(1100, 720, "edit");
+    rl.InitWindow(1100, 720, "zile");
     defer rl.CloseWindow();
     // raylib closes the window on Esc by default; Esc is a mode key here.
     rl.SetExitKey(rl.KEY_NULL);
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
     while (!rl.WindowShouldClose() and !ed.should_quit) : (frame += 1) {
         if (frame == next_segment_frame and screenshot_frame == null) {
             if (script.next()) |segment| {
-                ed.feed(segment) catch |err| std.log.err("EDIT_TEST_KEYS: {s}", .{@errorName(err)});
+                ed.feed(segment) catch |err| std.log.err("ZILE_TEST_KEYS: {s}", .{@errorName(err)});
                 next_segment_frame = frame + wait_frames;
             } else screenshot_frame = frame + 5;
         }
@@ -153,7 +153,7 @@ const TitleCache = struct {
 
     fn update(tc: *TitleCache, ed: *Editor) void {
         var next: [512]u8 = undefined;
-        const title = std.fmt.bufPrintSentinel(&next, "{s}{s} - edit", .{
+        const title = std.fmt.bufPrintSentinel(&next, "{s}{s} - zile", .{
             ed.buffer.displayName(),
             if (ed.buffer.modified) " [+]" else "",
         }, 0) catch return;

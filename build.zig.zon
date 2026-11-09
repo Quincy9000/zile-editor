@@ -1,7 +1,7 @@
 .{
-    .name = .edit,
+    .name = .zile,
     .version = "0.0.0",
-    .fingerprint = 0x8135de1a49cafa79,
+    .fingerprint = 0x9650de37d0b9eb79,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .raylib = .{

@@ -8,6 +8,7 @@ const Text = @import("Text.zig");
 const History = @import("History.zig");
 const Syntax = @import("../syntax/Syntax.zig");
 const Folds = @import("Folds.zig");
+const diff = @import("../git/diff.zig");
 
 const Buffer = @This();
 
@@ -19,6 +20,9 @@ syntax: ?Syntax = null,
 edit_version: u64 = 0,
 /// Closed folds.
 folds: Folds = .{},
+/// Diff against the file's git HEAD version (null outside a repo or for
+/// untracked files).
+git: ?diff.State = null,
 /// Owned. Relative to the cwd or absolute; null for a scratch buffer.
 path: ?[]u8 = null,
 modified: bool = false,
@@ -100,6 +104,7 @@ pub fn deinit(b: *Buffer, gpa: Allocator) void {
     b.history.deinit(gpa);
     if (b.syntax) |*s| s.deinit(gpa);
     b.folds.deinit(gpa);
+    if (b.git) |*g| g.deinit(gpa);
     if (b.path) |p| gpa.free(p);
     b.* = undefined;
 }

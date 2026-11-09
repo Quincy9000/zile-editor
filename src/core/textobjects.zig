@@ -64,8 +64,44 @@ pub fn word(t: *const Text, pos: usize, scope: Scope, big: bool, count: usize) ?
     return .{ .start = start, .end = end };
 }
 
-/// i" / a" (and ' `): the quoted string around or after the cursor on its line.
+/// How far ahead (in lines) objects look for a pair when the cursor isn't in
+/// one, like mini.ai's `n_lines`.
+pub const seek_lines = 50;
+
+/// i" / a" (and ' `): the quoted string around or after the cursor on its
+/// line, else the first one on the following lines.
 pub fn quote(t: *const Text, pos: usize, q: u8, scope: Scope) ?Range {
+    if (quoteOnLine(t, pos, q, scope)) |r| return r;
+    const first = t.lineOf(pos) + 1;
+    for (first..@min(t.lineCount(), first + seek_lines)) |line| {
+        if (quoteOnLine(t, t.lineStart(line), q, scope)) |r| return r;
+    }
+    return null;
+}
+
+/// `iq` / `aq`: whichever kind of quote is nearest: the innermost around
+/// the cursor, else the next one.
+pub fn anyQuote(t: *const Text, pos: usize, scope: Scope) ?Range {
+    var best: ?Range = null;
+    var best_outer: Range = undefined;
+    for ("\"'`") |q| {
+        const outer = quote(t, pos, q, .around) orelse continue;
+        const covers = outer.start <= pos;
+        const better = if (best == null) true else blk: {
+            const best_covers = best_outer.start <= pos;
+            if (covers != best_covers) break :blk covers;
+            // Both around the cursor: the inner one; both ahead: the nearer.
+            break :blk if (covers) outer.start > best_outer.start else outer.start < best_outer.start;
+        };
+        if (better) {
+            best = quote(t, pos, q, scope);
+            best_outer = outer;
+        }
+    }
+    return best;
+}
+
+fn quoteOnLine(t: *const Text, pos: usize, q: u8, scope: Scope) ?Range {
     const line = t.lineOf(pos);
     const ls = t.lineStart(line);
     const le = t.lineEnd(line);
@@ -93,48 +129,101 @@ pub fn quote(t: *const Text, pos: usize, q: u8, scope: Scope) ?Range {
 }
 
 /// i( / a( and friends: the innermost bracket pair around the cursor
-/// (`count` levels out). An inner block whose brackets sit on their own lines
-/// is linewise, so `di{` keeps the brace lines.
+/// (`count` levels out). Not inside one: the next pair ahead (within
+/// `seek_lines`), else the previous one, like mini.ai. An inner block whose
+/// brackets sit on their own lines is linewise, so `di{` keeps the brace lines.
 pub fn bracket(t: *const Text, pos: usize, open: u8, close: u8, scope: Scope, count: usize) ?Range {
+    const pair = [_][2]u8{.{ open, close }};
+    return bracketOf(t, pos, &pair, scope, count);
+}
+
+/// `ib` / `ab`: the same, for whichever of (), [] and {} is nearest.
+pub fn anyBracket(t: *const Text, pos: usize, scope: Scope, count: usize) ?Range {
+    return bracketOf(t, pos, &any_brackets, scope, count);
+}
+
+const any_brackets = [_][2]u8{ .{ '(', ')' }, .{ '[', ']' }, .{ '{', '}' } };
+
+fn pairIndex(pairs: []const [2]u8, b: u8, side: u1) ?usize {
+    for (pairs, 0..) |p, i| if (p[side] == b) return i;
+    return null;
+}
+
+fn bracketOf(t: *const Text, pos: usize, pairs: []const [2]u8, scope: Scope, count: usize) ?Range {
     if (t.len() == 0) return null;
-    var o = pos;
-    // On the opening bracket itself: that pair. Otherwise search outwards.
-    var depth: usize = if (pos < t.len() and t.byteAt(pos) == open) count - 1 else count;
-    if (pos < t.len() and t.byteAt(pos) == close) {
-        // On the closing bracket: its pair counts as the first level.
-        depth = count;
-        o = pos;
-        var d: usize = 0;
-        while (o > 0) {
-            o -= 1;
-            const b = t.byteAt(o);
-            if (b == close) d += 1 else if (b == open) {
-                if (d == 0) break;
-                d -= 1;
-            }
-        } else return null;
-        depth -= 1;
+    if (enclosingOpen(t, pos, pairs, count)) |o| {
+        if (pairFrom(t, o, pairs, scope)) |r| return r;
     }
-    var nest: usize = 0;
-    while (depth > 0) {
-        if (o == 0) return null;
+    return seekPair(t, pos, pairs, scope);
+}
+
+/// The opening bracket `count` levels out from `pos`. The cursor on a
+/// bracket counts as inside that pair.
+fn enclosingOpen(t: *const Text, pos: usize, pairs: []const [2]u8, count: usize) ?usize {
+    var remaining = count;
+    var from = @min(pos, t.len());
+    var found: ?usize = null;
+    if (pos < t.len()) {
+        const b = t.byteAt(pos);
+        if (pairIndex(pairs, b, 0) != null) {
+            found = pos;
+            remaining -= 1;
+        } else if (pairIndex(pairs, b, 1)) |pi| {
+            found = matchBackward(t, pos, pairs[pi]) orelse return null;
+            from = found.?;
+            remaining -= 1;
+        }
+    }
+    // Walk back; a closer means a pair to skip over, per kind.
+    var skip: [any_brackets.len]usize = @splat(0);
+    var i = from;
+    while (remaining > 0) {
+        if (i == 0) return null;
+        i -= 1;
+        const b = t.byteAt(i);
+        if (pairIndex(pairs, b, 1)) |pi| {
+            skip[pi] += 1;
+        } else if (pairIndex(pairs, b, 0)) |pi| {
+            if (skip[pi] > 0) skip[pi] -= 1 else {
+                found = i;
+                remaining -= 1;
+            }
+        }
+    }
+    return found;
+}
+
+fn matchBackward(t: *const Text, close_pos: usize, pair: [2]u8) ?usize {
+    var o = close_pos;
+    var d: usize = 0;
+    while (o > 0) {
         o -= 1;
         const b = t.byteAt(o);
-        if (b == close) nest += 1 else if (b == open) {
-            if (nest == 0) depth -= 1 else nest -= 1;
+        if (b == pair[1]) d += 1 else if (b == pair[0]) {
+            if (d == 0) return o;
+            d -= 1;
         }
     }
-    // Matching close.
-    var c = o + 1;
-    nest = 0;
+    return null;
+}
+
+fn matchForward(t: *const Text, open_pos: usize, pair: [2]u8) ?usize {
+    var c = open_pos + 1;
+    var d: usize = 0;
     while (c < t.len()) : (c += 1) {
         const b = t.byteAt(c);
-        if (b == open) nest += 1 else if (b == close) {
-            if (nest == 0) break;
-            nest -= 1;
+        if (b == pair[0]) d += 1 else if (b == pair[1]) {
+            if (d == 0) return c;
+            d -= 1;
         }
-    } else return null;
+    }
+    return null;
+}
 
+/// The range for the pair opening at `o`.
+fn pairFrom(t: *const Text, o: usize, pairs: []const [2]u8, scope: Scope) ?Range {
+    const pair = pairs[pairIndex(pairs, t.byteAt(o), 0).?];
+    const c = matchForward(t, o, pair) orelse return null;
     if (scope == .around) return .{ .start = o, .end = c + 1 };
     const lo = t.lineOf(o);
     const lc = t.lineOf(c);
@@ -142,6 +231,29 @@ pub fn bracket(t: *const Text, pos: usize, open: u8, close: u8, scope: Scope, co
         return .{ .start = t.lineStart(lo + 1), .end = t.lineEnd(lc - 1), .linewise = true };
     }
     return .{ .start = o + 1, .end = c };
+}
+
+/// Not inside a pair: the first one opening after the cursor, else the
+/// last one closing before it.
+fn seekPair(t: *const Text, pos: usize, pairs: []const [2]u8, scope: Scope) ?Range {
+    const line = t.lineOf(pos);
+    const fwd_limit = t.lineEnd(@min(t.lineCount() - 1, line + seek_lines));
+    var i = pos;
+    while (i < fwd_limit) : (i += 1) {
+        if (pairIndex(pairs, t.byteAt(i), 0) != null) {
+            if (pairFrom(t, i, pairs, scope)) |r| return r;
+        }
+    }
+    const back_limit = t.lineStart(line -| seek_lines);
+    i = @min(pos, t.len());
+    while (i > back_limit) {
+        i -= 1;
+        if (pairIndex(pairs, t.byteAt(i), 1)) |pi| {
+            const o = matchBackward(t, i, pairs[pi]) orelse continue;
+            return pairFrom(t, o, pairs, scope);
+        }
+    }
+    return null;
 }
 
 fn isBlank(t: *const Text, from: usize, to: usize) bool {
@@ -312,6 +424,35 @@ test "quote objects" {
     // Cursor before any quote: the first pair after it.
     try testing.expectEqualStrings("a \\\"b", sliceOf(&t, quote(&t, 0, '"', .inner)));
     try testing.expectEqualStrings("c", sliceOf(&t, quote(&t, 0, '\'', .inner)));
+}
+
+test "objects seek the nearest pair, like mini.ai" {
+    var t = try Text.init(testing.allocator, "x = 1; foo(a, b) + [c]\nbar(d)");
+    defer t.deinit(testing.allocator);
+    // Not inside: the next pair ahead.
+    try testing.expectEqualStrings("a, b", sliceOf(&t, bracket(&t, 0, '(', ')', .inner, 1)));
+    try testing.expectEqualStrings("c", sliceOf(&t, bracket(&t, 0, '[', ']', .inner, 1)));
+    try testing.expectEqualStrings("a, b", sliceOf(&t, anyBracket(&t, 0, .inner, 1)));
+    try testing.expectEqualStrings("c", sliceOf(&t, anyBracket(&t, 17, .inner, 1)));
+    // On the next line.
+    try testing.expectEqualStrings("d", sliceOf(&t, bracket(&t, 20, '(', ')', .inner, 1)));
+    // Nothing ahead: the previous pair.
+    try testing.expectEqualStrings("[c]", sliceOf(&t, bracket(&t, t.len() - 1, '[', ']', .around, 1)));
+
+    // `b`: the innermost of any kind around the cursor, then outwards.
+    var n = try Text.init(testing.allocator, "f({ x: [1, 2] })");
+    defer n.deinit(testing.allocator);
+    try testing.expectEqualStrings("1, 2", sliceOf(&n, anyBracket(&n, 8, .inner, 1)));
+    try testing.expectEqualStrings(" x: [1, 2] ", sliceOf(&n, anyBracket(&n, 8, .inner, 2)));
+    try testing.expectEqualStrings("{ x: [1, 2] }", sliceOf(&n, anyBracket(&n, 8, .inner, 3)));
+    try testing.expectEqualStrings("[1, 2]", sliceOf(&n, anyBracket(&n, 12, .around, 1))); // on ']'
+
+    // Quotes: on a later line, and `q` for the nearest kind.
+    var q = try Text.init(testing.allocator, "x\nsay('hi', \"yo\")");
+    defer q.deinit(testing.allocator);
+    try testing.expectEqualStrings("yo", sliceOf(&q, quote(&q, 0, '"', .inner)));
+    try testing.expectEqualStrings("hi", sliceOf(&q, anyQuote(&q, 0, .inner)));
+    try testing.expectEqualStrings("yo", sliceOf(&q, anyQuote(&q, 13, .inner)));
 }
 
 test "bracket objects" {

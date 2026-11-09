@@ -1,4 +1,4 @@
-# edit: design
+# zile: design
 
 A modal text editor in Zig 0.17, rendered with raylib. It uses vim/neovim editing
 (operator then motion: `dw`, `ci"`) with Doom Emacs-style leader menus, and works
@@ -54,9 +54,28 @@ under it is a compile error.
 
 | keys | group / command | status |
 |---|---|---|
-| `SPC f s` | save file | done |
+| `SPC f s` | save file (asks for a name if it has none) | done |
+| `SPC f n` | new file (prompt prefilled with the current folder) | done |
+| `SPC f S` | save as (buffer adopts the new path; never overwrites) | done |
+| `SPC f R` | rename / move file (makes folders; LSP, git, language follow) | done |
+| `SPC f C` | copy file to a new path and open it | done |
+| `SPC f D` | delete file from disk (Yes/No picker), closes its buffer | done |
+| `SPC f y` / `SPC f Y` | copy relative / absolute path to the clipboard | done |
+| `ys{motion}{c}`, `yss{c}`, `ds{c}`, `cs{old}{new}`, visual `S{c}` | surround, nvim-surround style. `)` plain pair, `(` with inner spaces; `b` nearest bracket, `q` nearest quote, `t` tag (delete/change); other punctuation wraps with itself. `ds`/`cs` seek the nearest pair like text objects. `s` after other operators is still snipe | done |
+| `s…<Tab>` / `/…<Tab>` | cursors on every match (on screen / in the file), each selected: `c` changes all, `<Esc>` leaves plain cursors | done |
+| visual `I` / `A` | a cursor on each selected line, typing at its start / end | done |
+| `qn` `qN` `qs` `qa` | cursor + next / previous match of the word (or selection), skip a match, all matches | done |
+| `qj` `qk`, visual `qI` `qA` | cursor + move down / up; cursors at line starts / ends without inserting | done |
+| `qu` `qq`, `<Esc>` in normal | remove the last cursor; remove all | done |
+| `Q{reg}` … `Q`, `@{reg}` | record / play a macro (`q` is the multicursor menu) | done |
+| `SPC t p` | toggle autopairs (on by default): `(` → `()`, closers and quotes step over, quotes skip word neighbors, `<CR>` in `{}` opens a block | done |
+| `SPC g g` | git menu (plain-English actions: commit, push, pull, branches, changed files, set remote, ...) | done |
+| `SPC g c` / `SPC g b` / `SPC g s` | commit all (saves, prompts for a message) / switch or create branch / changed files | done |
+| `SPC g r` / `SPC g n` / `SPC g p` / `SPC g R` | git: restore hunk / next / previous change / reload HEAD | done |
+| `SPC t g` / `SPC t r` / `SPC t d` | toggles: ghost lines / relative numbers / diagnostic messages (fields of `Editor.Options`, one comptime `toggle(field)` command each) | done |
 | `SPC q q` / `SPC q s` / `SPC q Q` | quit (refuses if any buffer is unsaved) / save all and quit / quit without saving | done |
-| `SPC SPC`, `SPC .`, `SPC f f` | find file (+ create) | done (`SPC .`/`SPC f f` to become a directory browser) |
+| `SPC SPC`, `SPC f f` | find file in project (fuzzy, + create) | done |
+| `SPC .`, `SPC f e` | explore files (browser): one folder at a time, starting at the current file's folder. `Enter`/`/` on a folder goes in, `Enter` on a file opens it, `<BS>` on an empty query goes up (selecting where you came from), `~` home, `/` on an empty query the root; a new name offers "Create" | done |
 | `SPC ,`, `SPC b b` / `SPC b k` | switch / kill buffer | done |
 | `SPC b n` / `SPC b p` | next / previous buffer | done |
 | `SPC :` | command picker (M-x) | done |
@@ -132,6 +151,22 @@ macros. Modern parts:
   selection. Motions are pure functions, so multiple cursors only add a loop.
 - **Which-key popup** for pending prefixes, generated from the keymap and
   command docs (see Keybindings).
+- **Multicursor (done):** extra cursors live in `Editor.cursors`; the primary
+  is `view`. A command's keys are collected until it completes (idle again, or
+  in insert mode) and then replayed at every extra cursor from the mode the
+  command began in, so every motion, operator, text object, surround and
+  `.` works per cursor with no per-command code; in insert mode each key
+  replays at once, so typing shows everywhere live. `insertAt`/`delete`
+  shift stored cursors. Commands marked `once` (undo/redo, `.`, macros,
+  cursor management) and all leader commands run at the primary only; `.`
+  and macros still reach every cursor because their queued keys replay.
+  Replays don't write registers' history for `.` and skip LSP completion.
+  Undo/redo and switching buffers drop the extra cursors.
+- **Seeking pairs, like mini.ai (done):** bracket and quote objects use the
+  pair around the cursor; outside one they jump to the next pair ahead (up to
+  50 lines), else the previous one. `ib`/`ab` is the nearest of `()` `[]` `{}`
+  and `iq`/`aq` the nearest of `"` `'` `` ` ``; `i(`, `i[`, `i{`, `i<`, `i"` and so on are
+  one kind each, and they seek too.
 - **Tree-sitter text objects (done):** `if`/`af` function, `ic`/`ac`
   class/struct, `ia`/`aa` argument (`syntax/objects.zig`). The grammars don't
   ship textobject queries, so each language lists its function/class/list
@@ -210,6 +245,40 @@ scrolling, `zz`, clicks and popups treat a closed fold as one line. Linewise
 operators extend to whole folds (`dd` on a fold deletes it); jumps (search,
 `n`, `gd`, pickers) open the folds they land in; insert mode opens the fold.
 Keys: `zc zo zO za zR zM zd zf`.
+
+## Git and ghost lines
+
+Only inside a git repository (`git rev-parse --show-toplevel`, checked the
+first time a file opens). Each tracked buffer keeps its HEAD version
+(`git show HEAD:path`, normalized like `Buffer.load`) and a line diff against
+it (`git/diff.zig`: common prefix/suffix trimmed, Myers on the middle,
+recomputed before each key / frame when the buffer changed).
+
+- **Gutter:** green bar for added lines, yellow for changed; with ghost lines
+  off, a red tick where lines were deleted.
+- **Ghost lines** (`SPC t g` toggles, on by default): the old HEAD lines of
+  changed/deleted hunks are shown inline below the new lines, tinted red. They
+  are real rows: `j`/`k` walk onto them, `h l 0 ^ $` move within them,
+  `yy`/`Y`/`V`+`y` yank them; `w b e W B E`, `f t F T ; ,`, `/ ? n N` and
+  snipe all reach into them (search scans rows in file order, including inside
+  closed folds, which it opens). Editing commands are refused with a hint and
+  any other command returns to the text. They are never written to the file.
+- **Rows:** `Editor.Row` = text line or ghost line (`ghost` = index into the
+  hunk's old lines, shown before text line `line`). `nextRow`/`prevRow`/
+  `stepRows`/`rowsFrom` handle folds and ghosts together; scrolling, `zz`,
+  clicks, the cursor and the renderer all use them.
+- **Keys:** `SPC t g` toggle ghost lines, `SPC g r` restore the hunk at the
+  cursor from HEAD (undoable), `SPC g n`/`SPC g p` next/previous change,
+  `SPC g R` reload HEAD (after committing outside the editor).
+- **Simple git UI** (deliberately not magit): `SPC g g` is a picker of
+  actions in words. Commit = save open files, `git add -A`, `git commit -m`
+  (message from a prompt box). Push = `git push -u origin HEAD` (sets up
+  tracking the first time). Pull = `git pull --ff-only` (never a surprise
+  merge). Branches picker with a "Create branch" row. Changed files picker from
+  `git status`. Set remote prompts for origin's URL (prefilled). Commands run in
+  the background (`git/Job.zig`) and report one readable line; after a pull or
+  branch switch, unmodified buffers reload from disk.
+- Next: stage individual hunks, blame, diff against the index.
 
 ## Search
 
@@ -336,7 +405,7 @@ src/terminal/
 
 ```
 zig build test                                        # headless core tests
-EDIT_TEST_KEYS='3jwi// hi<Esc><Space>f' EDIT_TEST_SCREENSHOT=/tmp/shot.png zig build run -- file.zig
+ZILE_TEST_KEYS='3jwi// hi<Esc><Space>f' ZILE_TEST_SCREENSHOT=/tmp/shot.png zig build run -- file.zig
 ```
-`EDIT_TEST_KEYS` feeds key notation at startup; `EDIT_TEST_SCREENSHOT` saves a
+`ZILE_TEST_KEYS` feeds key notation at startup; `ZILE_TEST_SCREENSHOT` saves a
 PNG of the first frames and exits.

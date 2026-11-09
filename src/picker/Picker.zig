@@ -40,6 +40,9 @@ preview: sources.Preview = .{},
 preview_for: ?u32 = null,
 /// For match highlighting in the view.
 pos_scratch: fuzzy.PositionScratch = .{},
+/// Item text to select once the results arrive (owned), e.g. the folder the
+/// file browser just came up from.
+want_select: ?[]u8 = null,
 
 pub fn create(ed: *Editor, kind: Kind, query: []const u8) !*Picker {
     const gpa = ed.gpa;
@@ -59,6 +62,7 @@ pub fn destroy(p: *Picker) void {
     if (p.shown != p.engine) p.shown.destroy();
     p.engine.destroy();
     p.query.deinit(gpa);
+    if (p.want_select) |w| gpa.free(w);
     p.preview.text.deinit(gpa);
     p.preview.styles.deinit(gpa);
     gpa.destroy(p);
@@ -89,7 +93,36 @@ pub fn activeQuery(p: *const Picker) []const u8 {
 }
 
 pub fn title(p: *const Picker) []const u8 {
+    if (p.kind == .browse) return p.ed.browse_label.items;
     return sources.title(p.kind);
+}
+
+/// Refills the source from scratch with an empty query (the file browser
+/// changed folder), then selects the item `select`, if given.
+pub fn restart(p: *Picker, select: ?[]const u8) !void {
+    p.query.clear();
+    p.kind = p.base;
+    const e = try p.startEngine(p.kind, "");
+    // Keep showing the current results until the new engine has some.
+    if (p.engine != p.shown) p.engine.destroy();
+    p.engine = e;
+    p.selected = 0;
+    p.top = 0;
+    if (p.want_select) |w| p.ed.gpa.free(w);
+    p.want_select = if (select) |s| try p.ed.gpa.dupe(u8, s) else null;
+}
+
+fn applyWantSelect(p: *Picker) void {
+    const want = p.want_select orelse return;
+    if (!p.isCurrent() or !p.snap.done) return;
+    for (p.snap.slice(), 0..) |r, row| {
+        if (std.mem.eql(u8, p.shown.items.get(r.index).text, want)) {
+            p.selected = row;
+            break;
+        }
+    }
+    p.ed.gpa.free(want);
+    p.want_select = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,12 +164,14 @@ pub fn poll(p: *Picker) void {
         p.snap = fresh;
         p.preview_for = null;
         if (p.selected >= p.rowCount()) p.selected = p.rowCount() -| 1;
+        p.applyWantSelect();
         return;
     }
     if (p.engine.poll(&p.snap)) {
         const rows = p.rowCount();
         if (p.selected >= rows) p.selected = rows -| 1;
     }
+    p.applyWantSelect();
 }
 
 /// Blocks until results reflect the current query (used before accepting).

@@ -12,7 +12,9 @@ const Registers = @import("Registers.zig");
 
 pub const Range = textobjects.Range;
 
-pub const Operator = enum { delete, change, yank, indent, outdent, lowercase, uppercase, toggle_case, fold };
+pub const Operator = enum { delete, change, yank, indent, outdent, lowercase, uppercase, toggle_case, fold,
+    /// `ys`: waits for the pair character, then surrounds the range.
+    surround };
 
 /// How a motion's span becomes a range (`:h exclusive`, `:h linewise`).
 pub const MotionKind = enum { exclusive, inclusive, linewise };
@@ -53,6 +55,7 @@ pub fn apply(ed: *Editor, op: Operator, range: Range, register: ?u8) !void {
         return;
     }
     switch (op) {
+        .surround => return ed.awaitSurroundChar(r),
         .yank => {
             try yank(ed, r, register, .yank);
             if (r.start < ed.view.cursor) {
@@ -91,6 +94,8 @@ pub fn apply(ed: *Editor, op: Operator, range: Range, register: ?u8) !void {
 
 /// Copies the range into a register (linewise ranges get a trailing newline).
 fn yank(ed: *Editor, r: Range, register: ?u8, kind: Registers.Kind) !void {
+    // With several cursors the registers keep what the primary cursor yanked.
+    if (ed.replaying) return;
     const body = ed.text().slice(r.start, r.end);
     if (!r.linewise) return ed.registers.store(register, kind, body, false);
     const with_nl = try std.mem.concat(ed.gpa, u8, &.{ body, "\n" });

@@ -102,7 +102,8 @@ fn drawList(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: f32
         const avail = list_cols -| (2 + detail_cells + @as(usize, if (detail_cells > 0) 2 else 0));
         var pos_buf: [Engine.max_query_len]usize = undefined;
         const positions = fuzzy.positions(query, item.text, &p.pos_scratch, &pos_buf) orelse &.{};
-        drawHighlighted(font, theme, item.text, positions, tx, y, avail, theme.fg);
+        const is_folder = p.kind == .browse and std.mem.endsWith(u8, item.text, "/");
+        drawHighlighted(font, theme, item.text, positions, tx, y, avail, if (is_folder) theme.whichkey_group else theme.fg);
     }
 
     if (rows == 0 and p.isCurrent() and p.snap.done) {

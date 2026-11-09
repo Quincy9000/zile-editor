@@ -7,6 +7,8 @@ comptime {
     _ = @import("core/motions.zig");
     _ = @import("core/Buffer.zig");
     _ = @import("core/Folds.zig");
+    _ = @import("git/diff.zig");
+    _ = @import("git/Git.zig");
     _ = @import("core/History.zig");
     _ = @import("core/textobjects.zig");
     _ = @import("Registers.zig");
