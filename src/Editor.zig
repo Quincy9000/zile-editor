@@ -261,6 +261,11 @@ run_started: Io.Timestamp = .zero,
 run_reported: bool = true,
 /// Errors found in the last run's output (`SPC r e`).
 run_errors: std.ArrayList(run_errors_mod.Error) = .empty,
+/// The command editor (`SPC r c`): a small floating window with its own
+/// scratch buffer, focused while open. Full vim editing works in it.
+cmd_float: ?*Windows.Window = null,
+/// The window to return to when the command editor closes.
+cmd_return: ?*Windows.Window = null,
 /// Which terminal the popup shows, if open. Keys go to it.
 popup: ?enum { shell, run } = null,
 /// The popup's size, kept current by the UI (new terminals start at it).
@@ -376,6 +381,12 @@ pub fn init(gpa: Allocator, io: Io) !Editor {
 
 pub fn deinit(ed: *Editor) void {
     if (ed.picker) |p| p.destroy();
+    if (ed.cmd_float) |w| {
+        // Its buffer isn't in `buffers`.
+        if (w != ed.window) w.buffer.deinit(ed.gpa) else ed.buffer.deinit(ed.gpa);
+        ed.gpa.destroy(if (w != ed.window) w.buffer else ed.buffer);
+        ed.gpa.destroy(w);
+    }
     if (ed.shell) |t| t.destroy();
     if (ed.run) |t| t.destroy();
     if (ed.run_command) |cmd| ed.gpa.free(cmd);
@@ -492,6 +503,7 @@ pub fn text(ed: *Editor) *Text {
 
 pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
     if (ed.popupKey(ev)) return;
+    if (ed.cmdFloatKey(ev)) return;
     if (ed.macro_register != null) ed.macro_keys.append(ed.gpa, ev) catch {};
     ed.processKey(ev);
     // Macro playback and `.` queue keys; a runaway macro (one that calls
@@ -682,6 +694,12 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 has_count = true;
             };
             const register = ed.register;
+            // The command editor holds its own scratch buffer: leader menus
+            // (buffers, windows, files...) would pull it out from under it.
+            if (ed.cmd_float != null and seq.len > 1 and seq[0].key == .codepoint and seq[0].key.codepoint == ' ') {
+                ed.resetCommand();
+                return ed.setMessage(.info, "close the command editor first (<Esc> in normal mode)", .{});
+            }
             // Leader menus, undo, `.` and the like act once, not per cursor.
             if (cmd.jump and !ed.replaying and (ed.mode == .normal or ed.mode == .visual)) ed.pushJump();
             if (cmd.once or (seq.len > 1 and seq[0].key == .codepoint and seq[0].key.codepoint == ' ')) ed.multi_once = true;
@@ -2052,8 +2070,15 @@ pub fn scrollToCursor(ed: *Editor) void {
     ed.setTop(top);
     if (cur.before(top) or ed.rowsFrom(top, cur, so) < so) {
         ed.setTop(ed.stepRows(cur, -@as(isize, @intCast(so))));
-    } else if (ed.rowsFrom(top, cur, v.rows) + so >= v.rows) {
-        ed.setTop(ed.stepRows(cur, -@as(isize, @intCast(v.rows -| (so + 1)))));
+    } else {
+        // Keep `so` rows below the cursor, but only rows that exist: near
+        // the end of the text (or when it all fits) there is nothing to
+        // scroll for, as in vim.
+        const last: Row = .{ .line = ed.visibleLine(ed.text().lineCount() -| 1) };
+        const below = @min(so, ed.rowsFrom(cur, last, so));
+        if (ed.rowsFrom(top, cur, v.rows) + below >= v.rows) {
+            ed.setTop(ed.stepRows(cur, -@as(isize, @intCast(v.rows -| (below + 1)))));
+        }
     }
 
     const col = if (ed.ghost) |g| g.col else ed.cursorCol();
@@ -2611,8 +2636,65 @@ fn popupKey(ed: *Editor, ev: KeyEvent) bool {
     return true;
 }
 
-/// `SPC r c` (empty prompt) / `SPC r r` (prefilled with the last command).
+/// `SPC r c`: opens the command editor, a floating vim buffer for the
+/// command (any number of lines). Insert mode first; in normal mode <CR>
+/// runs it and <Esc> cancels.
+pub fn openCommandEditor(ed: *Editor) !void {
+    if (ed.cmd_float != null) return;
+    const b = try ed.gpa.create(Buffer);
+    errdefer ed.gpa.destroy(b);
+    b.* = try Buffer.initEmpty(ed.gpa);
+    errdefer b.deinit(ed.gpa);
+    const w = try ed.gpa.create(Windows.Window);
+    w.* = .{ .buffer = b, .view = .{ .rows = ed.view.rows, .cols = ed.view.cols }, .node = undefined };
+    ed.cmd_float = w;
+    ed.cmd_return = ed.window;
+    ed.focusWindow(w);
+    ed.setMode(.insert);
+}
+
+/// The command editor's text, as one shell script. Caller frees.
+fn commandEditorText(ed: *Editor) ![]u8 {
+    const t = ed.text();
+    return ed.gpa.dupe(u8, std.mem.trim(u8, t.slice(0, t.len()), " \t\n"));
+}
+
+/// Closes the command editor, back to the window it was opened from.
+pub fn closeCommandEditor(ed: *Editor) void {
+    const w = ed.cmd_float orelse return;
+    if (ed.mode != .normal) ed.setMode(.normal);
+    ed.cursors.clearRetainingCapacity();
+    const back = ed.cmd_return.?;
+    ed.focusWindow(back);
+    ed.forgetJumps(w.buffer);
+    w.buffer.deinit(ed.gpa);
+    ed.gpa.destroy(w.buffer);
+    ed.gpa.destroy(w);
+    ed.cmd_float = null;
+    ed.cmd_return = null;
+}
+
+/// In the command editor's normal mode: <CR> runs, <Esc> cancels.
+fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
+    if (ed.cmd_float == null or ed.window != ed.cmd_float.? or ed.mode != .normal or !ed.isIdle()) return false;
+    if (ed.cursors.items.len > 0) return false; // <Esc> first drops extra cursors
+    if (ev.mods.any() or ev.key != .special) return false;
+    switch (ev.key.special) {
+        .escape => ed.closeCommandEditor(),
+        .enter => {
+            const cmd = ed.commandEditorText() catch return true;
+            defer ed.gpa.free(cmd);
+            ed.closeCommandEditor();
+            if (cmd.len > 0) ed.startRun(cmd) catch |err| ed.setMessage(.err, "could not run: {s}", .{@errorName(err)});
+        },
+        else => return false,
+    }
+    return true;
+}
+
+/// `SPC r r`: the code runner's prompt, prefilled with the last command.
 pub fn runPrompt(ed: *Editor, runner: bool) !void {
+    if (!runner) return ed.openCommandEditor();
     ed.startSearch(true, if (runner) .run_runner else .run_command);
     if (!runner) return;
     const last = ed.loadRunnerCommand() orelse return;
@@ -4307,7 +4389,7 @@ test "run: SPC r c shows output and how it ended; SPC r r remembers its command"
     ed.git_checked = true;
     ed.run_memory_path = try std.fs.path.join(gpa, &.{ dir, "run-commands" });
 
-    try ed.feed("<Space>rcecho hi; exit 4<CR>");
+    try ed.feed("<Space>rcecho hi; exit 4<Esc><CR>");
     try testing.expectEqual(.run, ed.popup.?);
     waitForRun(&ed);
     try testing.expectEqual(4, ed.run.?.exit_code);
@@ -4362,7 +4444,7 @@ test "run errors: a failing run lists its errors; e and SPC r e open them; Enter
     defer ed.deinit();
     ed.git_checked = true;
     ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
-    try ed.feed("<Space>rcprintf 'src/main.zig:4:7: error: boom\\nnot/a/file.zig:1:1: error: x\\n'; exit 1<CR>");
+    try ed.feed("<Space>rcprintf 'src/main.zig:4:7: error: boom\\nnot/a/file.zig:1:1: error: x\\n'; exit 1<Esc><CR>");
     waitForRun(&ed);
     try testing.expectEqual(1, ed.run_errors.items.len); // only real files count
     try testing.expectEqual(.err, ed.message.kind);
@@ -4376,4 +4458,33 @@ test "run errors: a failing run lists its errors; e and SPC r e open them; Enter
     try testing.expectEqual(6, ed.view.cursor - ed.text().lineStart(3));
     try ed.feed("<Space>re");
     try testing.expectEqual(.run_errors, ed.picker.?.kind);
+}
+
+test "command editor: multi-line with vim editing; Enter runs, Esc cancels" {
+    var ed = try testEditor("main text");
+    defer ed.deinit();
+    ed.git_checked = true;
+    ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
+    const main_buffer = ed.buffer;
+
+    try ed.feed("<Space>rc");
+    try testing.expect(ed.cmd_float != null);
+    try testing.expectEqual(.insert, ed.mode);
+    try ed.feed("echo one<CR>echo two<Esc>");
+    try ed.feed("ggA; echo three<Esc>"); // plain vim editing
+    try expectText(&ed, "echo one; echo three\necho two");
+    try ed.feed("<Space>bn"); // leader menus wait until it closes
+    try testing.expect(ed.cmd_float != null);
+    try ed.feed("<CR>"); // normal mode: run it
+    try testing.expectEqual(null, ed.cmd_float);
+    try testing.expectEqual(main_buffer, ed.buffer);
+    try expectText(&ed, "main text");
+    waitForRun(&ed);
+    const out = try ed.run.?.screenText(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "one\nthree\ntwo\n"));
+
+    try ed.feed("q<Space>rcecho nope<Esc><Esc>"); // Esc in normal mode cancels
+    try testing.expectEqual(null, ed.cmd_float);
+    try testing.expectEqualStrings("echo one; echo three\necho two", ed.run_command.?);
 }

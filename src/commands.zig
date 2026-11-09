@@ -248,7 +248,7 @@ const base = [_]Command{
     .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) , .jump = true },
     .{ .name = "terminal_toggle", .doc = "Terminal popup", .run = termCmd(.toggle), .once = true },
     .{ .name = "run_runner", .doc = "Code runner (repeat with Enter)", .run = termCmd(.runner), .once = true },
-    .{ .name = "run_command", .doc = "Run a command", .run = termCmd(.command), .once = true },
+    .{ .name = "run_command", .doc = "Run a command (multi-line editor)", .run = termCmd(.command), .once = true },
     .{ .name = "run_again", .doc = "Run the runner command again", .run = termCmd(.again), .once = true },
     .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
     .{ .name = "run_errors", .doc = "Errors from the last run", .run = termCmd(.errors), .once = true },

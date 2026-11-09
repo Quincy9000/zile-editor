@@ -65,9 +65,17 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
         .cell_h = @intFromFloat(font.cell_h),
     };
     if (ed.popupTerminal()) |t| t.resize(ed.term_size.cols, ed.term_size.rows, ed.term_size.cell_w, ed.term_size.cell_h);
+    if (ed.cmd_float) |f| {
+        f.rect = cmdFloatRect(ed, font, screen);
+        const fl = floatLayout(ed, font, f);
+        if (f == ed.window) ed.setViewSize(fl.rows, fl.cols) else {
+            f.view.rows = fl.rows;
+            f.view.cols = fl.cols;
+        }
+    }
     for (ed.window_list.items) |w| {
         const wl = windowLayout(ed, font, w);
-        if (w == ed.window) {
+        if (w == ed.window and ed.cmd_float == null) {
             ed.setViewSize(wl.rows, wl.cols);
         } else {
             w.view.rows = wl.rows;
@@ -106,8 +114,9 @@ extern fn rlTranslatef(x: f32, y: f32, z: f32) void;
 pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
     rl.ClearBackground(theme.bg);
     for (ed.window_list.items) |w| drawWindow(ed, font, theme, w);
+    if (ed.cmd_float) |f| drawCmdFloat(ed, font, theme, f, l);
     // Popups at the focused window's cursor.
-    const fl = windowLayout(ed, font, ed.window);
+    const fl = if (ed.cmd_float != null and ed.window == ed.cmd_float.?) floatLayout(ed, font, ed.window) else windowLayout(ed, font, ed.window);
     rlPushMatrix();
     rlTranslatef(fl.x0, fl.y0, 0);
     drawHover(ed, font, theme, fl);
@@ -185,6 +194,55 @@ fn keyCells(k: keys.KeyEvent) usize {
 
 pub fn rect(x: f32, y: f32, w: f32, h: f32, color: rl.Color) void {
     rl.DrawRectangleRec(.{ .x = x, .y = y, .width = w, .height = h }, color);
+}
+
+/// The command editor: a box growing with its text (3 to 16 lines), at the
+/// upper third of the screen.
+fn cmdFloatRect(ed: *Editor, font: *const Font, screen: Layout) Editor.Windows.Rect {
+    const lines = ed.windowBuffer(ed.cmd_float.?).text.lineCount();
+    const rows: f32 = @floatFromInt(std.math.clamp(lines + 1, 3, 16));
+    const w = @max(@min(@floor(screen.width * 0.7 / font.cell_w), 120), 30) * font.cell_w;
+    const h = (rows + 1) * font.cell_h; // + the title row
+    return .{ .x = @floor((screen.width - w) / 2), .y = @floor(@max(screen.status_y / 3 - h / 2, font.cell_h)), .w = w, .h = h };
+}
+
+fn floatLayout(ed: *Editor, font: *const Font, f: *Editor.Windows.Window) Layout {
+    const lines = ed.windowBuffer(f).text.lineCount();
+    const gutter_cols = @max(std.math.log10_int(lines) + 1, 2) + 2;
+    const text_x = @as(f32, @floatFromInt(gutter_cols)) * font.cell_w;
+    const text_h = f.rect.h - font.cell_h;
+    return .{
+        .gutter_cols = gutter_cols,
+        .text_x = text_x,
+        .rows = @max(@as(usize, @intFromFloat(text_h / font.cell_h)), 1),
+        .cols = @max(@as(usize, @intFromFloat(@max(f.rect.w - text_x, 0) / font.cell_w)), 1),
+        .status_y = text_h,
+        .width = f.rect.w,
+        .x0 = f.rect.x,
+        .y0 = f.rect.y + font.cell_h,
+    };
+}
+
+/// The command editor: title, then the buffer drawn like any window.
+fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.Windows.Window, screen: Layout) void {
+    const r = f.rect;
+    rect(0, 0, screen.width, screen.status_y, theme.backdrop);
+    rect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, theme.popup_border);
+    rect(r.x, r.y, r.w, r.h, theme.bg);
+    rect(r.x, r.y, r.w, font.cell_h, theme.status_bg);
+    _ = font.drawText("Run command", r.x + font.cell_w, r.y, theme.mode_picker);
+    const hint = if (ed.mode == .normal) "Enter runs   Esc cancels" else "Esc, then Enter runs";
+    _ = font.drawText(hint, r.x + r.w - @as(f32, @floatFromInt(cells(hint) + 1)) * font.cell_w, r.y, theme.status_dim);
+
+    const fl = floatLayout(ed, font, f);
+    rl.BeginScissorMode(@intFromFloat(r.x), @intFromFloat(r.y), @intFromFloat(@ceil(r.w)), @intFromFloat(@ceil(r.h)));
+    defer rl.EndScissorMode();
+    const peek: ?Editor.Peek = if (f == ed.window) null else ed.peekWindow(f);
+    defer if (peek) |p| ed.unpeekWindow(p);
+    rlPushMatrix();
+    defer rlPopMatrix();
+    rlTranslatef(fl.x0, fl.y0, 0);
+    drawText(ed, font, theme, fl, f == ed.window);
 }
 
 /// The terminal popup: most of the screen, centered over the text, on whole cells.
@@ -479,7 +537,7 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
     const typed = ed.showcmdKeys();
     try keys.formatSequenceDisplay(typed, w);
     if (typed.len > 0) try w.writeAll("-   ");
-    if (ed.buffers.items.len > 1) try w.print("[{d}/{d}]  ", .{ ed.bufferIndex(ed.buffer) + 1, ed.buffers.items.len });
+    if (ed.buffers.items.len > 1 and ed.cmd_float == null) try w.print("[{d}/{d}]  ", .{ ed.bufferIndex(ed.buffer) + 1, ed.buffers.items.len });
 
     const line = ed.cursorLine();
     const total = ed.text().lineCount();

@@ -144,6 +144,11 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
     const wheel = rl.GetMouseWheelMove();
     const clicked = rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
     if (wheel == 0 and !clicked) return;
+    // The command editor keeps focus while it is open.
+    if (ed.cmd_float != null) {
+        if (wheel != 0) ed.scrollLines(@intFromFloat(-wheel * 3));
+        return;
+    }
     // The terminal popup takes the wheel (scrollback) while it is open.
     if (ed.popupTerminal()) |t| {
         if (wheel != 0) t.scroll(@intFromFloat(-wheel * 3));

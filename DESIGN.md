@@ -101,7 +101,8 @@ under it is a compile error.
 | `SPC w v` / `SPC w s` / `SPC w hjkl` / `SPC w d` | splits | layout |
 | `SPC o t`, `<C-\>` | terminal popup: your `$SHELL`, kept running while hidden; every key goes to it; `<C-\>` hides; `<S-PageUp/Down>` / wheel scroll back; `<C-S-v>` pastes | done |
 | `SPC r r` | code runner: prompt prefilled with this project's last command (remembered across restarts), so `<CR>` runs it again | done |
-| `SPC r c`, `SPC r R`, `SPC r o` | run any command (empty prompt); run the runner command again without asking; show the last run | done |
+| `SPC r c` | command editor: a floating vim buffer (any number of lines, full editing: motions, operators, surround, multicursor, undo); starts in insert mode; in normal mode `<CR>` runs it via `$SHELL -c`, `<Esc>` cancels; leader menus wait until it closes | done |
+| `SPC r R`, `SPC r o` | run the runner command again without asking; show the last run | done |
 | in a finished run | `r` run again, `e` errors picker, `q` / `<Esc>` close, `j` / `k` scroll | done |
 | `SPC r e` | errors from the last run (`path:line:col` from zig/gcc/clang/go, rust `-->`, python `File "…", line N`), previewed; `<CR>` jumps | done |
 | `SPC h k` / `SPC h f` / `SPC h h` | describe key / command, search help | picker |
