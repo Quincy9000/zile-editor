@@ -51,6 +51,9 @@ pub const Command = struct {
     once: bool = false,
     /// A jump: the place it leaves goes on the jumplist (`<C-o>` returns).
     jump: bool = false,
+    /// Run from a menu (`SPC w r l`), the menu stays open for the next key
+    /// (`l l h`), until a key it doesn't have (that key then acts as usual).
+    sticky: bool = false,
     /// Works while the cursor is on a ghost line (otherwise the cursor
     /// returns to the text first, or the command is refused if it edits).
     ghost: bool = false,
@@ -262,6 +265,7 @@ const base = [_]Command{
     .{ .name = "claude_ask", .doc = "Ask Claude about the selection", .run = claudeCmd(.ask), .once = true },
     .{ .name = "claude_accept", .doc = "Accept Claude's change", .run = claudeCmd(.accept), .once = true },
     .{ .name = "claude_reject", .doc = "Reject Claude's change", .run = claudeCmd(.reject), .once = true },
+    .{ .name = "terminal_window", .doc = "Terminal here (in this window)", .run = termCmd(.window), .once = true },
     .{ .name = "terminal_toggle", .doc = "Terminal popup", .run = termCmd(.toggle), .once = true },
     .{ .name = "run_runner", .doc = "Code runner (repeat with Enter)", .run = termCmd(.runner), .once = true },
     .{ .name = "run_command", .doc = "Run a command (multi-line editor)", .run = termCmd(.command), .once = true },
@@ -292,10 +296,11 @@ const base = [_]Command{
     .{ .name = "window_close", .doc = "Close window", .run = windowCmd(.close), .once = true },
     .{ .name = "window_only", .doc = "Close other windows", .run = windowCmd(.only), .once = true },
     .{ .name = "window_balance", .doc = "Equal sizes", .run = windowCmd(.balance), .once = true },
-    .{ .name = "window_wider", .doc = "Wider", .run = windowCmd(.{ .resize = .{ .horizontal, 0.05 } }), .once = true },
-    .{ .name = "window_narrower", .doc = "Narrower", .run = windowCmd(.{ .resize = .{ .horizontal, -0.05 } }), .once = true },
-    .{ .name = "window_taller", .doc = "Taller", .run = windowCmd(.{ .resize = .{ .vertical, 0.05 } }), .once = true },
-    .{ .name = "window_shorter", .doc = "Shorter", .run = windowCmd(.{ .resize = .{ .vertical, -0.05 } }), .once = true },
+    .{ .name = "window_border_left", .doc = "Border left", .run = windowCmd(.{ .border = .left }), .once = true, .sticky = true },
+    .{ .name = "window_border_down", .doc = "Border down", .run = windowCmd(.{ .border = .down }), .once = true, .sticky = true },
+    .{ .name = "window_border_up", .doc = "Border up", .run = windowCmd(.{ .border = .up }), .once = true, .sticky = true },
+    .{ .name = "window_border_right", .doc = "Border right", .run = windowCmd(.{ .border = .right }), .once = true, .sticky = true },
+    .{ .name = "window_balance_stay", .doc = "Equal sizes", .run = windowCmd(.balance), .once = true, .sticky = true },
     .{ .name = "command_picker", .doc = "Run a command", .run = openPicker(.commands) },
     .{ .name = "resume_picker", .doc = "Resume last picker", .run = resumePicker },
     .{ .name = "smart_close", .doc = "Close (window, else buffer, else quit)", .run = smartClose, .once = true },
@@ -1429,12 +1434,13 @@ fn claudeCmd(comptime action: enum { panel, send, ask, accept, reject }) Handler
     }.run;
 }
 
-fn termCmd(comptime action: enum { toggle, runner, command, again, output, errors }) Handler {
+fn termCmd(comptime action: enum { toggle, window, runner, command, again, output, errors }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
                 .toggle => try ed.toggleShell(),
+                .window => ed.openTermWindow() catch |err| ed.setMessage(.err, "could not start the shell: {s}", .{@errorName(err)}),
                 .runner => try ed.runPrompt(true),
                 .command => try ed.runPrompt(false),
                 .again => try ed.runAgain(),
@@ -1494,7 +1500,7 @@ const WindowAction = union(enum) {
     close,
     only,
     balance,
-    resize: struct { Editor.Windows.Axis, f32 },
+    border: Editor.Windows.Dir,
 };
 
 fn windowCmd(comptime action: WindowAction) Handler {
@@ -1508,7 +1514,12 @@ fn windowCmd(comptime action: WindowAction) Handler {
                 .close => ed.closeWindow(),
                 .only => try ed.onlyWindow(),
                 .balance => ed.windows.balance(),
-                .resize => |r| Editor.Windows.resize(ed.window, r[0], r[1] * @as(f32, @floatFromInt(c.count))),
+                .border => |d| {
+                    // Two columns (or one row) per press.
+                    const cells: f32 = if (d == .left or d == .right) 2 else 1;
+                    if (!ed.windows.moveBorder(ed.window, d, cells * @as(f32, @floatFromInt(c.count))))
+                        ed.setMessage(.info, "no border that way", .{});
+                },
             }
         }
     }.run;
@@ -1547,10 +1558,11 @@ fn smartClose(c: Context) !void {
     // A terminal panel (Claude) closes like a window, but doesn't count as
     // one of the code windows: the last code window hides the panel first.
     if (ed.window.term != null or ed.codeWindowCount() > 1) return ed.closeWindow();
-    for (ed.window_list.items) |w| if (w.term != null) {
+    for (ed.window_list.items) |w| if (w.term) |t| {
+        const claude = ed.isClaudeTerm(t);
         ed.focusWindow(w);
         ed.closeWindow();
-        ed.setMessage(.info, "Claude panel hidden (SPC a a shows it again)", .{});
+        if (claude) ed.setMessage(.info, "Claude panel hidden (SPC a a shows it again)", .{}) else ed.setMessage(.info, "terminal closed", .{});
         return;
     };
     if (ed.buffers.items.len > 1) {

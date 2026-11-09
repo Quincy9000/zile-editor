@@ -292,9 +292,9 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
     _ = font.drawText(title, r.x + cw, r.y, theme.status_fg);
     var right_buf: [96]u8 = undefined;
     const right, const right_color = if (ed.popup.? == .shell)
-        .{ "Ctrl-\\ hides", theme.status_dim }
+        .{ "Esc Esc hides", theme.status_dim }
     else if (t.isRunning())
-        .{ std.fmt.bufPrint(&right_buf, "running {d:.1}s   Ctrl-\\ hides", .{ed.runSeconds()}) catch "", theme.status_dim }
+        .{ std.fmt.bufPrint(&right_buf, "running {d:.1}s   Esc Esc hides", .{ed.runSeconds()}) catch "", theme.status_dim }
     else if (t.exit_code == 0)
         .{ "done   r: again   q: close", theme.diff_add }
     else
@@ -373,10 +373,14 @@ fn drawTermWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Edito
     if (is_claude) {
         const c = ed.claude.?;
         const status: []const u8 = if (c.ready) "connected" else "connecting…";
-        const hint = if (focused) "   Ctrl-\\ back to code" else "";
+        const hint = if (!focused) "" else if (w.term_normal) "   NORMAL (i types)" else "   Esc Esc: normal";
         var buf: [64]u8 = undefined;
         const right = std.fmt.bufPrint(&buf, "{s}{s}", .{ status, hint }) catch status;
         _ = font.drawText(right, r.x + r.w - @as(f32, @floatFromInt(cells(right) + 1)) * font.cell_w, r.y, if (c.ready) theme.diff_add else theme.status_dim);
+    }
+    if (!is_claude and focused) {
+        const hint: []const u8 = if (w.term_normal) "NORMAL (i types)" else "Esc Esc: normal";
+        _ = font.drawText(hint, r.x + r.w - @as(f32, @floatFromInt(cells(hint) + 1)) * font.cell_w, r.y, theme.status_dim);
     }
     if (r.x > 0) rect(r.x, r.y, 1, r.h, theme.popup_border);
     drawTerminalScreen(t, font, theme, r.x + font.cell_w, r.y + font.cell_h, focused);

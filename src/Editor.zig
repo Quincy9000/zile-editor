@@ -332,6 +332,8 @@ registers: Registers,
 register: ?u8 = null,
 awaiting_register: bool = false,
 awaiting_char: ?AwaitingChar = null,
+/// A menu kept open by a sticky command (`SPC w r` resize mode).
+sticky_menu: bool = false,
 /// Extra cursors (multicursor); the primary one is `view`. Each command
 /// typed at the primary is replayed at each of these (see `replayAtCursors`).
 cursors: std.ArrayList(Cursor) = .empty,
@@ -446,6 +448,10 @@ ai_unreachable: bool = false,
 claude: ?*Claude = null,
 /// The editor window to come back to from a terminal window.
 last_editor_window: ?*Windows.Window = null,
+/// When Esc last went to a terminal (a second one soon after leaves it).
+last_term_esc: Io.Timestamp = .zero,
+/// Shells in windows (`SPC o T`); closing a window ends its shell.
+shells: std.ArrayList(*Terminal) = .empty,
 /// When open buffers were last checked for changes on disk.
 last_disk_check: Io.Timestamp = .zero,
 /// What `SPC a i` asks about: a file and its selected lines.
@@ -552,6 +558,8 @@ pub fn deinit(ed: *Editor) void {
     ed.clearAiSuggestion();
     if (ed.ai) |g| g.destroy();
     if (ed.claude) |c| c.destroy();
+    for (ed.shells.items) |t| t.destroy();
+    ed.shells.deinit(ed.gpa);
     if (ed.claude_ask) |a| ed.gpa.free(a.path);
     for (ed.buffers.items) |b| {
         b.deinit(ed.gpa);
@@ -641,6 +649,7 @@ pub fn tick(ed: *Editor) void {
     ed.pollTerminals();
     ed.pollAi();
     ed.tickClaude();
+    ed.pollShellWindows();
     ed.highlightView();
     if (ed.picker) |p| {
         p.poll();
@@ -894,8 +903,25 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 .has_count = has_count,
                 .register = register,
             });
+            // A sticky command keeps its menu open: the prefix stays typed.
+            if (cmd.sticky and seq.len > 1 and ed.mode == .normal) {
+                ed.pending_len = seq.len - 1;
+                ed.sticky_menu = true;
+                // The typed-keys indicator shows the menu we're in.
+                const n = @min(ed.pending_len, ed.showcmd.len);
+                @memcpy(ed.showcmd[0..n], ed.pending[0..n]);
+                ed.showcmd_len = n;
+            } else ed.sticky_menu = false;
         },
         .none => {
+            // A key the open (sticky) menu doesn't have leaves it and then
+            // acts as usual.
+            if (ed.sticky_menu and seq.len > 1) {
+                ed.sticky_menu = false;
+                ed.pending_len = 0;
+                ed.count = 0;
+                return ed.handleKeyInner(ev);
+            }
             ed.pending_len = 0;
             ed.count = 0;
             // Unbound keys in insert and picker modes are text, including any
@@ -3106,6 +3132,47 @@ pub fn showRunOutput(ed: *Editor) void {
     ed.popup = .run;
 }
 
+/// Esc in a terminal: the first goes to the program at once (Claude's
+/// interrupt, vim); a second within a third of a second means "leave",
+/// and isn't sent. True for that second Esc.
+fn doubleEsc(ed: *Editor, t: *Terminal, ev: KeyEvent) bool {
+    if (ev.key != .special or ev.key.special != .escape or ev.mods.any()) return false;
+    const now = Io.Timestamp.now(ed.io, .awake);
+    const since = ed.last_term_esc.durationTo(now).nanoseconds;
+    if (ed.last_term_esc.nanoseconds != 0 and since < 350 * std.time.ns_per_ms) {
+        ed.last_term_esc = .zero;
+        return true;
+    }
+    ed.last_term_esc = now;
+    _ = t;
+    return false;
+}
+
+/// A key in a terminal window's normal mode; false lets the keymap have it.
+fn termNormalKey(ed: *Editor, t: *Terminal, ev: KeyEvent) bool {
+    const half: isize = @intCast(@max(1, t.rows / 2));
+    switch (ev.key) {
+        .codepoint => |cp| if (ev.mods.ctrl) switch (cp) {
+            'd' => t.scroll(half),
+            'u' => t.scroll(-half),
+            else => {},
+        } else switch (cp) {
+            ' ' => return false,
+            'i', 'a', 'I', 'A' => ed.window.term_normal = false,
+            'j' => t.scroll(1),
+            'k' => t.scroll(-1),
+            else => {},
+        },
+        .special => |sp| switch (sp) {
+            .enter => ed.window.term_normal = false,
+            .down => t.scroll(1),
+            .up => t.scroll(-1),
+            else => {},
+        },
+    }
+    return true;
+}
+
 fn isCtrlBackslash(ev: KeyEvent) bool {
     return ev.mods.ctrl and ev.key == .codepoint and ev.key.codepoint == '\\';
 }
@@ -3116,15 +3183,19 @@ fn popupKey(ed: *Editor, ev: KeyEvent) bool {
     if (ed.popup == null) {
         // A terminal window (the Claude panel) has the keyboard.
         if (ed.window.term) |t| {
+            // Normal mode: SPC and what follows go to the keymap; i/a type
+            // again, j/k and Ctrl-d/u scroll, other keys do nothing.
+            if (ed.window.term_normal) return ed.pending_len == 0 and termNormalKey(ed, t, ev);
             // Ctrl-\: back to the code, the panel staying open. Ctrl-C: close
             // the panel (it keeps running; SPC a a brings it back). Claude
             // interrupts with Esc; Ctrl-Shift-C sends it a real Ctrl-C.
             const ctrl_c = ev.mods.ctrl and !ev.mods.alt and ev.key == .codepoint and (ev.key.codepoint == 'c' or ev.key.codepoint == 'C');
-            if (isCtrlBackslash(ev)) {
-                ed.focusEditorWindow();
-            } else if (ctrl_c and !ev.mods.shift) {
+            if (isCtrlBackslash(ev) or ed.doubleEsc(t, ev)) {
+                ed.window.term_normal = true;
+                ed.mode = .normal;
+            } else if (ctrl_c and !ev.mods.shift and ed.isClaudeTerm(t)) {
                 ed.closeWindow();
-            } else if (ctrl_c) {
+            } else if (ctrl_c and ed.isClaudeTerm(t)) {
                 t.sendKey(.{ .key = .{ .codepoint = 'c' }, .mods = .{ .ctrl = true } });
             } else termKey(ed, t, ev);
             return true;
@@ -3144,7 +3215,7 @@ fn popupKey(ed: *Editor, ev: KeyEvent) bool {
         ed.popup = null;
         return false;
     };
-    if (isCtrlBackslash(ev)) {
+    if (isCtrlBackslash(ev) or (t.isRunning() and ed.doubleEsc(t, ev))) {
         ed.popup = null;
         return true;
     }
@@ -3564,6 +3635,7 @@ pub fn showClaude(ed: *Editor) !void {
     ed.focusEditorWindow();
     try ed.splitWindow(.right);
     ed.window.term = c.term;
+    ed.window.term_normal = false;
     // The panel takes about 40% of the width.
     Windows.resize(ed.window, .horizontal, -0.1);
 }
@@ -4047,23 +4119,75 @@ pub fn splitWindow(ed: *Editor, dir: Windows.Dir) !void {
 }
 
 /// `SPC w d`: closes the focused window (not the last one).
-/// Windows showing code (not terminal panels).
+/// Windows of your own (not the Claude panel; a shell shown in a window
+/// still counts: the window has its file underneath).
 pub fn codeWindowCount(ed: *const Editor) usize {
     var n: usize = 0;
-    for (ed.window_list.items) |w| n += @intFromBool(w.term == null);
+    for (ed.window_list.items) |w| n += @intFromBool(if (w.term) |t| std.mem.indexOfScalar(*Terminal, ed.shells.items, t) != null else true);
     return n;
 }
 
 pub fn closeWindow(ed: *Editor) void {
     const closing = ed.window;
+    const shell = closing.term;
     // Never leave only a terminal panel on screen.
     if (closing.term == null and ed.codeWindowCount() <= 1 and ed.window_list.items.len > 1)
         return ed.setMessage(.info, "this is the last code window (SPC a a hides Claude)", .{});
+    // The only window, showing a shell: the shell ends, the file shows.
+    if (shell != null and ed.window_list.items.len == 1 and !ed.isClaudeTerm(shell.?)) {
+        closing.term = null;
+        if (std.mem.indexOfScalar(*Terminal, ed.shells.items, shell.?)) |i| _ = ed.shells.orderedRemove(i);
+        shell.?.destroy();
+        return ed.setMessage(.info, "terminal closed", .{});
+    }
     ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
     const target = ed.windows.close(closing) orelse
         return ed.setMessage(.info, "this is the last window (SPC q closes the buffer, then quits)", .{});
     ed.refreshWindowList();
     ed.loadWindow(target);
+    // A shell window's shell ends with it (the Claude panel just hides).
+    if (shell) |t| for (ed.shells.items, 0..) |o, i| if (o == t) {
+        _ = ed.shells.orderedRemove(i);
+        t.destroy();
+        break;
+    };
+}
+
+pub fn isClaudeTerm(ed: *const Editor, t: *const Terminal) bool {
+    const c = ed.claude orelse return false;
+    return c.term == t;
+}
+
+/// `SPC o T`: the current window becomes your shell (the file stays
+/// underneath). A shell hidden earlier comes back; else a new one starts in
+/// the project root.
+pub fn openTermWindow(ed: *Editor) !void {
+    ed.focusEditorWindow();
+    const t = for (ed.shells.items) |o| {
+        if (ed.windowShowing(o) == null) break o;
+    } else blk: {
+        const fresh = try ed.spawnTerminal(&.{Pty.userShell()});
+        errdefer fresh.destroy();
+        try ed.shells.append(ed.gpa, fresh);
+        break :blk fresh;
+    };
+    ed.window.term = t;
+    ed.window.term_normal = false;
+}
+
+/// Shells that exited: their windows show their files again.
+fn pollShellWindows(ed: *Editor) void {
+    var i = ed.shells.items.len;
+    while (i > 0) {
+        i -= 1;
+        const t = ed.shells.items[i];
+        if (t.isRunning()) continue;
+        _ = ed.shells.orderedRemove(i);
+        for (ed.window_list.items) |w| if (w.term == t) {
+            w.term = null;
+        };
+        t.destroy();
+    }
 }
 
 /// `SPC w o`: closes every other window.
@@ -6399,7 +6523,7 @@ test "claude: lock file, handshake, selection, mentions, openDiff accepted" {
     try testing.expect(std.mem.indexOf(u8, rejected, "DIFF_REJECTED") != null);
 }
 
-test "terminal window: Ctrl-\\ goes back to the code, Ctrl-C closes it, Ctrl-Shift-C reaches the program" {
+test "terminal window: Esc Esc is normal mode, SPC commands work, i types again" {
     var ed = try testEditor("code");
     defer ed.deinit();
     ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
@@ -6417,11 +6541,17 @@ test "terminal window: Ctrl-\\ goes back to the code, Ctrl-C closes it, Ctrl-Shi
     }
     try ed.feed("<C-S-c>"); // to the program
     try testing.expectEqual(term_window, ed.window);
-    try ed.feed("<C-\\>"); // back to the code, the panel open
+    try ed.feed("<Esc><Esc>"); // normal mode: keys go to the editor
+    try testing.expect(term_window.term_normal);
+    try ed.feed("x"); // does nothing
+    try expectText(&ed, "code");
+    try ed.feed("<Space>wh"); // SPC commands work from here
     try testing.expectEqual(code_window, ed.window);
     try testing.expectEqual(2, ed.window_list.items.len);
     try ed.feed("<C-\\>"); // and to the terminal again
     try testing.expectEqual(term_window, ed.window);
+    try ed.feed("i"); // typing into the program again
+    try testing.expect(!term_window.term_normal);
     var got = false;
     for (0..200) |_| {
         const out = try t.screenText(testing.allocator);
@@ -6433,10 +6563,9 @@ test "terminal window: Ctrl-\\ goes back to the code, Ctrl-C closes it, Ctrl-Shi
         io_sleep(10);
     }
     try testing.expect(got);
-    try ed.feed("<C-c>"); // closes the panel; the program keeps running
-    try testing.expectEqual(1, ed.window_list.items.len);
-    try testing.expectEqual(code_window, ed.window);
-    try testing.expect(t.isRunning());
+    try ed.feed("<C-c>"); // not the Claude panel: Ctrl-C is the program's
+    try testing.expectEqual(2, ed.window_list.items.len);
+    try testing.expectEqual(term_window, ed.window);
 }
 
 fn io_sleep(ms: i64) void {
@@ -6463,3 +6592,44 @@ test "SPC q with the Claude panel: the last code window hides the panel first" {
     try ed.feed("<Space>q"); // then on to buffers / quitting
     try testing.expect(ed.should_quit);
 }
+
+test "sticky menus: SPC w r stays open for h/l; another key leaves and acts" {
+    var ed = try testEditor("one\ntwo");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.feed("<Space>wsl<Space>wh");
+    const left = ed.window;
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.feed("<Space>wrl"); // border right: the left window grows
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try testing.expectEqual(@as(f32, 52), left.rect.w);
+    try testing.expect(ed.sticky_menu);
+    try ed.feed("ll"); // still in resize mode
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try testing.expectEqual(@as(f32, 56), left.rect.w);
+    try ed.feed("j"); // no stacked border: the menu stays
+    try ed.feed("x"); // not in the menu: leaves it, and x deletes a character
+    try testing.expect(!ed.sticky_menu);
+    try expectText(&ed, "ne\ntwo");
+    try ed.feed("<Space>wrh<Esc>"); // Esc leaves too
+    try testing.expect(!ed.sticky_menu);
+    try testing.expectEqual(0, ed.pending_len);
+}
+
+test "SPC w < and > keep the window menu open" {
+    var ed = try testEditor("x");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.feed("<Space>wsl<Space>wh");
+    const left = ed.window;
+    try ed.feed("<Space>w<lt><lt><lt>"); // three moves left, one SPC w
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try testing.expectEqual(@as(f32, 44), left.rect.w);
+    try testing.expect(ed.sticky_menu);
+    try ed.feed(">"); // still in the menu
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try testing.expectEqual(@as(f32, 46), left.rect.w);
+    try ed.feed("<Esc>");
+    try testing.expect(!ed.sticky_menu);
+}
+

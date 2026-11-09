@@ -72,13 +72,14 @@ under it is a compile error.
 | `SPC w s` + `h/j/k/l` | split: a new window on that side showing this buffer (focus moves into it) | done |
 | `SPC w h/j/k/l`, `SPC w w` | focus the window on that side; the next window (wrapping) | done |
 | `SPC w d` / `SPC w c`, `SPC w o`, `SPC w =` | close window, close the others, equal sizes | done |
-| `SPC w >` `<` `+` `-` | wider, narrower, taller, shorter | done |
+| `SPC w r` + `h/j/k/l`, `=` | resize mode (stays open): move the border on that side (the window's other border if none) left/down/up/right, two columns or one row per press; `=` equal sizes; any other key leaves and acts as usual. `SPC w <` / `>` move a border left / right the same way | done |
 | `SPC b N`, `SPC b b` / `SPC b l` / ``SPC ` ``, `SPC b O`, `SPC b r`, `SPC b s` / `SPC b S` | new empty buffer, flip to the other buffer (picker: `SPC b B` / `SPC ,`), kill others (keeps unsaved), revert from disk, save / save all | done |
 | in pickers: `<Tab>`, `<C-v>`, `<C-s>` | "Open in..." menu (this window, split right/below/left/above); open in a split right / below. Works for files, buffers, grep, references, symbols, diagnostics, jumps, run errors, git changes, explorer files; on a project (`SPC p p`) the split opens once a file is picked | done |
 | `zile -t` | terminal mode: the same editor drawn in the terminal; automatic when there is no display (SSH) or no window can open | done |
 | `zile <path>` | a file (trailing `/` and `..` resolved); a folder opens the explorer there; a file that can't be opened leaves a message instead of not starting | done |
 | `SPC p p`, `SPC p f` | switch project (projects opened before, most recent first; picking one finds a file in it); find file in project | done |
-| `SPC a a` | Claude Code panel: `claude` in a terminal window on the right (project root), connected to zile; `SPC a a` again focuses / hides it, `Ctrl-\` jumps between it and the code; in the panel `Ctrl-C` closes it (Claude keeps running; it interrupts with Esc) and `Ctrl-Shift-C` sends Claude a real Ctrl-C | done |
+| `SPC o T` | the current window becomes your shell (its file stays underneath); `exit` or `SPC q` ends the shell and shows the file again. Terminal windows (this and the Claude panel) are modal: Esc Esc (two within ~1/3 s; the first still reaches the program) is normal mode, where `SPC` commands work, `j`/`k` and `Ctrl-d`/`Ctrl-u` scroll and other keys do nothing; `i`/`a`/`Enter` type into the program again | done |
+| `SPC a a` | Claude Code panel: `claude` in a terminal window on the right (project root), connected to zile; `SPC a a` again focuses / hides it, Esc Esc is normal mode (see `SPC o T`); in the panel `Ctrl-C` closes it (Claude keeps running; it interrupts with Esc) and `Ctrl-Shift-C` sends Claude a real Ctrl-C | done |
 | `SPC a s`, `SPC a i` | mention the selected lines (visual) or the file in Claude's prompt (`@path#L…`); with an instruction typed into a popup (pasted into Claude's prompt, Enter there sends) | done |
 | `SPC a y` / `SPC a n` | accept / reject Claude's proposed edit, shown as a diff in the code window (removed lines as ghost lines); the proposal can be edited before accepting | done |
 | AI ghost completion, `SPC t a` | while typing in insert mode (at a line's end, or before closing `)]}"';,`), a local model through Ollama fills in the middle (`/api/generate` with `prompt` + `suffix`; `$ZILE_AI_MODEL`, default `qwen2.5-coder:1.5b-base`; `$OLLAMA_HOST`). Shown in gray at the cursor (first line inline, more below); typing it out keeps it, `<A-;>` takes all of it, `<A-l>` a line, `<A-Right>` a character (the rest stays offered); anything else drops it. `<Tab>` stays with the completion menu and placeholders, so the two never fight. One worker thread, latest request only, sent after a 120 ms pause; replies used only if the cursor and text are unchanged. No answer from Ollama turns it off with a message (`SPC t a` retries) | done |
@@ -111,7 +112,7 @@ under it is a compile error.
 | `SPC c r` (also `SPC c .`) | rename symbol (zls): prompt prefilled with the name, edits applied across files as one undo step each | done |
 | `SPC c a` / `SPC c f` | code action / format | LSP |
 | `SPC w v` / `SPC w s` / `SPC w hjkl` / `SPC w d` | splits | layout |
-| `SPC o t`, `<C-\>` | terminal popup: your `$SHELL`, kept running while hidden; every key goes to it; `<C-\>` hides; `<S-PageUp/Down>` / wheel scroll back; `<C-S-v>` pastes | done |
+| `SPC o t` | terminal popup: your `$SHELL`, kept running while hidden; every key goes to it; Esc Esc hides; `<S-PageUp/Down>` / wheel scroll back; `<C-S-v>` pastes | done |
 | `SPC r r` | code runner: prompt prefilled with this project's last command (remembered across restarts), so `<CR>` runs it again | done |
 | `SPC r c` | command editor: a floating vim buffer (any number of lines, full editing: motions, operators, surround, multicursor, undo); starts in insert mode; in normal mode `<CR>` runs it via `$SHELL -c`, `<Esc>` cancels; leader menus wait until it closes | done |
 | `SPC r R`, `SPC r o` | run the runner command again without asking; show the last run | done |
@@ -195,6 +196,10 @@ macros. Modern parts:
   (language, project) with that root. The status line and window headers
   show "project  path/in/project". Opened projects are remembered in
   `$XDG_STATE_HOME/zile/projects` for `SPC p p`.
+- **Sticky menus (done):** a command flagged `sticky`, run from a menu,
+  keeps the menu's prefix typed so the next key is looked up in it again
+  (hydra-like): `SPC w r l l h`. A key the menu doesn't have leaves it and is
+  then handled on its own.
 - **Windows (done):** `Windows.zig` is a tree of splits (side by side or
   stacked, with a ratio) whose leaves are windows, each with a buffer and its
   own `View`. The focused window's live state stays in `Editor.buffer`/`view`

@@ -46,6 +46,9 @@ pub const Window = struct {
     /// Shows this terminal instead of the buffer (borrowed: the editor owns
     /// it, and closing the window only hides it).
     term: ?*Editor.Terminal = null,
+    /// Esc Esc put the terminal in normal mode: keys go to the editor
+    /// (SPC commands), not the program, until i/a.
+    term_normal: bool = false,
 };
 
 pub const Node = struct {
@@ -66,6 +69,8 @@ pub const Split = struct {
 
 gpa: Allocator,
 root: *Node,
+/// The cell size of the last `layout` (border moves are in cells).
+cell: [2]f32 = .{ 8, 16 },
 
 pub fn init(gpa: Allocator, buffer: *Buffer) !Windows {
     const w = try gpa.create(Window);
@@ -209,6 +214,57 @@ fn span(n: *const Node, axis: Axis) usize {
     };
 }
 
+/// Moves a border of `w` by `cells` cells toward `dir` (the border on that
+/// side if `w` has one, else its other border): `l` moves a border right
+/// whichever window is focused. False when `w` has no border that way.
+pub fn moveBorder(ws: *Windows, w: *Window, dir: Dir, cells: f32) bool {
+    const axis = dir.axis();
+    // The nearest borders after (right/below) and before (left/above) `w`.
+    var after: ?*Node = null;
+    var before: ?*Node = null;
+    var child = w.node;
+    var n = child.parent;
+    while (n) |p| : ({
+        child = p;
+        n = p.parent;
+    }) {
+        const s = p.kind.split;
+        if (s.axis != axis) continue;
+        if (s.first == child and after == null) after = p;
+        if (s.second == child and before == null) before = p;
+    }
+    const target = (if (dir.after()) after orelse before else before orelse after) orelse return false;
+    const extent = nodeExtent(target, axis);
+    if (extent <= 0) return false;
+    const unit = cells * (if (axis == .horizontal) ws.cell[0] else ws.cell[1]) / extent;
+    const s = &target.kind.split;
+    s.ratio = std.math.clamp(s.ratio + (if (dir.after()) unit else -unit), 0.05, 0.95);
+    return true;
+}
+
+/// The size along `axis` of the area `n` covers (its windows' rectangles).
+fn nodeExtent(n: *const Node, axis: Axis) f32 {
+    var lo: f32 = std.math.inf(f32);
+    var hi: f32 = -std.math.inf(f32);
+    extentOf(n, axis, &lo, &hi);
+    return hi - lo;
+}
+
+fn extentOf(n: *const Node, axis: Axis, lo: *f32, hi: *f32) void {
+    switch (n.kind) {
+        .window => |w| {
+            const a = if (axis == .horizontal) w.rect.x else w.rect.y;
+            const b = a + (if (axis == .horizontal) w.rect.w else w.rect.h);
+            lo.* = @min(lo.*, a);
+            hi.* = @max(hi.*, b);
+        },
+        .split => |s| {
+            extentOf(s.first, axis, lo, hi);
+            extentOf(s.second, axis, lo, hi);
+        },
+    }
+}
+
 /// Grows (`delta` > 0) or shrinks `w` along `axis` by moving the divider of
 /// its nearest split on that axis.
 pub fn resize(w: *Window, axis: Axis, delta: f32) void {
@@ -228,6 +284,7 @@ pub fn resize(w: *Window, axis: Axis, delta: f32) void {
 
 /// Lays the tree out in `area`, splitting on whole cells.
 pub fn layout(ws: *Windows, area: Rect, cell_w: f32, cell_h: f32) void {
+    ws.cell = .{ cell_w, cell_h };
     layoutNode(ws.root, area, cell_w, cell_h);
 }
 
@@ -333,6 +390,29 @@ test "split, navigate, close" {
     try testing.expectEqual(a, ws.close(right).?);
     try testing.expectEqual(null, ws.close(a));
     try testing.expectEqual(1, ws.count());
+}
+
+test "moveBorder: the border moves the way of the key, from either side" {
+    var b: Buffer = undefined;
+    var ws = try Windows.init(testing.allocator, &b);
+    defer ws.deinit();
+    const left = ws.root.kind.window;
+    const right = try ws.split(left, .right, .{}, &b);
+    ws.layout(.{ .w = 100, .h = 10 }, 1, 1);
+    // From the left window, l moves its right border right: it grows.
+    try testing.expect(ws.moveBorder(left, .right, 10));
+    ws.layout(.{ .w = 100, .h = 10 }, 1, 1);
+    try testing.expectEqual(@as(f32, 60), left.rect.w);
+    // From the right window, l moves its (left) border right too: it shrinks.
+    try testing.expect(ws.moveBorder(right, .right, 10));
+    ws.layout(.{ .w = 100, .h = 10 }, 1, 1);
+    try testing.expectEqual(@as(f32, 30), right.rect.w);
+    // h from the right window: border left, it grows back.
+    try testing.expect(ws.moveBorder(right, .left, 20));
+    ws.layout(.{ .w = 100, .h = 10 }, 1, 1);
+    try testing.expectEqual(@as(f32, 50), right.rect.w);
+    // No stacked split: j/k have no border to move.
+    try testing.expect(!ws.moveBorder(left, .down, 1));
 }
 
 test "balance: three side by side get a third each" {
