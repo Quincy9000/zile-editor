@@ -78,6 +78,8 @@ pub fn main(init: std.process.Init) !void {
     var font = try Font.load(gpa, io, args.font, args.font_size);
     defer font.deinit();
     const theme = &Theme.default;
+    ed.term_fg = .{ .r = theme.fg.r, .g = theme.fg.g, .b = theme.fg.b };
+    ed.term_bg = .{ .r = theme.popup_bg.r, .g = theme.popup_bg.g, .b = theme.popup_bg.b };
 
     // Size the view before scripted keys so scrolling behaves like the real window.
     _ = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
@@ -142,6 +144,11 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
     const wheel = rl.GetMouseWheelMove();
     const clicked = rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
     if (wheel == 0 and !clicked) return;
+    // The terminal popup takes the wheel (scrollback) while it is open.
+    if (ed.popupTerminal()) |t| {
+        if (wheel != 0) t.scroll(@intFromFloat(-wheel * 3));
+        return;
+    }
     const w = ed.windows.at(pos.x, pos.y) orelse return;
     ed.focusWindow(w);
     if (wheel != 0) ed.scrollLines(@intFromFloat(-wheel * 3));

@@ -99,7 +99,10 @@ under it is a compile error.
 | `SPC c r` (also `SPC c .`) | rename symbol (zls): prompt prefilled with the name, edits applied across files as one undo step each | done |
 | `SPC c a` / `SPC c f` | code action / format | LSP |
 | `SPC w v` / `SPC w s` / `SPC w hjkl` / `SPC w d` | splits | layout |
-| `SPC o t` | open terminal | terminal |
+| `SPC o t`, `<C-\>` | terminal popup: your `$SHELL`, kept running while hidden; every key goes to it; `<C-\>` hides; `<S-PageUp/Down>` / wheel scroll back; `<C-S-v>` pastes | done |
+| `SPC r r` | code runner: prompt prefilled with this project's last command (remembered across restarts), so `<CR>` runs it again | done |
+| `SPC r c`, `SPC r R`, `SPC r o` | run any command (empty prompt); run the runner command again without asking; show the last run | done |
+| in a finished run | `r` run again, `q` / `<Esc>` close, `j` / `k` scroll | done |
 | `SPC h k` / `SPC h f` / `SPC h h` | describe key / command, search help | picker |
 
 ## Picker
@@ -343,6 +346,19 @@ Original plan:
 ## Terminal (libghostty-vt)
 
 `zig fetch --save=ghostty https://release.files.ghostty.org/libghostty-vt/1.0.0/libghostty-vt-1.0.0.tar.gz`
+
+**Built (popup + runner):** `terminal/Pty.zig` (forkpty, TERM=xterm-256color,
+resize, hangup/kill, exit status), `terminal/Terminal.zig` (reader thread
+polling the PTY, emulator under an `Io.Mutex`, write-back replies from the
+reader, key encoding via ghostty's encoder with the terminal's current modes,
+bracketed paste, scrollback, a `draw(ctx)` walk of the render-state snapshot),
+`terminal/RunMemory.zig` (last runner command per project in
+`$XDG_STATE_HOME/zile/run-commands`). Runs save open files first and go
+through `$SHELL -c`; when one ends, "exited N in Ts" is printed under its
+output. Build: `dep.artifact("ghostty-vt-static")` + translate-c of `vt.h`
+with the artifact's emitted include tree and `GHOSTTY_STATIC`.
+Not yet: terminals as split panes, terminal-normal mode (motions/yank over
+scrollback), an errors-from-last-run picker, CJK/emoji glyphs (atlas).
 
 - Requires exactly Zig 0.17. Provides VT parsing, terminal state, a render-state
   API with per-row dirty tracking, key/mouse/focus/paste encoders (including the

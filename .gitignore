@@ -1,3 +1,4 @@
 zig-out/
-.zig-cache/
-zig-pkg/
+# Also symlinks (see DESIGN.md: package dir on a case-sensitive filesystem).
+.zig-cache
+zig-pkg

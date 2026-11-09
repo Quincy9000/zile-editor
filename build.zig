@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("raylib", raylib_dep.module("raylib"));
     addSyntax(b, exe_mod, target, optimize);
+    addTerminal(b, exe_mod, target, optimize);
 
     const exe = b.addExecutable(.{
         .name = "zile",
@@ -60,10 +61,30 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addSyntax(b, test_mod, target, optimize);
+    addTerminal(b, test_mod, target, optimize);
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+}
+
+/// Links libghostty-vt (terminal emulation, C API) and provides it as the
+/// `vt` import. The PTY and drawing are ours (src/terminal, src/ui).
+fn addTerminal(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const dep = b.dependency("ghostty", .{ .target = target, .optimize = optimize });
+    const lib = dep.artifact("ghostty-vt-static");
+    const api = b.addTranslateC(.{
+        .root_source_file = dep.path("include/ghostty/vt.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // The headers are installed with the library, but a separate translate-c
+    // step needs the include tree explicitly.
+    api.addIncludePath(lib.getEmittedIncludeTree());
+    api.defineCMacro("GHOSTTY_STATIC", "1");
+    mod.addImport("vt", api.createModule());
+    mod.linkLibrary(lib);
 }
 
 /// Links tree-sitter and the grammars into `mod`, and provides the

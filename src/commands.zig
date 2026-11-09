@@ -246,6 +246,11 @@ const base = [_]Command{
     .{ .name = "kill_buffer", .doc = "Kill buffer", .run = killBuffer },
     .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) , .jump = true },
     .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) , .jump = true },
+    .{ .name = "terminal_toggle", .doc = "Terminal popup", .run = termCmd(.toggle), .once = true },
+    .{ .name = "run_runner", .doc = "Code runner (repeat with Enter)", .run = termCmd(.runner), .once = true },
+    .{ .name = "run_command", .doc = "Run a command", .run = termCmd(.command), .once = true },
+    .{ .name = "run_again", .doc = "Run the runner command again", .run = termCmd(.again), .once = true },
+    .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
     .{ .name = "jump_older", .doc = "Back (jumplist)", .run = jumpCmd(.older), .once = true },
     .{ .name = "jump_newer", .doc = "Forward (jumplist)", .run = jumpCmd(.newer), .once = true },
     .{ .name = "jump_list", .doc = "Jumplist", .run = openPicker(.jumps), .once = true },
@@ -1311,6 +1316,21 @@ fn surroundStep(comptime step: enum { add, delete, change_from, change_to, visua
                     ed.exitVisual();
                     try pairs.add(ed, r, c.char, r.linewise);
                 },
+            }
+        }
+    }.run;
+}
+
+fn termCmd(comptime action: enum { toggle, runner, command, again, output }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            switch (action) {
+                .toggle => try ed.toggleShell(),
+                .runner => try ed.runPrompt(true),
+                .command => try ed.runPrompt(false),
+                .again => try ed.runAgain(),
+                .output => ed.showRunOutput(),
             }
         }
     }.run;

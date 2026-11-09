@@ -26,6 +26,9 @@ const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
 pub const Windows = @import("Windows.zig");
+pub const Terminal = @import("terminal/Terminal.zig");
+const Pty = @import("terminal/Pty.zig");
+const RunMemory = @import("terminal/RunMemory.zig");
 const textobjects = @import("core/textobjects.zig");
 
 const Editor = @This();
@@ -150,6 +153,10 @@ pub const PromptKind = enum {
     save_as,
     rename_file,
     copy_file,
+    /// `SPC r c`: any command; `SPC r r`: the code runner (prefilled with the
+    /// project's last command, so <CR> runs it again).
+    run_command,
+    run_runner,
 
     /// One-line prompts shown in a centered box (not incremental searches).
     pub fn boxed(k: PromptKind) bool {
@@ -166,6 +173,8 @@ pub const PromptKind = enum {
             .save_as => "Save as",
             .rename_file => "Rename / move file to",
             .copy_file => "Copy file to",
+            .run_command => "Run command",
+            .run_runner => "Code runner (Enter runs it again)",
         };
     }
 };
@@ -241,6 +250,23 @@ multi_once: bool = false,
 replaying: bool = false,
 /// The primary cursor, set aside while replaying (edits still shift it).
 primary_saved: ?Cursor = null,
+/// The terminal popup's shell (`SPC o t`), kept running while hidden.
+shell: ?*Terminal = null,
+/// The last command run (`SPC r`), its terminal, and when it started.
+run: ?*Terminal = null,
+run_command: ?[]u8 = null,
+run_started: Io.Timestamp = .zero,
+/// The end of the run was reported (printed under its output).
+run_reported: bool = true,
+/// Which terminal the popup shows, if open. Keys go to it.
+popup: ?enum { shell, run } = null,
+/// The popup's size, kept current by the UI (new terminals start at it).
+term_size: Pty.Size = .{ .cols = 80, .rows = 24 },
+/// Terminal default colors (the UI sets them from the theme).
+term_fg: ?Terminal.Rgb = null,
+term_bg: ?Terminal.Rgb = null,
+/// Where the code runner remembers commands (null: the default location).
+run_memory_path: ?[]u8 = null,
 /// Jumplist (`<C-o>` / `<C-i>`, `SPC s j`): places left by jumps, oldest
 /// first. `jump_index` is the entry being visited, or `jumps.len` when not
 /// moving through the list.
@@ -347,6 +373,10 @@ pub fn init(gpa: Allocator, io: Io) !Editor {
 
 pub fn deinit(ed: *Editor) void {
     if (ed.picker) |p| p.destroy();
+    if (ed.shell) |t| t.destroy();
+    if (ed.run) |t| t.destroy();
+    if (ed.run_command) |cmd| ed.gpa.free(cmd);
+    if (ed.run_memory_path) |path| ed.gpa.free(path);
     for (ed.lsps) |maybe| if (maybe) |l| l.deinit();
     ed.clearLocations();
     ed.locations.deinit(ed.gpa);
@@ -431,6 +461,7 @@ pub fn unpeekWindow(ed: *Editor, p: Peek) void {
 pub fn tick(ed: *Editor) void {
     ed.tickLsp();
     ed.pollGitJob();
+    ed.pollTerminals();
     ed.highlightView();
     if (ed.picker) |p| {
         p.poll();
@@ -455,6 +486,7 @@ pub fn text(ed: *Editor) *Text {
 // Input
 
 pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
+    if (ed.popupKey(ev)) return;
     if (ed.macro_register != null) ed.macro_keys.append(ed.gpa, ev) catch {};
     ed.processKey(ev);
     // Macro playback and `.` queue keys; a runaway macro (one that calls
@@ -1325,6 +1357,7 @@ pub fn acceptSearch(ed: *Editor) !void {
         .git_commit => return ed.finishGitCommit(),
         .git_remote => return ed.finishGitRemote(),
         .new_file, .save_as, .rename_file, .copy_file => |k| return ed.finishFilePrompt(k),
+        .run_command, .run_runner => |k| return ed.finishRunPrompt(k),
         .search, .snipe => {},
     }
     if (sp.input.items().len > 0) {
@@ -2467,6 +2500,198 @@ pub fn cursorsFromPrompt(ed: *Editor) !void {
         } else try ed.cursors.append(ed.gpa, c);
     }
     ed.reportCursors();
+}
+
+// ---------------------------------------------------------------------------
+// Terminal popup (`SPC o t`) and running commands (`SPC r`).
+//
+// Both are terminals (a program on a PTY, emulated by libghostty-vt) shown
+// in a popup over the editor. While the popup is open every key goes to the
+// program, except <C-\> (hide) and, once a run has finished, q/<Esc>
+// (close) and r (run again).
+
+fn spawnTerminal(ed: *Editor, argv: []const []const u8) !*Terminal {
+    const sz = ed.term_size;
+    return Terminal.create(ed.gpa, ed.io, .{
+        .argv = argv,
+        .cwd = ed.cwd,
+        .cols = sz.cols,
+        .rows = sz.rows,
+        .cell_w = sz.cell_w,
+        .cell_h = sz.cell_h,
+        .fg = ed.term_fg,
+        .bg = ed.term_bg,
+        .wake = ed.wake_fn,
+    });
+}
+
+/// The terminal the popup shows.
+pub fn popupTerminal(ed: *Editor) ?*Terminal {
+    return switch (ed.popup orelse return null) {
+        .shell => ed.shell,
+        .run => ed.run,
+    };
+}
+
+/// `SPC o t` / <C-\>: shows or hides the shell (started on first use).
+pub fn toggleShell(ed: *Editor) !void {
+    if (ed.popup == .shell) {
+        ed.popup = null;
+        return;
+    }
+    if (ed.shell == null) ed.shell = try ed.spawnTerminal(&.{Pty.userShell()});
+    ed.popup = .shell;
+}
+
+/// `SPC r o`: shows the last run's output again.
+pub fn showRunOutput(ed: *Editor) void {
+    if (ed.run == null) return ed.setMessage(.info, "nothing has been run yet (SPC r r)", .{});
+    ed.popup = .run;
+}
+
+fn isCtrlBackslash(ev: KeyEvent) bool {
+    return ev.mods.ctrl and ev.key == .codepoint and ev.key.codepoint == '\\';
+}
+
+/// Keys while the popup is open (or <C-\> to open the shell). Returns
+/// true when the key was used.
+fn popupKey(ed: *Editor, ev: KeyEvent) bool {
+    if (ed.popup == null) {
+        if (isCtrlBackslash(ev) and ed.mode == .normal) {
+            ed.toggleShell() catch |err| ed.setMessage(.err, "could not start the shell: {s}", .{@errorName(err)});
+            return true;
+        }
+        return false;
+    }
+    const t = ed.popupTerminal() orelse {
+        ed.popup = null;
+        return false;
+    };
+    if (isCtrlBackslash(ev)) {
+        ed.popup = null;
+        return true;
+    }
+    // Shift+PageUp/PageDown: scroll through the output.
+    if (ev.mods.shift and ev.key == .special and (ev.key.special == .page_up or ev.key.special == .page_down)) {
+        const page: isize = @intCast(@max(t.rows, 2) - 1);
+        t.scroll(if (ev.key.special == .page_up) -page else page);
+        return true;
+    }
+    // Ctrl+Shift+V pastes the clipboard.
+    if (ev.mods.ctrl and ev.mods.shift and ev.key == .codepoint and (ev.key.codepoint == 'v' or ev.key.codepoint == 'V')) {
+        if (ed.registers.clipboard) |cb| if (cb.get(ed.gpa)) |clip| {
+            defer ed.gpa.free(clip);
+            t.paste(clip);
+        };
+        return true;
+    }
+    if (!t.isRunning()) {
+        // A finished run: q/<Esc> closes, r runs it again; scrolling still works.
+        if (ev.key == .special and ev.key.special == .escape) {
+            ed.popup = null;
+        } else if (ev.key == .codepoint and !ev.mods.blocksText()) switch (ev.key.codepoint) {
+            'q' => ed.popup = null,
+            'r' => if (ed.popup == .run) ed.rerun() catch |err| ed.setMessage(.err, "could not run: {s}", .{@errorName(err)}),
+            'k' => t.scroll(-1),
+            'j' => t.scroll(1),
+            else => {},
+        };
+        return true;
+    }
+    t.sendKey(ev);
+    return true;
+}
+
+/// `SPC r c` (empty prompt) / `SPC r r` (prefilled with the last command).
+pub fn runPrompt(ed: *Editor, runner: bool) !void {
+    ed.startSearch(true, if (runner) .run_runner else .run_command);
+    if (!runner) return;
+    const last = ed.loadRunnerCommand() orelse return;
+    defer ed.gpa.free(last);
+    try ed.search_prompt.?.input.set(ed.gpa, last);
+}
+
+fn runMemoryPath(ed: *Editor) ?[]const u8 {
+    if (ed.run_memory_path == null) ed.run_memory_path = RunMemory.defaultPath(ed.gpa);
+    return ed.run_memory_path;
+}
+
+fn projectDir(ed: *Editor) []const u8 {
+    return ed.git_root orelse ed.cwd;
+}
+
+/// This project's remembered runner command. Caller frees.
+fn loadRunnerCommand(ed: *Editor) ?[]u8 {
+    const path = ed.runMemoryPath() orelse return null;
+    return RunMemory.load(ed.gpa, ed.io, path, ed.projectDir());
+}
+
+fn finishRunPrompt(ed: *Editor, kind: PromptKind) !void {
+    const raw = try ed.takePromptText() orelse return;
+    defer ed.gpa.free(raw);
+    const cmd = std.mem.trim(u8, raw, " \t");
+    if (cmd.len == 0) return;
+    if (kind == .run_runner) if (ed.runMemoryPath()) |path| RunMemory.save(ed.gpa, ed.io, path, ed.projectDir(), cmd);
+    try ed.startRun(cmd);
+}
+
+/// `SPC r R`: the runner's command again, without asking.
+pub fn runAgain(ed: *Editor) !void {
+    const cmd = ed.loadRunnerCommand() orelse return ed.runPrompt(true);
+    defer ed.gpa.free(cmd);
+    try ed.startRun(cmd);
+}
+
+fn rerun(ed: *Editor) !void {
+    const cmd = try ed.gpa.dupe(u8, ed.run_command orelse return);
+    defer ed.gpa.free(cmd);
+    try ed.startRun(cmd);
+}
+
+/// Saves open files, then runs `cmd` through the user's shell in the popup
+/// (replacing the previous run, stopping it if it is still going).
+pub fn startRun(ed: *Editor, cmd: []const u8) !void {
+    for (ed.buffers.items) |b| if (b.modified and b.path != null) {
+        _ = b.save(ed.gpa, ed.io) catch {};
+        if (ed.lspFor(b)) |l| l.didSave(b);
+    };
+    const owned = try ed.gpa.dupe(u8, cmd);
+    errdefer ed.gpa.free(owned);
+    const t = try ed.spawnTerminal(&.{ Pty.userShell(), "-c", cmd });
+    if (ed.run) |old| old.destroy();
+    if (ed.run_command) |old| ed.gpa.free(old);
+    ed.run = t;
+    ed.run_command = owned;
+    ed.run_started = Io.Timestamp.now(ed.io, .awake);
+    ed.run_reported = false;
+    ed.popup = .run;
+}
+
+/// Seconds since the run started (or how long it took, once reported).
+pub fn runSeconds(ed: *Editor) f64 {
+    const ns = ed.run_started.durationTo(Io.Timestamp.now(ed.io, .awake)).nanoseconds;
+    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_s;
+}
+
+/// Notices finished programs: a run prints how it ended; an exited shell
+/// closes its popup.
+fn pollTerminals(ed: *Editor) void {
+    if (ed.run) |t| if (!ed.run_reported and !t.isRunning()) {
+        ed.run_reported = true;
+        const secs = ed.runSeconds();
+        var buf: [96]u8 = undefined;
+        const ok = t.exit_code == 0;
+        const line = std.fmt.bufPrint(&buf, "\r\n\x1b[1;{s}m{s} exited {d}\x1b[0;2m in {d:.2}s   r: run again   q: close\x1b[0m", .{
+            if (ok) "32" else "31", if (ok) "✓" else "✗", t.exit_code, secs,
+        }) catch "";
+        t.print(line);
+        ed.setMessage(if (ok) .info else .err, "{s}: exited {d} in {d:.2}s (SPC r o shows the output)", .{ ed.run_command orelse "", t.exit_code, secs });
+    };
+    if (ed.shell) |t| if (!t.isRunning()) {
+        t.destroy();
+        ed.shell = null;
+        if (ed.popup == .shell) ed.popup = null;
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -4025,4 +4250,71 @@ test "jumplist: C-o / C-i, one entry per line, the picker" {
     try testing.expectEqual(.jumps, ed.picker.?.kind);
     try ed.feed("<CR>");
     try testing.expect(ed.picker == null);
+}
+
+fn waitForRun(ed: *Editor) void {
+    while (ed.run.?.isRunning()) std.Thread.yield() catch {};
+    ed.tick();
+}
+
+test "run: SPC r c shows output and how it ended; SPC r r remembers its command" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.git_checked = true;
+    ed.run_memory_path = try std.fs.path.join(gpa, &.{ dir, "run-commands" });
+
+    try ed.feed("<Space>rcecho hi; exit 4<CR>");
+    try testing.expectEqual(.run, ed.popup.?);
+    waitForRun(&ed);
+    try testing.expectEqual(4, ed.run.?.exit_code);
+    try testing.expectEqual(.err, ed.message.kind);
+    const out = try ed.run.?.screenText(gpa);
+    defer gpa.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "hi\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "exited 4") != null);
+    try ed.feed("q");
+    try testing.expectEqual(null, ed.popup);
+
+    // The runner: first time empty, then prefilled with the last command.
+    try ed.feed("<Space>rr");
+    try testing.expectEqualStrings("", ed.search_prompt.?.input.items());
+    try ed.feed("echo runner<CR>");
+    waitForRun(&ed);
+    try testing.expectEqual(0, ed.run.?.exit_code);
+    try ed.feed("q<Space>rr");
+    try testing.expectEqualStrings("echo runner", ed.search_prompt.?.input.items());
+    try ed.feed("<CR>"); // Enter runs it again
+    try testing.expectEqualStrings("echo runner", ed.run_command.?);
+    waitForRun(&ed);
+    try ed.feed("r"); // `r` in a finished run: once more
+    waitForRun(&ed);
+    try testing.expectEqual(0, ed.run.?.exit_code);
+    try ed.feed("q<Space>ro"); // the output comes back
+    try testing.expectEqual(.run, ed.popup.?);
+}
+
+test "terminal popup: keys go to the shell, Ctrl-\\ hides it and keeps it running" {
+    var ed = try testEditor("text");
+    defer ed.deinit();
+    try ed.feed("<Space>ot");
+    try testing.expectEqual(.shell, ed.popup.?);
+    const shell = ed.shell.?;
+    try ed.feed("<C-\\>");
+    try testing.expectEqual(null, ed.popup);
+    try testing.expect(shell.isRunning());
+    try ed.feed("dd"); // back in the editor
+    try expectText(&ed, "");
+    try ed.feed("<C-\\>"); // the same shell again
+    try testing.expectEqual(shell, ed.shell.?);
+    try ed.feed("exit<CR>");
+    while (shell.isRunning()) std.Thread.yield() catch {};
+    ed.tick(); // an exited shell closes its popup
+    try testing.expectEqual(null, ed.popup);
+    try testing.expectEqual(null, ed.shell);
 }

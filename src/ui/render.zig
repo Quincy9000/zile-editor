@@ -56,6 +56,15 @@ pub fn layout(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
 pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
     const screen = layout(ed, font, width, height);
     ed.windows.layout(.{ .w = screen.width, .h = screen.status_y }, font.cell_w, font.cell_h);
+    // The terminal popup's grid; the shown terminal follows its size.
+    const pr = popupRect(font, screen);
+    ed.term_size = .{
+        .cols = @intFromFloat(@max(pr.w / font.cell_w - 2, 1)),
+        .rows = @intFromFloat(@max(pr.h / font.cell_h - 1, 1)),
+        .cell_w = @intFromFloat(font.cell_w),
+        .cell_h = @intFromFloat(font.cell_h),
+    };
+    if (ed.popupTerminal()) |t| t.resize(ed.term_size.cols, ed.term_size.rows, ed.term_size.cell_w, ed.term_size.cell_h);
     for (ed.window_list.items) |w| {
         const wl = windowLayout(ed, font, w);
         if (w == ed.window) {
@@ -104,6 +113,7 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     drawHover(ed, font, theme, fl);
     drawCompletion(ed, font, theme, fl);
     rlPopMatrix();
+    drawPopup(ed, font, theme, l);
     drawWhichKey(ed, font, theme, l);
     drawStatus(ed, font, theme, l);
     if (ed.picker) |p| picker_view.draw(p, font, theme, l);
@@ -175,6 +185,86 @@ fn keyCells(k: keys.KeyEvent) usize {
 
 pub fn rect(x: f32, y: f32, w: f32, h: f32, color: rl.Color) void {
     rl.DrawRectangleRec(.{ .x = x, .y = y, .width = w, .height = h }, color);
+}
+
+/// The terminal popup: most of the screen, centered over the text, on whole cells.
+fn popupRect(font: *const Font, screen: Layout) Editor.Windows.Rect {
+    const w = @max(@floor(screen.width * 0.9 / font.cell_w), 20) * font.cell_w;
+    const h = @max(@floor(screen.status_y * 0.85 / font.cell_h), 4) * font.cell_h;
+    return .{ .x = @floor((screen.width - w) / 2), .y = @floor((screen.status_y - h) / 2), .w = w, .h = h };
+}
+
+fn rgbColor(c: Editor.Terminal.Rgb) rl.Color {
+    return .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 };
+}
+
+/// A terminal (shell or run) in the popup: a header line, then its screen.
+fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout) void {
+    const t = ed.popupTerminal() orelse return;
+    const r = popupRect(font, screen);
+    const cw = font.cell_w;
+    const ch = font.cell_h;
+    rect(0, 0, screen.width, screen.status_y, theme.backdrop);
+    rect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, theme.popup_border);
+    rect(r.x, r.y, r.w, r.h, theme.popup_bg);
+
+    // Header: what runs here and how it is going.
+    rect(r.x, r.y, r.w, ch, theme.status_bg);
+    var buf: [160]u8 = undefined;
+    const title: []const u8 = switch (ed.popup.?) {
+        .shell => "Terminal",
+        .run => std.fmt.bufPrint(&buf, "$ {s}", .{ed.run_command orelse ""}) catch "$",
+    };
+    _ = font.drawText(title, r.x + cw, r.y, theme.status_fg);
+    var right_buf: [96]u8 = undefined;
+    const right, const right_color = if (ed.popup.? == .shell)
+        .{ "Ctrl-\\ hides", theme.status_dim }
+    else if (t.isRunning())
+        .{ std.fmt.bufPrint(&right_buf, "running {d:.1}s   Ctrl-\\ hides", .{ed.runSeconds()}) catch "", theme.status_dim }
+    else if (t.exit_code == 0)
+        .{ "done   r: again   q: close", theme.diff_add }
+    else
+        .{ std.fmt.bufPrint(&right_buf, "failed ({d})   r: again   q: close", .{t.exit_code}) catch "", theme.diag_error };
+    _ = font.drawText(right, r.x + r.w - @as(f32, @floatFromInt(cells(right) + 1)) * cw, r.y, right_color);
+
+    // The screen, one cell of padding at the sides.
+    const Ctx = struct {
+        font: *const Font,
+        x0: f32,
+        y0: f32,
+        pub fn cell(self: @This(), cl: Editor.Terminal.Cell) void {
+            const f = self.font;
+            const x = self.x0 + @as(f32, @floatFromInt(cl.x)) * f.cell_w;
+            const y = self.y0 + @as(f32, @floatFromInt(cl.y)) * f.cell_h;
+            const w = @as(f32, @floatFromInt(cl.width)) * f.cell_w;
+            if (cl.has_bg) rect(x, y, w, f.cell_h, rgbColor(cl.bg));
+            var fg = rgbColor(cl.fg);
+            if (cl.faint) fg.a = 150;
+            if (cl.text.len > 0) if (std.math.cast(u21, cl.text[0])) |cp| f.drawCodepoint(cp, x, y, fg);
+            if (cl.underline) rect(x, y + f.cell_h - 2, w, 1, fg);
+        }
+    };
+    const x0 = r.x + cw;
+    const y0 = r.y + ch;
+    if (t.draw(Ctx{ .font = font, .x0 = x0, .y0 = y0 })) |cur| {
+        const x = x0 + @as(f32, @floatFromInt(cur.x)) * cw;
+        const y = y0 + @as(f32, @floatFromInt(cur.y)) * ch;
+        var c = theme.cursor;
+        switch (cur.style) {
+            .block => {
+                c.a = 150;
+                rect(x, y, cw, ch, c);
+            },
+            .bar => rect(x, y, 2, ch, c),
+            .underline => rect(x, y + ch - 2, cw, 2, c),
+            .hollow => {
+                rect(x, y, cw, 1, c);
+                rect(x, y + ch - 1, cw, 1, c);
+                rect(x, y, 1, ch, c);
+                rect(x + cw - 1, y, 1, ch, c);
+            },
+        }
+    }
 }
 
 /// One window: its header (when there are several), then its text, clipped
@@ -330,7 +420,10 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
     rect(0, y, l.width, font.cell_h, theme.status_bg);
 
     // Mode pill.
-    const mode_name, const mode_color = switch (ed.mode) {
+    const mode_name, const mode_color = if (ed.popup) |pp| switch (pp) {
+        .shell => .{ " TERM ", theme.mode_insert },
+        .run => .{ " RUN ", theme.mode_insert },
+    } else switch (ed.mode) {
         .normal => .{ " NORMAL ", theme.mode_normal },
         .insert => .{ " INSERT ", theme.mode_insert },
         .picker => .{ " PICKER ", theme.mode_picker },
@@ -342,6 +435,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
             .rename => .{ " RENAME ", theme.mode_insert },
             .git_commit, .git_remote => .{ " GIT ", theme.mode_insert },
             .new_file, .save_as, .rename_file, .copy_file => .{ " FILE ", theme.mode_insert },
+            .run_command, .run_runner => .{ " RUN ", theme.mode_insert },
         },
     };
     rect(0, y, @as(f32, @floatFromInt(mode_name.len)) * font.cell_w, font.cell_h, mode_color);

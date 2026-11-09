@@ -30,10 +30,12 @@ const ranges = [_][2]u21{
     .{ 0x2190, 0x21FF }, // arrows
     .{ 0x2500, 0x259F }, // box drawing, block elements
     .{ 0x25A0, 0x25FF }, // geometric shapes
+    .{ 0x2700, 0x27BF }, // dingbats (✓ ✗)
     .{ 0xFFFD, 0xFFFD }, // replacement character
 };
 
 const codepoints = blk: {
+    @setEvalBranchQuota(10_000);
     var n: usize = 0;
     for (ranges) |r| n += r[1] - r[0] + 1;
     var out: [n]c_int = undefined;
