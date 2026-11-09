@@ -28,6 +28,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .raudio = false,
         .rmodels = false,
+        // Image clipboard is the one raylib feature calling X11 directly;
+        // without it nothing needs libX11 at startup (GLFW loads X11 and GL
+        // itself when a window opens), so the same binary starts on a
+        // server and draws in the terminal instead.
+        .config = @as([]const u8, "-DSUPPORT_CLIPBOARD_IMAGE=0"),
     });
 
     const exe_mod = b.createModule(.{
@@ -62,6 +67,8 @@ pub fn build(b: *std.Build) void {
     });
     addSyntax(b, test_mod, target, optimize);
     addTerminal(b, test_mod, target, optimize);
+    // For the terminal-mode grid's color type (no window code runs in tests).
+    test_mod.addImport("raylib", raylib_dep.module("raylib"));
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

@@ -17,6 +17,9 @@ pub const Item = struct {
     detail: []const u8,
     /// `insert` is a snippet (`${1:arg}` placeholders).
     snippet: bool = false,
+    /// A function, method or constructor (CompletionItemKind 2, 3, 4):
+    /// accepting it makes a call, which <Tab> can end with `;`.
+    call: bool = false,
 };
 
 arena: std.heap.ArenaAllocator,
@@ -53,6 +56,7 @@ pub fn fromJson(gpa: Allocator, result: std.json.Value, word_start: usize) !Comp
             .insert = try a.dupe(u8, insert),
             .detail = try a.dupe(u8, Lsp.str(Lsp.field(it, "detail")) orelse ""),
             .snippet = if (Lsp.field(it, "insertTextFormat")) |f| f == .integer and f.integer == 2 else false,
+            .call = if (Lsp.field(it, "kind")) |k| k == .integer and k.integer >= 2 and k.integer <= 4 else false,
         });
     }
     c.items = try items.toOwnedSlice(a);

@@ -39,6 +39,8 @@ pub fn spawn(gpa: Allocator, argv: []const []const u8, cwd: []const u8, size: Si
     while (std.c.environ[i]) |e| : (i += 1) {
         const s = std.mem.span(e);
         if (std.mem.startsWith(u8, s, "TERM=") or std.mem.startsWith(u8, s, "COLORTERM=")) continue;
+        // zile's own test hooks aren't for the programs it runs.
+        if (std.mem.startsWith(u8, s, "ZILE_TEST_")) continue;
         try env.append(arena, e);
     }
     try env.append(arena, "TERM=xterm-256color");

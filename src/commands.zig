@@ -114,6 +114,9 @@ const base = [_]Command{
     .{ .name = "completion_down", .doc = "Next completion or down", .run = completionKey(.next, motion(down, .linewise, .keep)), .hidden = true },
     .{ .name = "completion_up", .doc = "Previous completion or up", .run = completionKey(.previous, motion(up, .linewise, .keep)), .hidden = true },
     .{ .name = "completion_accept_or_tab", .doc = "Accept completion, next placeholder, or tab", .run = completionKey(.accept, snippetOrTab), .hidden = true },
+    .{ .name = "ai_accept", .doc = "Take the AI suggestion", .run = aiAccept(.all), .hidden = true },
+    .{ .name = "ai_accept_line", .doc = "Take a line of the AI suggestion", .run = aiAccept(.line), .hidden = true },
+    .{ .name = "ai_accept_char", .doc = "Take a character of the AI suggestion", .run = aiAccept(.char), .hidden = true },
     .{ .name = "snippet_previous", .doc = "Previous placeholder", .run = snippetPrevious, .hidden = true },
     .{ .name = "completion_accept_or_newline", .doc = "Accept completion or newline", .run = completionKey(.accept, insertNewline), .hidden = true },
     .{ .name = "completion_accept", .doc = "Accept completion", .run = completionKey(.accept, null), .hidden = true },
@@ -211,6 +214,9 @@ const base = [_]Command{
     .{ .name = "surround_change_from", .doc = "Change surrounding", .run = surroundStep(.change_from), .takes_char = true, .hidden = true },
     .{ .name = "surround_change_to", .doc = "Change surrounding to", .run = surroundStep(.change_to), .takes_char = true, .hidden = true },
     .{ .name = "surround_visual", .doc = "Surround selection", .run = surroundStep(.visual), .takes_char = true, .repeat = true },
+    .{ .name = "format_buffer", .doc = "Format (file, or the selected lines)", .run = formatCmd, .once = true },
+    .{ .name = "toggle_ai_complete", .doc = "AI completion", .run = toggleAi },
+    .{ .name = "toggle_format_on_save", .doc = "Format on save", .run = toggle("format_on_save", "format on save") },
     .{ .name = "zoom_in", .doc = "Bigger text", .run = zoom(.in), .once = true },
     .{ .name = "zoom_out", .doc = "Smaller text", .run = zoom(.out), .once = true },
     .{ .name = "zoom_reset", .doc = "Normal text size", .run = zoom(.reset), .once = true },
@@ -1278,7 +1284,41 @@ fn insertNewline(c: Context) !void {
     try c.ed.insertText(indent);
 }
 
+/// <A-;> / <A-l> / <A-Right>: all of the gray AI suggestion, a line of
+/// it, or one character.
+fn aiAccept(comptime part: Editor.AiPart) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            _ = try c.ed.acceptAiSuggestion(part);
+        }
+    }.run;
+}
+
 /// <Tab> without a completion popup: the next placeholder, else a tab.
+/// `SPC t a`: AI completion on/off (on again also retries a model that
+/// couldn't be reached).
+fn toggleAi(c: Context) !void {
+    const ed = c.ed;
+    const on = !ed.options.ai_complete or ed.ai_unreachable;
+    ed.options.ai_complete = on;
+    ed.ai_unreachable = false;
+    ed.clearAiSuggestion();
+    ed.setMessage(.info, "AI completion {s}", .{if (on) "on" else "off"});
+}
+
+/// `SPC c f`: the file, or in visual mode the selected lines.
+fn formatCmd(c: Context) !void {
+    const ed = c.ed;
+    if (ed.mode == .visual) {
+        const t = ed.text();
+        const first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
+        const last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
+        ed.exitVisual();
+        return ed.formatBuffer(.{ first, last }, false);
+    }
+    try ed.formatBuffer(null, false);
+}
+
 fn zoom(comptime how: enum { in, out, reset }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {

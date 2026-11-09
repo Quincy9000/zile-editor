@@ -75,9 +75,12 @@ under it is a compile error.
 | `SPC w >` `<` `+` `-` | wider, narrower, taller, shorter | done |
 | `SPC b N`, `SPC b b` / `SPC b l` / ``SPC ` ``, `SPC b O`, `SPC b r`, `SPC b s` / `SPC b S` | new empty buffer, flip to the other buffer (picker: `SPC b B` / `SPC ,`), kill others (keeps unsaved), revert from disk, save / save all | done |
 | in pickers: `<Tab>`, `<C-v>`, `<C-s>` | "Open in..." menu (this window, split right/below/left/above); open in a split right / below. Works for files, buffers, grep, references, symbols, diagnostics, jumps, run errors, git changes, explorer files; on a project (`SPC p p`) the split opens once a file is picked | done |
+| `zile -t` | terminal mode: the same editor drawn in the terminal; automatic when there is no display (SSH) or no window can open | done |
 | `zile <path>` | a file (trailing `/` and `..` resolved); a folder opens the explorer there; a file that can't be opened leaves a message instead of not starting | done |
 | `SPC p p`, `SPC p f` | switch project (projects opened before, most recent first; picking one finds a file in it); find file in project | done |
-| completion → function | arguments arrive as snippet placeholders: the current one is highlighted and typing replaces it; `<Tab>` / `<S-Tab>` next / previous (a fresh one keeps its text), `<BS>` clears it, the last `<Tab>` goes to the server's final cursor | done |
+| AI ghost completion, `SPC t a` | while typing in insert mode (at a line's end, or before closing `)]}"';,`), a local model through Ollama fills in the middle (`/api/generate` with `prompt` + `suffix`; `$ZILE_AI_MODEL`, default `qwen2.5-coder:1.5b-base`; `$OLLAMA_HOST`). Shown in gray at the cursor (first line inline, more below); typing it out keeps it, `<A-;>` takes all of it, `<A-l>` a line, `<A-Right>` a character (the rest stays offered); anything else drops it. `<Tab>` stays with the completion menu and placeholders, so the two never fight. One worker thread, latest request only, sent after a 120 ms pause; replies used only if the cursor and text are unchanged. No answer from Ollama turns it off with a message (`SPC t a` retries) | done |
+| `SPC c f`, `SPC t f` | format the file (visual: the selected lines, when the server can) with the language server, else the language's formatter (`zig fmt`, `rustfmt`, `clang-format`, `ruff format`, `jq`) run in the project root; changed lines only, one undo step, cursor kept. Format on save (on by default; `SPC t f` toggles); a failed format still saves | done |
+| completion → function | arguments arrive as snippet placeholders: the current one is highlighted and typing replaces it; `<Tab>` / `<S-Tab>` next / previous (a fresh one keeps its text), `<BS>` clears it, the last `<Tab>` goes to the server's final cursor; in Zig/C/Rust, when the call ends its line, one more `<Tab>` goes to the end of the statement, adding the `;` | done |
 | signature help | `(` (the server's trigger characters) shows the call's signature above the cursor with the current parameter highlighted and its doc; `,` updates it, `)` / leaving insert mode closes it; it follows placeholder jumps | done |
 | `SPC t p` | toggle autopairs (on by default): `(` → `()`, closers and quotes step over, quotes skip word neighbors, `<CR>` in `{}` opens a block | done |
 | `SPC g g` | git menu (plain-English actions: commit, push, pull, branches, changed files, set remote, ...) | done |
@@ -418,6 +421,35 @@ src/terminal/
   command" collects `path:line:col` matches.
 - Use ghostty's Unicode width functions in the editor too, so buffers and
   terminals agree on column widths.
+
+## Terminal mode (`zile -t`)
+
+One binary: it opens a window when it can, and draws in the terminal
+otherwise (`-t`, no `DISPLAY`/`WAYLAND_DISPLAY`, or the window fails to
+open). raylib is built with `SUPPORT_CLIPBOARD_IMAGE=0`, its only direct X11
+call, so the binary needs nothing but libc to start; GLFW loads X11/GL
+itself when a window opens.
+
+- **Drawing:** `ui/gfx.zig` is the UI's primitives (clear, rect, glyph,
+  clip, offset, cursor), sent to raylib or to `tui/Grid.zig`. The UI keeps
+  working in pixels; in a terminal a cell is 10x20 "pixels" and the grid
+  maps calls onto cells: full rects paint backgrounds (opaque ones clear the
+  text under them, translucent ones tint), thin horizontal lines near a
+  cell's bottom underline (colored underlines), thin vertical ones draw `│`
+  in empty cells (dividers, git signs), text is one codepoint per cell, and
+  the terminal's own cursor goes where the UI says (block/bar/underline).
+- **Output** (`tui/Tui.zig`): raw mode on the alternate screen; each frame
+  writes only changed cells (truecolor SGR) inside synchronized-output
+  markers.
+- **Input** (`tui/input.zig`): kitty keyboard protocol (`CSI > 1 u`) so
+  `<Esc>`, `<C-i>`/`<Tab>`, `<C-S-v>` stay distinct where supported; xterm
+  sequences, control bytes, `ESC`+key as Alt, UTF-8, bracketed paste (goes
+  where typing would; `p` in normal mode), SGR mouse (click, wheel). A
+  self-pipe wakes the loop for worker threads.
+- **Clipboard:** yanks go to the system clipboard with OSC 52 (works over
+  SSH in most terminals); pasting uses the terminal's own paste.
+- **Limits:** zoom is the terminal's; 1px borders and bars don't exist
+  (popups are set apart by color); wide (CJK) characters may misalign.
 
 ## Platform notes
 

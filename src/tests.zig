@@ -35,4 +35,8 @@ comptime {
     _ = @import("terminal/RunMemory.zig");
     _ = @import("terminal/Terminal.zig");
     _ = @import("terminal/errors.zig");
+    _ = @import("tui/input.zig");
+    _ = @import("format.zig");
+    _ = @import("ai/Ghost.zig");
+    _ = @import("tui/Grid.zig");
 }

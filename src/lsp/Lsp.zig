@@ -25,6 +25,9 @@ cwd: []const u8 = "",
 /// Characters that should pop up completion (from the server's capabilities).
 triggers: std.ArrayList(u8) = .empty,
 sig_triggers: std.ArrayList(u8) = .empty,
+/// The server formats whole documents / ranges.
+can_format: bool = false,
+can_format_range: bool = false,
 sig_retriggers: std.ArrayList(u8) = .empty,
 pending: std.AutoHashMapUnmanaged(i64, Pending) = .empty,
 /// Open documents.
@@ -59,6 +62,7 @@ const Pending = union(enum) {
     symbols,
     completion: struct { buffer: *Buffer, word_start: usize },
     signature: *Buffer,
+    format: struct { buffer: *Buffer, then_save: bool },
 };
 
 /// One edit of a WorkspaceEdit, by file (0-based positions).
@@ -249,6 +253,9 @@ pub fn closeBuffer(l: *Lsp, b: *Buffer) void {
         .signature => |sb| if (sb == b) {
             stale = e.key_ptr.*;
         },
+        .format => |f| if (f.buffer == b) {
+            stale = e.key_ptr.*;
+        },
         else => {},
     };
     if (stale) |k| _ = l.pending.remove(k);
@@ -313,6 +320,23 @@ pub fn requestRename(l: *Lsp, ed: *Editor, pos: usize, new_name: []const u8) !vo
     try l.pending.put(l.gpa, id, .rename);
 }
 
+/// Asks for the current buffer's formatting (lines `range`, inclusive, if
+/// given and supported). `then_save`: save once it's applied.
+pub fn requestFormat(l: *Lsp, ed: *Editor, range: ?[2]usize, then_save: bool) !void {
+    const doc = l.docs.get(ed.buffer) orelse return error.NotOpen;
+    try l.sync(ed);
+    const options = .{ .tabSize = ed.options.tab_width, .insertSpaces = ed.options.expand_tab };
+    const id = if (range != null and l.can_format_range)
+        try l.client.request("textDocument/rangeFormatting", .{
+            .textDocument = .{ .uri = doc.uri },
+            .range = .{ .start = .{ .line = range.?[0], .character = 0 }, .end = .{ .line = range.?[1] + 1, .character = 0 } },
+            .options = options,
+        })
+    else
+        try l.client.request("textDocument/formatting", .{ .textDocument = .{ .uri = doc.uri }, .options = options });
+    try l.pending.put(l.gpa, id, .{ .format = .{ .buffer = ed.buffer, .then_save = then_save } });
+}
+
 /// Asks what call the cursor is in, and which argument.
 pub fn requestSignature(l: *Lsp, ed: *Editor) !void {
     const doc = l.docs.get(ed.buffer) orelse return;
@@ -361,6 +385,8 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
     const result = obj.get("result") orelse .null;
     if (obj.get("error")) |e| {
         if (req != .completion) ed.setMessage(.err, "lsp: {s}", .{str(field(e, "message")) orelse "request failed"});
+        // Formatting before a save failed: save anyway.
+        if (req == .format and req.format.then_save) ed.saveBufferNow(req.format.buffer);
         return;
     }
     switch (req) {
@@ -372,6 +398,18 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                     try l.triggers.append(l.gpa, chars[chars.len - 1]);
                 };
             };
+            const provides = struct {
+                fn f(v: ?std.json.Value) bool {
+                    const x = v orelse return false;
+                    return switch (x) {
+                        .bool => |b| b,
+                        .null => false,
+                        else => true,
+                    };
+                }
+            }.f;
+            l.can_format = provides(field(caps, "documentFormattingProvider"));
+            l.can_format_range = provides(field(caps, "documentRangeFormattingProvider"));
             const sig = field(caps, "signatureHelpProvider");
             inline for (.{ .{ "triggerCharacters", &l.sig_triggers }, .{ "retriggerCharacters", &l.sig_retriggers } }) |f| {
                 if (field(sig, f[0])) |tc| if (tc == .array) {
@@ -398,6 +436,18 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
         },
         .completion => |cp| try ed.showCompletion(cp.buffer, cp.word_start, result),
         .signature => |b| try ed.showSignature(b, result),
+        .format => |f| {
+            var edits: std.ArrayList(TextEdit) = .empty;
+            defer {
+                for (edits.items) |e| {
+                    l.gpa.free(e.path);
+                    l.gpa.free(e.text);
+                }
+                edits.deinit(l.gpa);
+            }
+            if (l.docs.get(f.buffer)) |doc| try l.collectTextEdits(ed, doc.uri, result, &edits);
+            try ed.applyFormatEdits(f.buffer, edits.items, f.then_save);
+        },
         .symbols => {
             var list: std.ArrayList(Symbol) = .empty;
             errdefer {

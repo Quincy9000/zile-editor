@@ -7,6 +7,7 @@ const Font = @import("ui/Font.zig");
 const Theme = @import("ui/Theme.zig");
 const render = @import("ui/render.zig");
 const keys = @import("input/keys.zig");
+const Tui = @import("tui/Tui.zig");
 
 const usage =
     \\usage: zile [options] [file]
@@ -14,6 +15,8 @@ const usage =
     \\options:
     \\  --font <path>       TTF/OTF font file (default: discovered monospace font)
     \\  --font-size <px>    font size in pixels (default: 18)
+    \\  -t, --tui           draw in the terminal instead of a window (automatic
+    \\                      when there is no display, e.g. over SSH)
     \\  -h, --help          show this help
     \\
     \\debug environment variables:
@@ -24,6 +27,7 @@ const usage =
 
 const Args = struct {
     file: ?[]const u8 = null,
+    tui: bool = false,
     font: ?[]const u8 = null,
     font_size: i32 = 18,
 };
@@ -36,6 +40,8 @@ fn parseArgs(init: std.process.Init) !Args {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tui")) {
+            out.tui = true;
         } else if (std.mem.eql(u8, arg, "--font")) {
             out.font = it.next() orelse return error.MissingArgument;
         } else if (std.mem.eql(u8, arg, "--font-size")) {
@@ -62,10 +68,22 @@ pub fn main(init: std.process.Init) !void {
     defer ed.deinit();
     if (args.file) |path| ed.openArg(path);
 
+    const theme = &Theme.default;
+    ed.term_fg = .{ .r = theme.fg.r, .g = theme.fg.g, .b = theme.fg.b };
+    ed.term_bg = .{ .r = theme.popup_bg.r, .g = theme.popup_bg.g, .b = theme.popup_bg.b };
+
+    // Terminal mode when asked, or when there is no display to open a window on.
+    const env = init.environ_map;
+    const no_display = env.get("DISPLAY") == null and env.get("WAYLAND_DISPLAY") == null;
+    if (args.tui or no_display) return runTui(gpa, io, &ed, theme, test_keys, test_screenshot);
+
     // raylib warns about every oversized box-drawing glyph; only show errors.
     rl.SetTraceLogLevel(rl.LOG_ERROR);
     rl.SetConfigFlags(rl.FLAG_WINDOW_RESIZABLE | rl.FLAG_VSYNC_HINT);
     rl.InitWindow(1100, 720, "zile");
+    // No window after all (no X11/GL libraries, a display we can't reach):
+    // the terminal still works.
+    if (!rl.IsWindowReady()) return runTui(gpa, io, &ed, theme, test_keys, test_screenshot);
     defer rl.CloseWindow();
     // raylib closes the window on Esc by default; Esc is a mode key here.
     rl.SetExitKey(rl.KEY_NULL);
@@ -78,9 +96,6 @@ pub fn main(init: std.process.Init) !void {
 
     var font = try Font.load(gpa, io, args.font, args.font_size);
     defer font.deinit();
-    const theme = &Theme.default;
-    ed.term_fg = .{ .r = theme.fg.r, .g = theme.fg.g, .b = theme.fg.b };
-    ed.term_bg = .{ .r = theme.popup_bg.r, .g = theme.popup_bg.g, .b = theme.popup_bg.b };
 
     // Size the view before scripted keys so scrolling behaves like the real window.
     _ = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
@@ -131,6 +146,16 @@ pub fn main(init: std.process.Init) !void {
 }
 
 extern fn rlDrawRenderBatchActive() void; // rlgl, part of raylib
+
+fn runTui(gpa: std.mem.Allocator, io: std.Io, ed: *Editor, theme: *const Theme, test_keys: ?[]const u8, snapshot: ?[]const u8) !void {
+    Tui.run(gpa, io, ed, .{ .theme = theme, .test_keys = test_keys, .test_snapshot = snapshot }) catch |err| switch (err) {
+        error.NotATerminal => {
+            std.log.err("no display to open a window on, and not running in a terminal", .{});
+            return err;
+        },
+        else => return err,
+    };
+}
 
 fn clipboardGet(gpa: std.mem.Allocator) ?[]u8 {
     const text = rl.GetClipboardText() orelse return null;

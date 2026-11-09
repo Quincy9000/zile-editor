@@ -9,6 +9,7 @@ const Theme = @import("Theme.zig");
 const keymap = @import("../input/keymap.zig");
 const keys = @import("../input/keys.zig");
 const picker_view = @import("picker_view.zig");
+const gfx = @import("gfx.zig");
 const operators = @import("../operators.zig");
 const Syntax = @import("../syntax/Syntax.zig");
 const Lsp = @import("../lsp/Lsp.zig");
@@ -106,24 +107,18 @@ pub fn windowLayout(ed: *Editor, font: *const Font, w: *Editor.Windows.Window) L
     };
 }
 
-// rlgl (part of raylib): a transform applied to everything drawn, so window
-// contents draw at their own origin.
-extern fn rlPushMatrix() void;
-extern fn rlPopMatrix() void;
-extern fn rlTranslatef(x: f32, y: f32, z: f32) void;
 
 pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
-    rl.ClearBackground(theme.bg);
+    gfx.clear(theme.bg);
     for (ed.window_list.items) |w| drawWindow(ed, font, theme, w);
     if (ed.cmd_float) |f| drawCmdFloat(ed, font, theme, f, l);
     // Popups at the focused window's cursor.
     const fl = if (ed.cmd_float != null and ed.window == ed.cmd_float.?) floatLayout(ed, font, ed.window) else windowLayout(ed, font, ed.window);
-    rlPushMatrix();
-    rlTranslatef(fl.x0, fl.y0, 0);
+    gfx.pushOffset(fl.x0, fl.y0);
     drawHover(ed, font, theme, fl);
     drawSignature(ed, font, theme, fl);
     drawCompletion(ed, font, theme, fl);
-    rlPopMatrix();
+    gfx.popOffset();
     drawPopup(ed, font, theme, l);
     drawWhichKey(ed, font, theme, l);
     drawStatus(ed, font, theme, l);
@@ -195,7 +190,7 @@ fn keyCells(k: keys.KeyEvent) usize {
 }
 
 pub fn rect(x: f32, y: f32, w: f32, h: f32, color: rl.Color) void {
-    rl.DrawRectangleRec(.{ .x = x, .y = y, .width = w, .height = h }, color);
+    gfx.rect(x, y, w, h, color);
 }
 
 /// A path for lists: relative inside the current project, else its last
@@ -248,13 +243,12 @@ fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.
     _ = font.drawText(hint, r.x + r.w - @as(f32, @floatFromInt(cells(hint) + 1)) * font.cell_w, r.y, theme.status_dim);
 
     const fl = floatLayout(ed, font, f);
-    rl.BeginScissorMode(@intFromFloat(r.x), @intFromFloat(r.y), @intFromFloat(@ceil(r.w)), @intFromFloat(@ceil(r.h)));
-    defer rl.EndScissorMode();
+    gfx.beginClip(r.x, r.y, r.w, r.h);
+    defer gfx.endClip();
     const peek: ?Editor.Peek = if (f == ed.window) null else ed.peekWindow(f);
     defer if (peek) |p| ed.unpeekWindow(p);
-    rlPushMatrix();
-    defer rlPopMatrix();
-    rlTranslatef(fl.x0, fl.y0, 0);
+    gfx.pushOffset(fl.x0, fl.y0);
+    defer gfx.popOffset();
     drawText(ed, font, theme, fl, f == ed.window);
 }
 
@@ -323,6 +317,11 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
     if (t.draw(Ctx{ .font = font, .x0 = x0, .y0 = y0 })) |cur| {
         const x = x0 + @as(f32, @floatFromInt(cur.x)) * cw;
         const y = y0 + @as(f32, @floatFromInt(cur.y)) * ch;
+        gfx.cursor(x, y, switch (cur.style) {
+            .bar => .bar,
+            .underline => .underline,
+            .block, .hollow => .block,
+        });
         var c = theme.cursor;
         switch (cur.style) {
             .block => {
@@ -347,8 +346,8 @@ fn drawWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Wi
     const focused = w == ed.window;
     const wl = windowLayout(ed, font, w);
     const r = w.rect;
-    rl.BeginScissorMode(@intFromFloat(r.x), @intFromFloat(r.y), @intFromFloat(@ceil(r.w)), @intFromFloat(@ceil(r.h)));
-    defer rl.EndScissorMode();
+    gfx.beginClip(r.x, r.y, r.w, r.h);
+    defer gfx.endClip();
 
     const peek: ?Editor.Peek = if (focused) null else ed.peekWindow(w);
     defer if (peek) |p| ed.unpeekWindow(p);
@@ -371,9 +370,8 @@ fn drawWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Wi
     }
     if (r.x > 0) rect(r.x, r.y, 1, r.h, theme.popup_border);
 
-    rlPushMatrix();
-    defer rlPopMatrix();
-    rlTranslatef(wl.x0, wl.y0, 0);
+    gfx.pushOffset(wl.x0, wl.y0);
+    defer gfx.popOffset();
     drawText(ed, font, theme, wl, focused);
 }
 
@@ -385,19 +383,23 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     const v = &ed.view;
     const cursor_line = ed.cursorLine();
     const tab_width = ed.options.tab_width;
+    var ghost_below: ?struct { text: []const u8, y: f32 } = null;
 
     // Rows walk visible lines: a closed fold is drawn as its first line plus a
     // marker, and the lines it hides are skipped.
     // Rows: text lines (a closed fold is one) and ghost lines (old HEAD text).
     var row: usize = 0;
+    // Rows taken by an AI suggestion's extra lines (pushing the text below
+    // down, like inserted lines).
+    var virtual: usize = 0;
     var r = ed.topRow();
-    while (row < l.rows) : (row += 1) {
+    while (row + virtual < l.rows) : (row += 1) {
         if (row > 0) {
             const next = ed.nextRow(r);
             if (next.eql(r)) break;
             r = next;
         }
-        const y = @as(f32, @floatFromInt(row)) * font.cell_h;
+        const y = @as(f32, @floatFromInt(row + virtual)) * font.cell_h;
         if (r.ghost) |k| {
             drawGhostRow(ed, font, theme, l, r.line, k, y);
             continue;
@@ -444,6 +446,12 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         // Text, starting at the first visible display column, colored by syntax.
         const ls = t.lineStart(line);
         const bytes = t.lineSlice(line);
+        // An AI suggestion at the cursor: its first line goes inline (the
+        // rest of the line moves right), more lines are drawn below.
+        const ghost: ?[]const u8 = if (focused and is_current) ed.aiSuggestionHere() else null;
+        const ghost_at = if (ghost != null) v.cursor - ls else bytes.len + 1;
+        const ghost_first = if (ghost) |g| std.mem.sliceTo(g, '\n') else "";
+        const ghost_cells = cells(ghost_first);
         var it = Font.Utf8Lossy{ .bytes = bytes };
         var col: usize = 0;
         while (true) {
@@ -451,12 +459,18 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             const cp = it.next() orelse break;
             const next_col = if (cp == '\t') motions.nextTabStop(col, tab_width) else col + 1;
             defer col = next_col;
-            if (next_col <= v.left) continue;
-            if (col >= v.left + l.cols) break;
+            const shift: usize = if (offset >= ghost_at) ghost_cells else 0;
+            if (next_col + shift <= v.left) continue;
+            if (col + shift >= v.left + l.cols) break;
             if (cp == '\t' or cp == ' ') continue;
-            const x = l.text_x + @as(f32, @floatFromInt(col - v.left)) * font.cell_w;
+            const x = l.text_x + @as(f32, @floatFromInt(col + shift - v.left)) * font.cell_w;
             const style = if (syntax) |s| s.styleAt(ls + offset) else .none;
             font.drawCodepoint(cp, x, y, theme.syntax.get(style));
+        }
+        if (ghost) |g| {
+            const gc = motions.displayCol(bytes, ghost_at, tab_width);
+            if (gc >= v.left) _ = font.drawText(ghost_first, l.text_x + @as(f32, @floatFromInt(gc - v.left)) * font.cell_w, y, theme.ai_fg);
+            if (g.len > ghost_first.len) ghost_below = .{ .text = g[ghost_first.len + 1 ..], .y = y };
         }
         if (fold) |f| {
             // "… 12 lines" after the fold's first line.
@@ -466,7 +480,20 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
                 const label = std.fmt.bufPrint(&buf, "… {d} lines", .{f.last - f.first}) catch "…";
                 _ = font.drawText(label, l.text_x + @as(f32, @floatFromInt(end_col - v.left)) * font.cell_w, y, theme.fold_fg);
             }
-        } else if (line_diag != null) drawDiagnostics(ed, font, theme, l, diags, line, y);
+        } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, diags, line, y);
+
+        // The suggestion's further lines: rows of their own under this one
+        // (no line numbers: they aren't in the file yet).
+        if (ghost_below) |gb| {
+            var lines = std.mem.splitScalar(u8, gb.text, '\n');
+            while (lines.next()) |gl| {
+                if (row + virtual + 1 >= l.rows) break;
+                virtual += 1;
+                const yy = @as(f32, @floatFromInt(row + virtual)) * font.cell_h;
+                _ = font.drawText(gl, l.text_x - @as(f32, @floatFromInt(v.left)) * font.cell_w, yy, theme.ai_fg);
+            }
+            ghost_below = null;
+        }
     }
 
     // Extra cursors: the same shape, a little dimmer.
@@ -490,6 +517,12 @@ fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
 
     const x = l.text_x + @as(f32, @floatFromInt(col - v.left)) * font.cell_w;
     const y = @as(f32, @floatFromInt(row)) * font.cell_h;
+    // The terminal's own cursor goes on the focused one (a no-op in a window).
+    if (color.a == 255) gfx.cursor(x, y, switch (ed.mode) {
+        .insert => .bar,
+        .operator => .underline,
+        else => .block,
+    });
     switch (ed.mode) {
         .insert => rect(x, y, 2, font.cell_h, color),
         // Half block: an operator is waiting for its motion.
@@ -547,6 +580,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
         x = font.drawText(label, x, y, theme.status_dim);
         x = font.drawText(sp.input.items(), x, y, theme.fg);
         rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
+        gfx.cursor(x, y, .bar);
     } else if (ed.message.len > 0) {
         const color = if (ed.message.kind == .err) theme.message_err else theme.message_info;
         _ = font.drawText(ed.message.text(), x, y, color);

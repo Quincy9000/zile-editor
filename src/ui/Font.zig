@@ -9,6 +9,8 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const rl = @import("raylib");
+const gfx = @import("gfx.zig");
+const Grid = @import("../tui/Grid.zig");
 
 const Font = @This();
 
@@ -19,6 +21,14 @@ cell_w: f32,
 cell_h: f32,
 /// Offset from a cell's top to the glyph box's top, centering it vertically.
 glyph_y: f32,
+/// Terminal mode: no atlas; glyphs go to the cell grid (the terminal draws
+/// them with its own font).
+grid_mode: bool = false,
+
+/// The "font" of terminal mode: a cell in the grid's pixel units.
+pub fn cells() Font {
+    return .{ .font = undefined, .size = 0, .cell_w = Grid.cell_w, .cell_h = Grid.cell_h, .glyph_y = 0, .grid_mode = true };
+}
 
 const line_height = 1.3;
 
@@ -95,7 +105,7 @@ pub fn load(gpa: Allocator, io: Io, path: ?[]const u8, size: i32) LoadError!Font
 }
 
 pub fn deinit(f: *Font) void {
-    rl.UnloadFont(f.font);
+    if (!f.grid_mode) rl.UnloadFont(f.font);
     f.* = undefined;
 }
 
@@ -117,6 +127,7 @@ fn discover(gpa: Allocator, io: Io) Allocator.Error!?[:0]u8 {
 
 /// Draws one codepoint with its cell's top-left at (x, y).
 pub fn drawCodepoint(f: *const Font, cp: u21, x: f32, y: f32, color: rl.Color) void {
+    if (f.grid_mode) return gfx.glyph(cp, x, y, color);
     rl.DrawTextCodepoint(f.font, cp, .{ .x = x, .y = y + f.glyph_y }, @floatFromInt(f.font.baseSize), color);
 }
 

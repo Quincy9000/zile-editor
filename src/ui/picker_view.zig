@@ -11,6 +11,7 @@ const fuzzy = @import("../picker/fuzzy.zig");
 const Font = @import("Font.zig");
 const Theme = @import("Theme.zig");
 const render = @import("render.zig");
+const gfx = @import("gfx.zig");
 
 const rect = render.rect;
 const cells = render.cells;
@@ -85,6 +86,7 @@ fn drawQueryLine(p: *Picker, font: *const Font, theme: *const Theme, bx: f32, y:
     // Typing shows a cursor; moving through results shows the keys instead.
     if (p.ed.mode == .picker) {
         rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
+        gfx.cursor(x, y, .bar);
     } else {
         _ = font.drawText("  j/k move · Enter open · i type · q close", x, y, theme.status_dim);
     }
@@ -266,4 +268,5 @@ pub fn drawPromptBox(font: *const Font, theme: *const Theme, l: render.Layout, t
     }
     x = font.drawText(visible, x, y, theme.fg);
     rect(x, y + 2, 2, ch - 4, theme.cursor);
+    gfx.cursor(x, y, .bar);
 }

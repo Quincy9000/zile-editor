@@ -25,6 +25,8 @@ const Completion = @import("lsp/Completion.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
+const format = @import("format.zig");
+const Ghost = @import("ai/Ghost.zig");
 const Snippet = @import("lsp/Snippet.zig");
 pub const Windows = @import("Windows.zig");
 pub const Project = @import("core/Project.zig");
@@ -53,6 +55,10 @@ pub const Options = struct {
     diagnostic_text: bool = true,
     /// Close brackets and quotes as they are typed.
     auto_pairs: bool = true,
+    /// Format a file (language server, else its formatter) when saving it.
+    format_on_save: bool = true,
+    /// AI ghost completion while typing (a local model through Ollama).
+    ai_complete: bool = true,
 };
 
 pub const View = struct {
@@ -146,6 +152,19 @@ pub const OpenTarget = enum {
     }
 };
 
+/// A gray suggestion at `pos`: `text` is what Tab would insert.
+pub const AiSuggestion = struct {
+    buffer: *Buffer,
+    pos: usize,
+    /// Owned.
+    text: []u8,
+
+    /// What's still ahead of the cursor (typing the suggestion keeps it).
+    pub fn remaining(s: AiSuggestion, cursor: usize) []const u8 {
+        return s.text[@min(cursor - s.pos, s.text.len)..];
+    }
+};
+
 /// A signature: its label and the active parameter's range in it.
 pub const SignatureHelp = struct {
     label: []u8,
@@ -172,6 +191,11 @@ pub const SnippetSession = struct {
     /// The current placeholder still holds its default text: the first key
     /// typed replaces it.
     fresh: bool = false,
+    /// Past the arguments, at the end of the call: one more <Tab> goes to
+    /// the end of the statement, adding its `;`.
+    at_end: bool = false,
+    /// What was accepted is a call (a function), so it may end with `;`.
+    is_call: bool = false,
 };
 
 /// A cursor besides the primary one: position, visual anchor, wanted column.
@@ -405,6 +429,16 @@ completion: ?Completion = null,
 signature: ?SignatureHelp = null,
 /// Placeholders of an accepted snippet (function arguments) to fill in.
 snippet: ?SnippetSession = null,
+/// AI ghost completion: the worker (started on first use), the latest
+/// request, and the suggestion shown at the cursor.
+ai: ?*Ghost = null,
+ai_gen: u64 = 0,
+ai_asked: ?struct { buffer: *Buffer, pos: usize, version: u64 } = null,
+ai_suggestion: ?AiSuggestion = null,
+/// The model couldn't be reached: off until toggled again.
+ai_unreachable: bool = false,
+/// Tests never ask a model (they mustn't depend on one running).
+ai_offline: bool = @import("builtin").is_test,
 /// Word start a completion was last requested for (avoids re-asking per key).
 completion_asked: ?usize = null,
 
@@ -502,6 +536,8 @@ pub fn deinit(ed: *Editor) void {
     ed.closeCompletion();
     ed.closeSignature();
     ed.endSnippet();
+    ed.clearAiSuggestion();
+    if (ed.ai) |g| g.destroy();
     for (ed.buffers.items) |b| {
         b.deinit(ed.gpa);
         ed.gpa.destroy(b);
@@ -588,6 +624,7 @@ pub fn tick(ed: *Editor) void {
     ed.tickLsp();
     ed.pollGitJob();
     ed.pollTerminals();
+    ed.pollAi();
     ed.highlightView();
     if (ed.picker) |p| {
         p.poll();
@@ -705,6 +742,7 @@ fn processKey(ed: *Editor, ev: KeyEvent) void {
         ed.closeSignature();
         ed.endSnippet();
     }
+    ed.updateAi();
     ed.scrollToCursor();
 }
 
@@ -1050,25 +1088,162 @@ pub fn acceptCompletion(ed: *Editor) !void {
     defer ed.gpa.free(insert);
     const is_snippet = item.snippet;
     const start = c.word_start;
+    // A function (by its kind, or text that ends in a call when the server
+    // doesn't say): <Tab> after it can end the statement with `;`.
+    const is_call = item.call or std.mem.endsWith(u8, std.mem.trimEnd(u8, insert, "$0"), ")");
     ed.closeCompletion();
     try ed.deleteRange(start, ed.view.cursor);
-    if (!is_snippet) return ed.insertText(insert);
+    if (!is_snippet) {
+        try ed.insertText(insert);
+        if (is_call) ed.callEnded();
+        return;
+    }
     // A snippet: insert its text, then fill in the placeholders.
     const snip = try Snippet.parse(ed.gpa, insert);
     defer snip.deinit(ed.gpa);
     try ed.insertText(snip.text);
-    try ed.startSnippet(start, snip);
+    try ed.startSnippet(start, snip, is_call);
+}
+
+/// A call was inserted with nothing to fill in (`foo()`): the cursor is
+/// after it, and <Tab> can go on to the `;`.
+fn callEnded(ed: *Editor) void {
+    ed.endSnippet();
+    const stops = ed.gpa.alloc([2]usize, 1) catch return;
+    stops[0] = .{ ed.view.cursor, ed.view.cursor };
+    ed.snippet = .{ .buffer = ed.buffer, .stops = stops, .has_final = true, .is_call = true };
+    ed.snippetAtEnd();
+}
+
+// AI ghost completion: after typing in insert mode, a local model (Ollama)
+// suggests what comes next, shown in gray at the cursor; <Tab> takes it.
+
+/// Where Ollama is and which model to ask ($OLLAMA_HOST, $ZILE_AI_MODEL).
+fn aiConfig() struct { host: []const u8, model: []const u8 } {
+    const host: []const u8 = if (std.c.getenv("OLLAMA_HOST")) |h| std.mem.span(h) else "http://localhost:11434";
+    const model: []const u8 = if (std.c.getenv("ZILE_AI_MODEL")) |m| std.mem.span(m) else "qwen2.5-coder:1.5b-base";
+    return .{ .host = host, .model = model };
+}
+
+pub fn clearAiSuggestion(ed: *Editor) void {
+    const s = ed.ai_suggestion orelse return;
+    ed.gpa.free(s.text);
+    ed.ai_suggestion = null;
+}
+
+/// The suggestion as it stands at the cursor, if it is still valid there.
+pub fn aiSuggestionHere(ed: *Editor) ?[]const u8 {
+    const s = ed.ai_suggestion orelse return null;
+    if (s.buffer != ed.buffer or ed.mode != .insert) return null;
+    const c = ed.view.cursor;
+    if (c < s.pos or c - s.pos > s.text.len) return null;
+    if (!std.mem.eql(u8, ed.text().slice(s.pos, c), s.text[0 .. c - s.pos])) return null;
+    const rest = s.remaining(c);
+    return if (rest.len > 0) rest else null;
+}
+
+/// After each key: keep a suggestion that is being typed out, otherwise
+/// drop it and (at a line's end) ask for a new one.
+fn updateAi(ed: *Editor) void {
+    if (!ed.options.ai_complete or ed.ai_unreachable or ed.mode != .insert or
+        ed.replaying or ed.cursors.items.len > 0 or ed.cmd_float != null)
+    {
+        ed.clearAiSuggestion();
+        return;
+    }
+    if (ed.aiSuggestionHere() != null) return;
+    ed.clearAiSuggestion();
+    const b = ed.buffer;
+    const c = ed.view.cursor;
+    if (ed.ai_asked) |a| if (a.buffer == b and a.pos == c and a.version == b.edit_version) return;
+    // Only at the end of a line (or before closing brackets/quotes/;):
+    // mid-line guesses from a small model are mostly noise.
+    const rest = ed.restOfLine();
+    for (rest) |ch| if (std.mem.indexOfScalar(u8, ")]}\"';,", ch) == null) return;
+    if (ed.ai_offline) return;
+    const t = ed.text();
+    if (ed.ai == null) {
+        const cfg = aiConfig();
+        ed.ai = Ghost.create(ed.gpa, ed.io, ed.wake_fn, cfg.host, cfg.model) catch return;
+    }
+    // A window around the cursor: from a line start ~6KB back, ~2KB ahead.
+    var from = c -| 6000;
+    if (from > 0) from = t.lineStart(t.lineOf(from));
+    const to = @min(t.len(), c + 2000);
+    const tail: []const u8 = if (to == t.len() and b.final_newline) "\n" else "";
+    const suffix = std.mem.concat(ed.gpa, u8, &.{ t.slice(c, to), tail }) catch return;
+    defer ed.gpa.free(suffix);
+    ed.ai_gen += 1;
+    ed.ai.?.submit(ed.ai_gen, t.slice(from, c), suffix) catch return;
+    ed.ai_asked = .{ .buffer = b, .pos = c, .version = b.edit_version };
+}
+
+/// Picks up the model's reply, if it still fits where the cursor is.
+fn pollAi(ed: *Editor) void {
+    const g = ed.ai orelse return;
+    const r = g.take() orelse return;
+    defer if (r.text) |t| ed.gpa.free(t);
+    if (r.failed) {
+        ed.ai_unreachable = true;
+        ed.clearAiSuggestion();
+        ed.setMessage(.err, "AI completion is off: no answer from Ollama at {s} (SPC t a to try again)", .{g.url});
+        return;
+    }
+    if (r.gen != ed.ai_gen or ed.mode != .insert) return;
+    const a = ed.ai_asked orelse return;
+    if (a.buffer != ed.buffer or a.pos != ed.view.cursor or a.version != ed.buffer.edit_version) return;
+    const tidied = Ghost.tidy(r.text.?, ed.restOfLine(), 8);
+    // Drop lines that only repeat what's already around the cursor.
+    const t = ed.text();
+    const line = ed.cursorLine();
+    const ctx_from = t.lineStart(line -| 40);
+    const ctx_to = t.lineEnd(@min(line + 40, t.lineCount() - 1));
+    const prefix_on_line = t.slice(t.lineStart(line), ed.view.cursor);
+    const suggestion = Ghost.dropRepeats(tidied, prefix_on_line, t.slice(ctx_from, ctx_to));
+    if (suggestion.len == 0) return;
+    ed.clearAiSuggestion();
+    ed.ai_suggestion = .{ .buffer = ed.buffer, .pos = a.pos, .text = ed.gpa.dupe(u8, suggestion) catch return };
+}
+
+pub const AiPart = enum { all, line, char };
+
+/// Takes the suggestion (<A-;>), its current line (<A-l>; at a line break,
+/// the break and the next line), or one character (<A-Right>). What's left
+/// stays offered. False when there is none.
+pub fn acceptAiSuggestion(ed: *Editor, part: AiPart) !bool {
+    const rest = ed.aiSuggestionHere() orelse return false;
+    const n = switch (part) {
+        .all => rest.len,
+        .line => blk: {
+            const start: usize = if (rest[0] == '\n') 1 else 0;
+            break :blk start + (std.mem.indexOfScalar(u8, rest[start..], '\n') orelse rest.len - start);
+        },
+        .char => std.unicode.utf8ByteSequenceLength(rest[0]) catch 1,
+    };
+    const taken = try ed.gpa.dupe(u8, rest[0..@min(n, rest.len)]);
+    defer ed.gpa.free(taken);
+    // Typing it in keeps the rest of the suggestion on offer.
+    try ed.insertText(taken);
+    if (ed.aiSuggestionHere() == null) ed.clearAiSuggestion();
+    return true;
 }
 
 // Snippets: function arguments as placeholders.
 
-fn startSnippet(ed: *Editor, at: usize, snip: Snippet) !void {
+fn startSnippet(ed: *Editor, at: usize, snip: Snippet, is_call: bool) !void {
     ed.endSnippet();
-    if (snip.stops.len == 0) return;
-    const stops = try ed.gpa.alloc([2]usize, snip.stops.len);
-    for (snip.stops, stops) |st, *r| r.* = .{ at + st.start, at + st.end };
-    const has_final = snip.stops[snip.stops.len - 1].index == 0;
-    ed.snippet = .{ .buffer = ed.buffer, .stops = stops, .has_final = has_final };
+    if (snip.stops.len == 0) {
+        if (is_call) ed.callEnded();
+        return;
+    }
+    // Without a $0 the final cursor is the snippet's end (by the LSP spec;
+    // clangd's `printf(${1:...})` has none).
+    const explicit_final = snip.stops[snip.stops.len - 1].index == 0;
+    const n = snip.stops.len + @intFromBool(!explicit_final);
+    const stops = try ed.gpa.alloc([2]usize, n);
+    for (snip.stops, stops[0..snip.stops.len]) |st, *r| r.* = .{ at + st.start, at + st.end };
+    if (!explicit_final) stops[n - 1] = .{ at + snip.text.len, at + snip.text.len };
+    ed.snippet = .{ .buffer = ed.buffer, .stops = stops, .has_final = true, .is_call = is_call };
     ed.goSnippetStop(0);
 }
 
@@ -1085,11 +1260,9 @@ fn goSnippetStop(ed: *Editor, i: usize) void {
     const last = i == s.stops.len - 1;
     ed.view.cursor = @min(r[0], ed.text().len());
     ed.view.want_col = null;
-    if (last and s.has_final) {
-        ed.endSnippet();
-        return;
-    }
+    if (last and s.has_final) return ed.snippetAtEnd();
     s.current = i;
+    s.at_end = false;
     s.fresh = r[1] > r[0];
     // The signature popup follows to this argument.
     if (ed.lspFor(ed.buffer)) |l| l.requestSignature(ed) catch {};
@@ -1103,15 +1276,64 @@ pub fn snippetStep(ed: *Editor, forward: bool) bool {
         return false;
     }
     if (forward) {
+        if (s.at_end) {
+            ed.snippetSemicolon();
+            return true;
+        }
         if (s.current + 1 >= s.stops.len) {
             // Past the last placeholder (no $0): after it.
             ed.view.cursor = s.stops[s.current][1];
-            ed.endSnippet();
+            ed.snippetAtEnd();
             return true;
         }
         ed.goSnippetStop(s.current + 1);
+    } else if (s.at_end) {
+        ed.goSnippetStop(s.current);
     } else if (s.current > 0) ed.goSnippetStop(s.current - 1);
     return true;
+}
+
+/// Languages whose statements end in `;` (the extra <Tab> after a call).
+fn usesSemicolons(b: *const Buffer) bool {
+    const s = b.syntax orelse return false;
+    const name = s.lang.name;
+    return std.mem.eql(u8, name, "zig") or std.mem.eql(u8, name, "c") or std.mem.eql(u8, name, "rust");
+}
+
+/// What follows the cursor on its line, trimmed.
+fn restOfLine(ed: *Editor) []const u8 {
+    const t = ed.text();
+    return std.mem.trim(u8, t.slice(ed.view.cursor, t.lineEnd(ed.cursorLine())), " \t");
+}
+
+/// The cursor is after the call. If it ends the statement in a language
+/// with semicolons, keep the session for one more <Tab> (to the `;`);
+/// otherwise the snippet is done.
+fn snippetAtEnd(ed: *Editor) void {
+    const rest = ed.restOfLine();
+    const can = ed.snippet.?.is_call and usesSemicolons(ed.buffer) and (rest.len == 0 or std.mem.eql(u8, rest, ";"));
+    if (!can) return ed.endSnippet();
+    const s = &ed.snippet.?;
+    s.at_end = true;
+    s.fresh = false;
+}
+
+/// The last <Tab>: to the end of the statement, adding the `;` if missing.
+fn snippetSemicolon(ed: *Editor) void {
+    ed.endSnippet();
+    const rest = ed.restOfLine();
+    // Something was typed after the call that isn't a statement end: stay.
+    if (rest.len > 0 and !std.mem.eql(u8, rest, ";")) return;
+    const t = ed.text();
+    const line = ed.cursorLine();
+    var end = t.lineEnd(line);
+    while (end > t.lineStart(line) and (t.byteAt(end - 1) == ' ' or t.byteAt(end - 1) == '\t')) end -= 1;
+    if (end == t.lineStart(line) or t.byteAt(end - 1) != ';') {
+        ed.insertAt(end, ";") catch return;
+        end += 1;
+    }
+    ed.view.cursor = end;
+    ed.view.want_col = null;
 }
 
 /// The current placeholder, if it still holds its default and the cursor is
@@ -3619,14 +3841,159 @@ pub fn yankPath(ed: *Editor, absolute: bool) !void {
     ed.setMessage(.info, "yanked \"{s}\"", .{out});
 }
 
-/// `SPC f s`: writes the current buffer; one without a file asks for a name.
+/// `SPC f s`: writes the current buffer (formatted first, with format on
+/// save); one without a file asks for a name.
 pub fn saveCurrent(ed: *Editor) !void {
     const b = ed.buffer;
     if (b.path == null) return ed.filePrompt(.save_as);
+    if (ed.options.format_on_save and b.syntax != null) return ed.formatBuffer(null, true);
+    ed.saveBufferNow(b);
+}
+
+/// Writes `b` as it is.
+pub fn saveBufferNow(ed: *Editor, b: *Buffer) void {
     const n = b.save(ed.gpa, ed.io) catch |err|
         return ed.setMessage(.err, "could not save \"{s}\": {s}", .{ b.displayName(), @errorName(err) });
     ed.setMessage(.info, "\"{s}\" {d}L, {d}B written", .{ b.displayName(), b.text.lineCount(), n });
     if (ed.lspFor(b)) |l| l.didSave(b);
+}
+
+// ---------------------------------------------------------------------------
+// Formatting (`SPC c f`, and on save): the language server's, else the
+// language's formatter run directly.
+
+/// Formats the current buffer (lines `range`, inclusive, if the server can
+/// format ranges), then saves it if `then_save`.
+pub fn formatBuffer(ed: *Editor, range: ?[2]usize, then_save: bool) !void {
+    const b = ed.buffer;
+    if (ed.lspFor(b)) |l| if (l.can_format) {
+        l.requestFormat(ed, range, then_save) catch |err| {
+            ed.setMessage(.err, "could not format: {s}", .{@errorName(err)});
+            if (then_save) ed.saveBufferNow(b);
+            return;
+        };
+        if (!then_save) ed.setMessage(.info, "formatting...", .{});
+        return;
+    };
+    try ed.formatExternal(then_save);
+}
+
+fn formatExternal(ed: *Editor, then_save: bool) !void {
+    const b = ed.buffer;
+    defer if (then_save) ed.saveBufferNow(b);
+    const lang = if (b.syntax) |sx| sx.lang.name else "";
+    const t = ed.text();
+    // The buffer as the file would be written (final newline included).
+    const src = try std.mem.concat(ed.gpa, u8, &.{ t.slice(0, t.len()), if (b.final_newline and t.len() > 0) "\n" else "" });
+    defer ed.gpa.free(src);
+    switch (try format.run(ed.gpa, ed.io, lang, src, ed.projectRoot())) {
+        .none => if (!then_save) {
+            if (format.name(lang)) |n| ed.setMessage(.err, "{s} isn't installed", .{n}) else ed.setMessage(.info, "no formatter for this file", .{});
+        },
+        .failed => |m| {
+            defer ed.gpa.free(m);
+            ed.setMessage(.err, "{s}: {s}", .{ format.name(lang).?, m });
+        },
+        .ok => |out| {
+            defer ed.gpa.free(out);
+            const body = if (b.final_newline and out.len > 0 and out[out.len - 1] == '\n') out[0 .. out.len - 1] else out;
+            try ed.replaceTextKeepingCursor(body);
+        },
+    }
+}
+
+/// Replaces the buffer's text with `new`, changing only the lines that
+/// differ (one undo step), the cursor staying on its line and column.
+fn replaceTextKeepingCursor(ed: *Editor, new: []const u8) !void {
+    const t = ed.text();
+    if (std.mem.eql(u8, t.slice(0, t.len()), new)) return;
+    const new_text = try Text.init(ed.gpa, new);
+    var nt = new_text;
+    defer nt.deinit(ed.gpa);
+    const lines = struct {
+        fn of(gpa: Allocator, x: *const Text) ![][]const u8 {
+            const n = if (x.len() == 0) 0 else x.lineCount();
+            const out = try gpa.alloc([]const u8, n);
+            for (out, 0..) |*l, i| l.* = x.lineSlice(i);
+            return out;
+        }
+    }.of;
+    const old_lines = try lines(ed.gpa, t);
+    defer ed.gpa.free(old_lines);
+    const new_lines = try lines(ed.gpa, &nt);
+    defer ed.gpa.free(new_lines);
+    var hunks: std.ArrayList(diff.Hunk) = .empty;
+    defer hunks.deinit(ed.gpa);
+    try diff.diffLines(ed.gpa, old_lines, new_lines, &hunks);
+    const line = ed.cursorLine();
+    const col = ed.view.cursor - t.lineStart(line);
+    // Last hunk first, so earlier line numbers stay valid.
+    var i = hunks.items.len;
+    while (i > 0) {
+        i -= 1;
+        const h = hunks.items[i];
+        var repl: std.ArrayList(u8) = .empty;
+        defer repl.deinit(ed.gpa);
+        for (0..h.new_count) |k| {
+            if (k > 0) try repl.append(ed.gpa, '\n');
+            try repl.appendSlice(ed.gpa, new_lines[h.new_start + k]);
+        }
+        const total = t.lineCount();
+        if (h.old_count == 0) {
+            // Inserted lines: before line old_start (or after the last).
+            if (h.old_start < total and t.len() > 0) {
+                try repl.append(ed.gpa, '\n');
+                try ed.insertAt(t.lineStart(h.old_start), repl.items);
+            } else {
+                if (t.len() > 0) try repl.insert(ed.gpa, 0, '\n');
+                try ed.insertAt(t.len(), repl.items);
+            }
+        } else {
+            var start = t.lineStart(h.old_start);
+            var end = t.lineEnd(h.old_start + h.old_count - 1);
+            if (h.new_count == 0) {
+                // Removed lines, with one of their line breaks.
+                if (end < t.len()) end += 1 else if (start > 0) start -= 1;
+            }
+            try ed.deleteRangeKeepCursor(start, end);
+            try ed.insertAt(start, repl.items);
+        }
+    }
+    try ed.buffer.history.commit(ed.gpa);
+    const l = @min(line, t.lineCount() - 1);
+    ed.setCursor(t.lineStart(l) + @min(col, t.lineLen(l)));
+}
+
+/// The server's formatting edits for `b` arrived: apply them (one undo
+/// step, cursor kept on its line), then save if asked.
+pub fn applyFormatEdits(ed: *Editor, b: *Buffer, edits: []const Lsp.TextEdit, then_save: bool) !void {
+    defer if (then_save) ed.saveBufferNow(b);
+    if (edits.len == 0) {
+        if (!then_save) ed.setMessage(.info, "already formatted", .{});
+        return;
+    }
+    if (b != ed.buffer) return; // switched away meanwhile: leave it
+    const t = ed.text();
+    const line = ed.cursorLine();
+    const col = ed.view.cursor - t.lineStart(line);
+    const sorted = try ed.gpa.dupe(Lsp.TextEdit, edits);
+    defer ed.gpa.free(sorted);
+    std.mem.sort(Lsp.TextEdit, sorted, {}, struct {
+        fn later(_: void, a: Lsp.TextEdit, c: Lsp.TextEdit) bool {
+            return if (a.start_line != c.start_line) a.start_line > c.start_line else a.start_col > c.start_col;
+        }
+    }.later);
+    for (sorted) |e| {
+        const start = ed.offsetOf(e.start_line, e.start_col);
+        const end = ed.offsetOf(e.end_line, e.end_col);
+        try ed.deleteRangeKeepCursor(start, @max(start, end));
+        try ed.insertAt(start, e.text);
+    }
+    try ed.buffer.history.commit(ed.gpa);
+    ed.buffer.modified = ed.buffer.history.isModified();
+    const l = @min(line, t.lineCount() - 1);
+    ed.setCursor(t.lineStart(l) + @min(col, t.lineLen(l)));
+    if (!then_save) ed.setMessage(.info, "formatted", .{});
 }
 
 fn fileExists(ed: *Editor, path: []const u8) bool {
@@ -5333,4 +5700,150 @@ test "zoom keys request a size change" {
     try testing.expect(ed.zoom_reset);
     try expectText(&ed, "abc");
     try testing.expectEqual(.normal, ed.mode);
+}
+
+test "snippet: one more Tab after the call goes to the end, adding the ;" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("zile-test-snippet.zig"); // a Zig buffer (not on disk)
+    try ed.feed("iconst x = do");
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"doThing","insertText":"doThing(${1:a})$0","insertTextFormat":2}]}
+    , .{});
+    defer reply.deinit();
+    try ed.showCompletion(ed.buffer, ed.view.cursor - 2, reply.value);
+    try ed.feed("<Tab>1<Tab>"); // accept, fill a, past the call
+    try expectText(&ed, "const x = doThing(1)");
+    try testing.expect(ed.snippet != null); // one more stop: the ;
+    try ed.feed("<Tab>");
+    try expectText(&ed, "const x = doThing(1);");
+    try testing.expectEqual(ed.text().len(), ed.view.cursor);
+    try testing.expectEqual(null, ed.snippet);
+    try ed.feed("<Tab>"); // a plain tab again
+    try testing.expect(std.mem.endsWith(u8, ed.text().slice(0, ed.text().len()), ";   "));
+
+    // The ; already there: the Tab moves past it.
+    try ed.feed("<Esc>oconst y = do;<Left>");
+    try ed.showCompletion(ed.buffer, ed.view.cursor - 2, reply.value);
+    try ed.feed("<Tab>2<Tab><Tab>");
+    try expectText(&ed, "const x = doThing(1);   \nconst y = doThing(2);");
+    try testing.expectEqual(ed.text().len(), ed.view.cursor);
+
+    // Inside another call: no ; stop, the snippet just ends.
+    try ed.feed("<Esc>oouter(do, 3);<Esc>0fda");
+    try ed.feed("<Right>");
+    try ed.showCompletion(ed.buffer, ed.view.cursor - 2, reply.value);
+    try ed.feed("<Tab>4<Tab>");
+    try expectText(&ed, "const x = doThing(1);   \nconst y = doThing(2);\nouter(doThing(4), 3);");
+    try testing.expectEqual(null, ed.snippet);
+}
+
+test "formatting: SPC c f, one undo step, format on save, SPC t f" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.zig", .data = "const  x=1;\nfn f() void {\nreturn;\n}\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.allocPrint(gpa, "{s}/m.zig", .{buf[0..try tmp.dir.realPath(io, &buf)]});
+    defer gpa.free(path);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile(path);
+    try ed.feed("jj"); // on "return;"
+    try ed.feed("<Space>cf");
+    if (ed.message.kind == .err) return error.SkipZigTest; // no zig fmt here
+    try expectText(&ed, "const x = 1;\nfn f() void {\n    return;\n}");
+    try testing.expectEqual(2, ed.cursorLine()); // still on "return;"
+    try ed.feed("u"); // one undo step
+    try expectText(&ed, "const  x=1;\nfn f() void {\nreturn;\n}");
+
+    // Saving formats first.
+    try ed.feed("<Space>fs");
+    const saved = try tmp.dir.readFileAlloc(io, "m.zig", gpa, .limited(1024));
+    defer gpa.free(saved);
+    try testing.expectEqualStrings("const x = 1;\nfn f() void {\n    return;\n}\n", saved);
+
+    // Off: saved as typed.
+    try ed.feed("<Space>tfggiconst  y=2;<CR><Esc><Space>fs");
+    const raw = try tmp.dir.readFileAlloc(io, "m.zig", gpa, .limited(1024));
+    defer gpa.free(raw);
+    try testing.expect(std.mem.startsWith(u8, raw, "const  y=2;\n"));
+}
+
+test "snippet without $0 (clangd's printf): Tab after the last argument leaves the call, then the ;" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("zile-test-snippet.c");
+    try ed.feed("ipr");
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"printf","insertText":"printf(${1:const char *, ...})","insertTextFormat":2}]}
+    , .{});
+    defer reply.deinit();
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try ed.feed("<Tab>\"hi\"<Tab>");
+    try expectText(&ed, "printf(\"hi\")");
+    try testing.expectEqual(ed.text().len(), ed.view.cursor); // after the )
+    try ed.feed("<Tab>");
+    try expectText(&ed, "printf(\"hi\");");
+    try testing.expectEqual(null, ed.snippet);
+}
+
+test "any function completion ends with ; on Tab: no arguments, plain text; not for keywords" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("zile-test-calls.zig");
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[
+        \\ {"label":"reset","kind":3,"insertText":"reset()","insertTextFormat":2},
+        \\ {"label":"flush","kind":2,"insertText":"flush()"},
+        \\ {"label":"iffy","kind":14,"insertText":"if (${1:cond}) {$0}","insertTextFormat":2}
+        \\]}
+    , .{});
+    defer reply.deinit();
+
+    try ed.feed("ires");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try ed.feed("<Tab><Tab>"); // a snippet with nothing to fill in
+    try expectText(&ed, "reset();");
+
+    try ed.feed("<CR>flu");
+    try ed.showCompletion(ed.buffer, ed.view.cursor - 3, reply.value);
+    try ed.feed("<Tab><Tab>"); // plain text
+    try expectText(&ed, "reset();\nflush();");
+
+    try ed.feed("<CR>iff");
+    try ed.showCompletion(ed.buffer, ed.view.cursor - 3, reply.value);
+    try ed.feed("<Tab>x<Tab>"); // a keyword snippet: no ;
+    try expectText(&ed, "reset();\nflush();\nif (x) {}");
+    try testing.expectEqual(null, ed.snippet);
+}
+
+test "AI suggestion: typing it out keeps it, Tab takes the rest, other keys drop it" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ireturn ");
+    ed.ai_suggestion = .{ .buffer = ed.buffer, .pos = ed.view.cursor, .text = try testing.allocator.dupe(u8, "a + b;\n}") };
+    try ed.feed("a "); // matches: still offered, minus what was typed
+    try testing.expectEqualStrings("+ b;\n}", ed.aiSuggestionHere().?);
+    try ed.feed("<A-Right>"); // one character
+    try testing.expectEqualStrings(" b;\n}", ed.aiSuggestionHere().?);
+    try ed.feed("<A-l>"); // the rest of this line
+    try expectText(&ed, "return a + b;");
+    try testing.expectEqualStrings("\n}", ed.aiSuggestionHere().?);
+    try ed.feed("<A-;>"); // all of what's left
+    try expectText(&ed, "return a + b;\n}");
+    try testing.expectEqual(null, ed.ai_suggestion);
+    try ed.feed("<Tab>"); // Tab is just a tab
+    try expectText(&ed, "return a + b;\n}   ");
+
+    try ed.feed("<CR>");
+    ed.ai_suggestion = .{ .buffer = ed.buffer, .pos = ed.view.cursor, .text = try testing.allocator.dupe(u8, "xyz") };
+    try ed.feed("q"); // doesn't match: gone
+    try testing.expectEqual(null, ed.aiSuggestionHere());
+    try ed.feed("<Esc>");
 }
