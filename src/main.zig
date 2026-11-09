@@ -221,6 +221,10 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
     }
     const w = ed.windows.at(pos.x, pos.y) orelse return;
     ed.focusWindow(w);
+    if (w.term) |t| {
+        if (wheel != 0) t.scroll(@intFromFloat(-wheel * 3));
+        return;
+    }
     if (wheel != 0) ed.scrollLines(@intFromFloat(-wheel * 3));
     if (clicked) {
         const l = render.windowLayout(ed, font, w);

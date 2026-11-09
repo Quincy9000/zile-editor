@@ -38,5 +38,6 @@ comptime {
     _ = @import("tui/input.zig");
     _ = @import("format.zig");
     _ = @import("ai/Ghost.zig");
+    _ = @import("ai/WsServer.zig");
     _ = @import("tui/Grid.zig");
 }

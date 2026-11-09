@@ -181,7 +181,7 @@ pub fn dropRepeats(text: []const u8, line_prefix: []const u8, context: []const u
         // The line as it would read in the file.
         const significant = whole_trimmed.len + trimmed.len >= 6;
         if (significant and appearsIn(context, whole_trimmed, trimmed)) {
-            return std.mem.trimEnd(u8, text[0 .. start -| 1], " \t\r\n");
+            return std.mem.trimEnd(u8, text[0..start -| 1], " \t\r\n");
         }
         start += line.len + 1;
     }

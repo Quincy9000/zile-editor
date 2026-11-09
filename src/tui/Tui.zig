@@ -213,6 +213,15 @@ fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
     }
     if (ed.picker != null or ed.cmd_float != null) return;
     const w = ed.windows.at(x, y) orelse return;
+    if (w.term) |t| {
+        ed.focusWindow(w);
+        switch (m.kind) {
+            .wheel_up => t.scroll(-3),
+            .wheel_down => t.scroll(3),
+            else => {},
+        }
+        return;
+    }
     switch (m.kind) {
         .wheel_up, .wheel_down => {
             ed.focusWindow(w);

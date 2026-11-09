@@ -27,6 +27,8 @@ pub const Options = struct {
     /// Default colors, to match the editor theme.
     fg: ?Rgb = null,
     bg: ?Rgb = null,
+    /// Extra environment variables ("NAME=value").
+    env: []const []const u8 = &.{},
     wake: *const fn () void,
 };
 
@@ -88,7 +90,7 @@ pub fn create(gpa: Allocator, io: Io, opts: Options) !*Terminal {
     if (c.ghostty_key_event_new(null, &t.key_event) != c.GHOSTTY_SUCCESS) return error.TerminalInit;
     errdefer c.ghostty_key_event_free(t.key_event);
 
-    t.pty = try Pty.spawn(gpa, opts.argv, opts.cwd, .{ .cols = opts.cols, .rows = opts.rows, .cell_w = opts.cell_w, .cell_h = opts.cell_h });
+    t.pty = try Pty.spawnEnv(gpa, opts.argv, opts.cwd, .{ .cols = opts.cols, .rows = opts.rows, .cell_w = opts.cell_w, .cell_h = opts.cell_h }, opts.env);
     errdefer {
         t.pty.hangup();
         _ = t.pty.wait();

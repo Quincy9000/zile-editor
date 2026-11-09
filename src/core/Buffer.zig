@@ -19,6 +19,11 @@ history: History,
 syntax: ?Syntax = null,
 /// The project the file belongs to (owned by the editor), if any.
 project: ?*const Project = null,
+/// A name for buffers without a file (owned), e.g. a proposed edit.
+label: ?[]u8 = null,
+/// The file's modification time when last read or written (to notice
+/// changes made by other programs).
+disk_mtime: ?Io.Timestamp = null,
 /// Bumped on every edit (for syncing with the language server).
 edit_version: u64 = 0,
 /// Closed folds.
@@ -79,7 +84,9 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8) !Buffer {
 
     var text = try Text.init(gpa, content);
     errdefer text.deinit(gpa);
+    const mtime: ?Io.Timestamp = if (Io.Dir.cwd().statFile(io, path, .{})) |st| st.mtime else |_| null;
     return .{
+        .disk_mtime = mtime,
         .text = text,
         .history = try .init(gpa),
         .syntax = Syntax.forPath(path),
@@ -109,6 +116,7 @@ pub fn deinit(b: *Buffer, gpa: Allocator) void {
     b.folds.deinit(gpa);
     if (b.git) |*g| g.deinit(gpa);
     if (b.path) |p| gpa.free(p);
+    if (b.label) |l| gpa.free(l);
     b.* = undefined;
 }
 
@@ -129,7 +137,7 @@ pub fn delete(b: *Buffer, start: usize, end: usize) void {
 }
 
 pub fn displayName(b: *const Buffer) []const u8 {
-    return b.path orelse "[scratch]";
+    return b.path orelse b.label orelse "[scratch]";
 }
 
 pub const SaveError = error{NoPath} || Allocator.Error || Io.Dir.CreateFileAtomicError ||
@@ -173,6 +181,7 @@ pub fn save(b: *Buffer, gpa: Allocator, io: Io) SaveError!usize {
 
     b.modified = false;
     b.history.markSaved();
+    b.disk_mtime = if (dir.statFile(io, path, .{})) |st| st.mtime else |_| null;
     return out.items.len;
 }
 

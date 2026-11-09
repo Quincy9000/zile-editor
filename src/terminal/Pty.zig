@@ -25,6 +25,11 @@ pub const Size = struct { cols: u16, rows: u16, cell_w: u16 = 0, cell_h: u16 = 0
 /// child needs is prepared before forking (a forked child of a threaded
 /// process must not allocate).
 pub fn spawn(gpa: Allocator, argv: []const []const u8, cwd: []const u8, size: Size) !Pty {
+    return spawnEnv(gpa, argv, cwd, size, &.{});
+}
+
+/// `spawn` with extra environment variables ("NAME=value").
+pub fn spawnEnv(gpa: Allocator, argv: []const []const u8, cwd: []const u8, size: Size, extra_env: []const []const u8) !Pty {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -46,6 +51,7 @@ pub fn spawn(gpa: Allocator, argv: []const []const u8, cwd: []const u8, size: Si
     try env.append(arena, "TERM=xterm-256color");
     try env.append(arena, "COLORTERM=truecolor");
     try env.append(arena, "TERM_PROGRAM=zile");
+    for (extra_env) |e| try env.append(arena, (try arena.dupeSentinel(u8, e, 0)).ptr);
     const c_env = try arena.allocSentinel(?[*:0]const u8, env.items.len, null);
     @memcpy(c_env[0..env.items.len], env.items);
 

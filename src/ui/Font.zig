@@ -128,7 +128,9 @@ fn discover(gpa: Allocator, io: Io) Allocator.Error!?[:0]u8 {
 /// Draws one codepoint with its cell's top-left at (x, y).
 pub fn drawCodepoint(f: *const Font, cp: u21, x: f32, y: f32, color: rl.Color) void {
     if (f.grid_mode) return gfx.glyph(cp, x, y, color);
-    rl.DrawTextCodepoint(f.font, cp, .{ .x = x, .y = y + f.glyph_y }, @floatFromInt(f.font.baseSize), color);
+    // Whole pixels: the atlas is sampled pixel for pixel, and a glyph drawn
+    // between pixels comes out uneven (half rows, e.g. which-key padding).
+    rl.DrawTextCodepoint(f.font, cp, .{ .x = @round(x), .y = @round(y + f.glyph_y) }, @floatFromInt(f.font.baseSize), color);
 }
 
 /// Draws UTF-8 `s` one cell per codepoint. Returns the x after the last cell.

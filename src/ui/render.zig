@@ -76,6 +76,12 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
         }
     }
     for (ed.window_list.items) |w| {
+        if (w.term) |t| {
+            // Its screen: the window less a header row and a cell of padding.
+            const cols: u16 = @intFromFloat(@max(w.rect.w / font.cell_w - 2, 1));
+            const rows: u16 = @intFromFloat(@max(w.rect.h / font.cell_h - 1, 1));
+            t.resize(cols, rows, @intFromFloat(font.cell_w), @intFromFloat(font.cell_h));
+        }
         const wl = windowLayout(ed, font, w);
         if (w == ed.window and ed.cmd_float == null) {
             ed.setViewSize(wl.rows, wl.cols);
@@ -148,7 +154,10 @@ fn drawWhichKey(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) 
     const columns = @max((total_cols -| pad) / col_w, 1);
     const rows = (items.len + columns - 1) / columns;
 
-    const h = @as(f32, @floatFromInt(rows)) * font.cell_h + font.cell_h; // + half a row padding above and below
+    // Padding above and below: half a row in a window; a whole row in a
+    // terminal, which has no half rows (it would all end up on one side).
+    const vpad = if (font.grid_mode) font.cell_h else font.cell_h / 2;
+    const h = @as(f32, @floatFromInt(rows)) * font.cell_h + 2 * vpad;
     const y0 = l.status_y - h;
     rect(0, y0, l.width, h, theme.popup_bg);
     rect(0, y0, l.width, 1, theme.popup_border);
@@ -158,7 +167,7 @@ fn drawWhichKey(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) 
         const col = i / rows;
         const row = i % rows;
         var x = @as(f32, @floatFromInt(pad + col * col_w)) * font.cell_w;
-        const y = y0 + font.cell_h / 2 + @as(f32, @floatFromInt(row)) * font.cell_h;
+        const y = y0 + vpad + @as(f32, @floatFromInt(row)) * font.cell_h;
 
         var key_buf: [32]u8 = undefined;
         var w: std.Io.Writer = .fixed(&key_buf);
@@ -296,6 +305,14 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
     _ = font.drawText(right, r.x + r.w - @as(f32, @floatFromInt(cells(right) + 1)) * cw, r.y, right_color);
 
     // The screen, one cell of padding at the sides.
+    drawTerminalScreen(t, font, theme, r.x + cw, r.y + ch, true);
+}
+
+/// A terminal's screen with its top-left cell at (x0, y0), and its cursor
+/// (drawn if `focused`, hinted to the terminal either way).
+fn drawTerminalScreen(t: *Editor.Terminal, font: *const Font, theme: *const Theme, x0: f32, y0: f32, focused: bool) void {
+    const cw = font.cell_w;
+    const ch = font.cell_h;
     const Ctx = struct {
         font: *const Font,
         x0: f32,
@@ -312,37 +329,63 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
             if (cl.underline) rect(x, y + f.cell_h - 2, w, 1, fg);
         }
     };
-    const x0 = r.x + cw;
-    const y0 = r.y + ch;
-    if (t.draw(Ctx{ .font = font, .x0 = x0, .y0 = y0 })) |cur| {
-        const x = x0 + @as(f32, @floatFromInt(cur.x)) * cw;
-        const y = y0 + @as(f32, @floatFromInt(cur.y)) * ch;
-        gfx.cursor(x, y, switch (cur.style) {
-            .bar => .bar,
-            .underline => .underline,
-            .block, .hollow => .block,
-        });
-        var c = theme.cursor;
-        switch (cur.style) {
-            .block => {
-                c.a = 150;
-                rect(x, y, cw, ch, c);
-            },
-            .bar => rect(x, y, 2, ch, c),
-            .underline => rect(x, y + ch - 2, cw, 2, c),
-            .hollow => {
-                rect(x, y, cw, 1, c);
-                rect(x, y + ch - 1, cw, 1, c);
-                rect(x, y, 1, ch, c);
-                rect(x + cw - 1, y, 1, ch, c);
-            },
-        }
+    const cur = t.draw(Ctx{ .font = font, .x0 = x0, .y0 = y0 }) orelse return;
+    const x = x0 + @as(f32, @floatFromInt(cur.x)) * cw;
+    const y = y0 + @as(f32, @floatFromInt(cur.y)) * ch;
+    var c = theme.cursor;
+    if (!focused) {
+        c.a = 70;
+        return rect(x, y, cw, ch, c);
     }
+    gfx.cursor(x, y, switch (cur.style) {
+        .bar => .bar,
+        .underline => .underline,
+        .block, .hollow => .block,
+    });
+    switch (cur.style) {
+        .block => {
+            c.a = 150;
+            rect(x, y, cw, ch, c);
+        },
+        .bar => rect(x, y, 2, ch, c),
+        .underline => rect(x, y + ch - 2, cw, 2, c),
+        .hollow => {
+            rect(x, y, cw, 1, c);
+            rect(x, y + ch - 1, cw, 1, c);
+            rect(x, y, 1, ch, c);
+            rect(x + cw - 1, y, 1, ch, c);
+        },
+    }
+}
+
+/// A window showing a terminal (the Claude panel): a header, then its screen.
+fn drawTermWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Windows.Window, t: *Editor.Terminal) void {
+    const focused = w == ed.window;
+    const r = w.rect;
+    gfx.beginClip(r.x, r.y, r.w, r.h);
+    defer gfx.endClip();
+    rect(r.x, r.y, r.w, r.h, theme.popup_bg);
+    rect(r.x, r.y, r.w, font.cell_h, if (focused) theme.status_bg else theme.bg);
+    rect(r.x, r.y + font.cell_h - 1, r.w, 1, theme.popup_border);
+    const is_claude = if (ed.claude) |c| c.term == t else false;
+    const title: []const u8 = if (is_claude) "Claude Code" else "Terminal";
+    _ = font.drawText(title, r.x + font.cell_w, r.y, if (focused) theme.status_fg else theme.status_dim);
+    if (is_claude) {
+        const c = ed.claude.?;
+        const status: []const u8 = if (c.ready) "connected" else "connecting…";
+        const hint = if (focused) "   Ctrl-\\ back to code" else "";
+        var buf: [64]u8 = undefined;
+        const right = std.fmt.bufPrint(&buf, "{s}{s}", .{ status, hint }) catch status;
+        _ = font.drawText(right, r.x + r.w - @as(f32, @floatFromInt(cells(right) + 1)) * font.cell_w, r.y, if (c.ready) theme.diff_add else theme.status_dim);
+    }
+    if (r.x > 0) rect(r.x, r.y, 1, r.h, theme.popup_border);
+    drawTerminalScreen(t, font, theme, r.x + font.cell_w, r.y + font.cell_h, focused);
 }
 
 /// One window: its header (when there are several), then its text, clipped
 /// to its rectangle.
 fn drawWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Windows.Window) void {
+    if (w.term) |t| return drawTermWindow(ed, font, theme, w, t);
     const focused = w == ed.window;
     const wl = windowLayout(ed, font, w);
     const r = w.rect;
@@ -546,7 +589,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
     rect(0, y, l.width, font.cell_h, theme.status_bg);
 
     // Mode pill.
-    const mode_name, const mode_color = if (ed.popup) |pp| switch (pp) {
+    const mode_name, const mode_color = if (ed.window.term != null and ed.popup == null) .{ " TERM ", theme.mode_insert } else if (ed.popup) |pp| switch (pp) {
         .shell => .{ " TERM ", theme.mode_insert },
         .run => .{ " RUN ", theme.mode_insert },
     } else switch (ed.mode) {
@@ -563,6 +606,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
             .git_commit, .git_remote => .{ " GIT ", theme.mode_insert },
             .new_file, .save_as, .rename_file, .copy_file => .{ " FILE ", theme.mode_insert },
             .run_command, .run_runner => .{ " RUN ", theme.mode_insert },
+            .ask_claude => .{ " CLAUDE ", theme.mode_insert },
         },
     };
     rect(0, y, @as(f32, @floatFromInt(mode_name.len)) * font.cell_w, font.cell_h, mode_color);

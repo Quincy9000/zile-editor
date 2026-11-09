@@ -43,6 +43,9 @@ pub const Window = struct {
     /// Screen area, from the last `layout`.
     rect: Rect = .{},
     node: *Node,
+    /// Shows this terminal instead of the buffer (borrowed: the editor owns
+    /// it, and closing the window only hides it).
+    term: ?*Editor.Terminal = null,
 };
 
 pub const Node = struct {

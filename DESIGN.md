@@ -78,6 +78,9 @@ under it is a compile error.
 | `zile -t` | terminal mode: the same editor drawn in the terminal; automatic when there is no display (SSH) or no window can open | done |
 | `zile <path>` | a file (trailing `/` and `..` resolved); a folder opens the explorer there; a file that can't be opened leaves a message instead of not starting | done |
 | `SPC p p`, `SPC p f` | switch project (projects opened before, most recent first; picking one finds a file in it); find file in project | done |
+| `SPC a a` | Claude Code panel: `claude` in a terminal window on the right (project root), connected to zile; `SPC a a` again focuses / hides it, `Ctrl-\` jumps between it and the code; in the panel `Ctrl-C` closes it (Claude keeps running; it interrupts with Esc) and `Ctrl-Shift-C` sends Claude a real Ctrl-C | done |
+| `SPC a s`, `SPC a i` | mention the selected lines (visual) or the file in Claude's prompt (`@path#L…`); with an instruction typed into a popup (pasted into Claude's prompt, Enter there sends) | done |
+| `SPC a y` / `SPC a n` | accept / reject Claude's proposed edit, shown as a diff in the code window (removed lines as ghost lines); the proposal can be edited before accepting | done |
 | AI ghost completion, `SPC t a` | while typing in insert mode (at a line's end, or before closing `)]}"';,`), a local model through Ollama fills in the middle (`/api/generate` with `prompt` + `suffix`; `$ZILE_AI_MODEL`, default `qwen2.5-coder:1.5b-base`; `$OLLAMA_HOST`). Shown in gray at the cursor (first line inline, more below); typing it out keeps it, `<A-;>` takes all of it, `<A-l>` a line, `<A-Right>` a character (the rest stays offered); anything else drops it. `<Tab>` stays with the completion menu and placeholders, so the two never fight. One worker thread, latest request only, sent after a 120 ms pause; replies used only if the cursor and text are unchanged. No answer from Ollama turns it off with a message (`SPC t a` retries) | done |
 | `SPC c f`, `SPC t f` | format the file (visual: the selected lines, when the server can) with the language server, else the language's formatter (`zig fmt`, `rustfmt`, `clang-format`, `ruff format`, `jq`) run in the project root; changed lines only, one undo step, cursor kept. Format on save (on by default; `SPC t f` toggles); a failed format still saves | done |
 | completion → function | arguments arrive as snippet placeholders: the current one is highlighted and typing replaces it; `<Tab>` / `<S-Tab>` next / previous (a fresh one keeps its text), `<BS>` clears it, the last `<Tab>` goes to the server's final cursor; in Zig/C/Rust, when the call ends its line, one more `<Tab>` goes to the end of the statement, adding the `;` | done |
@@ -87,7 +90,7 @@ under it is a compile error.
 | `SPC g c` / `SPC g b` / `SPC g s` | commit all (saves, prompts for a message) / switch or create branch / changed files | done |
 | `SPC g r` / `SPC g n` / `SPC g p` / `SPC g R` | git: restore hunk / next / previous change / reload HEAD | done |
 | `SPC t g` / `SPC t r` / `SPC t d` | toggles: ghost lines / relative numbers / diagnostic messages (fields of `Editor.Options`, one comptime `toggle(field)` command each) | done |
-| `SPC q` | smart close: the focused window if there are several, else the current buffer if there are several (unsaved ones are kept, with a message), else quit (refuses if unsaved) | done |
+| `SPC q` | smart close: the focused window if there are several code windows (or it is the Claude panel); with one code window left, the Claude panel is hidden first; else the current buffer if there are several (unsaved ones are kept, with a message), else quit (refuses if unsaved) | done |
 | `SPC Q s` / `SPC Q Q` | save all and quit / quit without saving | done |
 | `SPC SPC`, `SPC f f` | find file in project (fuzzy, + create) | done |
 | `SPC .`, `SPC f e` | explore files (browser): one folder at a time, starting at the current file's folder. `Enter`/`/` on a folder goes in, `Enter` on a file opens it, `<BS>` on an empty query goes up (selecting where you came from), `~` home, `/` on an empty query the root; a new name offers "Create" | done |
@@ -421,6 +424,26 @@ src/terminal/
   command" collects `path:line:col` matches.
 - Use ghostty's Unicode width functions in the editor too, so buffers and
   terminals agree on column widths.
+
+## Claude Code (IDE protocol)
+
+`ai/WsServer.zig`: a WebSocket server on 127.0.0.1 (random port; the
+`X-Claude-Code-Ide-Authorization` token checked in constant time; ping/close
+answered; one JSON-RPC message per text frame) on its own thread.
+`ai/Claude.zig`: the lock file `$CLAUDE_CONFIG_DIR|~/.claude/ide/<port>.lock`
+(0600 in a 0700 dir; `pid`, `workspaceFolders` = cwd + projects, `ideName`,
+`transport: "ws"`, `authToken`), rewritten when projects change and removed
+on exit; MCP `initialize` (echoes a supported protocol version), `tools/list`,
+and the tools `openDiff` (blocking: a proposal buffer with the current file
+as its diff base; `SPC a y` answers `FILE_SAVED` + the text, `SPC a n`
+`DIFF_REJECTED`), `close_tab`, `closeAllDiffTabs`, `openFile`,
+`getDiagnostics`, selection / open editors / workspace queries,
+`checkDocumentDirty`, `saveDocument`. It sends `selection_changed` when the
+cursor or selection moves and `at_mentioned` for `SPC a s` (queued until
+connected). The panel runs `claude` with `CLAUDE_CODE_SSE_PORT=<port>`, so it
+connects to this editor. Claude writes accepted files itself; buffers
+whose files change on disk reload (checked each second; unsaved buffers are
+left alone). Terminals can now be windows (`Window.term`, borrowed).
 
 ## Terminal mode (`zile -t`)
 

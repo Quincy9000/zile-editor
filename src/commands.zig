@@ -257,6 +257,11 @@ const base = [_]Command{
     .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) , .jump = true },
     .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) , .jump = true },
     .{ .name = "switch_project", .doc = "Switch project", .run = openPicker(.projects), .once = true },
+    .{ .name = "claude_panel", .doc = "Claude Code panel", .run = claudeCmd(.panel), .once = true },
+    .{ .name = "claude_send", .doc = "Send selection/file to Claude", .run = claudeCmd(.send), .once = true },
+    .{ .name = "claude_ask", .doc = "Ask Claude about the selection", .run = claudeCmd(.ask), .once = true },
+    .{ .name = "claude_accept", .doc = "Accept Claude's change", .run = claudeCmd(.accept), .once = true },
+    .{ .name = "claude_reject", .doc = "Reject Claude's change", .run = claudeCmd(.reject), .once = true },
     .{ .name = "terminal_toggle", .doc = "Terminal popup", .run = termCmd(.toggle), .once = true },
     .{ .name = "run_runner", .doc = "Code runner (repeat with Enter)", .run = termCmd(.runner), .once = true },
     .{ .name = "run_command", .doc = "Run a command (multi-line editor)", .run = termCmd(.command), .once = true },
@@ -1409,6 +1414,21 @@ fn surroundStep(comptime step: enum { add, delete, change_from, change_to, visua
     }.run;
 }
 
+fn claudeCmd(comptime action: enum { panel, send, ask, accept, reject }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            switch (action) {
+                .panel => ed.toggleClaude() catch |err| ed.setMessage(.err, "could not start Claude Code: {s}", .{@errorName(err)}),
+                .send => try ed.claudeMention(),
+                .ask => try ed.claudeAskPrompt(),
+                .accept => ed.claudeResolve(true),
+                .reject => ed.claudeResolve(false),
+            }
+        }
+    }.run;
+}
+
 fn termCmd(comptime action: enum { toggle, runner, command, again, output, errors }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
@@ -1519,11 +1539,20 @@ fn fileCmd(comptime action: enum { new, save_as, rename, copy, delete, yank_path
     }.run;
 }
 
-/// `SPC q`: closes the focused window if there are several, else the
-/// current buffer if there are several, else the editor.
+/// `SPC q`: closes the focused window if there are several code windows (or
+/// it's a terminal panel), else hides the panel, else closes the current
+/// buffer if there are several, else the editor.
 fn smartClose(c: Context) !void {
     const ed = c.ed;
-    if (ed.window_list.items.len > 1) return ed.closeWindow();
+    // A terminal panel (Claude) closes like a window, but doesn't count as
+    // one of the code windows: the last code window hides the panel first.
+    if (ed.window.term != null or ed.codeWindowCount() > 1) return ed.closeWindow();
+    for (ed.window_list.items) |w| if (w.term != null) {
+        ed.focusWindow(w);
+        ed.closeWindow();
+        ed.setMessage(.info, "Claude panel hidden (SPC a a shows it again)", .{});
+        return;
+    };
     if (ed.buffers.items.len > 1) {
         const name = try ed.gpa.dupe(u8, ed.buffer.displayName());
         defer ed.gpa.free(name);

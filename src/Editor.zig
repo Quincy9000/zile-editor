@@ -27,6 +27,8 @@ const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
 const format = @import("format.zig");
 const Ghost = @import("ai/Ghost.zig");
+pub const Claude = @import("ai/Claude.zig");
+const Syntax = @import("syntax/Syntax.zig");
 const Snippet = @import("lsp/Snippet.zig");
 pub const Windows = @import("Windows.zig");
 pub const Project = @import("core/Project.zig");
@@ -246,6 +248,8 @@ pub const PromptKind = enum {
     /// project's last command, so <CR> runs it again).
     run_command,
     run_runner,
+    /// `SPC a i`: an instruction for Claude about the selection.
+    ask_claude,
 
     /// One-line prompts shown in a centered box (not incremental searches).
     pub fn boxed(k: PromptKind) bool {
@@ -264,6 +268,7 @@ pub const PromptKind = enum {
             .copy_file => "Copy file to",
             .run_command => "Run command",
             .run_runner => "Code runner (Enter runs it again)",
+            .ask_claude => "Ask Claude (about the selection)",
         };
     }
 };
@@ -437,6 +442,14 @@ ai_asked: ?struct { buffer: *Buffer, pos: usize, version: u64 } = null,
 ai_suggestion: ?AiSuggestion = null,
 /// The model couldn't be reached: off until toggled again.
 ai_unreachable: bool = false,
+/// Claude Code: the connection, its panel's terminal, pending diffs.
+claude: ?*Claude = null,
+/// The editor window to come back to from a terminal window.
+last_editor_window: ?*Windows.Window = null,
+/// When open buffers were last checked for changes on disk.
+last_disk_check: Io.Timestamp = .zero,
+/// What `SPC a i` asks about: a file and its selected lines.
+claude_ask: ?struct { path: []u8, lines: ?[2]usize } = null,
 /// Tests never ask a model (they mustn't depend on one running).
 ai_offline: bool = @import("builtin").is_test,
 /// Word start a completion was last requested for (avoids re-asking per key).
@@ -538,6 +551,8 @@ pub fn deinit(ed: *Editor) void {
     ed.endSnippet();
     ed.clearAiSuggestion();
     if (ed.ai) |g| g.destroy();
+    if (ed.claude) |c| c.destroy();
+    if (ed.claude_ask) |a| ed.gpa.free(a.path);
     for (ed.buffers.items) |b| {
         b.deinit(ed.gpa);
         ed.gpa.destroy(b);
@@ -625,6 +640,7 @@ pub fn tick(ed: *Editor) void {
     ed.pollGitJob();
     ed.pollTerminals();
     ed.pollAi();
+    ed.tickClaude();
     ed.highlightView();
     if (ed.picker) |p| {
         p.poll();
@@ -1856,6 +1872,7 @@ pub fn acceptSearch(ed: *Editor) !void {
         .git_remote => return ed.finishGitRemote(),
         .new_file, .save_as, .rename_file, .copy_file => |k| return ed.finishFilePrompt(k),
         .run_command, .run_runner => |k| return ed.finishRunPrompt(k),
+        .ask_claude => return ed.finishAskClaude(),
         .search, .snipe => {},
     }
     if (sp.input.items().len > 0) {
@@ -3097,7 +3114,27 @@ fn isCtrlBackslash(ev: KeyEvent) bool {
 /// true when the key was used.
 fn popupKey(ed: *Editor, ev: KeyEvent) bool {
     if (ed.popup == null) {
+        // A terminal window (the Claude panel) has the keyboard.
+        if (ed.window.term) |t| {
+            // Ctrl-\: back to the code, the panel staying open. Ctrl-C: close
+            // the panel (it keeps running; SPC a a brings it back). Claude
+            // interrupts with Esc; Ctrl-Shift-C sends it a real Ctrl-C.
+            const ctrl_c = ev.mods.ctrl and !ev.mods.alt and ev.key == .codepoint and (ev.key.codepoint == 'c' or ev.key.codepoint == 'C');
+            if (isCtrlBackslash(ev)) {
+                ed.focusEditorWindow();
+            } else if (ctrl_c and !ev.mods.shift) {
+                ed.closeWindow();
+            } else if (ctrl_c) {
+                t.sendKey(.{ .key = .{ .codepoint = 'c' }, .mods = .{ .ctrl = true } });
+            } else termKey(ed, t, ev);
+            return true;
+        }
         if (isCtrlBackslash(ev) and ed.mode == .normal) {
+            // To the terminal window if there is one, else the shell popup.
+            for (ed.window_list.items) |w| if (w.term != null) {
+                ed.focusWindow(w);
+                return true;
+            };
             ed.toggleShell() catch |err| ed.setMessage(.err, "could not start the shell: {s}", .{@errorName(err)});
             return true;
         }
@@ -3144,6 +3181,22 @@ fn popupKey(ed: *Editor, ev: KeyEvent) bool {
     }
     t.sendKey(ev);
     return true;
+}
+
+/// Keys for a terminal: scrolling and pasting are ours, the rest its.
+fn termKey(ed: *Editor, t: *Terminal, ev: KeyEvent) void {
+    if (ev.mods.shift and ev.key == .special and (ev.key.special == .page_up or ev.key.special == .page_down)) {
+        const page: isize = @intCast(@max(t.rows, 2) - 1);
+        return t.scroll(if (ev.key.special == .page_up) -page else page);
+    }
+    if (ev.mods.ctrl and ev.mods.shift and ev.key == .codepoint and (ev.key.codepoint == 'v' or ev.key.codepoint == 'V')) {
+        if (ed.registers.clipboard) |cb| if (cb.get(ed.gpa)) |clip| {
+            defer ed.gpa.free(clip);
+            t.paste(clip);
+        };
+        return;
+    }
+    t.sendKey(ev);
 }
 
 /// `SPC r c`: opens the command editor, a floating vim buffer for the
@@ -3435,6 +3488,304 @@ fn pollTerminals(ed: *Editor) void {
 }
 
 // ---------------------------------------------------------------------------
+// Claude Code (`SPC a`): `claude` in a side panel, connected to the editor
+// (ai/Claude.zig): proposed edits open here as diffs, the selection is
+// shared, and selections can be sent as @mentions.
+
+fn tickClaude(ed: *Editor) void {
+    // Files changed by other programs (Claude, a build, git) reload when
+    // they have no unsaved edits; checked at most once a second.
+    const now = Io.Timestamp.now(ed.io, .awake);
+    if (ed.last_disk_check.durationTo(now).nanoseconds > std.time.ns_per_s) {
+        ed.last_disk_check = now;
+        ed.checkDiskChanges();
+    }
+    const c = ed.claude orelse return;
+    c.tick(ed);
+    if (c.term) |t| if (!t.isRunning()) {
+        // `claude` exited: its window closes.
+        while (ed.windowShowing(t)) |w| {
+            ed.focusWindow(w);
+            ed.closeWindow();
+        }
+        t.destroy();
+        c.term = null;
+        ed.setMessage(.info, "Claude Code exited (SPC a a starts it again)", .{});
+    };
+}
+
+/// Reloads buffers whose files changed on disk (when they have no unsaved
+/// edits of their own).
+pub fn checkDiskChanges(ed: *Editor) void {
+    for (ed.buffers.items) |b| {
+        const path = b.path orelse continue;
+        const known = b.disk_mtime orelse continue;
+        if (b.modified) continue;
+        const st = Io.Dir.cwd().statFile(ed.io, path, .{}) catch continue;
+        if (st.mtime.nanoseconds == known.nanoseconds) continue;
+        ed.reloadBuffer(b) catch continue;
+        ed.setMessage(.info, "reloaded {s} (changed on disk)", .{b.displayName()});
+    }
+}
+
+/// `SPC a a`: shows Claude Code in a panel on the right (starting it, and
+/// the connection, the first time), focuses it, or hides it if focused.
+pub fn toggleClaude(ed: *Editor) !void {
+    if (ed.claude == null) ed.claude = try Claude.start(ed);
+    const c = ed.claude.?;
+    if (c.term) |t| if (ed.windowShowing(t)) |w| {
+        if (w == ed.window) {
+            ed.closeWindow(); // hidden; it keeps running
+        } else ed.focusWindow(w);
+        return;
+    };
+    try ed.showClaude();
+}
+
+/// Makes sure the panel is open (and focused).
+pub fn showClaude(ed: *Editor) !void {
+    if (ed.claude == null) ed.claude = try Claude.start(ed);
+    const c = ed.claude.?;
+    if (c.term) |t| if (ed.windowShowing(t)) |w| return ed.focusWindow(w);
+    if (c.term == null) {
+        var env_buf: [64]u8 = undefined;
+        const env = c.env(&env_buf);
+        c.term = try Terminal.create(ed.gpa, ed.io, .{
+            .argv = &.{ "/bin/sh", "-c", "exec claude" },
+            .cwd = ed.projectRoot(),
+            .cols = 80,
+            .rows = 24,
+            .fg = ed.term_fg,
+            .bg = ed.term_bg,
+            .env = &.{env},
+            .wake = ed.wake_fn,
+        });
+    }
+    ed.focusEditorWindow();
+    try ed.splitWindow(.right);
+    ed.window.term = c.term;
+    // The panel takes about 40% of the width.
+    Windows.resize(ed.window, .horizontal, -0.1);
+}
+
+/// Shows a proposed edit of `path` as a diff: a buffer holding the proposal
+/// with the file as it is now as its base (removed lines show as ghost
+/// lines, new ones are marked). The user can edit it before accepting.
+pub fn openProposal(ed: *Editor, path: []const u8, contents: []const u8) !*Buffer {
+    const b = try ed.gpa.create(Buffer);
+    errdefer ed.gpa.destroy(b);
+    b.* = try Buffer.initEmpty(ed.gpa);
+    errdefer b.deinit(ed.gpa);
+    const norm = try Git.normalize(ed.gpa, contents);
+    defer ed.gpa.free(norm);
+    try b.text.insert(ed.gpa, 0, norm);
+    b.final_newline = contents.len == 0 or contents[contents.len - 1] == '\n';
+    b.syntax = Syntax.forPath(path);
+    b.project = ed.projectOf(path);
+    const rel = try ed.normalizePath(path);
+    defer ed.gpa.free(rel);
+    b.label = try std.fmt.allocPrint(ed.gpa, "Claude: {s}", .{rel});
+    // The base: the file as the editor has it (unsaved edits included), else on disk.
+    const base: []u8 = if (ed.bufferForPath(path)) |open| try ed.gpa.dupe(u8, open.text.slice(0, open.text.len())) else blk: {
+        const raw = Io.Dir.cwd().readFileAlloc(ed.io, path, ed.gpa, .limited(64 << 20)) catch break :blk try ed.gpa.dupe(u8, "");
+        defer ed.gpa.free(raw);
+        break :blk try Git.normalize(ed.gpa, raw);
+    };
+    defer ed.gpa.free(base);
+    b.git = .{ .base = try Text.init(ed.gpa, base) };
+    try ed.buffers.append(ed.gpa, b);
+    ed.focusEditorWindow();
+    ed.switchTo(b);
+    ed.updateGit();
+    // Start at the first change.
+    if (b.git.?.hunks.items.len > 0) {
+        const line = @min(b.git.?.hunks.items[0].new_start, b.text.lineCount() - 1);
+        ed.revealLine(line);
+        ed.setCursor(motions.firstNonBlank(&b.text, line));
+    }
+    ed.setMessage(.info, "Claude proposes changes to {s}: SPC a y accept, SPC a n reject (edit it first if you like)", .{rel});
+    return b;
+}
+
+/// Removes a proposal; windows showing it go back to the file.
+pub fn closeProposal(ed: *Editor, b: *Buffer, path: []const u8) void {
+    var still_open = false;
+    for (ed.buffers.items) |o| still_open = still_open or o == b;
+    if (!still_open) return;
+    if (ed.buffer == b) ed.openFile(path) catch {};
+    b.modified = false;
+    ed.killBuffer(b) catch {};
+}
+
+/// The open buffer for `path` (absolute or relative), if any.
+pub fn bufferForPath(ed: *Editor, path: []const u8) ?*Buffer {
+    const norm = ed.normalizePath(path) catch return null;
+    defer ed.gpa.free(norm);
+    return ed.findBuffer(norm);
+}
+
+/// Claude's `openFile`: in an editor window, at `start_text` if given.
+pub fn openFromClaude(ed: *Editor, path: []const u8, start_text: ?[]const u8) !void {
+    ed.focusEditorWindow();
+    try ed.openFile(path);
+    const s0 = start_text orelse return;
+    if (s0.len == 0) return;
+    const t = ed.text();
+    if (std.mem.indexOf(u8, t.slice(0, t.len()), s0)) |at| {
+        ed.revealLine(t.lineOf(at));
+        ed.setCursor(at);
+    }
+}
+
+/// The current selection for Claude (`selection_changed`), as JSON; null
+/// when no file is focused. Lines and characters are 0-based, the end
+/// exclusive.
+pub fn selectionJson(ed: *Editor, gpa: Allocator) ?[]u8 {
+    if (ed.window.term != null) return null;
+    const path = ed.buffer.path orelse return null;
+    const abs = ed.absolutePath(path) catch return null;
+    defer ed.gpa.free(abs);
+    const t = ed.text();
+    var start = ed.view.cursor;
+    var end = ed.view.cursor;
+    if (ed.mode == .visual) {
+        const r = ed.visualRange();
+        start = r.start;
+        end = @min(r.end, t.len());
+    }
+    const pos = struct {
+        fn of(x: *const Text, p: usize) struct { line: usize, character: usize } {
+            const l = x.lineOf(p);
+            return .{ .line = l, .character = p - x.lineStart(l) };
+        }
+    }.of;
+    const url = std.fmt.allocPrint(gpa, "file://{s}", .{abs}) catch return null;
+    defer gpa.free(url);
+    return std.json.Stringify.valueAlloc(gpa, .{
+        .text = t.slice(start, @min(end, start + (100 << 10))),
+        .filePath = abs,
+        .fileUrl = url,
+        .selection = .{ .start = pos(t, start), .end = pos(t, end), .isEmpty = start == end },
+    }, .{}) catch null;
+}
+
+/// Open files, for Claude's `getOpenEditors`.
+pub fn openEditorsJson(ed: *Editor, gpa: Allocator) ![]u8 {
+    const Tab = struct { uri: []const u8, isActive: bool, label: []const u8, isDirty: bool };
+    var tabs: std.ArrayList(Tab) = .empty;
+    defer {
+        for (tabs.items) |tab| gpa.free(tab.uri);
+        tabs.deinit(gpa);
+    }
+    for (ed.buffers.items) |b| {
+        const path = b.path orelse continue;
+        const abs = try ed.absolutePath(path);
+        defer ed.gpa.free(abs);
+        try tabs.append(gpa, .{ .uri = try std.fmt.allocPrint(gpa, "file://{s}", .{abs}), .isActive = b == ed.buffer, .label = std.fs.path.basename(path), .isDirty = b.modified });
+    }
+    return std.json.Stringify.valueAlloc(gpa, .{ .tabs = tabs.items }, .{});
+}
+
+/// Language server diagnostics, for Claude's `getDiagnostics` (one file's,
+/// by `file://` URI, or all).
+pub fn diagnosticsJson(ed: *Editor, gpa: Allocator, uri: ?[]const u8) ![]u8 {
+    const Pos = struct { line: u32, character: u32 };
+    const D = struct { message: []const u8, severity: []const u8, range: struct { start: Pos, end: Pos }, source: []const u8 };
+    const F = struct { uri: []u8, diagnostics: []D };
+    var files: std.ArrayList(F) = .empty;
+    defer {
+        for (files.items) |f| {
+            gpa.free(f.uri);
+            gpa.free(f.diagnostics);
+        }
+        files.deinit(gpa);
+    }
+    const want: ?[]const u8 = if (uri) |u| (if (std.mem.startsWith(u8, u, "file://")) u[7..] else u) else null;
+    for (ed.lsps.items) |l| {
+        for (l.diagnostics.keys(), l.diagnostics.values()) |path, list| {
+            const abs = try ed.absolutePath(path);
+            defer ed.gpa.free(abs);
+            if (want) |w| if (!std.mem.eql(u8, w, abs)) continue;
+            const ds = try gpa.alloc(D, list.len);
+            for (list, ds) |d, *o| o.* = .{
+                .message = d.message,
+                .severity = switch (d.severity) {
+                    .err => "Error",
+                    .warning => "Warning",
+                    .info => "Information",
+                    .hint => "Hint",
+                },
+                .range = .{ .start = .{ .line = d.line, .character = d.col }, .end = .{ .line = d.end_line, .character = d.end_col } },
+                .source = Lsp.servers[l.index].name,
+            };
+            try files.append(gpa, .{ .uri = try std.fmt.allocPrint(gpa, "file://{s}", .{abs}), .diagnostics = ds });
+        }
+    }
+    return std.json.Stringify.valueAlloc(gpa, files.items, .{});
+}
+
+/// `SPC a s`: mentions the selected lines (visual mode) or the file in
+/// Claude's prompt, and shows the panel.
+pub fn claudeMention(ed: *Editor) !void {
+    const target = try ed.claudeTarget() orelse return;
+    defer ed.gpa.free(target.path);
+    try ed.showClaude();
+    ed.claude.?.mention(target.path, target.lines);
+}
+
+const ClaudeTarget = struct { path: []u8, lines: ?[2]usize };
+
+/// The file (absolute) and lines (the visual selection's) to send.
+fn claudeTarget(ed: *Editor) !?ClaudeTarget {
+    if (ed.window.term != null) return null;
+    const path = ed.buffer.path orelse {
+        ed.setMessage(.info, "save the file first: Claude refers to files by path", .{});
+        return null;
+    };
+    const abs = try ed.absolutePath(path);
+    var lines: ?[2]usize = null;
+    if (ed.mode == .visual) {
+        const t = ed.text();
+        lines = .{ t.lineOf(@min(ed.view.anchor, ed.view.cursor)), t.lineOf(@max(ed.view.anchor, ed.view.cursor)) };
+        ed.exitVisual();
+    }
+    return .{ .path = abs, .lines = lines };
+}
+
+/// `SPC a i`: asks for an instruction to send along with the selection.
+pub fn claudeAskPrompt(ed: *Editor) !void {
+    const target = try ed.claudeTarget() orelse return;
+    if (ed.claude_ask) |a| ed.gpa.free(a.path);
+    ed.claude_ask = .{ .path = target.path, .lines = target.lines };
+    ed.startSearch(true, .ask_claude);
+}
+
+fn finishAskClaude(ed: *Editor) !void {
+    const raw = try ed.takePromptText() orelse return;
+    defer ed.gpa.free(raw);
+    const ask = ed.claude_ask orelse return;
+    ed.claude_ask = null;
+    defer ed.gpa.free(ask.path);
+    const instruction = std.mem.trim(u8, raw, " \t");
+    try ed.showClaude();
+    const c = ed.claude.?;
+    c.mention(ask.path, ask.lines);
+    // Typed into Claude's prompt, after the mention; <CR> in the panel sends it.
+    if (instruction.len > 0) if (c.term) |t| t.paste(instruction);
+}
+
+/// `SPC a y` / `SPC a n`: accepts or rejects the proposal shown (or shows
+/// the first one waiting, if another buffer is shown).
+pub fn claudeResolve(ed: *Editor, accept: bool) void {
+    const c = ed.claude orelse return ed.setMessage(.info, "no proposed changes", .{});
+    if (c.diffFor(ed.buffer)) |i| return c.resolve(ed, i, accept);
+    if (c.diffs.items.len == 0) return ed.setMessage(.info, "no proposed changes", .{});
+    ed.focusEditorWindow();
+    ed.switchTo(c.diffs.items[0].buffer);
+    ed.setMessage(.info, "Claude's proposal for {s}: SPC a y accept, SPC a n reject", .{std.fs.path.basename(c.diffs.items[0].path)});
+}
+
+// ---------------------------------------------------------------------------
 // Jumplist: where you were before each jump. `<C-o>` goes back, `<C-i>`
 // forward, `SPC s j` lists them. One entry per line (the newest wins).
 
@@ -3666,6 +4017,7 @@ pub fn windowView(ed: *Editor, w: *Windows.Window) *View {
 /// Moves focus to `w`, keeping the current window's state in it.
 pub fn focusWindow(ed: *Editor, w: *Windows.Window) void {
     if (w == ed.window) return;
+    if (ed.window.term == null) ed.last_editor_window = ed.window;
     ed.window.view = ed.view;
     ed.window.buffer = ed.buffer;
     ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
@@ -3695,8 +4047,18 @@ pub fn splitWindow(ed: *Editor, dir: Windows.Dir) !void {
 }
 
 /// `SPC w d`: closes the focused window (not the last one).
+/// Windows showing code (not terminal panels).
+pub fn codeWindowCount(ed: *const Editor) usize {
+    var n: usize = 0;
+    for (ed.window_list.items) |w| n += @intFromBool(w.term == null);
+    return n;
+}
+
 pub fn closeWindow(ed: *Editor) void {
     const closing = ed.window;
+    // Never leave only a terminal panel on screen.
+    if (closing.term == null and ed.codeWindowCount() <= 1 and ed.window_list.items.len > 1)
+        return ed.setMessage(.info, "this is the last code window (SPC a a hides Claude)", .{});
     ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
     const target = ed.windows.close(closing) orelse
         return ed.setMessage(.info, "this is the last window (SPC q closes the buffer, then quits)", .{});
@@ -3708,6 +4070,19 @@ pub fn closeWindow(ed: *Editor) void {
 pub fn onlyWindow(ed: *Editor) !void {
     try ed.windows.only(ed.window);
     ed.refreshWindowList();
+}
+
+/// Back to an editor window (from a terminal window).
+pub fn focusEditorWindow(ed: *Editor) void {
+    if (ed.window.term == null) return;
+    if (ed.last_editor_window) |w| for (ed.window_list.items) |o| if (o == w) return ed.focusWindow(w);
+    for (ed.window_list.items) |o| if (o.term == null) return ed.focusWindow(o);
+}
+
+/// The window showing terminal `t`, if any.
+pub fn windowShowing(ed: *Editor, t: *const Terminal) ?*Windows.Window {
+    for (ed.window_list.items) |w| if (w.term == t) return w;
+    return null;
 }
 
 /// `SPC w h/j/k/l`: focus the window on that side.
@@ -3845,6 +4220,8 @@ pub fn yankPath(ed: *Editor, absolute: bool) !void {
 /// save); one without a file asks for a name.
 pub fn saveCurrent(ed: *Editor) !void {
     const b = ed.buffer;
+    if (ed.claude) |c| if (c.diffFor(b) != null)
+        return ed.setMessage(.info, "this is Claude's proposal: SPC a y accepts it, SPC a n rejects it", .{});
     if (b.path == null) return ed.filePrompt(.save_as);
     if (ed.options.format_on_save and b.syntax != null) return ed.formatBuffer(null, true);
     ed.saveBufferNow(b);
@@ -5846,4 +6223,243 @@ test "AI suggestion: typing it out keeps it, Tab takes the rest, other keys drop
     try ed.feed("q"); // doesn't match: gone
     try testing.expectEqual(null, ed.aiSuggestionHere());
     try ed.feed("<Esc>");
+}
+
+/// A minimal Claude Code CLI for tests: a WebSocket client speaking JSON-RPC.
+const FakeCli = struct {
+    fd: c_int,
+    buf: std.ArrayList(u8) = .empty,
+
+    const socketFn = @extern(*const fn (c_uint, c_uint, c_uint) callconv(.c) c_int, .{ .name = "socket" });
+    const SockaddrIn = extern struct { family: u16 = 2, port: u16, addr: u32, zero: [8]u8 = @splat(0) };
+
+    fn connect(port: u16, token: []const u8) !FakeCli {
+        const fd = socketFn(2, 1, 0);
+        var addr: SockaddrIn = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(SockaddrIn)) != 0) return error.Connect;
+        var req: [512]u8 = undefined;
+        const r = try std.fmt.bufPrint(&req, "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mcp\r\nX-Claude-Code-Ide-Authorization: {s}\r\n\r\n", .{token});
+        _ = std.c.write(fd, r.ptr, r.len);
+        var resp: [512]u8 = undefined;
+        const n = std.c.read(fd, &resp, resp.len);
+        if (n <= 0 or !std.mem.startsWith(u8, resp[0..@intCast(n)], "HTTP/1.1 101")) return error.Handshake;
+        return .{ .fd = fd };
+    }
+
+    fn deinit(f: *FakeCli) void {
+        _ = std.c.close(f.fd);
+        f.buf.deinit(testing.allocator);
+    }
+
+    fn send(f: *FakeCli, msg: []const u8) void {
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(testing.allocator);
+        frame.append(testing.allocator, 0x81) catch return;
+        if (msg.len < 126) {
+            frame.append(testing.allocator, 0x80 | @as(u8, @intCast(msg.len))) catch return;
+        } else {
+            frame.appendSlice(testing.allocator, &.{ 0x80 | 126, @intCast(msg.len >> 8), @intCast(msg.len & 0xff) }) catch return;
+        }
+        frame.appendSlice(testing.allocator, &.{ 0, 0, 0, 0 }) catch return; // a zero mask
+        frame.appendSlice(testing.allocator, msg) catch return;
+        _ = std.c.write(f.fd, frame.items.ptr, frame.items.len);
+    }
+
+    /// The next message containing `needle`, running the editor's frames
+    /// until it arrives (caller frees).
+    fn expect(f: *FakeCli, ed: *Editor, needle: []const u8) ![]u8 {
+        for (0..400) |_| {
+            ed.tick();
+            while (f.nextFrame()) |msg| {
+                if (std.mem.indexOf(u8, msg, needle) != null) return msg;
+                testing.allocator.free(msg);
+            }
+            var fds = [_]std.c.pollfd{.{ .fd = f.fd, .events = std.c.POLL.IN, .revents = 0 }};
+            if (std.c.poll(&fds, 1, 10) > 0) {
+                var chunk: [64 * 1024]u8 = undefined;
+                const n = std.c.read(f.fd, &chunk, chunk.len);
+                if (n > 0) try f.buf.appendSlice(testing.allocator, chunk[0..@intCast(n)]);
+            }
+        }
+        return error.Timeout;
+    }
+
+    fn nextFrame(f: *FakeCli) ?[]u8 {
+        const b = f.buf.items;
+        if (b.len < 2) return null;
+        var len: usize = b[1] & 0x7f;
+        var at: usize = 2;
+        if (len == 126) {
+            if (b.len < 4) return null;
+            len = std.mem.readInt(u16, b[2..4], .big);
+            at = 4;
+        } else if (len == 127) {
+            if (b.len < 10) return null;
+            len = @intCast(std.mem.readInt(u64, b[2..10], .big));
+            at = 10;
+        }
+        if (b.len < at + len) return null;
+        const msg = testing.allocator.dupe(u8, b[at .. at + len]) catch return null;
+        f.buf.replaceRangeAssumeCapacity(0, at + len, &.{});
+        return msg;
+    }
+};
+
+test "claude: lock file, handshake, selection, mentions, openDiff accepted" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "proj/.git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/a.zig", .data = "const a = 1;\nconst b = 2;\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const cfg = try std.fmt.allocPrintSentinel(gpa, "{s}/cfg", .{base}, 0);
+    defer gpa.free(cfg);
+    const setenv = @extern(*const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) c_int, .{ .name = "setenv" });
+    _ = setenv("CLAUDE_CONFIG_DIR", cfg.ptr, 1);
+    const file = try std.fmt.allocPrint(gpa, "{s}/proj/a.zig", .{base});
+    defer gpa.free(file);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile(file);
+    ed.claude = try Claude.start(&ed);
+    const c = ed.claude.?;
+
+    // The lock file announces us.
+    const lock = try std.fmt.allocPrint(gpa, "{s}/ide/{d}.lock", .{ cfg, c.port() });
+    defer gpa.free(lock);
+    const lock_text = try Io.Dir.cwd().readFileAlloc(io, lock, gpa, .limited(4096));
+    defer gpa.free(lock_text);
+    try testing.expect(std.mem.indexOf(u8, lock_text, "\"transport\":\"ws\"") != null);
+    try testing.expect(std.mem.indexOf(u8, lock_text, &c.token) != null);
+
+    // A wrong token is turned away; the right one gets in.
+    try testing.expectError(error.Handshake, FakeCli.connect(c.port(), "wrong-token-wrong-token-wrong-to"));
+    var cli = try FakeCli.connect(c.port(), &c.token);
+    defer cli.deinit();
+    cli.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"test\"}}}");
+    const hello = try cli.expect(&ed, "\"id\":1");
+    defer gpa.free(hello);
+    try testing.expect(std.mem.indexOf(u8, hello, "\"protocolVersion\":\"2025-06-18\"") != null);
+    try testing.expect(std.mem.indexOf(u8, hello, "\"logging\":{}") != null);
+
+    // The cursor's place in the file is shared.
+    const sel = try cli.expect(&ed, "selection_changed");
+    defer gpa.free(sel);
+    try testing.expect(std.mem.indexOf(u8, sel, "a.zig") != null);
+
+    // Tools are listed.
+    cli.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}");
+    const tools = try cli.expect(&ed, "\"id\":2");
+    defer gpa.free(tools);
+    try testing.expect(std.mem.indexOf(u8, tools, "openDiff") != null);
+
+    // A mention of lines 1-2 (0-based 0..1).
+    c.mention(file, .{ 0, 1 });
+    const men = try cli.expect(&ed, "at_mentioned");
+    defer gpa.free(men);
+    try testing.expect(std.mem.indexOf(u8, men, "\"lineStart\":0,\"lineEnd\":1") != null);
+
+    // A proposed edit opens as a diff; SPC a y accepts it.
+    const call = try std.fmt.allocPrint(gpa,
+        \\{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"openDiff","arguments":{{"old_file_path":"{s}","new_file_path":"{s}","new_file_contents":"const a = 10;\nconst b = 2;\n","tab_name":"t1"}}}}}}
+    , .{ file, file });
+    defer gpa.free(call);
+    cli.send(call);
+    for (0..200) |_| {
+        ed.tick();
+        if (c.diffs.items.len > 0) break;
+        io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try testing.expectEqual(1, c.diffs.items.len);
+    try testing.expect(std.mem.startsWith(u8, ed.buffer.displayName(), "Claude: "));
+    try testing.expectEqual(1, ed.buffer.git.?.hunks.items.len); // line 1 changed
+    try ed.feed("<Space>ay");
+    const saved = try cli.expect(&ed, "\"id\":3");
+    defer gpa.free(saved);
+    try testing.expect(std.mem.indexOf(u8, saved, "FILE_SAVED") != null);
+    try testing.expect(std.mem.indexOf(u8, saved, "const a = 10;") != null);
+    try testing.expectEqual(0, c.diffs.items.len);
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "a.zig")); // back on the file
+
+    // A rejected one answers DIFF_REJECTED.
+    const call2 = try std.mem.replaceOwned(u8, gpa, call, "\"id\":3", "\"id\":4");
+    defer gpa.free(call2);
+    cli.send(call2);
+    for (0..200) |_| {
+        ed.tick();
+        if (c.diffs.items.len > 0) break;
+        io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try ed.feed("<Space>an");
+    const rejected = try cli.expect(&ed, "\"id\":4");
+    defer gpa.free(rejected);
+    try testing.expect(std.mem.indexOf(u8, rejected, "DIFF_REJECTED") != null);
+}
+
+test "terminal window: Ctrl-\\ goes back to the code, Ctrl-C closes it, Ctrl-Shift-C reaches the program" {
+    var ed = try testEditor("code");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    const t = try Terminal.create(ed.gpa, ed.io, .{ .argv = &.{ "/bin/sh", "-c", "trap 'echo got-int' INT; echo ready; while :; do sleep 0.05; done" }, .cwd = "/", .cols = 40, .rows = 5, .wake = noWake });
+    defer t.destroy();
+    const code_window = ed.window;
+    try ed.splitWindow(.right);
+    ed.window.term = t;
+    const term_window = ed.window;
+    for (0..200) |_| {
+        const out = try t.screenText(testing.allocator);
+        defer testing.allocator.free(out);
+        if (std.mem.indexOf(u8, out, "ready") != null) break;
+        io_sleep(10);
+    }
+    try ed.feed("<C-S-c>"); // to the program
+    try testing.expectEqual(term_window, ed.window);
+    try ed.feed("<C-\\>"); // back to the code, the panel open
+    try testing.expectEqual(code_window, ed.window);
+    try testing.expectEqual(2, ed.window_list.items.len);
+    try ed.feed("<C-\\>"); // and to the terminal again
+    try testing.expectEqual(term_window, ed.window);
+    var got = false;
+    for (0..200) |_| {
+        const out = try t.screenText(testing.allocator);
+        defer testing.allocator.free(out);
+        if (std.mem.indexOf(u8, out, "got-int") != null) {
+            got = true;
+            break;
+        }
+        io_sleep(10);
+    }
+    try testing.expect(got);
+    try ed.feed("<C-c>"); // closes the panel; the program keeps running
+    try testing.expectEqual(1, ed.window_list.items.len);
+    try testing.expectEqual(code_window, ed.window);
+    try testing.expect(t.isRunning());
+}
+
+fn io_sleep(ms: i64) void {
+    testing.io.sleep(.fromMilliseconds(ms), .awake) catch {};
+}
+
+test "SPC q with the Claude panel: the last code window hides the panel first" {
+    var ed = try testEditor("code");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    const t = try Terminal.create(ed.gpa, ed.io, .{ .argv = &.{ "/bin/sh", "-c", "sleep 5" }, .cwd = "/", .cols = 40, .rows = 5, .wake = noWake });
+    defer t.destroy();
+    const code_window = ed.window;
+    try ed.splitWindow(.right);
+    ed.window.term = t;
+    ed.focusWindow(code_window);
+
+    try ed.feed("<Space>wd"); // the last code window stays
+    try testing.expectEqual(2, ed.window_list.items.len);
+    try ed.feed("<Space>q"); // hides the panel, not the code
+    try testing.expectEqual(1, ed.window_list.items.len);
+    try testing.expectEqual(code_window, ed.window);
+    try testing.expect(!ed.should_quit);
+    try ed.feed("<Space>q"); // then on to buffers / quitting
+    try testing.expect(ed.should_quit);
 }
