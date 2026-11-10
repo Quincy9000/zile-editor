@@ -28,14 +28,20 @@ pub const Found = struct { root: []const u8, git: bool };
 /// The project folder containing `dir` (absolute), or null. Returns a slice
 /// of `dir`.
 pub fn detect(io: Io, dir: []const u8) ?Found {
+    return detectIn(io, dir, has);
+}
+
+/// `detect` with the "does `dir/entry` exist" check passed in, so the walk
+/// can be tested without touching the disk.
+fn detectIn(ctx: anytype, dir: []const u8, comptime exists: fn (@TypeOf(ctx), []const u8, []const u8) bool) ?Found {
     // Git wins over build files further down (a monorepo is one project).
     var d: ?[]const u8 = dir;
     while (d) |p| : (d = std.fs.path.dirname(p)) {
-        if (has(io, p, ".git")) return .{ .root = p, .git = true };
+        if (exists(ctx, p, ".git")) return .{ .root = p, .git = true };
     }
     d = dir;
     while (d) |p| : (d = std.fs.path.dirname(p)) {
-        for (markers) |m| if (has(io, p, m)) return .{ .root = p, .git = false };
+        for (markers) |m| if (exists(ctx, p, m)) return .{ .root = p, .git = false };
     }
     return null;
 }
@@ -47,27 +53,28 @@ fn has(io: Io, dir: []const u8, entry: []const u8) bool {
     return true;
 }
 
+/// A pretend filesystem for tests: the paths that exist.
+const FakeFs = struct {
+    paths: []const []const u8,
+    fn has(fs: FakeFs, dir: []const u8, entry: []const u8) bool {
+        for (fs.paths) |p| {
+            if (p.len == dir.len + 1 + entry.len and std.mem.startsWith(u8, p, dir) and
+                p[dir.len] == '/' and std.mem.endsWith(u8, p, entry)) return true;
+        }
+        return false;
+    }
+};
+
 test "detects git roots before build files, walking up" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "repo/.git");
-    try tmp.dir.createDirPath(io, "repo/sub/crate/src");
-    try tmp.dir.writeFile(io, .{ .sub_path = "repo/sub/crate/Cargo.toml", .data = "" });
-    try tmp.dir.createDirPath(io, "plain/pkg/src");
-    try tmp.dir.writeFile(io, .{ .sub_path = "plain/pkg/build.zig", .data = "" });
-    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var p: [Io.Dir.max_path_bytes]u8 = undefined;
+    const fs: FakeFs = .{ .paths = &.{ "/w/repo/.git", "/w/repo/sub/crate/Cargo.toml", "/w/plain/pkg/build.zig" } };
 
-    const in_repo = detect(io, try std.fmt.bufPrint(&p, "{s}/repo/sub/crate/src", .{base})).?;
+    const in_repo = detectIn(fs, "/w/repo/sub/crate/src", FakeFs.has).?;
     try std.testing.expect(in_repo.git);
-    try std.testing.expect(std.mem.endsWith(u8, in_repo.root, "/repo"));
+    try std.testing.expectEqualStrings("/w/repo", in_repo.root);
 
-    // The test folder can itself be inside a git checkout (.zig-cache in
-    // the project), and then git rightly wins.
-    if (detect(io, base)) |outer| if (outer.git) return;
-    const plain = detect(io, try std.fmt.bufPrint(&p, "{s}/plain/pkg/src", .{base})).?;
+    const plain = detectIn(fs, "/w/plain/pkg/src", FakeFs.has).?;
     try std.testing.expect(!plain.git);
-    try std.testing.expect(std.mem.endsWith(u8, plain.root, "/plain/pkg"));
+    try std.testing.expectEqualStrings("/w/plain/pkg", plain.root);
+
+    try std.testing.expectEqual(null, detectIn(fs, "/elsewhere/dir", FakeFs.has));
 }
