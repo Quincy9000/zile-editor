@@ -347,7 +347,7 @@ fn drawTerminalScreen(t: *Editor.Terminal, font: *const Font, theme: *const Them
             c.a = 150;
             rect(x, y, cw, ch, c);
         },
-        .bar => rect(x, y, 2, ch, c),
+        .bar => if (gfx.grid == null) rect(x, y, 2, ch, c),
         .underline => rect(x, y + ch - 2, cw, 2, c),
         .hollow => {
             rect(x, y, cw, 1, c);
@@ -571,7 +571,8 @@ fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
         else => .block,
     });
     switch (ed.mode) {
-        .insert => rect(x, y, 2, font.cell_h, color),
+        // In a terminal the real (bar) cursor is the focused one.
+        .insert => if (gfx.grid == null or color.a != 255) rect(x, y, 2, font.cell_h, color),
         // Half block: an operator is waiting for its motion.
         .operator => rect(x, y + font.cell_h / 2, font.cell_w, font.cell_h / 2, color),
         .normal, .picker, .picker_normal, .visual, .search => {
@@ -627,7 +628,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
         };
         x = font.drawText(label, x, y, theme.status_dim);
         x = font.drawText(sp.input.items(), x, y, theme.fg);
-        rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
+        if (gfx.grid == null) rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
         gfx.cursor(x, y, .bar);
     } else if (ed.message.len > 0) {
         const color = if (ed.message.kind == .err) theme.message_err else theme.message_info;
