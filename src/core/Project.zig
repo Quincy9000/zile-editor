@@ -64,6 +64,9 @@ test "detects git roots before build files, walking up" {
     try std.testing.expect(in_repo.git);
     try std.testing.expect(std.mem.endsWith(u8, in_repo.root, "/repo"));
 
+    // The test folder can itself be inside a git checkout (.zig-cache in
+    // the project), and then git rightly wins.
+    if (detect(io, base)) |outer| if (outer.git) return;
     const plain = detect(io, try std.fmt.bufPrint(&p, "{s}/plain/pkg/src", .{base})).?;
     try std.testing.expect(!plain.git);
     try std.testing.expect(std.mem.endsWith(u8, plain.root, "/plain/pkg"));
