@@ -450,15 +450,29 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     // A gliding scroll: everything is drawn `scroll_offset` rows lower (or
     // higher), with the rows that slide in from beyond the top or bottom.
     const y_off = scrollPx(ed, font);
-    const slack: usize = @intFromFloat(@ceil(@abs(v.scroll_offset)));
+    const draw_off = v.drawOffset();
+    // The first row in view, and where it is relative to `top`: rows above
+    // `top` while the text is lower, rows below it while it is higher.
     var first_row = ed.topRow();
-    var above: usize = 0;
-    if (v.scroll_offset > 0) while (above < slack) : (above += 1) {
-        const prev = ed.prevRow(first_row);
-        if (prev.eql(first_row)) break;
-        first_row = prev;
-    };
-    const row_limit = l.rows + above + (if (v.scroll_offset < 0) slack else 0);
+    var first_index: f32 = 0;
+    if (draw_off > 0) {
+        var n: usize = @intFromFloat(@ceil(draw_off));
+        while (n > 0) : (n -= 1) {
+            const prev = ed.prevRow(first_row);
+            if (prev.eql(first_row)) break;
+            first_row = prev;
+            first_index -= 1;
+        }
+    } else if (draw_off < 0) {
+        var n: usize = @intFromFloat(@floor(-draw_off));
+        while (n > 0) : (n -= 1) {
+            const next = ed.nextRow(first_row);
+            if (next.eql(first_row)) break;
+            first_row = next;
+            first_index += 1;
+        }
+    }
+    const area_h = @as(f32, @floatFromInt(l.rows)) * font.cell_h;
 
     // Rows walk visible lines: a closed fold is drawn as its first line plus a
     // marker, and the lines it hides are skipped.
@@ -468,13 +482,14 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     // down, like inserted lines).
     var virtual: usize = 0;
     var r = first_row;
-    while (row + virtual < row_limit) : (row += 1) {
+    while (true) : (row += 1) {
         if (row > 0) {
             const next = ed.nextRow(r);
             if (next.eql(r)) break;
             r = next;
         }
-        const y = (@as(f32, @floatFromInt(row + virtual)) - @as(f32, @floatFromInt(above))) * font.cell_h + y_off;
+        const y = (@as(f32, @floatFromInt(row + virtual)) + first_index) * font.cell_h + y_off;
+        if (y >= area_h) break;
         if (r.ghost) |k| {
             drawGhostRow(ed, font, theme, l, r.line, k, y);
             continue;
@@ -634,7 +649,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
 
 /// How far (in pixels) a gliding scroll still has the text from its place.
 fn scrollPx(ed: *Editor, font: *const Font) f32 {
-    return @round(ed.view.scroll_offset * font.cell_h);
+    return @round(ed.view.drawOffset() * font.cell_h);
 }
 
 /// The word under the cursor, when its other occurrences should stand out.

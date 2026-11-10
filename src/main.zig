@@ -138,7 +138,6 @@ pub fn main(init: std.process.Init) !void {
             ed.handleKey(ev);
         }
         ed.tick();
-        ed.animate(rl.GetFrameTime());
         applyZoom(&ed, gpa, io, &font, args);
         if (theme != Theme.get(ed.theme_index)) {
             theme = Theme.get(ed.theme_index);
@@ -146,6 +145,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         handleMouse(&ed, &font);
+        // After everything that scrolls this frame (keys and the wheel): a
+        // scroll the glide hasn't taken in yet would show for one frame as
+        // a jump ahead and back.
+        ed.animate(rl.GetFrameTime());
         const l = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
         title.update(&ed);
 
@@ -230,9 +233,8 @@ fn applyZoom(ed: *Editor, gpa: std.mem.Allocator, io: std.Io, font: *Font, args:
     ed.setMessage(.info, "text size {d}", .{size});
 }
 
-/// Wheel movement not yet turned into whole lines. Touchpads and smooth
-/// wheels report many small fractions of a notch; dropping them (or waiting
-/// for a whole one) is what makes scrolling stutter.
+/// Wheel movement over a terminal not yet turned into whole lines
+/// (touchpads and smooth wheels report fractions of a notch).
 var wheel_rest: f32 = 0;
 
 /// Whole lines to scroll for this frame's wheel movement (three per notch).
@@ -248,7 +250,7 @@ fn wheelLines(wheel: f32) isize {
 
 fn handleMouse(ed: *Editor, font: *const Font) void {
     const pos = rl.GetMousePosition();
-    const wheel = rl.GetMouseWheelMove();
+    const wheel = glfw.takeWheel();
     // Ctrl+wheel zooms.
     if (wheel != 0 and (rl.IsKeyDown(rl.KEY_LEFT_CONTROL) or rl.IsKeyDown(rl.KEY_RIGHT_CONTROL))) {
         ed.zoom_request += if (wheel > 0) 1 else -1;
@@ -268,15 +270,13 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
         return;
     }
     const w = ed.windows.at(pos.x, pos.y) orelse return;
-    // The wheel focuses the window it turns over; a fraction of a line
-    // (nothing to scroll yet) doesn't.
-    if (lines == 0 and !clicked) return;
     ed.focusWindow(w);
     if (w.term) |t| {
         if (lines != 0) t.scroll(lines);
         return;
     }
-    if (lines != 0) ed.scrollLines(lines);
+    // Editor windows take the wheel as it is, fractions and all.
+    ed.scrollSmooth(-wheel * 3);
     if (clicked) {
         const l = render.windowLayout(ed, font, w);
         if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.clickCell(cell.row, cell.col);

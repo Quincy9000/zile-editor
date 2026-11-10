@@ -18,11 +18,13 @@ const Special = keys.Special;
 const GLFWwindow = opaque {};
 const KeyFn = *const fn (?*GLFWwindow, c_int, c_int, c_int, c_int) callconv(.c) void;
 const CharFn = *const fn (?*GLFWwindow, c_uint) callconv(.c) void;
+const ScrollFn = *const fn (?*GLFWwindow, f64, f64) callconv(.c) void;
 
 // Provided by raylib's bundled GLFW (rglfw.c), linked statically.
 extern fn glfwGetCurrentContext() ?*GLFWwindow;
 extern fn glfwSetKeyCallback(window: ?*GLFWwindow, callback: ?KeyFn) ?KeyFn;
 extern fn glfwSetCharCallback(window: ?*GLFWwindow, callback: ?CharFn) ?CharFn;
+extern fn glfwSetScrollCallback(window: ?*GLFWwindow, callback: ?ScrollFn) ?ScrollFn;
 extern fn glfwGetKeyName(key: c_int, scancode: c_int) ?[*:0]const u8;
 extern fn glfwPostEmptyEvent() void;
 
@@ -35,6 +37,11 @@ const GLFW_MOD_SUPER = 0x8;
 
 var prev_key_cb: ?KeyFn = null;
 var prev_char_cb: ?CharFn = null;
+var prev_scroll_cb: ?ScrollFn = null;
+/// Vertical wheel movement since `takeWheel`, every event added up. (raylib
+/// keeps only the last event of a frame, so a fast wheel loses most of its
+/// movement there, unevenly.)
+var wheel_sum: f64 = 0;
 var installed = false;
 
 /// Modifier state from the most recent key event. GLFW delivers the char event
@@ -55,6 +62,7 @@ pub fn install() error{NoWindow}!void {
     const window = glfwGetCurrentContext() orelse return error.NoWindow;
     prev_key_cb = glfwSetKeyCallback(window, onKey);
     prev_char_cb = glfwSetCharCallback(window, onChar);
+    prev_scroll_cb = glfwSetScrollCallback(window, onScroll);
     installed = true;
 }
 
@@ -65,6 +73,18 @@ pub fn next() ?KeyEvent {
     head = (head + 1) % queue_cap;
     len -= 1;
     return ev;
+}
+
+fn onScroll(window: ?*GLFWwindow, x: f64, y: f64) callconv(.c) void {
+    wheel_sum += y;
+    if (prev_scroll_cb) |cb| cb(window, x, y);
+}
+
+/// All the wheel movement since the last call, in notches (up is positive).
+pub fn takeWheel() f32 {
+    const sum = wheel_sum;
+    wheel_sum = 0;
+    return @floatCast(sum);
 }
 
 /// Number of events lost because the queue was full (should stay 0).

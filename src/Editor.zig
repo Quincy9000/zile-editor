@@ -104,9 +104,20 @@ pub const View = struct {
     /// Smooth scrolling: rows the drawn text still is from `top` (positive
     /// after scrolling down: it is drawn that much lower, gliding to 0).
     scroll_offset: f32 = 0,
+    /// The part of a line the wheel has scrolled past `top` (touchpads and
+    /// smooth wheels move by fractions): shown, so the text follows the
+    /// wheel exactly, and settled onto a whole line when the wheel rests.
+    scroll_frac: f32 = 0,
+    /// Seconds since the wheel last moved.
+    scroll_idle: f32 = 0,
     /// The top and buffer `scroll_offset` was last brought up to date for.
     seen_top: usize = 0,
     seen_buffer: ?*const Buffer = null,
+
+    /// How many rows lower than its place the text is drawn right now.
+    pub fn drawOffset(v: *const View) f32 {
+        return v.scroll_offset - v.scroll_frac;
+    }
 };
 
 /// A screen row: a text line (a closed fold counts as one), or one of the
@@ -474,6 +485,8 @@ now: Io.Timestamp = .zero,
 visits: Visits = .{},
 /// `git blame` results per buffer (inline blame, `SPC t b`).
 blames: std.ArrayList(struct { buffer: *Buffer, blame: *Blame }) = .empty,
+/// Wheel movement not yet a whole line (with smooth scrolling off).
+wheel_rest: f32 = 0,
 /// Where state files go instead of `$XDG_STATE_HOME/zile` (tests).
 state_dir: ?[]const u8 = null,
 surround_from: u21 = 0,
@@ -698,11 +711,13 @@ pub fn highlightView(ed: *Editor) void {
     if (ed.buffer.syntax) |*s| {
         const t = ed.text();
         s.update(t);
-        // While a scroll glides, a screenful on either side is in view too.
-        const margin: usize = if (ed.view.scroll_offset != 0) ed.view.rows else 0;
-        const first = @min(ed.view.top, t.lineCount() - 1) -| margin;
+        // While a scroll glides, the lines in view are the ones around where
+        // the text is drawn, some rows from `top`.
+        const off = ed.view.drawOffset();
+        const shift: isize = if (off > 0) -@as(isize, @intFromFloat(@ceil(off))) else @intFromFloat(@floor(-off));
+        const first = ed.stepVisible(@min(ed.view.top, t.lineCount() - 1), shift);
         // With closed folds the screen reaches past `top + rows` raw lines.
-        const last_visible = ed.stepVisible(first, @intCast(ed.view.rows + 2 * margin));
+        const last_visible = ed.stepVisible(first, @intCast(ed.view.rows + 2));
         const last = if (ed.foldAt(last_visible)) |f| f.last else last_visible;
         s.highlight(ed.gpa, t, t.lineStart(first), t.lineEnd(last)) catch {};
     }
@@ -4950,8 +4965,8 @@ fn pruneToasts(ed: *Editor) void {
 /// Something on screen is moving (a gliding scroll, a fading toast): the UI
 /// should keep drawing frames instead of sleeping until the next key.
 pub fn wantsFrames(ed: *const Editor) bool {
-    if (ed.view.scroll_offset != 0) return true;
-    for (ed.window_list.items) |w| if (w != ed.window and w.view.scroll_offset != 0) return true;
+    if (ed.view.scroll_offset != 0 or ed.view.scroll_frac != 0) return true;
+    for (ed.window_list.items) |w| if (w != ed.window and (w.view.scroll_offset != 0 or w.view.scroll_frac != 0)) return true;
     for (ed.toasts.items) |t| if (!t.busy) return true;
     return false;
 }
@@ -4966,23 +4981,76 @@ pub fn wantsFrames(ed: *const Editor) bool {
 pub fn animate(ed: *Editor, dt: f32) void {
     const step = @min(dt, 1.0 / 30.0);
     for (ed.window_list.items) |w| ed.animateView(ed.windowView(w), ed.windowBuffer(w), w == ed.window, step);
-    if (ed.cmd_float) |f| ed.windowView(f).scroll_offset = 0;
+    if (ed.cmd_float) |f| {
+        ed.windowView(f).scroll_offset = 0;
+        ed.windowView(f).scroll_frac = 0;
+    }
+}
+
+/// The mouse wheel: scrolls the focused window by `delta` rows, fractions
+/// included. Whole lines move `top` (and glide like any scroll); the rest is
+/// shown as a partial line, so a touchpad or smooth wheel moves the text
+/// continuously instead of a line at a time.
+pub fn scrollSmooth(ed: *Editor, delta: f32) void {
+    if (delta == 0) return;
+    const v = &ed.view;
+    if (!ed.options.smooth_scroll) {
+        // Whole lines only; fractions add up out of sight.
+        if ((delta > 0) != (ed.wheel_rest > 0)) ed.wheel_rest = 0;
+        ed.wheel_rest += delta;
+        const whole = @trunc(ed.wheel_rest);
+        ed.wheel_rest -= whole;
+        if (whole != 0) ed.scrollLines(@intFromFloat(whole));
+        return;
+    }
+    v.scroll_idle = 0;
+    const top = ed.topRow();
+    const at_edge = if (delta < 0) ed.prevRow(top).eql(top) else ed.nextRow(top).eql(top);
+    // Turning back, or nowhere left to go: the partial line becomes part of
+    // the glide (the text doesn't jump) and eases back into place.
+    if (at_edge or (delta > 0) != (v.scroll_frac > 0)) {
+        v.scroll_offset -= v.scroll_frac;
+        v.scroll_frac = 0;
+        if (at_edge) return;
+    }
+    const frac = v.scroll_frac + delta;
+    const whole = @trunc(frac);
+    if (whole != 0) ed.scrollLines(@intFromFloat(whole));
+    // The text must not move at the moment of input: what the target gained
+    // is added to the glide's distance (`animate` adds the whole lines when
+    // it sees `top` moved; the partial line is added here).
+    v.scroll_offset += (frac - whole) - v.scroll_frac;
+    v.scroll_frac = frac - whole;
 }
 
 /// The glide's time constant in seconds: about a fifth of a second to settle.
 const scroll_glide = 0.06;
 
+/// How long the wheel rests before a partial line settles.
+const wheel_settle = 0.12;
+
 fn animateView(ed: *Editor, v: *View, b: *const Buffer, focused: bool, dt: f32) void {
-    const cap: f32 = @floatFromInt(v.rows);
+    // A scroll can run this many screens ahead of the drawn text before the
+    // text jumps to keep up.
+    const max_rows = v.rows * 4;
+    const cap: f32 = @floatFromInt(max_rows);
+    // The wheel has come to rest between two lines: settle on the nearer.
+    v.scroll_idle += dt;
+    if (v.scroll_frac != 0 and v.scroll_idle > wheel_settle and v.seen_buffer == b) {
+        if (focused and @abs(v.scroll_frac) >= 0.5) ed.scrollLines(if (v.scroll_frac > 0) 1 else -1);
+        v.scroll_offset -= v.scroll_frac;
+        v.scroll_frac = 0;
+    }
     if (!ed.options.smooth_scroll or v.seen_buffer != b) {
         v.scroll_offset = 0;
+        v.scroll_frac = 0;
     } else if (v.top != v.seen_top) {
         const old: Row = .{ .line = v.seen_top };
         const new: Row = .{ .line = v.top };
         // Folds and ghost lines count as the rows they take (for the
         // focused window, whose buffer is the current one).
         const rows: f32 = if (focused)
-            @floatFromInt(if (old.before(new)) ed.rowsFrom(old, new, v.rows) else ed.rowsFrom(new, old, v.rows))
+            @floatFromInt(if (old.before(new)) ed.rowsFrom(old, new, max_rows) else ed.rowsFrom(new, old, max_rows))
         else
             @min(@as(f32, @floatFromInt(if (v.top > v.seen_top) v.top - v.seen_top else v.seen_top - v.top)), cap);
         v.scroll_offset = std.math.clamp(v.scroll_offset + (if (old.before(new)) rows else -rows), -cap, cap);
@@ -7412,4 +7480,31 @@ test "Ctrl-/ toggles comments in normal, visual and insert mode, cursor on its t
     try expectText(&ed, "one\n  xytwo\nthree");
     try ed.feed("jj<C-_>");
     try expectText(&ed, "one\n  xytwo\n# three");
+}
+
+test "wheel: fractions of a line show at once, settle on a whole line, stop at the ends" {
+    var buf: [400]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = if (i % 2 == 0) 'x' else '\n';
+    var ed = try testEditor(&buf);
+    defer ed.deinit();
+    ed.setViewSize(10, 40);
+    ed.animate(0.016);
+    // At the top, scrolling up does nothing.
+    ed.scrollSmooth(-0.4);
+    try testing.expectEqual(0, ed.view.drawOffset());
+    // Small steps add up; the text doesn't jump at the moment of input.
+    for (0..7) |_| {
+        const before = ed.view.drawOffset() - @as(f32, @floatFromInt(ed.view.top));
+        ed.scrollSmooth(0.4);
+        ed.animate(0); // sees `top` move, no time passes
+        const after = ed.view.drawOffset() - @as(f32, @floatFromInt(ed.view.top));
+        try testing.expectApproxEqAbs(before, after, 0.001);
+    }
+    try testing.expectEqual(2, ed.view.top); // 2.8 rows so far
+    try testing.expectApproxEqAbs(0.8, ed.view.scroll_frac, 0.001);
+    // The wheel rests: the nearer line (one more), then everything settles.
+    for (0..120) |_| ed.animate(0.016);
+    try testing.expectEqual(3, ed.view.top);
+    try testing.expectEqual(0, ed.view.drawOffset());
+    try testing.expect(!ed.wantsFrames());
 }
