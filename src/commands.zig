@@ -18,6 +18,9 @@ const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
 const Picker = @import("picker/Picker.zig");
+const textops = @import("textops.zig");
+const indents = @import("core/indent.zig");
+const comment = @import("core/comment.zig");
 
 const Operator = operators.Operator;
 const MotionKind = operators.MotionKind;
@@ -169,6 +172,10 @@ const base = [_]Command{
     .{ .name = "paste_after", .doc = "Paste after", .run = paste(false), .repeat = true },
     .{ .name = "paste_before", .doc = "Paste before", .run = paste(true), .repeat = true },
     .{ .name = "replace_char", .doc = "Replace character", .run = replaceChar, .repeat = true, .takes_char = true },
+    .{ .name = "shift_text_down", .doc = "Move line/selection down", .run = moveCmd(.down) },
+    .{ .name = "shift_text_up", .doc = "Move line/selection up", .run = moveCmd(.up) },
+    .{ .name = "shift_text_left", .doc = "Move line/selection left", .run = moveCmd(.left) },
+    .{ .name = "shift_text_right", .doc = "Move line/selection right", .run = moveCmd(.right) },
     .{ .name = "join_lines", .doc = "Join lines", .run = joinLines, .repeat = true },
     .{ .name = "toggle_case_char", .doc = "Toggle case of character", .run = toggleCaseChar, .repeat = true },
     .{ .name = "undo", .doc = "Undo", .run = undo , .once = true },
@@ -308,6 +315,49 @@ const base = [_]Command{
     .{ .name = "save_and_quit", .doc = "Save all and quit", .run = saveAndQuit },
     .{ .name = "quit_without_saving", .doc = "Quit without saving", .run = quitWithoutSaving },
 
+    // mini.nvim: comment, operators, align, splitjoin, trailspace.
+    .{ .name = "comment", .doc = "Comment / uncomment", .run = operator(.comment), .repeat = true },
+    .{ .name = "toggle_comment", .doc = "Comment / uncomment line(s)", .run = toggleComment, .repeat = true },
+    .{ .name = "comment_object", .doc = "comment block", .run = commentObject, .hidden = true },
+    .{ .name = "replace_with_register", .doc = "Replace with register", .run = operator(.replace), .repeat = true },
+    .{ .name = "exchange", .doc = "Exchange (twice: swaps two texts)", .run = operator(.exchange) },
+    .{ .name = "sort", .doc = "Sort lines / list items", .run = operator(.sort), .repeat = true },
+    .{ .name = "multiply", .doc = "Duplicate", .run = operator(.multiply), .repeat = true },
+    .{ .name = "replace_line", .doc = "Whole line", .run = operatorLine(.replace), .hidden = true },
+    .{ .name = "exchange_line", .doc = "Whole line", .run = operatorLine(.exchange), .hidden = true },
+    .{ .name = "multiply_line", .doc = "Whole line", .run = operatorLine(.multiply), .hidden = true },
+    .{ .name = "align", .doc = "Align lines on a character", .run = operator(.@"align"), .repeat = true },
+    .{ .name = "align_char", .doc = "Align on", .run = alignChar, .takes_char = true, .hidden = true },
+    .{ .name = "split_join", .doc = "Split / join arguments", .run = splitJoin, .repeat = true },
+    .{ .name = "trim_trailing_whitespace", .doc = "Trim trailing whitespace", .run = trimTrailing, .once = true },
+    // mini.bracketed
+    .{ .name = "next_diagnostic", .doc = "Next diagnostic", .run = bracketed(.diagnostic, true), .once = true, .jump = true },
+    .{ .name = "previous_diagnostic", .doc = "Previous diagnostic", .run = bracketed(.diagnostic, false), .once = true, .jump = true },
+    .{ .name = "next_conflict", .doc = "Next conflict marker", .run = bracketed(.conflict, true), .once = true, .jump = true },
+    .{ .name = "previous_conflict", .doc = "Previous conflict marker", .run = bracketed(.conflict, false), .once = true, .jump = true },
+    .{ .name = "next_comment", .doc = "Next comment block", .run = bracketed(.comment, true), .once = true, .jump = true },
+    .{ .name = "previous_comment", .doc = "Previous comment block", .run = bracketed(.comment, false), .once = true, .jump = true },
+    .{ .name = "indent_scope_top", .doc = "Top of indent scope", .run = motion(indentEdge(false), .linewise, .reset), .jump = true },
+    .{ .name = "indent_scope_bottom", .doc = "Bottom of indent scope", .run = motion(indentEdge(true), .linewise, .reset), .jump = true },
+    // More toggles
+    .{ .name = "toggle_highlight_patterns", .doc = "Todo words and colours", .run = toggle("highlight_patterns", "todo and colour highlights") },
+    .{ .name = "toggle_cursor_word", .doc = "Word under cursor", .run = toggle("cursor_word", "word under cursor highlight") },
+    .{ .name = "toggle_indent_scope", .doc = "Indent scope guide", .run = toggle("indent_scope", "indent scope guide") },
+    .{ .name = "toggle_trailing_space", .doc = "Trailing whitespace", .run = toggle("trailing_space", "trailing whitespace highlight") },
+    .{ .name = "toggle_trim_on_save", .doc = "Trim whitespace on save", .run = toggle("trim_on_save", "trim trailing whitespace on save") },
+    .{ .name = "toggle_icons", .doc = "File icons", .run = toggle("icons", "file icons") },
+    .{ .name = "toggle_smooth_scroll", .doc = "Smooth scrolling", .run = toggle("smooth_scroll", "smooth scrolling") },
+    .{ .name = "toggle_git_blame", .doc = "Git blame on the cursor line", .run = toggle("git_blame", "inline git blame") },
+    // Pickers and state
+    .{ .name = "recent_files", .doc = "Recent files", .run = openPicker(.recent), .once = true },
+    .{ .name = "search_todos", .doc = "Todo comments in project", .run = openPicker(.todos), .once = true },
+    .{ .name = "pick_theme", .doc = "Colour scheme", .run = openPicker(.themes), .once = true },
+    .{ .name = "message_history", .doc = "Messages", .run = openPicker(.messages), .once = true },
+    .{ .name = "start_screen", .doc = "Start screen", .run = openPicker(.start), .once = true },
+    .{ .name = "save_session", .doc = "Save session", .run = sessionCmd(.save), .once = true },
+    .{ .name = "load_session", .doc = "Restore session", .run = sessionCmd(.load), .once = true },
+    .{ .name = "git_line_commit", .doc = "Commit that changed this line", .run = gitLineCommit, .once = true },
+
     // Inside the picker
     .{ .name = "picker_next", .doc = "Next result", .run = pickerMove(1, .wrap), .hidden = true },
     .{ .name = "picker_previous", .doc = "Previous result", .run = pickerMove(-1, .wrap), .hidden = true },
@@ -349,6 +399,8 @@ pub const ObjectKind = union(enum) {
     tag,
     /// From the syntax tree (function, class, argument).
     syntax: syntax_objects.Object,
+    /// The cursor's indent scope (`ai`: with its border lines).
+    indent,
 };
 
 pub const ObjectSpec = struct {
@@ -359,6 +411,8 @@ pub const ObjectSpec = struct {
     kind: ObjectKind,
     /// Which-key labels when "inner X" / "around X" don't describe it.
     labels: ?[2][]const u8 = null,
+    /// Also gets "next" / "previous" forms: `in(` `an(`, `iN(` `aN(`.
+    seek: bool = true,
 };
 
 pub const text_object_specs = [_]ObjectSpec{
@@ -374,44 +428,118 @@ pub const text_object_specs = [_]ObjectSpec{
     .{ .name = "braces", .doc = "{braces}", .keys = "{}B", .kind = .{ .bracket = .{ '{', '}' } } },
     .{ .name = "angles", .doc = "<angles>", .keys = "<>", .kind = .{ .bracket = .{ '<', '>' } } },
     .{ .name = "paragraph", .doc = "paragraph", .keys = "p", .kind = .paragraph },
-    .{ .name = "line", .doc = "line", .keys = "l", .kind = .line, .labels = .{ "in line", "all lines" } },
+    .{ .name = "line", .doc = "line", .keys = "l", .kind = .line, .labels = .{ "in line", "all lines" }, .seek = false },
+    .{ .name = "indent", .doc = "indent scope", .keys = "i", .kind = .indent, .seek = false },
     .{ .name = "tag", .doc = "<tag> block", .keys = "t", .kind = .tag },
     .{ .name = "function", .doc = "function", .keys = "f", .kind = .{ .syntax = .function } },
     .{ .name = "class", .doc = "class/struct", .keys = "c", .kind = .{ .syntax = .class } },
     .{ .name = "argument", .doc = "argument", .keys = "a", .kind = .{ .syntax = .argument } },
 };
 
+/// Which instance of an object: the one at the cursor (seeking ahead when
+/// not in one), or strictly the next / previous one (mini.ai's `n` / `l`;
+/// `l` is the line object here, so "previous" is `N`).
+const Which = enum { here, next, previous };
+
+/// Per spec: `inner_X`, `around_X`; with `seek`, `inner_next_X`,
+/// `around_next_X`, `inner_previous_X`, `around_previous_X`; and the motions
+/// `goto_start_X` / `goto_end_X` (`g[` / `g]`: to the object's edges).
 const text_object_commands = blk: {
-    var out: [text_object_specs.len * 2]Command = undefined;
-    for (text_object_specs, 0..) |spec, i| {
-        for ([_]textobjects.Scope{ .inner, .around }, 0..) |scope, j| {
-            out[i * 2 + j] = .{
-                .name = @tagName(scope) ++ "_" ++ spec.name,
-                .doc = if (spec.labels) |l| l[j] else (if (scope == .inner) "inner " else "around ") ++ spec.doc,
-                .run = textObject(spec.kind, scope),
-            };
+    @setEvalBranchQuota(100_000);
+    var n: usize = 0;
+    for (text_object_specs) |spec| n += if (spec.seek) 8 else 4;
+    var out: [n]Command = undefined;
+    var i: usize = 0;
+    for (text_object_specs) |spec| {
+        for ([_]Which{ .here, .next, .previous }) |which| {
+            if (which != .here and !spec.seek) continue;
+            for ([_]textobjects.Scope{ .inner, .around }, 0..) |scope, j| {
+                const plain = if (spec.labels) |l| l[j] else (if (scope == .inner) "inner " else "around ") ++ spec.doc;
+                out[i] = switch (which) {
+                    .here => .{ .name = @tagName(scope) ++ "_" ++ spec.name, .doc = plain, .run = textObject(spec.kind, scope, which) },
+                    else => .{
+                        .name = @tagName(scope) ++ "_" ++ @tagName(which) ++ "_" ++ spec.name,
+                        .doc = @tagName(which) ++ " " ++ spec.doc,
+                        .run = textObject(spec.kind, scope, which),
+                    },
+                };
+                i += 1;
+            }
         }
+        out[i] = .{ .name = "goto_start_" ++ spec.name, .doc = "start of " ++ spec.doc, .run = objectEdge(spec.kind, false), .jump = true };
+        out[i + 1] = .{ .name = "goto_end_" ++ spec.name, .doc = "end of " ++ spec.doc, .run = objectEdge(spec.kind, true), .jump = true };
+        i += 2;
     }
     const result = out;
     break :blk result;
 };
 
-fn textObject(comptime kind: ObjectKind, comptime scope: textobjects.Scope) Handler {
+/// The object of `kind` at `pos`.
+fn objectAt(ed: *Editor, comptime kind: ObjectKind, scope: textobjects.Scope, pos: usize, count: usize) ?textobjects.Range {
+    const t = ed.text();
+    return switch (kind) {
+        .word => |big| textobjects.word(t, pos, scope, big, count),
+        .quote => |q| textobjects.quote(t, pos, q, scope),
+        .any_quote => textobjects.anyQuote(t, pos, scope),
+        .any_bracket => textobjects.anyBracket(t, pos, scope, count),
+        .bracket => |b| textobjects.bracket(t, pos, b[0], b[1], scope, count),
+        .paragraph => textobjects.paragraph(t, pos, scope),
+        .line => textobjects.lineObject(t, pos, scope),
+        .tag => textobjects.tag(t, pos, scope, count),
+        .syntax => |obj| if (ed.buffer.syntax) |*s| syntax_objects.find(s, t, pos, obj, scope, count) else null,
+        .indent => blk: {
+            const s = indents.scope(t, t.lineOf(pos), ed.options.tab_width, true) orelse break :blk null;
+            if (scope == .inner) break :blk operators.linesRange(t, s.first, s.last);
+            break :blk operators.linesRange(t, s.top orelse s.first, s.bottom orelse s.last);
+        },
+    };
+}
+
+/// Whether an object of `kind` can begin (going forward) or end (going
+/// backward) at byte `b`: keeps the search for the next one cheap.
+fn objectCandidate(comptime kind: ObjectKind, b: u8, forward: bool) bool {
+    return switch (kind) {
+        .bracket => |p| b == (if (forward) p[0] else p[1]),
+        .any_bracket => std.mem.indexOfScalar(u8, if (forward) "([{" else ")]}", b) != null,
+        .quote => |q| b == q,
+        .any_quote => b == '"' or b == '\'' or b == '`',
+        else => b != ' ' and b != '\t' and b != '\n',
+    };
+}
+
+/// The first object of `kind` that starts after the cursor (or the last
+/// that ends before it), within a few thousand bytes.
+fn seekObject(ed: *Editor, comptime kind: ObjectKind, scope: textobjects.Scope, pos: usize, forward: bool) ?textobjects.Range {
+    const t = ed.text();
+    const reach = 8000;
+    if (forward) {
+        var p = pos + 1;
+        while (p < @min(t.len(), pos + reach)) : (p += 1) {
+            if (!objectCandidate(kind, t.byteAt(p), true)) continue;
+            const r = objectAt(ed, kind, scope, p, 1) orelse continue;
+            if (r.start > pos) return r;
+        }
+        return null;
+    }
+    var p = pos;
+    while (p > pos -| reach) {
+        p -= 1;
+        if (!objectCandidate(kind, t.byteAt(p), false)) continue;
+        const r = objectAt(ed, kind, scope, p, 1) orelse continue;
+        if (r.end <= pos) return r;
+    }
+    return null;
+}
+
+fn textObject(comptime kind: ObjectKind, comptime scope: textobjects.Scope, comptime which: Which) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            const t = ed.text();
             const pos = ed.view.cursor;
-            const r = switch (kind) {
-                .word => |big| textobjects.word(t, pos, scope, big, c.count),
-                .quote => |q| textobjects.quote(t, pos, q, scope),
-                .any_quote => textobjects.anyQuote(t, pos, scope),
-                .any_bracket => textobjects.anyBracket(t, pos, scope, c.count),
-                .bracket => |b| textobjects.bracket(t, pos, b[0], b[1], scope, c.count),
-                .paragraph => textobjects.paragraph(t, pos, scope),
-                .line => textobjects.lineObject(t, pos, scope),
-                .tag => textobjects.tag(t, pos, scope, c.count),
-                .syntax => |obj| if (ed.buffer.syntax) |*s| syntax_objects.find(s, t, pos, obj, scope, c.count) else null,
+            const r = switch (which) {
+                .here => objectAt(ed, kind, scope, pos, c.count),
+                .next => seekObject(ed, kind, scope, pos, true),
+                .previous => seekObject(ed, kind, scope, pos, false),
             } orelse return fail(ed);
             switch (ed.mode) {
                 .operator => try ed.applyPending(r),
@@ -420,6 +548,122 @@ fn textObject(comptime kind: ObjectKind, comptime scope: textobjects.Scope) Hand
             }
         }
     }.run;
+}
+
+/// `g[` / `g]` + an object's key: a motion to its first / last character.
+fn objectEdge(comptime kind: ObjectKind, comptime end: bool) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const t = ed.text();
+            const from = ed.view.cursor;
+            const r = objectAt(ed, kind, .around, from, c.count) orelse return fail(ed);
+            const to = if (!end) r.start else if (r.end > r.start) motions.prevChar(t, r.end) else r.start;
+            try finishMotion(ed, from, to, if (end) .inclusive else .exclusive, .reset);
+        }
+    }.run;
+}
+
+/// `gc` after an operator: the block of comment lines at the cursor.
+fn commentObject(c: Context) !void {
+    const ed = c.ed;
+    const t = ed.text();
+    const b = comment.block(t, ed.cursorLine(), textops.commentPrefix(ed)) orelse return fail(ed);
+    const r = operators.linesRange(t, b[0], b[1]);
+    switch (ed.mode) {
+        .operator => try ed.applyPending(r),
+        .visual => ed.selectRange(r),
+        else => {},
+    }
+}
+
+/// `[i` / `]i`: the line above / below the cursor's indent scope (its
+/// border); pressed again it goes on to the next scope out.
+fn indentEdge(comptime bottom: bool) Target {
+    return struct {
+        fn target(ed: *Editor, from: usize, _: Context) ?usize {
+            const t = ed.text();
+            const s = indents.scope(t, t.lineOf(from), ed.options.tab_width, false) orelse return null;
+            const line = if (bottom) s.bottom orelse s.last else s.top orelse s.first;
+            return motions.firstNonBlank(t, line);
+        }
+    }.target;
+}
+
+/// A doubled mini operator (`grr`, `gxx`, `gmm`): the whole line. After
+/// another operator the key means nothing (`dr` is not `dd`).
+fn operatorLine(comptime op: Operator) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            if (c.ed.pendingOperator() != op) return c.ed.resetCommand();
+            try operateLine(c);
+        }
+    }.run;
+}
+
+/// `<C-/>`: comments or uncomments [count] lines (visual: the selected
+/// lines) in any mode. The cursor stays on the text it was on.
+fn toggleComment(c: Context) !void {
+    const ed = c.ed;
+    const t = ed.text();
+    const line = ed.cursorLine();
+    var first = line;
+    var last = @min(line + c.count - 1, t.lineCount() - 1);
+    if (ed.mode == .visual) {
+        first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
+        last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
+        ed.exitVisual();
+    }
+    const col = ed.view.cursor - t.lineStart(line);
+    const indent = motions.firstNonBlank(t, line) - t.lineStart(line);
+    const old_len = t.lineLen(line);
+    try textops.toggleComment(ed, first, last);
+    // The prefix came or went before the cursor: move with the text.
+    const new_len = t.lineLen(line);
+    const moved = if (col < indent) col else if (new_len >= old_len) col + (new_len - old_len) else col -| (old_len - new_len);
+    ed.setCursor(t.lineStart(line) + @min(moved, new_len));
+}
+
+fn alignChar(c: Context) !void {
+    c.ed.capture_repeatable = true;
+    try textops.alignLines(c.ed, c.ed.align_range, c.char);
+}
+
+fn splitJoin(c: Context) !void {
+    try textops.splitJoin(c.ed);
+}
+
+fn trimTrailing(c: Context) !void {
+    const n = try textops.trimTrailing(c.ed);
+    c.ed.setMessage(.info, "trimmed {d} line(s)", .{n});
+}
+
+fn bracketed(comptime what: enum { diagnostic, conflict, comment }, comptime forward: bool) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            for (0..c.count) |_| switch (what) {
+                .diagnostic => c.ed.jumpDiagnostic(forward),
+                .conflict => c.ed.jumpConflict(forward),
+                .comment => c.ed.jumpComment(forward),
+            };
+        }
+    }.run;
+}
+
+fn sessionCmd(comptime what: enum { save, load }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            switch (what) {
+                .save => ed.saveSession(true),
+                .load => if (!ed.restoreSession(ed.projectRoot())) ed.setMessage(.info, "no saved session for this project", .{}),
+            }
+        }
+    }.run;
+}
+
+fn gitLineCommit(c: Context) !void {
+    try c.ed.showLineCommit();
 }
 
 // ---------------------------------------------------------------------------
@@ -749,7 +993,8 @@ fn findChar(comptime forward: bool, comptime till: bool) Target {
         fn target(ed: *Editor, from: usize, c: Context) ?usize {
             const f = motions.Find.init(c.char, forward, till) orelse return null;
             ed.last_find = f;
-            return motions.findInLine(ed.text(), from, f, c.count, false);
+            ed.find_shown = true;
+            return motions.findAcross(ed.text(), from, f, c.count, false);
         }
     }.target;
 }
@@ -761,7 +1006,8 @@ fn repeatFind(comptime reverse: bool) Handler {
             var f = ed.last_find orelse return fail(ed);
             if (reverse) f.forward = !f.forward;
             const from = ed.view.cursor;
-            const to = motions.findInLine(ed.text(), from, f, c.count, true) orelse return fail(ed);
+            const to = motions.findAcross(ed.text(), from, f, c.count, true) orelse return fail(ed);
+            ed.find_shown = true;
             try finishMotion(ed, from, to, if (f.forward) .inclusive else .exclusive, .reset);
         }
     }.run;
@@ -1127,6 +1373,118 @@ fn joinLines(c: Context) !void {
     try operators.join(ed, c.count);
 }
 
+const MoveDir = enum { down, up, left, right };
+
+fn moveCmd(comptime dir: MoveDir) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            if (c.ed.ghost != null) return;
+            for (0..c.count) |_| {
+                const moved = switch (dir) {
+                    .down, .up => try moveLines(c.ed, dir == .down),
+                    .left, .right => try moveSideways(c.ed, dir == .right),
+                };
+                if (!moved) break;
+            }
+        }
+    }.run;
+}
+
+/// mini.move: swaps the current line (or the selected lines) with the one
+/// below/above. The cursor and selection travel with the text.
+fn moveLines(ed: *Editor, to_down: bool) !bool {
+    const t = ed.text();
+    const visual = ed.mode == .visual;
+    const a = t.lineOf(if (visual) @min(ed.view.anchor, ed.view.cursor) else ed.view.cursor);
+    const b = t.lineOf(if (visual) @max(ed.view.anchor, ed.view.cursor) else ed.view.cursor);
+    const gpa = ed.gpa;
+    if (to_down) {
+        if (b + 1 >= t.lineCount()) return false;
+        const other = try gpa.dupe(u8, t.lineSlice(b + 1));
+        defer gpa.free(other);
+        const shift = other.len + 1;
+        const cur = ed.view.cursor + shift;
+        const anchor = ed.view.anchor + shift;
+        try ed.deleteRangeKeepCursor(t.lineEnd(b), t.lineEnd(b + 1));
+        const ins = try std.mem.concat(gpa, u8, &.{ other, "\n" });
+        defer gpa.free(ins);
+        try ed.insertAt(ed.text().lineStart(a), ins);
+        ed.view.cursor = cur;
+        ed.view.anchor = anchor;
+    } else {
+        if (a == 0) return false;
+        const other = try gpa.dupe(u8, t.lineSlice(a - 1));
+        defer gpa.free(other);
+        const shift = other.len + 1;
+        const cur = ed.view.cursor - shift;
+        const anchor = ed.view.anchor -| shift;
+        const old_end = t.lineEnd(b);
+        try ed.deleteRangeKeepCursor(t.lineStart(a - 1), t.lineStart(a));
+        const ins = try std.mem.concat(gpa, u8, &.{ "\n", other });
+        defer gpa.free(ins);
+        try ed.insertAt(old_end - shift, ins);
+        ed.view.cursor = cur;
+        ed.view.anchor = anchor;
+    }
+    ed.view.want_col = null;
+    ed.scrollToCursor();
+    return true;
+}
+
+/// mini.move: shifts the line (or linewise selection) by an indent level, or
+/// moves a charwise selection one character along its line.
+fn moveSideways(ed: *Editor, to_right: bool) !bool {
+    const t = ed.text();
+    if (ed.mode == .visual and !ed.visual_line) {
+        const r = ed.visualRange();
+        const line = t.lineOf(r.start);
+        if (t.lineOf(r.end -| 1) != line) return false;
+        var delta: usize = undefined;
+        if (to_right) {
+            if (r.end >= t.lineEnd(line)) return false;
+            const next = motions.nextChar(t, r.end);
+            delta = next - r.end;
+            var buf: [8]u8 = undefined;
+            @memcpy(buf[0..delta], t.slice(r.end, next));
+            try ed.deleteRangeKeepCursor(r.end, next);
+            try ed.insertAt(r.start, buf[0..delta]);
+            ed.view.cursor += delta;
+            ed.view.anchor += delta;
+        } else {
+            if (r.start <= t.lineStart(line)) return false;
+            const prev = motions.prevChar(t, r.start);
+            delta = r.start - prev;
+            var buf: [8]u8 = undefined;
+            @memcpy(buf[0..delta], t.slice(prev, r.start));
+            try ed.deleteRangeKeepCursor(prev, r.start);
+            try ed.insertAt(r.end - delta, buf[0..delta]);
+            ed.view.cursor -= delta;
+            ed.view.anchor -= delta;
+        }
+        ed.scrollToCursor();
+        return true;
+    }
+    const visual = ed.mode == .visual;
+    const range = if (visual) ed.visualRange() else operators.linesRange(t, ed.cursorLine(), ed.cursorLine());
+    const col = ed.view.cursor - t.lineStart(t.lineOf(ed.view.cursor));
+    const old_len = t.lineLen(t.lineOf(ed.view.cursor));
+    const anchor_line = t.lineOf(ed.view.anchor);
+    const anchor_col = ed.view.anchor - t.lineStart(anchor_line);
+    const anchor_len = t.lineLen(anchor_line);
+    const cur_line = t.lineOf(ed.view.cursor);
+    try operators.apply(ed, if (to_right) .indent else .outdent, range, null);
+    const nt = ed.text();
+    if (visual) {
+        const na = nt.lineStart(anchor_line) + @min(nt.lineLen(anchor_line), anchor_col + nt.lineLen(anchor_line) -| anchor_len);
+        ed.view.anchor = na;
+    }
+    const grown = nt.lineLen(cur_line);
+    const pos = if (grown >= old_len) col + (grown - old_len) else col -| (old_len - grown);
+    ed.view.cursor = nt.lineStart(cur_line) + @min(pos, grown);
+    ed.view.want_col = null;
+    return true;
+}
+
 /// `~` in normal mode: toggles case and moves past the characters.
 fn toggleCaseChar(c: Context) !void {
     const ed = c.ed;
@@ -1376,6 +1734,7 @@ fn surroundOrSnipe(c: Context) !void {
     const op = ed.op orelse return;
     switch (op.op) {
         .yank => ed.op.?.op = .surround, // still waiting for a motion
+        .sort => try operateLine(c), // `gss`
         .surround => {
             // `yss`: [count] lines.
             const t = ed.text();
@@ -1811,6 +2170,10 @@ fn clearSearchHighlight(c: Context) !void {
     // With extra cursors, <Esc> removes them first.
     if (c.ed.cursors.items.len > 0) return c.ed.clearCursors();
     c.ed.search_highlight = false;
+    if (c.ed.exchange_mark != null) {
+        c.ed.exchange_mark = null;
+        c.ed.setMessage(.info, "exchange cancelled", .{});
+    }
 }
 
 fn cursorCmd(comptime action: enum { next, previous, skip, all, down, up, undo, clear, line_starts, line_ends, insert_starts, insert_ends, from_prompt }) Handler {

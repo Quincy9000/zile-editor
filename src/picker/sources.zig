@@ -24,8 +24,9 @@ const Syntax = @import("../syntax/Syntax.zig");
 const languages = @import("../syntax/languages.zig");
 const motions = @import("../core/motions.zig");
 const Git = @import("../git/Git.zig");
+const hipatterns = @import("../core/hipatterns.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -47,6 +48,11 @@ fn Impl(comptime kind: Kind) type {
         .projects => Projects,
         .open_in => OpenIn,
         .quickfix => Quickfix,
+        .recent => Recent,
+        .todos => Todos,
+        .themes => Themes,
+        .messages => Messages,
+        .start => Start,
     };
 }
 
@@ -205,11 +211,37 @@ const Files = struct {
         .{"zig-out"}, .{"zig-pkg"}, .{"node_modules"}, .{"target"}, .{"__pycache__"},
     });
 
-    pub fn produce(e: *Engine) anyerror!void {
-        try eachProjectFile(e, {}, addPath);
+    /// How many visited files go first.
+    const max_seeded = 30;
+
+    /// The project's files you open most (mini.visits) come first, so an
+    /// empty query already lists where you are likely going.
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const root = ed.picker_root;
+        const v = ed.loadedVisits();
+        v.rank(ed.unixNow());
+        const current = if (ed.buffer.path) |p| try ed.absolutePath(p) else null;
+        defer if (current) |c| ed.gpa.free(c);
+        var n: usize = 0;
+        for (v.entries.items) |entry| {
+            if (n == max_seeded) break;
+            const p = entry.path;
+            if (!(p.len > root.len + 1 and std.mem.startsWith(u8, p, root) and p[root.len] == '/')) continue;
+            // Not the file you are already in; not files that are gone.
+            if (current) |c| if (std.mem.eql(u8, c, p)) continue;
+            Io.Dir.cwd().access(ed.io, p, .{}) catch continue;
+            try items.append(.{ .text = p[root.len + 1 ..] });
+            n += 1;
+        }
     }
 
-    fn addPath(_: void, e: *Engine, path: []const u8, n: usize) !void {
+    pub fn produce(e: *Engine) anyerror!void {
+        // Items already there are the visited files `fill` put first.
+        try eachProjectFile(e, e.items.count(), addPath);
+    }
+
+    fn addPath(seeded: usize, e: *Engine, path: []const u8, n: usize) !void {
+        for (0..seeded) |i| if (std.mem.eql(u8, e.items.get(i).text, path)) return;
         try e.items.append(.{ .text = path });
         if (n % 2048 == 0) try e.checkpoint();
     }
@@ -407,6 +439,240 @@ const Browse = struct {
         try Files.previewPath(ed, path, out);
     }
 };
+
+/// A file's path for a list: inside the current project, relative to it;
+/// under the home folder, with `~`; else as it is.
+fn displayPath(ed: *Editor, abs: []const u8, buf: []u8) []const u8 {
+    const root = ed.projectRoot();
+    if (abs.len > root.len + 1 and std.mem.startsWith(u8, abs, root) and abs[root.len] == '/') return abs[root.len + 1 ..];
+    const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "";
+    if (home.len > 1 and std.mem.startsWith(u8, abs, home)) return std.fmt.bufPrint(buf, "~{s}", .{abs[home.len..]}) catch abs;
+    return abs;
+}
+
+/// `SPC f r`: files opened before, in any session (mini.visits), the ones
+/// used most and most recently first.
+const Recent = struct {
+    pub const title = "Recent files";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const v = ed.loadedVisits();
+        v.rank(ed.unixNow());
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        for (v.entries.items, 0..) |e, i| {
+            if (i == 300) break;
+            try items.append(.{ .text = displayPath(ed, e.path, &buf), .id = @intCast(i) });
+        }
+    }
+
+    fn pathOf(ed: *Editor, id: u32) ?[]const u8 {
+        const entries = ed.visits.entries.items;
+        return if (id < entries.len) entries[id].path else null;
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        const p = try ed.gpa.dupe(u8, pathOf(ed, item.id) orelse return);
+        defer ed.gpa.free(p);
+        try ed.openFile(p);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        try Files.previewPath(ed, pathOf(ed, item.id) orelse return, out);
+    }
+};
+
+/// `SPC s t`: todo comments (`TODO`, `FIXME`, `HACK`, `NOTE`, ...) in the
+/// project (mini.hipatterns' words).
+const Todos = struct {
+    pub const title = "Todo comments";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
+
+    pub fn produce(e: *Engine) anyerror!void {
+        if (!haveRg(e.io)) return Files.eachProjectFile(e, {}, addLines);
+        _ = try streamCommand(e, &.{
+            "rg",                    "--null",              "--line-number",         "--no-heading", "--color=never",
+            "--no-require-git",      "--max-columns=300",   "--max-columns-preview", "-e",           hipatterns.words_regex,
+        }, '\n', {}, addRgMatch);
+    }
+
+    /// Where the first todo word of `line` starts, if it has one.
+    fn todoStart(line: []const u8) ?usize {
+        for (line, 0..) |b, i| if (std.ascii.isUpper(b) and hipatterns.todoAt(line, i) != null) return i;
+        return null;
+    }
+
+    /// "path\0line:text" from rg; the row shows the line from its todo word on.
+    fn addRgMatch(_: void, e: *Engine, record: []const u8) !bool {
+        if (e.items.count() >= Grep.max_matches) return false;
+        const nul = std.mem.indexOfScalar(u8, record, 0) orelse return true;
+        const rest = record[nul + 1 ..];
+        const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return true;
+        var detail: [std.fs.max_path_bytes + 16]u8 = undefined;
+        const where = std.fmt.bufPrint(&detail, "{s}:{s}", .{ record[0..nul], rest[0..colon] }) catch return true;
+        const line = rest[colon + 1 ..];
+        const text = std.mem.trim(u8, line[todoStart(line) orelse 0 ..], " \t\r");
+        try e.items.append(.{ .text = text, .detail = where });
+        return true;
+    }
+
+    fn addLines(_: void, e: *Engine, path: []const u8, _: usize) !void {
+        var full_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ e.root, path }) catch return;
+        const data = Io.Dir.cwd().readFileAlloc(e.io, full, e.gpa, .limited(Grep.max_file)) catch return;
+        defer e.gpa.free(data);
+        if (std.mem.indexOfScalar(u8, data[0..@min(data.len, 8192)], 0) != null) return; // binary
+        var detail: [std.fs.max_path_bytes + 16]u8 = undefined;
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        var n: usize = 0;
+        while (lines.next()) |line| {
+            n += 1;
+            const start = todoStart(line) orelse continue;
+            const text = std.mem.trim(u8, line[start..], " \t\r");
+            const where = std.fmt.bufPrint(&detail, "{s}:{d}", .{ path, n }) catch continue;
+            try e.items.append(.{ .text = text[0..@min(text.len, Grep.max_line)], .detail = where });
+        }
+    }
+
+    pub const location = Grep.location;
+    pub const accept = Grep.accept;
+    pub const preview = Grep.preview;
+};
+
+/// `SPC t t`: colour schemes. Moving through them previews each on the whole
+/// editor; Enter keeps one (remembered for next time), Esc goes back.
+const Themes = struct {
+    pub const title = "Colour scheme";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    const sample =
+        \\//! A sample, in the selected colours.
+        \\const std = @import("std");
+        \\
+        \\/// TODO: colours like #e6c384 show too.
+        \\pub fn main() !void {
+        \\    const answer: usize = 42;
+        \\    for (0..answer) |i| {
+        \\        std.debug.print("{d}: {s}\n", .{ i, "hello" });
+        \\    }
+        \\}
+        \\
+    ;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        for (ed.theme_names, 0..) |name, i| {
+            try items.append(.{ .text = name, .detail = if (i == ed.theme_before) "current" else "", .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        ed.setTheme(item.id);
+        if (item.id < ed.theme_names.len) ed.setMessage(.info, "colour scheme: {s}", .{ed.theme_names[item.id]});
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id < ed.theme_names.len) ed.theme_index = item.id;
+        try out.setCode(ed.gpa, sample, "sample.zig");
+    }
+};
+
+/// `SPC s m`: every message and notification so far, newest first. Enter
+/// copies one.
+const Messages = struct {
+    pub const title = "Messages";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var i = ed.history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const h = ed.history.items[i];
+            try items.append(.{ .text = h.text, .detail = if (h.kind == .err) "error" else "", .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try ed.registers.store(null, .yank, item.text, false);
+        ed.setMessage(.info, "copied the message", .{});
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        // Wrapped: messages are one long line.
+        var col: usize = 0;
+        var words = std.mem.tokenizeScalar(u8, item.text, ' ');
+        while (words.next()) |w| {
+            if (col > 0 and col + w.len > 60) {
+                try out.text.append(ed.gpa, '\n');
+                col = 0;
+            } else if (col > 0) {
+                try out.text.append(ed.gpa, ' ');
+                col += 1;
+            }
+            try out.text.appendSlice(ed.gpa, w);
+            col += w.len;
+        }
+    }
+};
+
+/// The start screen (mini.starter), shown when zile opens without a file:
+/// the files you were last in, then first steps.
+const Start = struct {
+    pub const title = "zile";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    const recent_count = 9;
+    /// Ids at and above this are recent files (the visit's index added).
+    pub const recent_base = 1000;
+
+    const actions = [_]struct { []const u8, []const u8, []const u8, []const u8 }{
+        .{ "Find file", "SPC SPC", "find_file", "Search this project's files by name." },
+        .{ "Explore files", "SPC .", "browse_files", "Walk through folders, one at a time." },
+        .{ "Recent files", "SPC f r", "recent_files", "Every file opened before, the most used first." },
+        .{ "Search project", "SPC /", "search_project", "Search the text of every file in the project." },
+        .{ "Switch project", "SPC p p", "switch_project", "Projects opened before. One with a saved session comes back as you left it." },
+        .{ "Restore session", "SPC p l", "load_session", "Reopen this project's files and splits as they were when you left." },
+        .{ "Colour scheme", "SPC t t", "pick_theme", "Pick the editor's colours." },
+        .{ "Quit", "SPC q", "quit", "Leave zile." },
+    };
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const v = ed.loadedVisits();
+        v.rank(ed.unixNow());
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        var n: usize = 0;
+        for (v.entries.items, 0..) |e, i| {
+            if (n == recent_count) break;
+            Io.Dir.cwd().access(ed.io, e.path, .{}) catch continue;
+            try items.append(.{ .text = displayPath(ed, e.path, &buf), .detail = "recent", .id = @intCast(recent_base + i) });
+            n += 1;
+        }
+        for (actions, 0..) |a, i| {
+            if (std.mem.eql(u8, a[2], "load_session") and !Editor.Session.exists(ed, ed.projectRoot())) continue;
+            try items.append(.{ .text = a[0], .detail = a[1], .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id >= recent_base) return Recent.accept(ed, .{ .text = item.text, .id = item.id - recent_base });
+        if (item.id >= actions.len) return;
+        try ed.runCommand(commands.find(actions[item.id][2]) orelse return);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= recent_base) return Files.previewPath(ed, Recent.pathOf(ed, item.id - recent_base) orelse return, out);
+        if (item.id < actions.len) try out.text.print(ed.gpa, "{s}\n\n{s}", .{ actions[item.id][0], actions[item.id][3] });
+    }
+};
+
+/// Whether item `id` of the start screen is a file (it gets a file icon).
+pub fn startItemIsFile(id: u32) bool {
+    return id >= Start.recent_base;
+}
 
 /// `SPC s j`: the jumplist, newest first, with the line each jump left.
 const Jumps = struct {

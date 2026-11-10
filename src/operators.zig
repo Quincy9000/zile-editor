@@ -9,12 +9,20 @@ const Text = @import("core/Text.zig");
 const motions = @import("core/motions.zig");
 const textobjects = @import("core/textobjects.zig");
 const Registers = @import("Registers.zig");
+const textops = @import("textops.zig");
 
 pub const Range = textobjects.Range;
 
 pub const Operator = enum { delete, change, yank, indent, outdent, lowercase, uppercase, toggle_case, fold,
     /// `ys`: waits for the pair character, then surrounds the range.
-    surround };
+    surround,
+    /// `gc`: comments / uncomments the range's lines.
+    comment,
+    /// `gr` / `gx` / `gs` / `gm` (mini.operators): replace with a register,
+    /// exchange two ranges, sort, duplicate.
+    replace, exchange, sort, multiply,
+    /// `ga`: waits for a character, then lines the range's lines up on it.
+    @"align" };
 
 /// How a motion's span becomes a range (`:h exclusive`, `:h linewise`).
 pub const MotionKind = enum { exclusive, inclusive, linewise };
@@ -43,6 +51,12 @@ pub fn linesRange(t: *const Text, first: usize, last: usize) Range {
     return .{ .start = t.lineStart(first), .end = t.lineEnd(last), .linewise = true };
 }
 
+/// The last line a range touches (a charwise range ending at a line's start
+/// doesn't touch that line).
+pub fn lastLine(t: *const Text, r: Range) usize {
+    return if (r.linewise) t.lineOf(r.end) else t.lineOf(@max(r.end, r.start + 1) - 1);
+}
+
 pub fn apply(ed: *Editor, op: Operator, range: Range, register: ?u8) !void {
     // Linewise operators on a closed fold act on the whole fold.
     const r = ed.extendToFolds(range);
@@ -56,6 +70,15 @@ pub fn apply(ed: *Editor, op: Operator, range: Range, register: ?u8) !void {
     }
     switch (op) {
         .surround => return ed.awaitSurroundChar(r),
+        .@"align" => return ed.awaitAlignChar(r),
+        .comment => {
+            const t = ed.text();
+            try textops.toggleComment(ed, t.lineOf(r.start), lastLine(t, r));
+        },
+        .replace => try textops.replaceWithRegister(ed, r, register),
+        .exchange => try textops.exchange(ed, r),
+        .sort => try textops.sort(ed, r),
+        .multiply => try textops.multiply(ed, r, 1),
         .yank => {
             try yank(ed, r, register, .yank);
             if (r.start < ed.view.cursor) {

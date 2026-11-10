@@ -13,6 +13,10 @@ const gfx = @import("gfx.zig");
 const operators = @import("../operators.zig");
 const Syntax = @import("../syntax/Syntax.zig");
 const Lsp = @import("../lsp/Lsp.zig");
+const hipatterns = @import("../core/hipatterns.zig");
+const indent = @import("../core/indent.zig");
+const search = @import("../core/search.zig");
+const Blame = @import("../git/Blame.zig");
 
 /// Screen geometry in pixels and cells, recomputed every frame.
 pub const Layout = struct {
@@ -128,6 +132,7 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     drawPopup(ed, font, theme, l);
     drawWhichKey(ed, font, theme, l);
     drawStatus(ed, font, theme, l);
+    drawToasts(ed, font, theme, l);
     if (ed.picker) |p| picker_view.draw(p, font, theme, l);
     if (ed.search_prompt) |*sp| if (sp.kind.boxed()) {
         picker_view.drawPromptBox(font, theme, l, sp.kind.title(), sp.input.items());
@@ -417,6 +422,9 @@ fn drawWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Wi
     }
     if (r.x > 0) rect(r.x, r.y, 1, r.h, theme.popup_border);
 
+    // The text stays below the header while a scroll glides.
+    gfx.endClip();
+    gfx.beginClip(r.x, wl.y0, r.w, @max(r.y + r.h - wl.y0, 0));
     gfx.pushOffset(wl.x0, wl.y0);
     defer gfx.popOffset();
     drawText(ed, font, theme, wl, focused);
@@ -432,6 +440,26 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     const tab_width = ed.options.tab_width;
     var ghost_below: ?struct { text: []const u8, y: f32 } = null;
 
+    // mini.nvim decorations, worked out once per window.
+    const cword: ?search.Pattern = if (cursorWord(ed, focused)) |w| .{ .needle = w, .case_sensitive = true, .whole_word = true } else null;
+    const scope: ?indent.Scope = if (focused and ed.options.indent_scope and ed.ghost == null) indent.scope(t, cursor_line, tab_width, true) else null;
+    const show_trail = ed.options.trailing_space and ed.buffer.path != null;
+    const find: ?motions.Find = if (focused and ed.find_shown) ed.last_find else null;
+    const exchange: ?operators.Range = if (ed.exchange_mark) |m| (if (m.buffer == ed.buffer and m.version == ed.buffer.edit_version) m.range else null) else null;
+
+    // A gliding scroll: everything is drawn `scroll_offset` rows lower (or
+    // higher), with the rows that slide in from beyond the top or bottom.
+    const y_off = scrollPx(ed, font);
+    const slack: usize = @intFromFloat(@ceil(@abs(v.scroll_offset)));
+    var first_row = ed.topRow();
+    var above: usize = 0;
+    if (v.scroll_offset > 0) while (above < slack) : (above += 1) {
+        const prev = ed.prevRow(first_row);
+        if (prev.eql(first_row)) break;
+        first_row = prev;
+    };
+    const row_limit = l.rows + above + (if (v.scroll_offset < 0) slack else 0);
+
     // Rows walk visible lines: a closed fold is drawn as its first line plus a
     // marker, and the lines it hides are skipped.
     // Rows: text lines (a closed fold is one) and ghost lines (old HEAD text).
@@ -439,14 +467,14 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     // Rows taken by an AI suggestion's extra lines (pushing the text below
     // down, like inserted lines).
     var virtual: usize = 0;
-    var r = ed.topRow();
-    while (row + virtual < l.rows) : (row += 1) {
+    var r = first_row;
+    while (row + virtual < row_limit) : (row += 1) {
         if (row > 0) {
             const next = ed.nextRow(r);
             if (next.eql(r)) break;
             r = next;
         }
-        const y = @as(f32, @floatFromInt(row + virtual)) * font.cell_h;
+        const y = (@as(f32, @floatFromInt(row + virtual)) - @as(f32, @floatFromInt(above))) * font.cell_h + y_off;
         if (r.ghost) |k| {
             drawGhostRow(ed, font, theme, l, r.line, k, y);
             continue;
@@ -493,6 +521,45 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         // Text, starting at the first visible display column, colored by syntax.
         const ls = t.lineStart(line);
         const bytes = t.lineSlice(line);
+
+        // Backgrounds under the text: the text marked for exchange, the word
+        // under the cursor, f/t targets, trailing whitespace, todo words and
+        // colour literals.
+        if (exchange) |x| drawRange(ed, font, l, x, line, y, theme.search_match);
+        if (cword) |p| {
+            var i: usize = 0;
+            while (p.forward(bytes, i)) |m| : (i = m + p.needle.len) drawSpan(ed, font, l, bytes, m, m + p.needle.len, y, font.cell_h, theme.cursorword_bg);
+        }
+        if (find) |f| {
+            var i: usize = 0;
+            while (std.mem.indexOfPos(u8, bytes, i, f.needle())) |m| : (i = m + f.len) drawSpan(ed, font, l, bytes, m, m + f.len, y, font.cell_h, theme.search_match);
+        }
+        if (show_trail and !(is_current and ed.mode == .insert)) {
+            const keep = std.mem.trimEnd(u8, bytes, " \t").len;
+            if (keep < bytes.len) drawSpan(ed, font, l, bytes, keep, bytes.len, y, font.cell_h, theme.trail_bg);
+        }
+        var hp_buf: [24]hipatterns.Match = undefined;
+        var hps: []hipatterns.Match = if (ed.options.highlight_patterns) hipatterns.scan(bytes, &hp_buf) else hp_buf[0..0];
+        {
+            // Todo words count only in comments (anywhere without a grammar).
+            var kept: usize = 0;
+            for (hps) |m| {
+                if (m.kind == .todo) if (syntax) |s| if (s.styleAt(ls + m.start) != .comment) continue;
+                hps[kept] = m;
+                kept += 1;
+            }
+            hps = hps[0..kept];
+        }
+        for (hps) |m| switch (m.kind) {
+            .todo => |class| drawSpan(ed, font, l, bytes, m.start, m.end, y, font.cell_h, todoColor(theme, class)),
+            .color => |c| drawSpan(ed, font, l, bytes, m.start, m.end, y, font.cell_h, .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }),
+            .hex_number => |c| drawSpan(ed, font, l, bytes, m.start, m.end, y + font.cell_h - 2, 2, .{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }),
+        };
+        // The indent scope's guide: a line down the scope at its border's indent.
+        if (scope) |s| if (line >= s.first and line <= s.last and s.guide_col >= v.left and s.guide_col < v.left + l.cols) {
+            rect(l.text_x + @as(f32, @floatFromInt(s.guide_col - v.left)) * font.cell_w, y, 1, font.cell_h, theme.indent_guide);
+        };
+        var hp_i: usize = 0;
         // An AI suggestion at the cursor: its first line goes inline (the
         // rest of the line moves right), more lines are drawn below.
         const ghost: ?[]const u8 = if (focused and is_current) ed.aiSuggestionHere() else null;
@@ -512,7 +579,15 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             if (cp == '\t' or cp == ' ') continue;
             const x = l.text_x + @as(f32, @floatFromInt(col + shift - v.left)) * font.cell_w;
             const style = if (syntax) |s| s.styleAt(ls + offset) else .none;
-            font.drawCodepoint(cp, x, y, theme.syntax.get(style));
+            var color = theme.syntax.get(style);
+            // On a todo word or a colour: text that reads on that background.
+            while (hp_i < hps.len and hps[hp_i].end <= offset) hp_i += 1;
+            if (hp_i < hps.len and hps[hp_i].start <= offset) switch (hps[hp_i].kind) {
+                .todo => color = theme.bg,
+                .color => |c| color = Theme.contrast(.{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }),
+                .hex_number => {},
+            };
+            font.drawCodepoint(cp, x, y, color);
         }
         if (ghost) |g| {
             const gc = motions.displayCol(bytes, ghost_at, tab_width);
@@ -528,6 +603,9 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
                 _ = font.drawText(label, l.text_x + @as(f32, @floatFromInt(end_col - v.left)) * font.cell_w, y, theme.fold_fg);
             }
         } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, diags, line, y);
+        // Inline blame: who last changed the cursor's line.
+        if (focused and is_current and ed.options.git_blame and fold == null and ghost == null and ed.ghost == null and
+            !(line_diag != null and ed.options.diagnostic_text)) drawBlame(ed, font, theme, l, bytes, line, y);
 
         // The suggestion's further lines: rows of their own under this one
         // (no line numbers: they aren't in the file yet).
@@ -554,6 +632,95 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     drawCursorAt(ed, font, theme, l, ed.view.cursor, cursor_color);
 }
 
+/// How far (in pixels) a gliding scroll still has the text from its place.
+fn scrollPx(ed: *Editor, font: *const Font) f32 {
+    return @round(ed.view.scroll_offset * font.cell_h);
+}
+
+/// The word under the cursor, when its other occurrences should stand out.
+fn cursorWord(ed: *Editor, focused: bool) ?[]const u8 {
+    if (!focused or !ed.options.cursor_word or ed.ghost != null) return null;
+    if (ed.mode != .normal and ed.mode != .operator) return null;
+    const t = ed.text();
+    const pos = ed.view.cursor;
+    if (pos >= t.len() or !search.isWord(t.byteAt(pos))) return null;
+    const line = t.lineOf(pos);
+    var start = pos;
+    var end = pos;
+    while (start > t.lineStart(line) and search.isWord(t.byteAt(start - 1))) start -= 1;
+    while (end < t.lineEnd(line) and search.isWord(t.byteAt(end))) end += 1;
+    // One letter (`i`, `x`) would light up half the file.
+    if (end - start < 2) return null;
+    return t.slice(start, end);
+}
+
+fn todoColor(theme: *const Theme, class: hipatterns.Class) rl.Color {
+    return switch (class) {
+        .todo => theme.diag_info,
+        .fixme => theme.diag_error,
+        .hack => theme.diag_warning,
+        .note => theme.diff_add,
+    };
+}
+
+/// A rectangle of height `h` at `y` behind bytes `[a, b)` of the line `bytes`.
+fn drawSpan(ed: *Editor, font: *const Font, l: Layout, bytes: []const u8, a: usize, b: usize, y: f32, h: f32, color: rl.Color) void {
+    const tab = ed.options.tab_width;
+    const left = ed.view.left;
+    const c0 = motions.displayCol(bytes, a, tab);
+    const c1 = motions.displayCol(bytes, b, tab);
+    if (c1 <= left or c0 >= left + l.cols) return;
+    const start = @max(c0, left);
+    rect(l.text_x + @as(f32, @floatFromInt(start - left)) * font.cell_w, y, @as(f32, @floatFromInt(c1 - start)) * font.cell_w, h, color);
+}
+
+/// "author, 3 days ago · summary" after the end of the line.
+fn drawBlame(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, bytes: []const u8, line: usize, y: f32) void {
+    var buf: [200]u8 = undefined;
+    var ago_buf: [32]u8 = undefined;
+    const text = switch (ed.blameLine(line)) {
+        .unknown => return,
+        .uncommitted => "not committed yet",
+        .commit => |c| std.fmt.bufPrint(&buf, "{s}, {s} \u{b7} {s}", .{ c.author, Blame.ago(&ago_buf, ed.unixNow() - c.time), c.summary }) catch return,
+    };
+    const end_col = motions.displayCol(bytes, bytes.len, ed.options.tab_width) + 4;
+    const left = ed.view.left;
+    if (end_col < left or end_col >= left + l.cols) return;
+    _ = font.drawText(clip(text, left + l.cols - end_col), l.text_x + @as(f32, @floatFromInt(end_col - left)) * font.cell_w, y, theme.ai_fg);
+}
+
+/// Notifications (mini.notify): stacked at the top right, newest lowest,
+/// fading out as they expire.
+fn drawToasts(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
+    const max_cols = 60;
+    var y = font.cell_h;
+    for (ed.toasts.items) |*toast| {
+        const text = clip(toast.text(), max_cols);
+        const cols = cells(text) + 4;
+        const w = @as(f32, @floatFromInt(cols)) * font.cell_w;
+        const x = l.width - w - font.cell_w;
+        if (x < 0 or y + font.cell_h > l.status_y) break;
+        // The last half second fades (windows; a terminal has no alpha).
+        var alpha: f32 = 1;
+        if (!toast.busy and gfx.grid == null) {
+            const left_ms = @as(f32, @floatFromInt(@divTrunc(toast.expires.nanoseconds - ed.now.nanoseconds, std.time.ns_per_ms)));
+            alpha = std.math.clamp(left_ms / Editor.Toast.fade_ms, 0, 1);
+        }
+        const accent = if (toast.kind == .err) theme.message_err else if (toast.busy) theme.diag_warning else theme.mode_normal;
+        rect(x - 1, y - 1, w + 2, font.cell_h + 2, faded(theme.popup_border, alpha));
+        rect(x, y, w, font.cell_h, faded(theme.status_bg, alpha));
+        rect(x, y, font.cell_w, font.cell_h, faded(accent, alpha));
+        _ = font.drawText(text, x + font.cell_w * 2, y, faded(if (toast.kind == .err) theme.message_err else theme.fg, alpha));
+        y += font.cell_h + 4;
+    }
+}
+
+fn faded(c: rl.Color, alpha: f32) rl.Color {
+    var out = c;
+    out.a = @intFromFloat(@as(f32, @floatFromInt(c.a)) * alpha);
+    return out;
+}
+
 fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, pos: usize, color: rl.Color) void {
     const v = &ed.view;
     const t0 = ed.text();
@@ -563,7 +730,7 @@ fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
     if (col < v.left or col >= v.left + l.cols) return;
 
     const x = l.text_x + @as(f32, @floatFromInt(col - v.left)) * font.cell_w;
-    const y = @as(f32, @floatFromInt(row)) * font.cell_h;
+    const y = @as(f32, @floatFromInt(row)) * font.cell_h + scrollPx(ed, font);
     // The terminal's own cursor goes on the focused one (a no-op in a window).
     if (color.a == 255) gfx.cursor(x, y, switch (ed.mode) {
         .insert => .bar,
@@ -950,7 +1117,7 @@ fn drawGhostCursor(ed: *Editor, font: *const Font, theme: *const Theme, l: Layou
     const col = motions.displayCol(text, @min(g.col, text.len), ed.options.tab_width);
     if (col < ed.view.left or col >= ed.view.left + l.cols) return;
     const x = l.text_x + @as(f32, @floatFromInt(col - ed.view.left)) * font.cell_w;
-    const y = @as(f32, @floatFromInt(row)) * font.cell_h;
+    const y = @as(f32, @floatFromInt(row)) * font.cell_h + scrollPx(ed, font);
     rect(x, y, font.cell_w, font.cell_h, theme.cursor);
     if (g.col < text.len) {
         var it = Font.Utf8Lossy{ .bytes = text[g.col..] };

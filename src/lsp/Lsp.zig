@@ -30,6 +30,8 @@ can_format: bool = false,
 can_format_range: bool = false,
 sig_retriggers: std.ArrayList(u8) = .empty,
 pending: std.AutoHashMapUnmanaged(i64, Pending) = .empty,
+/// Titles of the server's work in progress, by notification key (owned).
+progress_titles: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
 /// Open documents.
 docs: std.AutoHashMapUnmanaged(*Buffer, Doc) = .empty,
 /// Diagnostics by buffer-style path (relative to the cwd when inside it).
@@ -149,6 +151,8 @@ pub fn start(ed: *Editor, index: usize, root_path: []const u8) !*Lsp {
         .workspaceFolders = &[_]struct { uri: []const u8, name: []const u8 }{.{ .uri = root, .name = std.fs.path.basename(root_path) }},
         .capabilities = .{
             .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} },
+            // Indexing and the like show as notifications.
+            .window = .{ .workDoneProgress = true },
             .textDocument = .{
                 .synchronization = .{ .didSave = true },
                 // Snippets: function arguments arrive as placeholders.
@@ -175,6 +179,9 @@ pub fn deinit(l: *Lsp) void {
     l.sig_triggers.deinit(gpa);
     l.sig_retriggers.deinit(gpa);
     l.pending.deinit(gpa);
+    var titles = l.progress_titles.valueIterator();
+    while (titles.next()) |t| gpa.free(t.*);
+    l.progress_titles.deinit(gpa);
     var docs = l.docs.valueIterator();
     while (docs.next()) |d| gpa.free(d.uri);
     l.docs.deinit(gpa);
@@ -377,6 +384,14 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
         const method = if (m == .string) m.string else return;
         if (obj.get("id")) |id| return l.answerServerRequest(id, method, obj.get("params"));
         if (std.mem.eql(u8, method, "textDocument/publishDiagnostics")) try l.onDiagnostics(ed, obj.get("params") orelse return);
+        if (std.mem.eql(u8, method, "$/progress")) try l.onProgress(ed, obj.get("params") orelse return);
+        if (std.mem.eql(u8, method, "window/showMessage")) {
+            const params = obj.get("params") orelse return;
+            const message = str(field(params, "message")) orelse return;
+            // 1 = error, 2 = warning, 3 = info, 4 = log.
+            const level = if (field(params, "type")) |t| (if (t == .integer) t.integer else 3) else 3;
+            if (level <= 3) ed.notify(if (level == 1) .err else .info, "{s}: {s}", .{ l.server().name, std.mem.sliceTo(message, '\n') });
+        }
         return;
     }
     const id = obj.get("id") orelse return;
@@ -481,6 +496,41 @@ fn answerServerRequest(l: *Lsp, id: std.json.Value, method: []const u8, params: 
         return l.client.respond(id, nulls[0..@min(n, nulls.len)]);
     }
     try l.client.respond(id, null);
+}
+
+/// `$/progress`: work the server reports on (indexing, building) becomes a
+/// notification that updates in place and goes when the work ends.
+fn onProgress(l: *Lsp, ed: *Editor, params: std.json.Value) !void {
+    const token = field(params, "token") orelse return;
+    var h = std.hash.Wyhash.init(l.index + 1);
+    switch (token) {
+        .string => |s| h.update(s),
+        .integer => |i| h.update(std.mem.asBytes(&i)),
+        else => return,
+    }
+    const key = h.final() | 1;
+    const value = field(params, "value") orelse return;
+    const kind = str(field(value, "kind")) orelse return;
+    const name = l.server().name;
+    const message = str(field(value, "message")) orelse "";
+    if (std.mem.eql(u8, kind, "begin")) {
+        const title = try l.gpa.dupe(u8, str(field(value, "title")) orelse "working");
+        if (try l.progress_titles.fetchPut(l.gpa, key, title)) |old| l.gpa.free(old.value);
+    }
+    const title: []const u8 = l.progress_titles.get(key) orelse "";
+    if (std.mem.eql(u8, kind, "end")) {
+        ed.progress(key, false, "{s}: {s} {s}", .{ name, title, if (message.len > 0) message else "done" });
+        if (l.progress_titles.fetchRemove(key)) |old| l.gpa.free(old.value);
+        return;
+    }
+    const percent: ?i64 = if (field(value, "percentage")) |p| switch (p) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => null,
+    } else null;
+    if (percent) |p| {
+        ed.progress(key, true, "{s}: {s} {s} {d}%", .{ name, title, message, p });
+    } else ed.progress(key, true, "{s}: {s} {s}", .{ name, title, message });
 }
 
 fn onDiagnostics(l: *Lsp, ed: *Editor, params: std.json.Value) !void {

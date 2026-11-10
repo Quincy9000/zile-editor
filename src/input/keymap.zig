@@ -291,6 +291,14 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ NV, "<PageDown>", "page_down" },
     .{ NV, "<C-b>", "page_up" },
     .{ NV, "<PageUp>", "page_up" },
+    .{ NV, "<C-j>", "page_down" },
+    .{ NV, "<C-k>", "page_up" },
+    .{ NVO, "<C-h>", "first_non_blank" },
+    .{ NVO, "<C-l>", "line_end" },
+    .{ NV, "<A-j>", "shift_text_down" },
+    .{ NV, "<A-k>", "shift_text_up" },
+    .{ NV, "<A-h>", "shift_text_left" },
+    .{ NV, "<A-l>", "shift_text_right" },
     .{ NV, "<C-e>", "scroll_down" },
     .{ NV, "<C-y>", "scroll_up" },
     .{ N, "zc", "fold_close" },
@@ -447,7 +455,6 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ N, leader ++ "cx", "list_diagnostics" },
     .{ NV, leader ++ "cf", "format_buffer" },
     .{ N, "gd", "goto_definition" },
-    .{ N, "gr", "find_references" },
     .{ N, "K", "hover" },
     .{ N, leader ++ "gg", "git_menu" },
     .{ N, leader ++ "gc", "git_commit" },
@@ -474,6 +481,56 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ N, leader ++ "QQ", "quit_without_saving" },
 
     // Insert mode: unbound keys type.
+    // mini.nvim operators: comment, replace with register, exchange, sort,
+    // duplicate, align; doubled (or + the operator's last key) for a line.
+    .{ NV, "gc", "comment" },
+    .{ O, "gc", "comment_object" },
+    // The usual editor key; a terminal without the kitty protocol sends it
+    // as Ctrl-_.
+    .{ &[_]Mode{ .normal, .visual, .insert }, "<C-/>", "toggle_comment" },
+    .{ &[_]Mode{ .normal, .visual, .insert }, "<C-_>", "toggle_comment" },
+    .{ NV, "gr", "replace_with_register" },
+    .{ NV, "gx", "exchange" },
+    .{ NV, "gs", "sort" },
+    .{ NV, "gm", "multiply" },
+    .{ NV, "ga", "align" },
+    .{ O, "r", "replace_line" },
+    .{ O, "x", "exchange_line" },
+    .{ O, "m", "multiply_line" },
+    .{ N, "gS", "split_join" },
+    // mini.bracketed: ] forward, [ backward.
+    .{ N, "]b", "next_buffer" },
+    .{ N, "[b", "previous_buffer" },
+    .{ N, "]d", "next_diagnostic" },
+    .{ N, "[d", "previous_diagnostic" },
+    .{ N, "]h", "git_next_hunk" },
+    .{ N, "[h", "git_previous_hunk" },
+    .{ N, "]c", "next_comment" },
+    .{ N, "[c", "previous_comment" },
+    .{ N, "]x", "next_conflict" },
+    .{ N, "[x", "previous_conflict" },
+    .{ N, "]j", "jump_newer" },
+    .{ N, "[j", "jump_older" },
+    .{ NVO, "]i", "indent_scope_bottom" },
+    .{ NVO, "[i", "indent_scope_top" },
+    .{ N, leader ++ "fr", "recent_files" },
+    .{ N, leader ++ "st", "search_todos" },
+    .{ N, leader ++ "sm", "message_history" },
+    .{ N, leader ++ "cw", "trim_trailing_whitespace" },
+    .{ N, leader ++ "ps", "save_session" },
+    .{ N, leader ++ "pl", "load_session" },
+    .{ N, leader ++ "gl", "git_line_commit" },
+    .{ N, leader ++ "os", "start_screen" },
+    .{ N, leader ++ "tt", "pick_theme" },
+    .{ N, leader ++ "th", "toggle_highlight_patterns" },
+    .{ N, leader ++ "tw", "toggle_cursor_word" },
+    .{ N, leader ++ "ti", "toggle_indent_scope" },
+    .{ N, leader ++ "ts", "toggle_trailing_space" },
+    .{ N, leader ++ "tS", "toggle_trim_on_save" },
+    .{ N, leader ++ "tI", "toggle_icons" },
+    .{ N, leader ++ "tm", "toggle_smooth_scroll" },
+    .{ N, leader ++ "tb", "toggle_git_blame" },
+
     .{ I, "<Esc>", "normal_mode" },
     .{ I, "<CR>", "completion_accept_or_newline" },
     .{ I, "<Tab>", "completion_accept_or_tab" },
@@ -539,19 +596,29 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
 };
 
 /// `iw`/`aw`, `i(`/`ib`/`a)`, ... for every text object, in visual and
-/// operator-pending mode.
+/// operator-pending mode; `in(` / `an(` the next one and `iN(` / `aN(` the
+/// previous one (mini.ai); `g[(` / `g](` move to its edges.
 const text_object_table = blk: {
     const specs = commands.text_object_specs;
     var n: usize = 0;
-    for (specs) |spec| n += spec.keys.len * 2;
+    for (specs) |spec| n += spec.keys.len * (if (spec.seek) 8 else 4);
     var out: [n]struct { []const Mode, []const u8, []const u8 } = undefined;
     var i: usize = 0;
+    const VO = &[_]Mode{ .visual, .operator };
     for (specs) |spec| {
         for (spec.keys) |k| {
             const key = if (k == '<') "<lt>" else &[_]u8{k};
-            out[i] = .{ &[_]Mode{ .visual, .operator }, "i" ++ key, "inner_" ++ spec.name };
-            out[i + 1] = .{ &[_]Mode{ .visual, .operator }, "a" ++ key, "around_" ++ spec.name };
-            i += 2;
+            out[i] = .{ VO, "i" ++ key, "inner_" ++ spec.name };
+            out[i + 1] = .{ VO, "a" ++ key, "around_" ++ spec.name };
+            out[i + 2] = .{ NVO, "g[" ++ key, "goto_start_" ++ spec.name };
+            out[i + 3] = .{ NVO, "g]" ++ key, "goto_end_" ++ spec.name };
+            i += 4;
+            if (!spec.seek) continue;
+            out[i] = .{ VO, "in" ++ key, "inner_next_" ++ spec.name };
+            out[i + 1] = .{ VO, "an" ++ key, "around_next_" ++ spec.name };
+            out[i + 2] = .{ VO, "iN" ++ key, "inner_previous_" ++ spec.name };
+            out[i + 3] = .{ VO, "aN" ++ key, "around_previous_" ++ spec.name };
+            i += 4;
         }
     }
     const result = out;
@@ -574,7 +641,7 @@ const Default = struct { mode: Mode, binding: Binding };
 
 /// Every (mode, binding) pair, expanded from the tables above at compile time.
 const default_bindings = blk: {
-    @setEvalBranchQuota(1_000_000);
+    @setEvalBranchQuota(4_000_000);
     const tables = binding_table ++ text_object_table;
     var n: usize = 0;
     for (tables) |d| n += d[0].len;
@@ -592,7 +659,7 @@ const default_bindings = blk: {
 };
 
 const default_groups = blk: {
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(2_000_000);
     var out: [group_table.len]Group = undefined;
     for (group_table, 0..) |g, i| {
         const seq = comptimeSeq(g[0]);

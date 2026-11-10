@@ -202,7 +202,7 @@ pub const Find = struct {
         return f;
     }
 
-    fn needle(f: *const Find) []const u8 {
+    pub fn needle(f: *const Find) []const u8 {
         return f.bytes[0..f.len];
     }
 };
@@ -231,6 +231,28 @@ pub fn findInLine(t: *const Text, pos: usize, f: Find, count: usize, repeat: boo
     const target = ls + at;
     if (!f.till) return target;
     return if (f.forward) prevChar(t, target) else nextChar(t, target);
+}
+
+/// `findInLine` without the line: f/F/t/T reach the next occurrence anywhere
+/// in the text (mini.jump).
+pub fn findAcross(t: *const Text, pos: usize, f: Find, count: usize, repeat: bool) ?usize {
+    const bytes = t.slice(0, t.len());
+    const needle = f.needle();
+    var at = pos;
+    for (0..count) |i| {
+        const skip: usize = @intFromBool(f.till and repeat and i == 0);
+        if (f.forward) {
+            const from = at + 1 + skip;
+            if (from > bytes.len) return null;
+            at = std.mem.indexOfPos(u8, bytes, from, needle) orelse return null;
+        } else {
+            const end = at -| skip;
+            if (end == 0) return null;
+            at = std.mem.lastIndexOf(u8, bytes[0..end], needle) orelse return null;
+        }
+    }
+    if (!f.till) return at;
+    return if (f.forward) prevChar(t, at) else nextChar(t, at);
 }
 
 // ---------------------------------------------------------------------------

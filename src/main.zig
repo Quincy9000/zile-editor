@@ -66,24 +66,37 @@ pub fn main(init: std.process.Init) !void {
 
     var ed = try Editor.init(gpa, io);
     defer ed.deinit();
+    // What is remembered between runs: the session and the visits, saved on
+    // the way out (however we leave).
+    defer {
+        ed.saveSession(false);
+        ed.saveVisits();
+    }
+    ed.theme_names = &Theme.names;
+    ed.loadTheme();
     if (args.file) |path| ed.openArg(path);
+    // No file: the start screen (not under scripted keys, which expect to
+    // begin in normal mode).
+    if (args.file == null and test_keys == null) ed.openStarter() catch {};
 
-    const theme = &Theme.default;
-    ed.term_fg = .{ .r = theme.fg.r, .g = theme.fg.g, .b = theme.fg.b };
-    ed.term_bg = .{ .r = theme.popup_bg.r, .g = theme.popup_bg.g, .b = theme.popup_bg.b };
+    var theme = Theme.get(ed.theme_index);
+    syncTerminalColors(&ed, theme);
 
     // Terminal mode when asked, or when there is no display to open a window on.
     const env = init.environ_map;
     const no_display = env.get("DISPLAY") == null and env.get("WAYLAND_DISPLAY") == null;
-    if (args.tui or no_display) return runTui(gpa, io, &ed, theme, test_keys, test_screenshot);
+    if (args.tui or no_display) return runTui(gpa, io, &ed, test_keys, test_screenshot);
 
     // raylib warns about every oversized box-drawing glyph; only show errors.
     rl.SetTraceLogLevel(rl.LOG_ERROR);
-    rl.SetConfigFlags(rl.FLAG_WINDOW_RESIZABLE | rl.FLAG_VSYNC_HINT);
+    // A screenshot run must not take the keyboard from whoever is typing.
+    const flags: c_uint = rl.FLAG_WINDOW_RESIZABLE | rl.FLAG_VSYNC_HINT;
+    const quiet: c_uint = rl.FLAG_WINDOW_UNFOCUSED;
+    rl.SetConfigFlags(if (test_screenshot != null) flags | quiet else flags);
     rl.InitWindow(1100, 720, "zile");
     // No window after all (no X11/GL libraries, a display we can't reach):
     // the terminal still works.
-    if (!rl.IsWindowReady()) return runTui(gpa, io, &ed, theme, test_keys, test_screenshot);
+    if (!rl.IsWindowReady()) return runTui(gpa, io, &ed, test_keys, test_screenshot);
     defer rl.CloseWindow();
     // raylib closes the window on Esc by default; Esc is a mode key here.
     rl.SetExitKey(rl.KEY_NULL);
@@ -96,6 +109,10 @@ pub fn main(init: std.process.Init) !void {
 
     var font = try Font.load(gpa, io, args.font, args.font_size);
     defer font.deinit();
+    // Without a Nerd Font the icons would be boxes.
+    if (!font.has_icons) ed.options.icons = false;
+    // A screenshot should show where things are, not a scroll in mid-glide.
+    if (test_screenshot != null) ed.options.smooth_scroll = false;
 
     // Size the view before scripted keys so scrolling behaves like the real window.
     _ = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
@@ -121,7 +138,12 @@ pub fn main(init: std.process.Init) !void {
             ed.handleKey(ev);
         }
         ed.tick();
+        ed.animate(rl.GetFrameTime());
         applyZoom(&ed, gpa, io, &font, args);
+        if (theme != Theme.get(ed.theme_index)) {
+            theme = Theme.get(ed.theme_index);
+            syncTerminalColors(&ed, theme);
+        }
 
         handleMouse(&ed, &font);
         const l = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
@@ -141,14 +163,23 @@ pub fn main(init: std.process.Init) !void {
                 ed.should_quit = true;
             }
         }
+        // Something is still moving (a gliding scroll, a fading toast):
+        // draw the next frame without waiting for input.
+        if (ed.wantsFrames()) glfw.wake();
         rl.EndDrawing();
     }
 }
 
+/// New terminals take their default colours from the theme.
+fn syncTerminalColors(ed: *Editor, theme: *const Theme) void {
+    ed.term_fg = .{ .r = theme.fg.r, .g = theme.fg.g, .b = theme.fg.b };
+    ed.term_bg = .{ .r = theme.popup_bg.r, .g = theme.popup_bg.g, .b = theme.popup_bg.b };
+}
+
 extern fn rlDrawRenderBatchActive() void; // rlgl, part of raylib
 
-fn runTui(gpa: std.mem.Allocator, io: std.Io, ed: *Editor, theme: *const Theme, test_keys: ?[]const u8, snapshot: ?[]const u8) !void {
-    Tui.run(gpa, io, ed, .{ .theme = theme, .test_keys = test_keys, .test_snapshot = snapshot }) catch |err| switch (err) {
+fn runTui(gpa: std.mem.Allocator, io: std.Io, ed: *Editor, test_keys: ?[]const u8, snapshot: ?[]const u8) !void {
+    Tui.run(gpa, io, ed, .{ .test_keys = test_keys, .test_snapshot = snapshot }) catch |err| switch (err) {
         error.NotATerminal => {
             std.log.err("no display to open a window on, and not running in a terminal", .{});
             return err;
@@ -199,6 +230,22 @@ fn applyZoom(ed: *Editor, gpa: std.mem.Allocator, io: std.Io, font: *Font, args:
     ed.setMessage(.info, "text size {d}", .{size});
 }
 
+/// Wheel movement not yet turned into whole lines. Touchpads and smooth
+/// wheels report many small fractions of a notch; dropping them (or waiting
+/// for a whole one) is what makes scrolling stutter.
+var wheel_rest: f32 = 0;
+
+/// Whole lines to scroll for this frame's wheel movement (three per notch).
+fn wheelLines(wheel: f32) isize {
+    if (wheel == 0) return 0;
+    // A change of direction starts over.
+    if ((wheel > 0) == (wheel_rest > 0)) wheel_rest = 0;
+    wheel_rest += -wheel * 3;
+    const whole = @trunc(wheel_rest);
+    wheel_rest -= whole;
+    return @intFromFloat(whole);
+}
+
 fn handleMouse(ed: *Editor, font: *const Font) void {
     const pos = rl.GetMousePosition();
     const wheel = rl.GetMouseWheelMove();
@@ -209,23 +256,27 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
     }
     const clicked = rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
     if (wheel == 0 and !clicked) return;
+    const lines = wheelLines(wheel);
     // The command editor keeps focus while it is open.
     if (ed.cmd_float != null) {
-        if (wheel != 0) ed.scrollLines(@intFromFloat(-wheel * 3));
+        if (lines != 0) ed.scrollLines(lines);
         return;
     }
     // The terminal popup takes the wheel (scrollback) while it is open.
     if (ed.popupTerminal()) |t| {
-        if (wheel != 0) t.scroll(@intFromFloat(-wheel * 3));
+        if (lines != 0) t.scroll(lines);
         return;
     }
     const w = ed.windows.at(pos.x, pos.y) orelse return;
+    // The wheel focuses the window it turns over; a fraction of a line
+    // (nothing to scroll yet) doesn't.
+    if (lines == 0 and !clicked) return;
     ed.focusWindow(w);
     if (w.term) |t| {
-        if (wheel != 0) t.scroll(@intFromFloat(-wheel * 3));
+        if (lines != 0) t.scroll(lines);
         return;
     }
-    if (wheel != 0) ed.scrollLines(@intFromFloat(-wheel * 3));
+    if (lines != 0) ed.scrollLines(lines);
     if (clicked) {
         const l = render.windowLayout(ed, font, w);
         if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.clickCell(cell.row, cell.col);

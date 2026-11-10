@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const rl = @import("raylib");
 const gfx = @import("gfx.zig");
 const Grid = @import("../tui/Grid.zig");
+const icons = @import("icons.zig");
 
 const Font = @This();
 
@@ -24,6 +25,9 @@ glyph_y: f32,
 /// Terminal mode: no atlas; glyphs go to the cell grid (the terminal draws
 /// them with its own font).
 grid_mode: bool = false,
+/// The font has the Nerd Font file icons (a terminal's font is its own
+/// business: assumed there).
+has_icons: bool = true,
 
 /// The "font" of terminal mode: a cell in the grid's pixel units.
 pub fn cells() Font {
@@ -48,7 +52,8 @@ const codepoints = blk: {
     @setEvalBranchQuota(10_000);
     var n: usize = 0;
     for (ranges) |r| n += r[1] - r[0] + 1;
-    var out: [n]c_int = undefined;
+    var out: [n + icons.codepoints.len]c_int = undefined;
+    for (icons.codepoints, n..) |cp, at| out[at] = cp;
     var i: usize = 0;
     for (ranges) |r| {
         for (r[0]..r[1] + 1) |cp| {
@@ -94,7 +99,10 @@ pub fn load(gpa: Allocator, io: Io, path: ?[]const u8, size: i32) LoadError!Font
         font.recs[m].width;
     const base: f32 = @floatFromInt(font.baseSize);
     const cell_h = @round(base * line_height);
+    // Only glyphs the font has are in the atlas.
+    const probe = @as(usize, @intCast(rl.GetGlyphIndex(font, icons.folder.cp)));
     return .{
+        .has_icons = font.glyphs[probe].value == icons.folder.cp,
         .font = font,
         .size = size,
         // Integer cells keep every glyph pixel-aligned.

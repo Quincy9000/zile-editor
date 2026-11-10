@@ -37,6 +37,12 @@ const Pty = @import("terminal/Pty.zig");
 const RunMemory = @import("terminal/RunMemory.zig");
 pub const run_errors_mod = @import("terminal/errors.zig");
 const textobjects = @import("core/textobjects.zig");
+const textops = @import("textops.zig");
+const indents = @import("core/indent.zig");
+const comment = @import("core/comment.zig");
+const Visits = @import("Visits.zig");
+pub const Session = @import("Session.zig");
+pub const Blame = @import("git/Blame.zig");
 
 const Editor = @This();
 
@@ -47,7 +53,7 @@ pub const Options = struct {
     /// Insert spaces for <Tab> in insert mode.
     expand_tab: bool = true,
     /// Lines kept visible above/below the cursor.
-    scrolloff: usize = 4,
+    scrolloff: usize = 0,
     // Toggles (SPC t ...):
     /// Show deleted/changed HEAD lines as ghost lines.
     ghost_lines: bool = true,
@@ -61,6 +67,22 @@ pub const Options = struct {
     format_on_save: bool = true,
     /// AI ghost completion while typing (a local model through Ollama).
     ai_complete: bool = true,
+    /// Todo words and colour literals stand out (mini.hipatterns).
+    highlight_patterns: bool = true,
+    /// Other occurrences of the word under the cursor (mini.cursorword).
+    cursor_word: bool = true,
+    /// A guide line along the cursor's indent scope (mini.indentscope).
+    indent_scope: bool = true,
+    /// Trailing whitespace stands out (mini.trailspace).
+    trailing_space: bool = true,
+    /// Remove trailing whitespace when saving.
+    trim_on_save: bool = false,
+    /// File-type icons in pickers (needs a Nerd Font).
+    icons: bool = true,
+    /// Scrolling glides instead of jumping (windows only, not terminals).
+    smooth_scroll: bool = true,
+    /// Who last changed the cursor's line, after its end.
+    git_blame: bool = false,
 };
 
 pub const View = struct {
@@ -79,6 +101,12 @@ pub const View = struct {
     anchor: usize = 0,
     /// When set, the top row is this ghost line shown before line `top`.
     top_ghost: ?u32 = null,
+    /// Smooth scrolling: rows the drawn text still is from `top` (positive
+    /// after scrolling down: it is drawn that much lower, gliding to 0).
+    scroll_offset: f32 = 0,
+    /// The top and buffer `scroll_offset` was last brought up to date for.
+    seen_top: usize = 0,
+    seen_buffer: ?*const Buffer = null,
 };
 
 /// A screen row: a text line (a closed fold counts as one), or one of the
@@ -281,6 +309,42 @@ const AwaitingChar = struct {
     register: ?u8,
 };
 
+/// A notification shown at the top right for a few seconds (mini.notify):
+/// things that happen on their own (a language server's progress, a git
+/// command finishing), as opposed to the status line's answer to a key.
+pub const Toast = struct {
+    kind: Message.Kind = .info,
+    /// Progress toasts are found again by key and updated in place.
+    key: u64 = 0,
+    /// Still in progress: stays up until it is done.
+    busy: bool = false,
+    expires: Io.Timestamp = .zero,
+    buf: [160]u8 = undefined,
+    len: usize = 0,
+
+    pub const lifetime_ms = 4000;
+    pub const fade_ms = 500;
+
+    pub fn text(t: *const Toast) []const u8 {
+        return t.buf[0..t.len];
+    }
+
+    fn set(t: *Toast, comptime fmt: []const u8, args: anytype) void {
+        var w: Io.Writer = .fixed(&t.buf);
+        w.print(fmt, args) catch {};
+        t.len = w.buffered().len;
+    }
+};
+
+/// A past message or notification (`SPC s m`). `text` is owned.
+pub const HistoryEntry = struct {
+    kind: Message.Kind,
+    text: []u8,
+};
+
+const max_history = 200;
+const max_toasts = 6;
+
 pub const Message = struct {
     pub const Kind = enum { info, err };
     kind: Kind = .info,
@@ -389,6 +453,29 @@ jumps: std.ArrayList(Jump) = .empty,
 jump_index: usize = 0,
 /// Surround in progress: the range `ys` will wrap, the pair `cs` replaces.
 surround_range: operators.Range = .{ .start = 0, .end = 0 },
+/// `ga{motion}`: the lines to align once the character is typed.
+align_range: operators.Range = .{ .start = 0, .end = 0 },
+/// `gx`: the first of the two texts to exchange (dropped if the buffer is
+/// edited before the second is picked).
+exchange_mark: ?struct { buffer: *Buffer, version: u64, range: operators.Range } = null,
+/// The last key was an f/t jump: its other targets are highlighted.
+find_shown: bool = false,
+/// The colour scheme: an index into `theme_names` (set by the UI, which owns
+/// the themes), and the one to go back to if the theme picker is cancelled.
+theme_index: usize = 0,
+theme_names: []const []const u8 = &.{},
+theme_before: usize = 0,
+/// Notifications on screen, and every message so far (`SPC s m`).
+toasts: std.ArrayList(Toast) = .empty,
+history: std.ArrayList(HistoryEntry) = .empty,
+/// The time of the current frame (toasts expire against it).
+now: Io.Timestamp = .zero,
+/// Files visited before, across sessions (`SPC f r`, file picker order).
+visits: Visits = .{},
+/// `git blame` results per buffer (inline blame, `SPC t b`).
+blames: std.ArrayList(struct { buffer: *Buffer, blame: *Blame }) = .empty,
+/// Where state files go instead of `$XDG_STATE_HOME/zile` (tests).
+state_dir: ?[]const u8 = null,
 surround_from: u21 = 0,
 op: ?PendingOp = null,
 /// Visual mode selects whole lines (`V`).
@@ -583,6 +670,13 @@ pub fn deinit(ed: *Editor) void {
         k.deinit(ed.gpa);
     }
     if (ed.search_prompt) |*sp| sp.input.deinit(ed.gpa);
+    ed.dropAllBlames();
+    ed.blames.deinit(ed.gpa);
+    ed.saveVisits();
+    ed.visits.deinit(ed.gpa);
+    ed.toasts.deinit(ed.gpa);
+    for (ed.history.items) |h| ed.gpa.free(h.text);
+    ed.history.deinit(ed.gpa);
     ed.last_search.deinit(ed.gpa);
     ed.change_keys.deinit(ed.gpa);
     ed.cursors.deinit(ed.gpa);
@@ -604,9 +698,11 @@ pub fn highlightView(ed: *Editor) void {
     if (ed.buffer.syntax) |*s| {
         const t = ed.text();
         s.update(t);
-        const first = @min(ed.view.top, t.lineCount() - 1);
+        // While a scroll glides, a screenful on either side is in view too.
+        const margin: usize = if (ed.view.scroll_offset != 0) ed.view.rows else 0;
+        const first = @min(ed.view.top, t.lineCount() - 1) -| margin;
         // With closed folds the screen reaches past `top + rows` raw lines.
-        const last_visible = ed.stepVisible(first, @intCast(ed.view.rows));
+        const last_visible = ed.stepVisible(first, @intCast(ed.view.rows + 2 * margin));
         const last = if (ed.foldAt(last_visible)) |f| f.last else last_visible;
         s.highlight(ed.gpa, t, t.lineStart(first), t.lineEnd(last)) catch {};
     }
@@ -644,6 +740,9 @@ pub fn unpeekWindow(ed: *Editor, p: Peek) void {
 /// Per-frame housekeeping: reparses and highlights the visible lines, and
 /// picks up picker results from the worker.
 pub fn tick(ed: *Editor) void {
+    ed.now = Io.Timestamp.now(ed.io, .awake);
+    ed.pruneToasts();
+    ed.ensureBlame();
     ed.tickLsp();
     ed.pollGitJob();
     ed.pollTerminals();
@@ -893,6 +992,7 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 if (ed.mode == .visual) ed.exitVisual();
             }
             if (cmd.repeat) ed.capture_repeatable = true;
+            ed.find_shown = false;
             if (cmd.takes_char) {
                 ed.awaiting_char = .{ .cmd = cmd, .count = @max(count, 1), .has_count = has_count, .register = register };
                 return;
@@ -957,7 +1057,7 @@ fn tickLsp(ed: *Editor) void {
         if (ed.lsp_failed[i] or ed.lspFor(b) != null) continue;
         const l = Lsp.start(ed, i, Lsp.bufferRoot(b, ed.cwd)) catch |err| {
             ed.lsp_failed[i] = true;
-            ed.setMessage(.err, "could not start {s}: {s}", .{ Lsp.servers[i].name, @errorName(err) });
+            ed.notify(.err, "could not start {s}: {s}", .{ Lsp.servers[i].name, @errorName(err) });
             continue;
         };
         ed.lsps.append(ed.gpa, l) catch l.deinit();
@@ -972,7 +1072,7 @@ fn tickLsp(ed: *Editor) void {
             l.deinit();
             _ = ed.lsps.orderedRemove(k);
             ed.lsp_failed[i] = true;
-            ed.setMessage(.err, "{s} exited", .{Lsp.servers[i].name});
+            ed.notify(.err, "{s} exited", .{Lsp.servers[i].name});
         }
     }
 }
@@ -1497,14 +1597,14 @@ fn pollGitJob(ed: *Editor) void {
             "  (set one with SPC g g > Set remote URL)"
         else
             "";
-        return ed.setMessage(.err, "git: {s}{s}", .{ job.message, hint });
+        return ed.notify(.err, "git: {s}{s}", .{ job.message, hint });
     }
     switch (job.kind) {
-        .commit => ed.setMessage(.info, "committed: {s}", .{job.message}),
-        .push => ed.setMessage(.info, "pushed", .{}),
-        .pull => ed.setMessage(.info, "pulled: {s}", .{job.message}),
-        .switch_branch, .create_branch => ed.setMessage(.info, "{s}", .{job.message}),
-        .set_remote => ed.setMessage(.info, "remote origin set", .{}),
+        .commit => ed.notify(.info, "committed: {s}", .{job.message}),
+        .push => ed.notify(.info, "pushed", .{}),
+        .pull => ed.notify(.info, "pulled: {s}", .{job.message}),
+        .switch_branch, .create_branch => ed.notify(.info, "{s}", .{job.message}),
+        .set_remote => ed.notify(.info, "remote origin set", .{}),
     }
     // Files may have changed on disk; HEAD has moved.
     if (job.kind == .pull or job.kind == .switch_branch or job.kind == .create_branch) ed.reloadFromDisk();
@@ -1618,6 +1718,7 @@ fn takePromptText(ed: *Editor) !?[]u8 {
 
 /// Re-reads HEAD for every buffer (after committing outside the editor).
 pub fn reloadGit(ed: *Editor) void {
+    ed.dropAllBlames();
     for (ed.buffers.items) |b| {
         if (b.git) |*g| g.deinit(ed.gpa);
         b.git = null;
@@ -2182,6 +2283,12 @@ pub fn awaitChar(ed: *Editor, comptime name: []const u8, count: usize) void {
     ed.awaiting_char = .{ .cmd = cmd, .count = count, .has_count = false, .register = null };
 }
 
+/// `ga{motion}`: the range is known; the character to align on comes next.
+pub fn awaitAlignChar(ed: *Editor, r: operators.Range) void {
+    ed.align_range = r;
+    ed.awaitChar("align_char", 1);
+}
+
 /// `ys{motion}`: the range is known; the pair character comes next.
 pub fn awaitSurroundChar(ed: *Editor, r: operators.Range) void {
     ed.surround_range = r;
@@ -2696,6 +2803,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
         cur.last_used = ed.use_counter;
         ed.loadGitBase(cur);
         ed.activate(cur);
+        ed.recordVisit(cur);
         return;
     }
     errdefer loaded.deinit(ed.gpa);
@@ -2767,6 +2875,7 @@ pub fn switchTo(ed: *Editor, b: *Buffer) void {
     ed.use_counter += 1;
     b.last_used = ed.use_counter;
     ed.activate(b);
+    ed.recordVisit(b);
 }
 
 /// Shows `b` with its saved view, without saving the current one.
@@ -2793,6 +2902,10 @@ pub fn killBuffer(ed: *Editor, b: *Buffer) !void {
         return;
     }
     ed.lspCloseBuffer(b);
+    ed.dropBlame(b);
+    if (ed.exchange_mark) |m| if (m.buffer == b) {
+        ed.exchange_mark = null;
+    };
     if (ed.buffers.items.len == 1) {
         const fresh = try Buffer.initEmpty(ed.gpa);
         b.deinit(ed.gpa);
@@ -3595,7 +3708,7 @@ pub fn checkDiskChanges(ed: *Editor) void {
         const st = Io.Dir.cwd().statFile(ed.io, path, .{}) catch continue;
         if (st.mtime.nanoseconds == known.nanoseconds) continue;
         ed.reloadBuffer(b) catch continue;
-        ed.setMessage(.info, "reloaded {s} (changed on disk)", .{b.displayName()});
+        ed.notify(.info, "reloaded {s} (changed on disk)", .{b.displayName()});
     }
 }
 
@@ -4065,7 +4178,12 @@ fn saveKnownProjects(ed: *Editor) void {
 pub fn switchProject(ed: *Editor, root: []const u8) !void {
     const f = Project.detect(ed.io, root) orelse Project.Found{ .root = root, .git = false };
     const p = ed.internProject(f.root, f.git) orelse return;
+    // Leaving a project keeps its session; coming back to one with nothing
+    // open restores it.
+    const same = ed.project() == p;
+    if (!same) ed.saveSession(false);
     ed.enterProject(p);
+    if (!same and ed.deferred_target == null and !ed.hasBuffersIn(p) and ed.restoreSession(p.root)) return;
     ed.next_picker_root = p.root;
     try ed.openPicker(.files, "");
 }
@@ -4347,6 +4465,7 @@ pub fn saveCurrent(ed: *Editor) !void {
     if (ed.claude) |c| if (c.diffFor(b) != null)
         return ed.setMessage(.info, "this is Claude's proposal: SPC a y accepts it, SPC a n rejects it", .{});
     if (b.path == null) return ed.filePrompt(.save_as);
+    if (ed.options.trim_on_save) _ = try textops.trimTrailing(ed);
     if (ed.options.format_on_save and b.syntax != null) return ed.formatBuffer(null, true);
     ed.saveBufferNow(b);
 }
@@ -4593,7 +4712,10 @@ pub fn openPicker(ed: *Editor, kind: Picker.Kind, query: []const u8) !void {
     ed.closePicker();
     ed.picker_root = ed.next_picker_root orelse ed.projectRoot();
     ed.next_picker_root = null;
+    if (kind == .themes) ed.theme_before = ed.theme_index;
     ed.picker = try Picker.create(ed, kind, query);
+    // The theme picker starts on the theme in use (moving previews).
+    if (kind == .themes) ed.picker.?.want_id = @intCast(ed.theme_index);
     ed.mode = if (@import("picker/sources.zig").startsNormal(kind)) .picker_normal else .picker;
 }
 
@@ -4604,6 +4726,8 @@ pub fn closePicker(ed: *Editor) void {
     ed.resume_kind = p.base;
     ed.resume_query.clearRetainingCapacity();
     ed.resume_query.appendSlice(ed.gpa, p.query.items()) catch {};
+    // Moving through the themes previews them; only Enter keeps one.
+    if (p.base == .themes) ed.theme_index = ed.theme_before;
     p.destroy();
     ed.picker = null;
     ed.mode = .normal;
@@ -4688,7 +4812,7 @@ pub fn acceptPickerAs(ed: *Editor, target: OpenTarget) !void {
 /// Sources whose choices open something somewhere (files, places).
 pub fn opensPlaces(kind: Picker.Kind) bool {
     return switch (kind) {
-        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes, .browse, .jumps, .run_errors, .projects => true,
+        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes, .browse, .jumps, .run_errors, .projects, .recent, .todos => true,
         else => false,
     };
 }
@@ -4735,7 +4859,7 @@ fn runChoice(ed: *Editor, choice: Picker.Choice, target_in: OpenTarget) anyerror
     }
     // Pickers that take you somewhere are jumps.
     if (kind) |k| switch (k) {
-        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes => ed.pushJump(),
+        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes, .recent, .todos => ed.pushJump(),
         else => {},
     };
     if (target.dir()) |d| try ed.splitWindow(d);
@@ -4757,10 +4881,375 @@ pub fn setMessage(ed: *Editor, kind: Message.Kind, comptime fmt: []const u8, arg
         break :blk ed.message.buf[0..];
     };
     ed.message.len = s.len;
+    ed.remember(kind, s);
 }
 
 pub fn clearMessage(ed: *Editor) void {
     ed.message.len = 0;
+}
+
+/// Keeps a message for the history (`SPC s m`); repeats aren't kept twice.
+fn remember(ed: *Editor, kind: Message.Kind, s: []const u8) void {
+    if (s.len == 0) return;
+    if (ed.history.items.len > 0) {
+        const last = ed.history.items[ed.history.items.len - 1];
+        if (last.kind == kind and std.mem.eql(u8, last.text, s)) return;
+    }
+    const owned = ed.gpa.dupe(u8, s) catch return;
+    if (ed.history.items.len >= max_history) ed.gpa.free(ed.history.orderedRemove(0).text);
+    ed.history.append(ed.gpa, .{ .kind = kind, .text = owned }) catch ed.gpa.free(owned);
+}
+
+// ---------------------------------------------------------------------------
+// Notifications (mini.notify): toasts at the top right for things that
+// happen on their own, fading after a few seconds.
+
+fn timeAfter(ed: *Editor, ms: i64) Io.Timestamp {
+    const now = Io.Timestamp.now(ed.io, .awake);
+    return .{ .nanoseconds = now.nanoseconds + @as(i96, ms) * std.time.ns_per_ms };
+}
+
+fn pushToast(ed: *Editor, t: Toast) void {
+    if (ed.toasts.items.len >= max_toasts) _ = ed.toasts.orderedRemove(0);
+    ed.toasts.append(ed.gpa, t) catch return;
+    ed.wake_fn();
+}
+
+pub fn notify(ed: *Editor, kind: Message.Kind, comptime fmt: []const u8, args: anytype) void {
+    var t: Toast = .{ .kind = kind, .expires = ed.timeAfter(Toast.lifetime_ms) };
+    t.set(fmt, args);
+    ed.remember(kind, t.text());
+    ed.pushToast(t);
+}
+
+/// A notification for work in progress, updated in place: the same `key`
+/// changes its text; `busy` false ends it (it lingers a moment, then goes).
+pub fn progress(ed: *Editor, key: u64, busy: bool, comptime fmt: []const u8, args: anytype) void {
+    for (ed.toasts.items) |*t| if (t.key == key and key != 0) {
+        t.set(fmt, args);
+        t.busy = busy;
+        t.expires = ed.timeAfter(1500);
+        return ed.wake_fn();
+    };
+    if (!busy) return;
+    var t: Toast = .{ .key = key, .busy = true };
+    t.set(fmt, args);
+    ed.pushToast(t);
+}
+
+fn pruneToasts(ed: *Editor) void {
+    var i: usize = 0;
+    while (i < ed.toasts.items.len) {
+        const t = ed.toasts.items[i];
+        if (!t.busy and t.expires.nanoseconds <= ed.now.nanoseconds) {
+            _ = ed.toasts.orderedRemove(i);
+        } else i += 1;
+    }
+}
+
+/// Something on screen is moving (a gliding scroll, a fading toast): the UI
+/// should keep drawing frames instead of sleeping until the next key.
+pub fn wantsFrames(ed: *const Editor) bool {
+    if (ed.view.scroll_offset != 0) return true;
+    for (ed.window_list.items) |w| if (w != ed.window and w.view.scroll_offset != 0) return true;
+    for (ed.toasts.items) |t| if (!t.busy) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Smooth scrolling (mini.animate): when a view's top moves, the text is
+// drawn offset by the distance and glides into place over a few frames.
+// Purely visual: `top` and the cursor are where they are at once.
+
+/// Advances every window's glide by `dt` seconds. Called once per frame by
+/// the windowed UI (never in a terminal or in tests).
+pub fn animate(ed: *Editor, dt: f32) void {
+    const step = @min(dt, 1.0 / 30.0);
+    for (ed.window_list.items) |w| ed.animateView(ed.windowView(w), ed.windowBuffer(w), w == ed.window, step);
+    if (ed.cmd_float) |f| ed.windowView(f).scroll_offset = 0;
+}
+
+/// The glide's time constant in seconds: about a fifth of a second to settle.
+const scroll_glide = 0.06;
+
+fn animateView(ed: *Editor, v: *View, b: *const Buffer, focused: bool, dt: f32) void {
+    const cap: f32 = @floatFromInt(v.rows);
+    if (!ed.options.smooth_scroll or v.seen_buffer != b) {
+        v.scroll_offset = 0;
+    } else if (v.top != v.seen_top) {
+        const old: Row = .{ .line = v.seen_top };
+        const new: Row = .{ .line = v.top };
+        // Folds and ghost lines count as the rows they take (for the
+        // focused window, whose buffer is the current one).
+        const rows: f32 = if (focused)
+            @floatFromInt(if (old.before(new)) ed.rowsFrom(old, new, v.rows) else ed.rowsFrom(new, old, v.rows))
+        else
+            @min(@as(f32, @floatFromInt(if (v.top > v.seen_top) v.top - v.seen_top else v.seen_top - v.top)), cap);
+        v.scroll_offset = std.math.clamp(v.scroll_offset + (if (old.before(new)) rows else -rows), -cap, cap);
+    }
+    v.seen_top = v.top;
+    v.seen_buffer = b;
+    // Every frame closes the same share of what is left, also while more
+    // scrolling keeps arriving (a held key, a turning wheel): the text
+    // then moves at an even speed a little behind, instead of in steps.
+    if (v.scroll_offset != 0) {
+        v.scroll_offset *= @exp(-dt / scroll_glide);
+        if (@abs(v.scroll_offset) < 0.02) v.scroll_offset = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State files, visits, sessions, themes
+
+/// `$XDG_STATE_HOME/zile/<name>` (or under `state_dir`). Caller frees. Null
+/// when there is nowhere to keep state (and always in tests without a
+/// `state_dir`, so they never touch the real one).
+pub fn statePath(ed: *Editor, name: []const u8) ?[]u8 {
+    if (ed.state_dir) |d| return std.fs.path.join(ed.gpa, &.{ d, name }) catch null;
+    if (@import("builtin").is_test) return null;
+    return RunMemory.statePath(ed.gpa, name);
+}
+
+pub fn unixNow(ed: *Editor) i64 {
+    return Io.Timestamp.now(ed.io, .real).toSeconds();
+}
+
+/// The visit history, read from disk the first time.
+pub fn loadedVisits(ed: *Editor) *Visits {
+    if (!ed.visits.loaded) {
+        ed.visits.loaded = true;
+        if (ed.statePath("visits")) |p| {
+            defer ed.gpa.free(p);
+            ed.visits.load(ed.gpa, ed.io, p);
+        }
+    }
+    return &ed.visits;
+}
+
+fn recordVisit(ed: *Editor, b: *const Buffer) void {
+    const path = b.path orelse return;
+    const abs = ed.absolutePath(path) catch return;
+    defer ed.gpa.free(abs);
+    const v = ed.loadedVisits();
+    v.record(ed.gpa, abs, ed.unixNow()) catch return;
+    if (v.unsaved >= 8) ed.saveVisits();
+}
+
+pub fn saveVisits(ed: *Editor) void {
+    if (ed.visits.unsaved == 0) return;
+    const p = ed.statePath("visits") orelse return;
+    defer ed.gpa.free(p);
+    ed.visits.save(ed.gpa, ed.io, p, ed.unixNow());
+}
+
+/// Saves the current project's session (`SPC p s`, and on the way out).
+pub fn saveSession(ed: *Editor, report: bool) void {
+    const n = Session.save(ed) catch |err| {
+        if (report) ed.setMessage(.err, "could not save the session: {s}", .{@errorName(err)});
+        return;
+    };
+    if (!report) return;
+    if (n == 0) ed.setMessage(.info, "no files of this project are open: nothing to save", .{}) else ed.setMessage(.info, "session saved: {d} file(s)", .{n});
+}
+
+/// Restores `root`'s session. False when it has none.
+pub fn restoreSession(ed: *Editor, root: []const u8) bool {
+    const n = Session.restore(ed, root) catch 0;
+    if (n == 0) return false;
+    ed.setMessage(.info, "session restored: {d} file(s)", .{n});
+    return true;
+}
+
+fn hasBuffersIn(ed: *const Editor, p: *const Project) bool {
+    for (ed.buffers.items) |b| if (b.project == p) return true;
+    return false;
+}
+
+/// Picks colour scheme `i` and remembers it for the next start.
+pub fn setTheme(ed: *Editor, i: usize) void {
+    if (i >= ed.theme_names.len) return;
+    ed.theme_index = i;
+    ed.theme_before = i;
+    const p = ed.statePath("theme") orelse return;
+    defer ed.gpa.free(p);
+    if (std.fs.path.dirname(p)) |dir| Io.Dir.cwd().createDirPath(ed.io, dir) catch return;
+    Io.Dir.cwd().writeFile(ed.io, .{ .sub_path = p, .data = ed.theme_names[i] }) catch {};
+}
+
+/// The colour scheme chosen last time, if it still exists.
+pub fn loadTheme(ed: *Editor) void {
+    const p = ed.statePath("theme") orelse return;
+    defer ed.gpa.free(p);
+    const data = Io.Dir.cwd().readFileAlloc(ed.io, p, ed.gpa, .limited(256)) catch return;
+    defer ed.gpa.free(data);
+    const name = std.mem.trim(u8, data, " \n");
+    for (ed.theme_names, 0..) |n, i| if (std.mem.eql(u8, n, name)) {
+        ed.theme_index = i;
+        ed.theme_before = i;
+    };
+}
+
+/// The start screen (mini.starter): recent files and first steps.
+pub fn openStarter(ed: *Editor) !void {
+    try ed.openPicker(.start, "");
+}
+
+// ---------------------------------------------------------------------------
+// Bracketed jumps (mini.bracketed): `]d` `[d` diagnostics, `]x` `[x`
+// conflict markers, `]c` `[c` comment blocks.
+
+fn goLine(ed: *Editor, line: usize, col: usize) void {
+    const t = ed.text();
+    const l = @min(line, t.lineCount() - 1);
+    ed.ghost = null;
+    ed.revealLine(l);
+    ed.setCursor(t.lineStart(l) + @min(col, t.lineLen(l)));
+}
+
+pub fn jumpDiagnostic(ed: *Editor, forward: bool) void {
+    const diags = ed.diagnostics(ed.buffer);
+    if (diags.len == 0) return ed.setMessage(.info, "no diagnostics in this file", .{});
+    const line = ed.cursorLine();
+    const col = ed.view.cursor - ed.text().lineStart(line);
+    var target: ?*const Lsp.Diagnostic = null;
+    for (diags) |*d| {
+        const after = d.line > line or (d.line == line and d.col > col);
+        const before = d.line < line or (d.line == line and d.col < col);
+        if (forward and after) {
+            target = d;
+            break;
+        }
+        if (!forward and before) target = d;
+    }
+    // Past the last one: around to the other end.
+    const d = target orelse if (forward) &diags[0] else &diags[diags.len - 1];
+    ed.goLine(d.line, d.col);
+    ed.setMessage(if (d.severity == .err) .err else .info, "{s}", .{std.mem.sliceTo(d.message, '\n')});
+}
+
+fn isConflictMarker(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "<<<<<<< ") or std.mem.startsWith(u8, line, ">>>>>>> ") or
+        std.mem.startsWith(u8, line, "||||||| ") or std.mem.eql(u8, line, "=======");
+}
+
+pub fn jumpConflict(ed: *Editor, forward: bool) void {
+    const t = ed.text();
+    var line = ed.cursorLine();
+    while (true) {
+        if (forward) {
+            line += 1;
+            if (line >= t.lineCount()) break;
+        } else {
+            if (line == 0) break;
+            line -= 1;
+        }
+        if (isConflictMarker(t.lineSlice(line))) return ed.goLine(line, 0);
+    }
+    ed.setMessage(.info, "no more conflict markers", .{});
+}
+
+pub fn jumpComment(ed: *Editor, forward: bool) void {
+    const t = ed.text();
+    const line = comment.nextBlock(t, ed.cursorLine(), textops.commentPrefix(ed), forward) orelse
+        return ed.setMessage(.info, "no more comments", .{});
+    ed.goLine(line, motions.firstNonBlank(t, line) - t.lineStart(line));
+}
+
+// ---------------------------------------------------------------------------
+// Git blame (mini.git): who last changed a line. Blame is of HEAD, and
+// buffer lines map onto HEAD lines through the diff, so edits don't
+// invalidate it.
+
+pub fn blameFor(ed: *const Editor, b: *const Buffer) ?*Blame {
+    for (ed.blames.items) |e| if (e.buffer == b) return e.blame;
+    return null;
+}
+
+/// Starts blaming the current buffer when inline blame is on (each frame;
+/// a no-op once started).
+fn ensureBlame(ed: *Editor) void {
+    if (!ed.options.git_blame) return;
+    const b = ed.buffer;
+    if (b.git == null or ed.blameFor(b) != null) return;
+    const rel = ed.repoPath(b) orelse return;
+    defer ed.gpa.free(rel.path);
+    const blame = Blame.start(ed.gpa, ed.io, rel.root, rel.path, ed.wake_fn) catch return;
+    ed.blames.append(ed.gpa, .{ .buffer = b, .blame = blame }) catch blame.destroy();
+}
+
+/// `b`'s repository and its path inside it (`path` is owned by the caller).
+fn repoPath(ed: *Editor, b: *const Buffer) ?struct { root: []const u8, path: []u8 } {
+    const proj = b.project orelse return null;
+    if (!proj.git) return null;
+    const abs = ed.absolutePath(b.path orelse return null) catch return null;
+    defer ed.gpa.free(abs);
+    if (!(abs.len > proj.root.len + 1 and std.mem.startsWith(u8, abs, proj.root))) return null;
+    return .{ .root = proj.root, .path = ed.gpa.dupe(u8, abs[proj.root.len + 1 ..]) catch return null };
+}
+
+fn dropBlame(ed: *Editor, b: *const Buffer) void {
+    for (ed.blames.items, 0..) |e, i| if (e.buffer == b) {
+        e.blame.destroy();
+        _ = ed.blames.orderedRemove(i);
+        return;
+    };
+}
+
+fn dropAllBlames(ed: *Editor) void {
+    for (ed.blames.items) |e| e.blame.destroy();
+    ed.blames.clearRetainingCapacity();
+}
+
+/// The HEAD line that buffer line `line` still is, or null if the line was
+/// added or changed since.
+pub fn headLineOf(ed: *const Editor, line: usize) ?usize {
+    const g = ed.buffer.git orelse return null;
+    var delta: isize = 0;
+    for (g.hunks.items) |h| {
+        if (line < h.new_start) break;
+        if (line < h.new_start + h.new_count) return null;
+        delta += @as(isize, @intCast(h.old_count)) - @as(isize, @intCast(h.new_count));
+    }
+    return @intCast(@as(isize, @intCast(line)) + delta);
+}
+
+pub const BlameLine = union(enum) {
+    /// Still being computed, or not a tracked file.
+    unknown,
+    uncommitted,
+    commit: *const Blame.Commit,
+};
+
+/// Who last changed the current buffer's line `line`.
+pub fn blameLine(ed: *const Editor, line: usize) BlameLine {
+    const blame = ed.blameFor(ed.buffer) orelse return .unknown;
+    if (!blame.done.load(.acquire)) return .unknown;
+    const head = ed.headLineOf(line) orelse return .uncommitted;
+    return if (blame.at(head)) |c| .{ .commit = c } else .unknown;
+}
+
+/// `SPC g l`: the commit that last changed the cursor's line, in a popup.
+pub fn showLineCommit(ed: *Editor) !void {
+    const gpa = ed.gpa;
+    const rel = ed.repoPath(ed.buffer) orelse return ed.setMessage(.info, "not a file in a git repository", .{});
+    defer gpa.free(rel.path);
+    const head = ed.headLineOf(ed.cursorLine()) orelse return ed.setMessage(.info, "this line isn't committed yet", .{});
+    var range_buf: [48]u8 = undefined;
+    const range = try std.fmt.bufPrint(&range_buf, "{d},{d}", .{ head + 1, head + 1 });
+    const blamed = std.process.run(gpa, ed.io, .{
+        .argv = &.{ "git", "blame", "--porcelain", "-L", range, "HEAD", "--", rel.path },
+        .cwd = .{ .path = rel.root },
+    }) catch |err| return ed.setMessage(.err, "git blame: {s}", .{@errorName(err)});
+    defer gpa.free(blamed.stdout);
+    defer gpa.free(blamed.stderr);
+    if (!blamed.term.success() or blamed.stdout.len < 40) return ed.setMessage(.err, "git blame: {s}", .{std.mem.sliceTo(blamed.stderr, '\n')});
+    const shown = std.process.run(gpa, ed.io, .{
+        .argv = &.{ "git", "show", "--stat", "--date=relative", "--format=%h  %an, %ad%n%n%B", blamed.stdout[0..40] },
+        .cwd = .{ .path = rel.root },
+    }) catch |err| return ed.setMessage(.err, "git show: {s}", .{@errorName(err)});
+    defer gpa.free(shown.stdout);
+    defer gpa.free(shown.stderr);
+    try ed.showHover(std.mem.trim(u8, shown.stdout, " \n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -5120,6 +5609,29 @@ test "J, r, ~, >>, %" {
     try testing.expectEqual(12, ed.view.cursor);
     try ed.feed("<lt><lt>");
     try expectText(&ed, "FOo( bar)\nx");
+}
+
+test "mini.move: <A-j>/<A-k>/<A-h>/<A-l>" {
+    var ed = try testEditor("one\ntwo\nthree");
+    defer ed.deinit();
+    try ed.feed("<A-j>");
+    try expectText(&ed, "two\none\nthree");
+    try testing.expectEqual(1, ed.cursorLine());
+    try ed.feed("<A-j><A-j>"); // second is a no-op at the end
+    try expectText(&ed, "two\nthree\none");
+    try ed.feed("<A-k>");
+    try expectText(&ed, "two\none\nthree");
+    try ed.feed("<A-l>");
+    try expectText(&ed, "two\n    one\nthree");
+    try ed.feed("<A-h>");
+    try expectText(&ed, "two\none\nthree");
+    // Charwise selection moves along the line; linewise selection moves lines.
+    try ed.feed("ggvl<A-l>");
+    try expectText(&ed, "otw\none\nthree");
+    try ed.feed("<A-h><Esc>Vj<A-j>");
+    try expectText(&ed, "three\ntwo\none");
+    try ed.feed("<Esc>u");
+    try expectText(&ed, "two\none\nthree");
 }
 
 test "search: incremental /, n, N, *, Esc restores, d/ as motion" {
@@ -6633,3 +7145,271 @@ test "SPC w < and > keep the window menu open" {
     try testing.expect(!ed.sticky_menu);
 }
 
+
+test "mini.comment: gcc, gc{motion}, visual gc, the gc object" {
+    var ed = try testEditor("one\n  two\n\n  three");
+    defer ed.deinit();
+    try ed.feed("gcc");
+    try expectText(&ed, "# one\n  two\n\n  three");
+    try ed.feed("gcc");
+    try expectText(&ed, "one\n  two\n\n  three");
+    // The prefix goes at the block's smallest indentation; blank lines stay.
+    try ed.feed("jgcG");
+    try expectText(&ed, "one\n  # two\n\n  # three");
+    try ed.feed("dgc"); // the comment block at the cursor (one line)
+    try expectText(&ed, "one\n\n  # three");
+    try ed.feed("GVgc");
+    try expectText(&ed, "one\n\n  three");
+    try ed.feed("ggVGgc");
+    try expectText(&ed, "# one\n\n#   three");
+    try ed.feed("gcgc"); // uncomments only the block under the cursor
+    try expectText(&ed, "one\n\n#   three");
+}
+
+test "mini.operators: gr replaces, gx exchanges, gs sorts, gm duplicates" {
+    var ed = try testEditor("foo bar\nc, a, b\nz\ny");
+    defer ed.deinit();
+    try ed.feed("yiwwgriw");
+    try expectText(&ed, "foo foo\nc, a, b\nz\ny");
+    try testing.expectEqualStrings("foo", ed.registers.get(null).?.text); // kept
+    try ed.feed("u0gxiwwgxiw");
+    try expectText(&ed, "bar foo\nc, a, b\nz\ny");
+    try ed.feed("j0gs$");
+    try expectText(&ed, "bar foo\na, b, c\nz\ny");
+    try ed.feed("jgsj");
+    try expectText(&ed, "bar foo\na, b, c\ny\nz");
+    try ed.feed("gmm");
+    try expectText(&ed, "bar foo\na, b, c\ny\ny\nz");
+    try testing.expectEqual(3, ed.cursorLine());
+    try ed.feed("grr");
+    try expectText(&ed, "bar foo\na, b, c\ny\nfoo\nz");
+    try ed.feed("gmiw");
+    try expectText(&ed, "bar foo\na, b, c\ny\nfoofoo\nz");
+    // A mark is dropped by <Esc>; `dr` is not `dd`.
+    try ed.feed("gxiw<Esc>ggdr");
+    try testing.expect(ed.exchange_mark == null);
+    try expectText(&ed, "bar foo\na, b, c\ny\nfoofoo\nz");
+}
+
+test "mini.align: ga{motion}{char}; mini.splitjoin: gS" {
+    var ed = try testEditor("a = 1\nbbb = 2\ncc += 3");
+    defer ed.deinit();
+    try ed.feed("gaip=");
+    try expectText(&ed, "a   = 1\nbbb = 2\ncc  += 3");
+    try ed.feed("u");
+    try expectText(&ed, "a = 1\nbbb = 2\ncc += 3");
+
+    var ed2 = try testEditor("x: 1,\nlonger: 2,");
+    defer ed2.deinit();
+    try ed2.feed("Vjga:");
+    try expectText(&ed2, "x:      1,\nlonger: 2,");
+
+    var ed3 = try testEditor("  f(a, g(b, c), d);");
+    defer ed3.deinit();
+    try ed3.feed("gS");
+    try expectText(&ed3, "  f(\n      a,\n      g(b, c),\n      d\n  );");
+    try ed3.feed("gS");
+    try expectText(&ed3, "  f(a, g(b, c), d);");
+}
+
+test "mini.ai: next / previous objects, the indent scope, g[ and g]" {
+    var ed = try testEditor("f(a) + g(b) + h(c)");
+    defer ed.deinit();
+    try ed.feed("fgdin(");
+    try expectText(&ed, "f(a) + g() + h(c)");
+    try ed.feed("diN(");
+    try expectText(&ed, "f() + g() + h(c)");
+    try ed.feed("$g[(");
+    try expectCursor(&ed, 0, 13);
+    try ed.feed("0can\"x<Esc>"); // no quotes anywhere: nothing happens, no insert mode
+    try testing.expectEqual(Mode.normal, ed.mode);
+
+    var ed2 = try testEditor("if x:\n    a\n\n    b\nend\n  \"s\" 'q' \"t\"");
+    defer ed2.deinit();
+    try ed2.feed("j]i");
+    try testing.expectEqual(4, ed2.cursorLine());
+    try ed2.feed("k[i");
+    try testing.expectEqual(0, ed2.cursorLine());
+    try ed2.feed("jdii");
+    try expectText(&ed2, "if x:\nend\n  \"s\" 'q' \"t\"");
+    try ed2.feed("Gfqcinqz<Esc>"); // from inside 'q': the next quoted string
+    try expectText(&ed2, "if x:\nend\n  \"s\" 'q' \"z\"");
+}
+
+test "mini.jump: f and t reach across lines; ; repeats" {
+    var ed = try testEditor("abc\ndef x\nyy x");
+    defer ed.deinit();
+    try ed.feed("fx");
+    try expectCursor(&ed, 1, 4);
+    try testing.expect(ed.find_shown);
+    try ed.feed(";");
+    try expectCursor(&ed, 2, 3);
+    try ed.feed("Fa");
+    try expectCursor(&ed, 0, 0);
+    try ed.feed("l");
+    try testing.expect(!ed.find_shown);
+    try ed.feed("dtx");
+    try expectText(&ed, "ax\nyy x");
+}
+
+test "mini.bracketed: conflict markers and comment blocks; trailing whitespace" {
+    var ed = try testEditor("x  \n<<<<<<< HEAD\na\t\n=======\nb\n>>>>>>> other\n# note\ny");
+    defer ed.deinit();
+    try ed.feed("]x");
+    try testing.expectEqual(1, ed.cursorLine());
+    try ed.feed("]x]x");
+    try testing.expectEqual(5, ed.cursorLine());
+    try ed.feed("[x");
+    try testing.expectEqual(3, ed.cursorLine());
+    try ed.feed("]c");
+    try testing.expectEqual(6, ed.cursorLine());
+    try ed.feed("<Space>cw");
+    try expectText(&ed, "x\n<<<<<<< HEAD\na\n=======\nb\n>>>>>>> other\n# note\ny");
+    try ed.feed("u");
+    try testing.expect(std.mem.startsWith(u8, ed.text().slice(0, 3), "x  "));
+}
+
+test "notifications: toasts expire, progress updates in place, history keeps both" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.notify(.info, "pushed", .{});
+    ed.progress(7, true, "zls: indexing {d}%", .{10});
+    ed.progress(7, true, "zls: indexing {d}%", .{80});
+    try testing.expectEqual(2, ed.toasts.items.len);
+    try testing.expectEqualStrings("zls: indexing 80%", ed.toasts.items[1].text());
+    try testing.expect(ed.wantsFrames());
+    // Long after: the plain toast is gone, the busy one stays until done.
+    ed.now = ed.timeAfter(60_000);
+    ed.pruneToasts();
+    try testing.expectEqual(1, ed.toasts.items.len);
+    ed.progress(7, false, "zls: done", .{});
+    ed.now = ed.timeAfter(60_000);
+    ed.pruneToasts();
+    try testing.expectEqual(0, ed.toasts.items.len);
+    ed.setMessage(.err, "oops", .{});
+    try ed.feed("<Space>sm");
+    settlePicker(&ed);
+    try testing.expectEqualStrings("oops", ed.picker.?.itemAt(0).?.text);
+    try testing.expectEqualStrings("pushed", ed.picker.?.itemAt(1).?.text);
+    try ed.feed("q");
+}
+
+test "themes: moving previews, Esc goes back, Enter keeps" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.theme_names = &.{ "one", "two", "three" };
+    try ed.feed("<Space>tt");
+    settlePicker(&ed);
+    try ed.feed("j");
+    settlePicker(&ed);
+    try testing.expectEqual(1, ed.theme_index);
+    try ed.feed("<Esc>");
+    try testing.expectEqual(0, ed.theme_index);
+    try ed.feed("<Space>tt");
+    settlePicker(&ed);
+    try ed.feed("jj<CR>");
+    try testing.expectEqual(2, ed.theme_index);
+}
+
+test "smooth scrolling: the offset follows a scroll and glides to zero" {
+    var buf: [400]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = if (i % 2 == 0) 'x' else '\n';
+    var ed = try testEditor(&buf);
+    defer ed.deinit();
+    ed.setViewSize(10, 40);
+    ed.animate(0.016); // sees the buffer
+    try ed.feed("<C-d>");
+    ed.animate(0.016);
+    const first = ed.view.scroll_offset;
+    try testing.expect(first > 3 and first < 5); // already moving
+    try testing.expect(ed.wantsFrames());
+    // More scrolling while it glides adds on; every frame still moves.
+    try ed.feed("<C-e>");
+    ed.animate(0.016);
+    const second = ed.view.scroll_offset;
+    try testing.expect(second < first + 1 and second > first * 0.7);
+    ed.animate(0.016);
+    try testing.expect(ed.view.scroll_offset < second);
+    for (0..80) |_| ed.animate(0.016);
+    try testing.expectEqual(0, ed.view.scroll_offset);
+    // Another buffer in the window is not a scroll.
+    try ed.feed("<Space>bN");
+    ed.animate(0.016);
+    try testing.expectEqual(0, ed.view.scroll_offset);
+}
+
+test "visits, recent files and sessions survive a restart" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "proj/.git");
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/a.txt", .data = "a1\na2\na3\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "proj/b.txt", .data = "b1\nb2\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const state = try std.fs.path.join(gpa, &.{ base, "state" });
+    defer gpa.free(state);
+    const a = try std.fmt.allocPrint(gpa, "{s}/proj/a.txt", .{base});
+    defer gpa.free(a);
+    const b = try std.fmt.allocPrint(gpa, "{s}/proj/b.txt", .{base});
+    defer gpa.free(b);
+    const root = try std.fmt.allocPrint(gpa, "{s}/proj", .{base});
+    defer gpa.free(root);
+
+    {
+        var ed = try testEditor("");
+        defer ed.deinit();
+        ed.state_dir = state;
+        ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+        try ed.openFile(b);
+        try ed.openFile(a);
+        try ed.feed("jj"); // a.txt: line 3
+        try ed.feed("<Space>wsl");
+        try ed.openFile(b);
+        try ed.feed("j");
+        try testing.expect(!Session.exists(&ed, root));
+        try ed.feed("<Space>ps");
+        try testing.expect(Session.exists(&ed, root));
+        // deinit saves the visits.
+    }
+    {
+        var ed = try testEditor("");
+        defer ed.deinit();
+        ed.state_dir = state;
+        ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+        // b.txt was opened most.
+        try ed.feed("<Space>fr");
+        settlePicker(&ed);
+        try testing.expect(std.mem.endsWith(u8, ed.picker.?.itemAt(0).?.text, "b.txt"));
+        try testing.expectEqual(2, ed.picker.?.rowCount());
+        try ed.feed("<Esc><Esc>");
+
+        try testing.expect(ed.restoreSession(root));
+        try testing.expectEqual(2, ed.window_list.items.len);
+        try testing.expectEqual(2, ed.buffers.items.len);
+        // Focus is back in the right-hand window, on b.txt line 2.
+        try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "b.txt"));
+        try testing.expectEqual(1, ed.cursorLine());
+        try ed.feed("<Space>wh");
+        try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "a.txt"));
+        try testing.expectEqual(2, ed.cursorLine());
+    }
+}
+
+test "Ctrl-/ toggles comments in normal, visual and insert mode, cursor on its text" {
+    var ed = try testEditor("one\n  two\nthree");
+    defer ed.deinit();
+    try ed.feed("jw<C-/>"); // on "two"
+    try expectText(&ed, "one\n  # two\nthree");
+    try expectCursor(&ed, 1, 4);
+    try ed.feed("ix<C-/>y<Esc>");
+    try expectText(&ed, "one\n  xytwo\nthree");
+    try ed.feed("ggVj<C-/>");
+    try expectText(&ed, "# one\n#   xytwo\nthree");
+    try testing.expectEqual(Mode.normal, ed.mode);
+    try ed.feed("gg2<C-/>");
+    try expectText(&ed, "one\n  xytwo\nthree");
+    try ed.feed("jj<C-_>");
+    try expectText(&ed, "one\n  xytwo\n# three");
+}

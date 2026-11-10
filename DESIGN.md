@@ -99,12 +99,12 @@ under it is a compile error.
 | `SPC b n` / `SPC b p` | next / previous buffer | done |
 | `SPC :` | command picker (M-x) | done |
 | `SPC '` | resume last picker | done |
-| `SPC f r` | recent files | picker |
+| `SPC f r` | recent files (see mini.nvim features) | done |
 | `SPC s s` | search buffer lines | done |
 | `/` `?` `n` `N` `*` `#` | in-buffer search (incremental, highlighted) | done |
 | `s` | **snipe** (ours, replaces vim's `s`): type text, jumps as soon as one match is left on screen; `RET` = first match, then `n`/`N`; works after operators (`ds…`) and in visual mode | done |
 | `SPC /`, `SPC s p` | live fuzzy grep over every project line | done |
-| `gd` / `SPC c d`, `r` / `gr` / `SPC c D` | definition, references (zls); `r` is ours, replacing vim's replace-char | done |
+| `gd` / `SPC c d`, `r` / `SPC c D` | definition, references (zls); `r` is ours, replacing vim's replace-char (`gr` is replace-with-register) | done |
 | `K` / `SPC c k` | hover docs (zls) | done |
 | `SPC c x` | diagnostics picker (zls) | done |
 | `SPC c l` | go to symbol: zls documentSymbol, else a tree-sitter outline | done |
@@ -237,6 +237,56 @@ macros. Modern parts:
 - **Defaults:** system clipboard, mouse support, persistent undo tree, smooth
   scrolling.
 - **Config in ZON** (`std.zon.parse`): keymaps, theme, per-language settings.
+
+## mini.nvim features
+
+Built in, not plugins; each is on by default unless noted, and visual ones
+have a toggle under `SPC t`.
+
+| keys | what (mini module) | where |
+|---|---|---|
+| `gc{motion}`, `gcc`, visual `gc`, `dgc`, `Ctrl-/` | comment / uncomment lines with the language's prefix, at the block's smallest indent; `gc` after an operator is the comment block (comment) | `core/comment.zig`, `textops.zig` |
+| `gr{motion}` / `grr` | replace with a register, which is kept (operators). `gr` used to be references: those are `r` and `SPC c D` | `textops.zig` |
+| `gx{motion}` twice / `gxx` | exchange two texts; the first is highlighted until the second is picked, `<Esc>` cancels | |
+| `gs{motion}` / `gss` | sort lines, or within a line its `,` (else `;`, else space) separated parts | |
+| `gm{motion}` / `gmm` | duplicate (lines below, text right after) | |
+| `ga{motion}{char}` | align lines on the first `char`; for `,` and `:` what follows is lined up; `=` keeps `+=`, `!=` whole (align, not interactive) | |
+| `gS` | split the bracketed list at the cursor one argument per line, or join it back; a trailing comma in zig, rust, python, go (splitjoin) | |
+| `in(` `an(` / `iN(` `aN(` | the next / previous object, for every text object but line and indent (ai's `n` / `l`; `l` is the line object here) | `commands.zig` (generated from the spec table) |
+| `ii` / `ai`, `[i` / `]i` | the indent scope (with its border lines); jump to its top / bottom border, again for the next scope out (indentscope) | `core/indent.zig` |
+| `g[` / `g]` + object key | to the first / last character of that object | |
+| `]b ]d ]h ]c ]x ]j ]q` and `[...` | next / previous buffer, diagnostic, git hunk, comment block, conflict marker, jump, quickfix entry (bracketed) | `Editor.jump*` |
+| `f` `t` `F` `T` | reach the next occurrence on any line; the other targets are highlighted until the next key (jump) | `motions.findAcross` |
+| `SPC s t` | todo comments in the project (rg, else a scan) | `sources.Todos` |
+| `SPC f r` | recent files, by frecency across sessions; the file picker lists a project's most used files first (visits) | `Visits.zig` |
+| `SPC p s` / `SPC p l` | save / restore the project's session: its files, cursors and splits. Saved on quit and when `SPC p p` leaves a project; `SPC p p` into a project with nothing open restores it (sessions) | `Session.zig` |
+| `SPC t t` | colour scheme picker with live preview; remembered (hues / base16) | `ui/Theme.zig` |
+| `SPC s m` | message and notification history; Enter copies | |
+| `SPC o s` | the start screen: recent files and first steps; shown when started without a file (starter) | `sources.Start` |
+| `SPC g l`, `SPC t b` | the commit that last changed this line (popup); inline blame on the cursor line, off by default (git) | `git/Blame.zig` |
+| `SPC c w`, `SPC t S` | trim trailing whitespace; do it on every save (off by default) (trailspace) | |
+| `SPC t h` `w` `i` `s` `I` `m` | toggles: todo / colour highlights, cursor word, indent guide, trailing space, icons, smooth scrolling | |
+
+- **Highlights** are drawn by the renderer per visible line (`core/hipatterns.zig`
+  scans a line): todo words (in comments only, when there is a grammar) on a
+  coloured background, `#rgb` / `#rrggbb` / `#rrggbbaa` on their own colour,
+  `0xRRGGBB` underlined in it; other occurrences of the word under the cursor;
+  trailing whitespace; a guide line down the cursor's indent scope.
+- **Notifications** (`Editor.notify` / `progress`): toasts at the top right for
+  things that happen on their own (git jobs, files reloaded, a language
+  server's `$/progress` and `window/showMessage`), fading after 4 s. Answers
+  to a key still go to the status line (`setMessage`). Both are kept in the
+  history.
+- **Smooth scrolling** is visual only: `View.scroll_offset` is how many rows
+  the drawn text still is from `top`; `Editor.animate(dt)` (window UI only)
+  adds the distance when `top` moves and decays it. While anything moves
+  (`wantsFrames`), the loop wakes itself instead of waiting for input.
+- **Icons** are Nerd Font glyphs baked into the atlas (`ui/icons.zig`); a font
+  without them turns the option off.
+- **Themes**: "zile" is hand-tuned; the rest are derived at compile time from
+  nine-colour palettes (`Theme.fromPalette`). Adding one is a row in `palettes`.
+- **State** lives in `$XDG_STATE_HOME/zile/` (`visits`, `sessions/<hash>`,
+  `theme`); tests set `Editor.state_dir` or write nothing.
 
 ## Grammar implementation
 

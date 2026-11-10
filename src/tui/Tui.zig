@@ -20,7 +20,6 @@ const input = @import("input.zig");
 const keys = @import("../input/keys.zig");
 
 pub const Options = struct {
-    theme: *const Theme,
     /// Scripted keys (`<Wait>` separated) and a text snapshot of the screen
     /// to write when they're done (for testing without a terminal).
     test_keys: ?[]const u8 = null,
@@ -125,7 +124,7 @@ pub fn run(gpa: Allocator, io: Io, ed: *Editor, opts: Options) !void {
         const size = termSize(tty);
         try grid.resize(gpa, size[0], size[1]);
         const l = render.prepare(ed, &font, @intFromFloat(@as(f32, @floatFromInt(size[0])) * Grid.cell_w), @intFromFloat(@as(f32, @floatFromInt(size[1])) * Grid.cell_h));
-        render.draw(ed, &font, opts.theme, l);
+        render.draw(ed, &font, Theme.get(ed.theme_index), l);
         if (prev.len != grid.cells.len) {
             gpa.free(prev);
             prev = try gpa.alloc(Grid.Cell, grid.cells.len);

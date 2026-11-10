@@ -40,4 +40,12 @@ comptime {
     _ = @import("ai/Ghost.zig");
     _ = @import("ai/WsServer.zig");
     _ = @import("tui/Grid.zig");
+    _ = @import("core/hipatterns.zig");
+    _ = @import("core/indent.zig");
+    _ = @import("core/comment.zig");
+    _ = @import("textops.zig");
+    _ = @import("Visits.zig");
+    _ = @import("Session.zig");
+    _ = @import("git/Blame.zig");
+    _ = @import("ui/icons.zig");
 }

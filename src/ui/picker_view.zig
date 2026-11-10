@@ -12,6 +12,7 @@ const Font = @import("Font.zig");
 const Theme = @import("Theme.zig");
 const render = @import("render.zig");
 const gfx = @import("gfx.zig");
+const icons = @import("icons.zig");
 
 const rect = render.rect;
 const cells = render.cells;
@@ -131,13 +132,28 @@ fn drawList(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: f32
         const detail_cells = @min(cells(item.detail), list_cols * 3 / 5);
         if (detail_cells > 0) {
             const dx = x0 + @as(f32, @floatFromInt(list_cols -| (detail_cells + 1))) * cw;
-            drawHighlighted(font, theme, item.detail, &.{}, dx, y, detail_cells, theme.status_dim);
+            drawHighlighted(font, theme, item.detail, &.{}, dx, y, detail_cells, theme.status_dim, false);
         }
-        const avail = list_cols -| (2 + detail_cells + @as(usize, if (detail_cells > 0) 2 else 0));
+        var avail = list_cols -| (2 + detail_cells + @as(usize, if (detail_cells > 0) 2 else 0));
         var pos_buf: [Engine.max_query_len]usize = undefined;
         const positions = fuzzy.positions(query, item.text, &p.pos_scratch, &pos_buf) orelse &.{};
         const is_folder = p.kind == .browse and std.mem.endsWith(u8, item.text, "/");
-        drawHighlighted(font, theme, item.text, positions, tx, y, avail, if (is_folder) theme.whichkey_group else theme.fg);
+        // A file-type icon in front of rows that are files (mini.icons).
+        var text_x = tx;
+        const is_file = switch (p.kind) {
+            .files, .browse, .recent, .buffers, .git_changes => true,
+            .start => sources.startItemIsFile(item.id),
+            else => false,
+        };
+        if (is_file and p.ed.options.icons and font.has_icons and avail > 4) {
+            const ic = icons.forPath(item.text);
+            font.drawCodepoint(ic.cp, tx, y, .{ .r = ic.color[0], .g = ic.color[1], .b = ic.color[2], .a = 255 });
+            text_x += cw * 2;
+            avail -= 2;
+        }
+        // Prose reads from its start; paths keep their end (the file name).
+        const prose = p.kind == .todos or p.kind == .messages;
+        drawHighlighted(font, theme, item.text, positions, text_x, y, avail, if (is_folder) theme.whichkey_group else theme.fg, prose);
     }
 
     if (rows == 0 and p.isCurrent() and p.snap.done) {
@@ -146,13 +162,14 @@ fn drawList(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: f32
 }
 
 /// Draws `text` in at most `max_cells`, highlighting codepoints whose bytes are
-/// in `positions` (sorted byte offsets).
-fn drawHighlighted(font: *const Font, theme: *const Theme, text: []const u8, positions: []const usize, x: f32, y: f32, max_cells: usize, color: rl.Color) void {
+/// in `positions` (sorted byte offsets). Text that doesn't fit loses its
+/// start, or its end with `keep_head`.
+fn drawHighlighted(font: *const Font, theme: *const Theme, text: []const u8, positions: []const usize, x: f32, y: f32, max_cells: usize, color: rl.Color, keep_head: bool) void {
     if (max_cells == 0) return;
     const total = cells(text);
     var cx = x;
     var skip: usize = 0;
-    if (total > max_cells) {
+    if (total > max_cells and !keep_head) {
         // Keep the tail (file names), unless that would hide the first match.
         skip = total - (max_cells - 1);
         if (positions.len > 0) {
