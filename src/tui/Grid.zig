@@ -153,6 +153,11 @@ pub fn rect(g: *Grid, x: f32, y: f32, w: f32, h: f32, color: Color) void {
         return;
     }
     const s = g.span(x, y, w, h);
+    // Something solid drawn over the cursor (which-key, a popup) hides it:
+    // the terminal would draw its cursor on top.
+    if (color.a == 255) if (g.cursor) |cur| {
+        if (cur.row >= s.r0 and cur.row < s.r1 and cur.col >= s.c0 and cur.col < s.c1) g.cursor = null;
+    };
     for (s.r0..s.r1) |r| for (s.c0..s.c1) |c| {
         const cell = &g.cells[r * g.cols + c];
         if (color.a == 255) {

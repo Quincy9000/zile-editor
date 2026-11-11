@@ -191,3 +191,75 @@ test "config files: toml, yaml and json are highlighted" {
         };
     }
 }
+
+test "JSX and HTML: tags, props and brackets have their own colours" {
+    const gpa = std.testing.allocator;
+    const tsx = "const a = <View style={s}><Text msg=\"hi\" /></View>;";
+    const html = "<div class=\"x\"></div>";
+    const Case = struct { path: []const u8, text: []const u8, needle: []const u8, style: Style };
+    const cases = [_]Case{
+        .{ .path = "a.tsx", .text = tsx, .needle = "View style", .style = .tag },
+        .{ .path = "a.tsx", .text = tsx, .needle = "style=", .style = .tag_attribute },
+        .{ .path = "a.tsx", .text = tsx, .needle = "<View", .style = .tag_delimiter },
+        .{ .path = "a.tsx", .text = tsx, .needle = "Text msg", .style = .tag },
+        .{ .path = "a.tsx", .text = tsx, .needle = "msg=", .style = .tag_attribute },
+        .{ .path = "a.tsx", .text = tsx, .needle = "/>", .style = .tag_delimiter },
+        .{ .path = "a.tsx", .text = tsx, .needle = "</View", .style = .tag_delimiter },
+        .{ .path = "a.tsx", .text = tsx, .needle = "View>;", .style = .tag },
+        .{ .path = "a.tsx", .text = tsx, .needle = "\"hi\"", .style = .string },
+        .{ .path = "a.jsx", .text = tsx, .needle = "View style", .style = .tag },
+        .{ .path = "a.jsx", .text = tsx, .needle = "msg=", .style = .tag_attribute },
+        .{ .path = "a.html", .text = html, .needle = "div class", .style = .tag },
+        .{ .path = "a.html", .text = html, .needle = "class=", .style = .tag_attribute },
+        .{ .path = "a.html", .text = html, .needle = "<div", .style = .tag_delimiter },
+        // The rest of TypeScript still highlights (the queries compile).
+        .{ .path = "a.tsx", .text = tsx, .needle = "const", .style = .keyword },
+    };
+    for (cases) |cs| {
+        var out: std.ArrayList(Style) = .empty;
+        defer out.deinit(gpa);
+        var s = forPath(cs.path) orelse return error.TestUnexpectedResult;
+        defer s.deinit(gpa);
+        try highlightText(gpa, s.lang, cs.text, &out);
+        const at = std.mem.indexOf(u8, cs.text, cs.needle).?;
+        std.testing.expectEqual(cs.style, out.items[at]) catch |err| {
+            std.debug.print("{s}: \"{s}\" is {s}\n", .{ cs.path, cs.needle, @tagName(out.items[at]) });
+            return err;
+        };
+    }
+}
+
+test ".env files: shell highlighting, by name" {
+    const gpa = std.testing.allocator;
+    const langs = @import("languages.zig");
+    for ([_][]const u8{ ".env", "/proj/.env.local", ".env.production", "app.env" }) |p| {
+        try std.testing.expect(langs.isEnvFile(p));
+        try std.testing.expectEqualStrings("bash", forPath(p).?.lang.name);
+    }
+    for ([_][]const u8{ ".venv", "env.zig", "environment.ts" }) |p| try std.testing.expect(!langs.isEnvFile(p));
+    const text = "# database\nDATABASE_URL=\"postgres://x\"\nexport PORT=3000\n";
+    var out: std.ArrayList(Style) = .empty;
+    defer out.deinit(gpa);
+    var s = forPath(".env.local").?;
+    defer s.deinit(gpa);
+    try highlightText(gpa, s.lang, text, &out);
+    try std.testing.expectEqual(.comment, out.items[0]);
+    try std.testing.expectEqual(.string, out.items[std.mem.indexOf(u8, text, "\"postgres").?]);
+    try std.testing.expectEqual(.keyword, out.items[std.mem.indexOf(u8, text, "export").?]);
+    try std.testing.expect(out.items[std.mem.indexOf(u8, text, "DATABASE_URL").?] != .none);
+}
+
+test "lua: highlighted, by name and by #!" {
+    const gpa = std.testing.allocator;
+    const text = "local function greet(name)\n  -- say it\n  return \"hi \" .. name\nend\n";
+    var out: std.ArrayList(Style) = .empty;
+    defer out.deinit(gpa);
+    var s = forPath("init.lua").?;
+    defer s.deinit(gpa);
+    try highlightText(gpa, s.lang, text, &out);
+    try std.testing.expectEqual(.keyword, out.items[std.mem.indexOf(u8, text, "local").?]);
+    try std.testing.expectEqual(.function, out.items[std.mem.indexOf(u8, text, "greet").?]);
+    try std.testing.expectEqual(.comment, out.items[std.mem.indexOf(u8, text, "-- say").?]);
+    try std.testing.expectEqual(.string, out.items[std.mem.indexOf(u8, text, "\"hi").?]);
+    try std.testing.expectEqualStrings("lua", forFile("script", "#!/usr/bin/env lua5.4\nprint(1)").?.lang.name);
+}

@@ -13,6 +13,7 @@ const Theme = @import("Theme.zig");
 const render = @import("render.zig");
 const gfx = @import("gfx.zig");
 const icons = @import("icons.zig");
+const Replace = @import("../Replace.zig");
 
 const rect = render.rect;
 const cells = render.cells;
@@ -20,37 +21,120 @@ const cells = render.cells;
 /// Below this many columns the preview pane is hidden.
 const preview_min_cols = 90;
 
+/// Where pickers and prompts go: docked full width at the bottom, right
+/// above the status line, like telescope's ivy layout; the code stays in
+/// view above it. `want_rows` is clamped to what fits.
+const Dock = struct { bx: f32, by: f32, bw: f32, bh: f32, cols: usize, rows: usize };
+
+fn dock(font: *const Font, l: render.Layout, want_rows: usize) Dock {
+    const ch = font.cell_h;
+    const total_cols: usize = @intFromFloat(l.width / font.cell_w);
+    const above: usize = @intFromFloat(l.status_y / ch); // rows above the status line
+    const rows = @max(@min(want_rows, above -| 2), @min(above, 3));
+    const bh = @as(f32, @floatFromInt(rows)) * ch;
+    return .{ .bx = 0, .by = l.status_y - bh, .bw = l.width, .bh = bh, .cols = total_cols, .rows = rows };
+}
+
+/// The panel: its background and a line along its top.
+fn drawPanel(theme: *const Theme, d: Dock) void {
+    rect(d.bx, d.by, d.bw, d.bh, theme.popup_bg);
+    rect(d.bx, d.by, d.bw, 1, theme.popup_border);
+}
+
+/// A list's height: about 45% of the window, 8 to 24 rows.
+fn listRows(font: *const Font, l: render.Layout) usize {
+    const above: usize = @intFromFloat(l.status_y / font.cell_h);
+    return std.math.clamp(above * 45 / 100, 8, 24);
+}
+
 pub fn draw(p: *Picker, font: *const Font, theme: *const Theme, l: render.Layout) void {
     const cw = font.cell_w;
     const ch = font.cell_h;
-    const total_cols: usize = @intFromFloat(l.width / cw);
-    const total_rows: usize = @intFromFloat((l.status_y + ch) / ch);
-
-    const box_cols = @max(@min(total_cols -| 4, total_cols * 9 / 10), @min(total_cols, 30));
-    const box_rows = @max(@min(total_rows -| 4, total_rows * 3 / 4), @min(total_rows, 6));
-    const bx = @as(f32, @floatFromInt((total_cols - box_cols) / 2)) * cw;
-    const by = @as(f32, @floatFromInt(@max((total_rows - box_rows) / 3, 1))) * ch;
-    const bw = @as(f32, @floatFromInt(box_cols)) * cw;
-    const bh = @as(f32, @floatFromInt(box_rows)) * ch;
-
-    // Dim the editor behind the picker.
-    rect(0, 0, l.width, l.status_y + ch, theme.backdrop);
-    rect(bx - 1, by - 1, bw + 2, bh + 2, theme.popup_border);
-    rect(bx, by, bw, bh, theme.popup_bg);
+    const d = dock(font, l, listRows(font, l));
+    const box_cols = d.cols;
+    const box_rows = d.rows;
+    const bx = d.bx;
+    const by = d.by;
+    const bw = d.bw;
+    const bh = d.bh;
+    drawPanel(theme, d);
 
     drawQueryLine(p, font, theme, bx, by, box_cols);
     rect(bx, by + ch, bw, 1, theme.popup_border);
 
     const show_preview = box_cols >= preview_min_cols;
     const list_cols = if (show_preview) box_cols * 2 / 5 else box_cols;
-    const visible = box_rows - 1;
+    // The picker's actions along the bottom, when it has any.
+    const bar = actionBar(p);
+    const visible = box_rows - 1 - @intFromBool(bar);
     drawList(p, font, theme, bx, by + ch, list_cols, visible);
 
     if (show_preview) {
         const px = bx + @as(f32, @floatFromInt(list_cols)) * cw;
-        rect(px, by + ch, 1, bh - ch, theme.popup_border);
+        rect(px, by + ch, 1, @as(f32, @floatFromInt(visible)) * ch, theme.popup_border);
         drawPreview(p, font, theme, px + cw, by + ch, box_cols - list_cols - 2, visible);
     }
+    if (bar) drawActionBar(p, font, theme, bx, by + bh - ch, box_cols);
+}
+
+/// One `key label` of the bar at `x.*`, if it fits before `end`.
+fn putPart(font: *const Font, theme: *const Theme, x: *f32, end: f32, y: f32, key: []const u8, label: []const u8) bool {
+    const need = @as(f32, @floatFromInt(cells(key) + 1 + cells(label) + 3)) * font.cell_w;
+    if (x.* + need > end) return false;
+    x.* = font.drawText(key, x.*, y, theme.whichkey_group);
+    x.* = font.drawText(label, x.* + font.cell_w, y, theme.status_dim) + 3 * font.cell_w;
+    return true;
+}
+
+/// The key that starts typing in a menu: `/`, unless that's a row (the
+/// leader's grep), then `i`.
+fn filterKey(p: *const Picker) []const u8 {
+    return if (std.mem.indexOfScalar(u8, sources.rowKeys(p.kind), '/') != null) "i" else "/";
+}
+
+fn actionBar(p: *const Picker) bool {
+    return sources.itemActions(p.kind).len > 0 or sources.rowKeys(p.kind).len > 0 or sources.scopeGroup(p.kind) != null;
+}
+
+/// `C-t project · open · recent · disk`, the current scope bright.
+fn drawScopes(p: *const Picker, font: *const Font, theme: *const Theme, x: *f32, end: f32, y: f32) void {
+    const group = sources.scopeGroup(p.kind) orelse return;
+    var need: usize = 4;
+    for (group) |sc| need += cells(sc.name) + 3;
+    if (x.* + @as(f32, @floatFromInt(need)) * font.cell_w > end) return;
+    x.* = font.drawText("C-t", x.*, y, theme.whichkey_group) + font.cell_w;
+    for (group, 0..) |sc, i| {
+        if (i > 0) x.* = font.drawText(" · ", x.*, y, theme.status_dim);
+        x.* = font.drawText(sc.name, x.*, y, if (sc.kind == p.kind) theme.fg else theme.status_dim);
+    }
+    x.* += 3 * font.cell_w;
+}
+
+/// The bottom line: what the picker does besides Enter. After <Esc>, the
+/// letters; while typing, the Ctrl keys; <Tab> for all of them.
+fn drawActionBar(p: *const Picker, font: *const Font, theme: *const Theme, x0: f32, y: f32, cols: usize) void {
+    const cw = font.cell_w;
+    rect(x0, y, @as(f32, @floatFromInt(cols)) * cw, 1, theme.popup_border);
+    const x_end = x0 + @as(f32, @floatFromInt(cols -| 1)) * cw;
+    var x = x0 + cw;
+    const typing = p.ed.mode == .picker;
+    if (sources.rowKeys(p.kind).len > 0) {
+        _ = putPart(font, theme, &x, x_end, y, "key", "runs its row");
+        _ = putPart(font, theme, &x, x_end, y, filterKey(p), "type to filter");
+        return;
+    }
+    drawScopes(p, font, theme, &x, x_end, y);
+    if (sources.itemActions(p.kind).len == 0) return;
+    var buf: [16]u8 = undefined;
+    const tab_label = if (typing) "actions" else "all actions";
+    if (!putPart(font, theme, &x, x_end, y, "Tab", tab_label)) return;
+    for (sources.itemActions(p.kind)) |a| {
+        const key = if (typing)
+            (if (a.ctrl != 0) std.fmt.bufPrint(&buf, "C-{c}", .{a.ctrl}) catch continue else continue)
+        else if (a.key != 0) std.fmt.bufPrint(&buf, "{c}", .{a.key}) catch continue else continue;
+        if (!putPart(font, theme, &x, x_end, y, key, a.label)) break;
+    }
+    if (typing) _ = putPart(font, theme, &x, x_end, y, "Esc", "for the letters");
 }
 
 fn drawQueryLine(p: *Picker, font: *const Font, theme: *const Theme, bx: f32, y: f32, box_cols: usize) void {
@@ -58,29 +142,61 @@ fn drawQueryLine(p: *Picker, font: *const Font, theme: *const Theme, bx: f32, y:
     var x = bx + cw;
     x = font.drawText(p.title(), x, y, theme.mode_picker);
     x = font.drawText(" › ", x, y, theme.status_dim);
-    x = font.drawText(p.query.items(), x, y, theme.fg);
-    // Typing shows a cursor; moving through results shows the keys instead.
+    const q = p.query.items();
+    const qx = x;
+    x = font.drawText(q, x, y, theme.fg);
+    // The query's cursor: a bar while typing, a block on its character in
+    // normal mode (where vim keys edit the query).
+    const cur = @min(p.query.cursor, q.len);
+    const qcx = qx + @as(f32, @floatFromInt(cells(q[0..cur]))) * cw;
     if (p.ed.mode == .picker) {
         // In a terminal its own cursor is the bar; drawing one too makes two.
-        if (gfx.grid == null) rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
-        gfx.cursor(x, y, .bar);
-    } else {
+        if (gfx.grid == null) rect(qcx, y + 2, 2, font.cell_h - 4, theme.cursor);
+        gfx.cursor(qcx, y, .bar);
+    } else if (q.len > 0) {
+        gfx.cursor(qcx, y, .block);
+        if (gfx.grid == null) {
+            rect(qcx, y, cw, font.cell_h, theme.cursor);
+            var it = Font.Utf8Lossy{ .bytes = q[cur..] };
+            if (it.next()) |ch| if (ch != ' ') font.drawCodepoint(ch, qcx, y, theme.cursor_text);
+        }
+    }
+    if (p.ed.mode != .picker) {
         const hint = switch (p.kind) {
             .browse => "  o folder · n file · r rename · m move · x delete · yy p copy · i type",
-            .buffers => "  j/k move · Enter open · x close it · n new · i type",
-            .runner => "  j/k move · Enter run · Tab edit it · x forget · i type",
+            .buffers => "  j/k move · Enter open · i type",
+            .runner => "  j/k move · Enter run · i type",
             .quickfix => "  j/k move · Enter open · x clear the list · i type",
-            else => "  j/k move · Enter open · i type · q close",
+            else => if (sources.rowKeys(p.kind).len > 0)
+                (if (std.mem.eql(u8, filterKey(p), "i")) "  j/k move · Enter run · i type · q close" else "  j/k move · Enter run · / type · q close")
+            else
+                "  j/k move · Enter open · i type · q close",
         };
-        _ = font.drawText(hint, x, y, theme.status_dim);
+        x = font.drawText(hint, x, y, theme.status_dim);
     }
 
     // "matched/total", with an ellipsis while the source is still producing.
     var buf: [48]u8 = undefined;
     const s = &p.snap;
-    const count = std.fmt.bufPrint(&buf, "{d}/{d}{s}", .{ s.matched, s.total, if (s.done) "" else "…" }) catch "";
+    const elsewhere = p.globalLen();
+    const count = if (elsewhere > 0)
+        std.fmt.bufPrint(&buf, "{d}/{d}{s} · {d} elsewhere", .{ s.matched, s.total, if (s.done) "" else "…", elsewhere }) catch ""
+    else
+        std.fmt.bufPrint(&buf, "{d}/{d}{s}", .{ s.matched, s.total, if (s.done) "" else "…" }) catch "";
     const cx = bx + @as(f32, @floatFromInt(box_cols -| (cells(count) + 1))) * cw;
     _ = font.drawText(count, cx, y, theme.status_dim);
+    // A reminder of what else this picker does, before the count.
+    const extra: ?[]const u8 = switch (p.kind) {
+        .grep => "C-r replace",
+        else => null,
+    };
+    if (extra) |e| {
+        const hx = cx - @as(f32, @floatFromInt(cells(e) + 3)) * cw;
+        if (hx > x + 2 * cw) {
+            const kx = font.drawText("C-r", hx, y, theme.whichkey_group);
+            _ = font.drawText(e[3..], kx, y, theme.status_dim);
+        }
+    }
 }
 
 fn drawList(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: f32, list_cols: usize, visible: usize) void {
@@ -98,6 +214,8 @@ fn drawList(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: f32
     while (row < rows and row < p.top + visible) : (row += 1) {
         const y = y0 + @as(f32, @floatFromInt(row - p.top)) * ch;
         const width = @as(f32, @floatFromInt(list_cols)) * cw;
+        // Found elsewhere (the explorer's second search): under a line.
+        if (row > p.top and p.isGlobalRow(row) and !p.isGlobalRow(row - 1)) rect(x0, y, width, 1, theme.popup_border);
         if (row == p.selected) {
             rect(x0, y, width, ch, theme.selection_bg);
             rect(x0, y, 2, ch, theme.cursor);
@@ -235,26 +353,17 @@ fn drawLine(font: *const Font, theme: *const Theme, line: []const u8, styles: []
     }
 }
 
-/// A small centered input box in the picker's style, sized to its content:
-/// at least `min_cols` wide, growing with the text, capped at 80% of the
-/// window. Used for one-line prompts (rename, ...).
+/// A one-line prompt (rename, commit message, new file...), docked at the
+/// bottom like the pickers: its title, then the input.
 pub fn drawPromptBox(font: *const Font, theme: *const Theme, l: render.Layout, title: []const u8, text: []const u8) void {
     const cw = font.cell_w;
     const ch = font.cell_h;
-    const total_cols: usize = @intFromFloat(l.width / cw);
-    const total_rows: usize = @intFromFloat((l.status_y + ch) / ch);
-    const min_cols = 40;
-    const want = @max(min_cols, @max(cells(title), cells(text) + 2) + 4);
-    const box_cols = @min(want, @max(total_cols * 4 / 5, @min(total_cols, min_cols)));
-    const box_rows = 3; // title, separator gap, input
-    const bx = @as(f32, @floatFromInt((total_cols -| box_cols) / 2)) * cw;
-    const by = @as(f32, @floatFromInt(@max(total_rows / 3, 1))) * ch;
-    const bw = @as(f32, @floatFromInt(box_cols)) * cw;
-    const bh = @as(f32, @floatFromInt(box_rows)) * ch;
-
-    rect(0, 0, l.width, l.status_y + ch, theme.backdrop);
-    rect(bx - 1, by - 1, bw + 2, bh + 2, theme.popup_border);
-    rect(bx, by, bw, bh, theme.popup_bg);
+    const d = dock(font, l, 3); // title, gap, input
+    const box_cols = d.cols;
+    const bx = d.bx;
+    const by = d.by;
+    const bw = d.bw;
+    drawPanel(theme, d);
     _ = font.drawText(title, bx + cw, by, theme.mode_picker);
     rect(bx, by + ch * 1.5, bw, 1, theme.popup_border);
 
@@ -272,4 +381,148 @@ pub fn drawPromptBox(font: *const Font, theme: *const Theme, l: render.Layout, t
     x = font.drawText(visible, x, y, theme.fg);
     if (gfx.grid == null) rect(x, y + 2, 2, ch - 4, theme.cursor);
     gfx.cursor(x, y, .bar);
+}
+
+// ---------------------------------------------------------------------------
+// Search and replace across the project (`<C-r>` in the grep picker)
+
+/// The replace prompt: "Replace <needle> with › <replacement>" over the
+/// lines with matches, grouped by file, each as it is (matches in red) and
+/// as it will be (replacements in green). Skipped lines are dimmed.
+pub fn drawReplace(r: *Replace, font: *const Font, theme: *const Theme, l: render.Layout, replacement: []const u8) void {
+    const cw = font.cell_w;
+    const ch = font.cell_h;
+    const d = dock(font, l, listRows(font, l));
+    const box_cols = d.cols;
+    const box_rows = d.rows;
+    const bx = d.bx;
+    const by = d.by;
+    const bw = d.bw;
+    const bh = d.bh;
+    drawPanel(theme, d);
+
+    // Replace "needle" with › replacement            12 in 4 files
+    var x = font.drawText("Replace ", bx + cw, by, theme.mode_picker);
+    x = font.drawText(r.needle, x, by, theme.diff_delete);
+    x = font.drawText(" with › ", x, by, theme.status_dim);
+    x = font.drawText(replacement, x, by, theme.diff_add);
+    if (gfx.grid == null) rect(x, by + 2, 2, ch - 4, theme.cursor);
+    gfx.cursor(x, by, .bar);
+    var buf: [64]u8 = undefined;
+    const done = r.isDone();
+    const c: @TypeOf(r.counts()) = if (done) r.counts() else .{ .matches = 0, .files = 0 };
+    const count = if (!done) "searching…" else if (r.failed) "rg failed" else std.fmt.bufPrint(&buf, "{d} in {d} file{s}{s}", .{
+        c.matches, c.files, if (c.files == 1) "" else "s", if (r.truncated) " (first 10000)" else "",
+    }) catch "";
+    _ = font.drawText(count, bx + @as(f32, @floatFromInt(box_cols -| (cells(count) + 1))) * cw, by, theme.status_dim);
+    rect(bx, by + ch, bw, 1, theme.popup_border);
+
+    const hint = "↑↓ move · Tab skip line · S-Tab skip file · Enter replace · Esc back";
+    _ = font.drawText(hint, bx + cw, by + bh - ch, theme.status_dim);
+    const visible = box_rows -| 3; // query, list, hint
+    if (!done) return;
+    const rows = r.matches.items;
+    if (rows.len == 0) {
+        _ = font.drawText(if (r.failed) "rg could not search here" else "no matches", bx + cw, by + ch, theme.status_dim);
+        return;
+    }
+
+    // Keep the selection on screen (rows: a header per file, two per line).
+    if (r.selected < r.top) r.top = r.selected;
+    while (r.top < r.selected and replaceRows(r, r.top, r.selected) > visible) r.top += 1;
+
+    var y = by + ch;
+    const y_end = y + @as(f32, @floatFromInt(visible)) * ch;
+    const text_cols = box_cols -| 9;
+    var i = r.top;
+    while (i < rows.len and y < y_end) : (i += 1) {
+        const m = rows[i];
+        if (i == r.top or !std.mem.eql(u8, rows[i - 1].path, m.path)) {
+            _ = font.drawText(m.path, bx + cw, y, if (m.skip) theme.status_dim else theme.whichkey_group);
+            y += ch;
+            if (y >= y_end) break;
+        }
+        const n_rows: f32 = if (m.skip) 1 else 2;
+        if (i == r.selected) {
+            rect(bx, y, bw, ch * n_rows, theme.selection_bg);
+            rect(bx, y, 2, ch * n_rows, theme.cursor);
+        }
+        var nb: [16]u8 = undefined;
+        const num = std.fmt.bufPrint(&nb, "{d: >5}  ", .{m.line + 1}) catch "";
+        const tx = font.drawText(num, bx + cw, y, theme.gutter_fg);
+        if (m.skip) {
+            drawMarked(font, m.text, &.{}, tx, y, text_cols, theme.status_dim, theme.status_dim);
+            y += ch;
+            continue;
+        }
+        // As it is: each match marked.
+        var spans: [32][2]usize = undefined;
+        var n: usize = 0;
+        for (m.cols) |col| {
+            if (n == spans.len) break;
+            if (!r.matchesAt(m.text, col)) continue;
+            spans[n] = .{ col, col + r.needle.len };
+            n += 1;
+        }
+        drawMarked(font, m.text, spans[0..n], tx, y, text_cols, theme.fg, theme.diff_delete);
+        y += ch;
+        if (y >= y_end) break;
+        // As it will be: each replacement marked.
+        var line_buf: [2048]u8 = undefined;
+        var len: usize = 0;
+        var from: usize = 0;
+        var k: usize = 0;
+        var new_spans: [32][2]usize = undefined;
+        for (spans[0..n]) |sp| {
+            const before = m.text[from..sp[0]];
+            if (len + before.len + replacement.len > line_buf.len) break;
+            @memcpy(line_buf[len..][0..before.len], before);
+            len += before.len;
+            @memcpy(line_buf[len..][0..replacement.len], replacement);
+            new_spans[k] = .{ len, len + replacement.len };
+            k += 1;
+            len += replacement.len;
+            from = sp[1];
+        }
+        const rest = m.text[@min(from, m.text.len)..];
+        const take = @min(rest.len, line_buf.len - len);
+        @memcpy(line_buf[len..][0..take], rest[0..take]);
+        len += take;
+        drawMarked(font, line_buf[0..len], new_spans[0..k], tx, y, text_cols, theme.fg, theme.diff_add);
+        y += ch;
+    }
+}
+
+/// Screen rows the list takes from line `from` through line `to`.
+fn replaceRows(r: *const Replace, from: usize, to: usize) usize {
+    var n: usize = 0;
+    const rows = r.matches.items;
+    for (from..to + 1) |i| {
+        if (i == from or !std.mem.eql(u8, rows[i - 1].path, rows[i].path)) n += 1;
+        n += if (rows[i].skip) 1 else 2;
+    }
+    return n;
+}
+
+/// A code line without its indentation, tabs as spaces, in at most
+/// `max_cells`; the byte ranges `marks` (ascending) in `mark_color`.
+fn drawMarked(font: *const Font, line: []const u8, marks: []const [2]usize, x: f32, y: f32, max_cells: usize, color: rl.Color, mark_color: rl.Color) void {
+    var start: usize = 0;
+    while (start < line.len and (line[start] == ' ' or line[start] == '\t')) start += 1;
+    var it = Font.Utf8Lossy{ .bytes = line[start..] };
+    var col: usize = 0;
+    var mi: usize = 0;
+    while (true) {
+        const at = start + it.i;
+        const cp = it.next() orelse break;
+        if (col >= max_cells) break;
+        while (mi < marks.len and marks[mi][1] <= at) mi += 1;
+        const marked = mi < marks.len and marks[mi][0] <= at;
+        if (cp == '\t') {
+            col += 4;
+            continue;
+        }
+        if (cp != ' ' and cp != '\r') font.drawCodepoint(cp, x + @as(f32, @floatFromInt(col)) * font.cell_w, y, if (marked) mark_color else color);
+        col += 1;
+    }
 }

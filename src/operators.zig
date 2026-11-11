@@ -79,12 +79,8 @@ pub fn apply(ed: *Editor, op: Operator, range: Range, register: ?u8) !void {
         .exchange => try textops.exchange(ed, r),
         .sort => try textops.sort(ed, r),
         .multiply => try textops.multiply(ed, r, 1),
-        .yank => {
-            try yank(ed, r, register, .yank);
-            if (r.start < ed.view.cursor) {
-                if (r.linewise) ed.gotoLine(ed.text().lineOf(r.start)) else ed.setCursor(r.start);
-            }
-        },
+        // The cursor stays where it is (vim's goes to the start).
+        .yank => try yank(ed, r, register, .yank),
         .delete => {
             try yank(ed, r, register, .delete);
             try deleteText(ed, r);
@@ -196,8 +192,10 @@ fn changeCase(ed: *Editor, r: Range, op: Operator) !void {
 }
 
 /// `p` / `P`: pastes `count` copies after/before the cursor (linewise text
-/// goes below/above the current line).
-pub fn paste(ed: *Editor, v: Registers.Value, count: usize, before: bool) !void {
+/// goes below/above the current line). The cursor ends on the last pasted
+/// line or character with `to_end` (`p`: unlike vim's first line), else on
+/// the first (`P`), so pastes in a row with either key stack in order.
+pub fn paste(ed: *Editor, v: Registers.Value, count: usize, before: bool, to_end: bool) !void {
     const t = ed.text();
     const gpa = ed.gpa;
     var buf: std.ArrayList(u8) = .empty;
@@ -212,14 +210,15 @@ pub fn paste(ed: *Editor, v: Registers.Value, count: usize, before: bool) !void 
         }
         const pos = if (before) t.lineStart(line) else t.lineEnd(line);
         try ed.insertAt(pos, buf.items);
-        ed.setCursor(motions.firstNonBlank(t, if (before) line else line + 1));
+        const first = if (before) line else line + 1;
+        const lines = (std.mem.count(u8, body, "\n") + 1) * count;
+        ed.setCursor(motions.firstNonBlank(t, if (to_end) first + lines - 1 else first));
     } else {
         for (0..count) |_| try buf.appendSlice(gpa, v.text);
         const le = t.lineEnd(line);
         const pos = if (before or ed.view.cursor >= le) ed.view.cursor else motions.nextChar(t, ed.view.cursor);
         try ed.insertAt(pos, buf.items);
-        // On the last pasted character.
-        ed.setCursor(motions.prevChar(t, pos + buf.items.len));
+        ed.setCursor(if (to_end) motions.prevChar(t, pos + buf.items.len) else pos);
     }
 }
 

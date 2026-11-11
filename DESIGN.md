@@ -43,34 +43,47 @@ src/
 planned: picker/  syntax/  lsp/  terminal/  ui/layout.zig (split tree)
 ```
 
-## Keybindings (Doom Emacs style)
+## Keybindings: the leader is a picker
 
-Vim motions, operators and text objects stay on single keys. Every other command
-lives in a nested leader menu under `SPC`, shown by the which-key popup as soon
-as a prefix is typed (groups as `+name`, commands by their doc). There are no
-ctrl-chord commands and no ex command line. Default bindings and groups are
-tables in `input/keymap.zig`, validated at compile time. A group with nothing
-under it is a compile error.
+Vim motions, operators and text objects stay on single keys. Everything else
+starts at `SPC`, which opens the **Leader menu**: a picker listing every
+entry point with its key beside it (`b` buffers, `l` code, `r` run...).
+Pressing a row's key runs it, so `SPC b` reads and types like a leader
+sequence, but what you see is a list you can filter (`i`) rather than a
+which-key popup. There is no which-key anywhere: vim prefixes (`g`, `z`, `[`,
+`]`, `q`, operators) wait silently like vim's, and `SPC f k` (keys) searches
+every binding, the menus' rows included. In visual mode `SPC` keeps the
+selection for the row that runs (`SPC l a` code actions on it, `SPC f f`
+files with it as the query). No ex command line. Bindings are tables in
+`input/keymap.zig`; menus are `Menu(...)` sources in `picker/sources.zig`.
 
-### Leader layout
+### Leader layout: pickers are the menus
 
-Menus are by what you are doing, not by Doom's nouns. Three rules: every
-picker is under `SPC f`; acting on code is under `SPC l`; the top level holds
-only what is done constantly, without shift (the other letters stay free).
+The leader keeps a few entry points, and each opens a picker that *is* the
+menu: you see every row, type to filter, and act on rows right there, so
+there is no which-key hunting for the key of one action. Every picker shows
+its actions along its bottom: the letters after `<Esc>`, the Ctrl keys while
+typing, and `<Tab>` for the full list (with "open in a split" for pickers of
+places). Menus (`SPC l`, `SPC g`) show each row's key beside it: the key runs
+the row, `/` types to filter.
 
-| menu | keys |
-|---|---|
-| top level | `SPC` find file, `/` grep, `,` buffers, `.` browse, `;` shell command, `'` resume picker, `s` save, `q` close |
-| `SPC f` find | `f` files, `r` recent, `v` frecent, `a` anywhere, `d` directory anywhere, `e` explore, `b` buffers, `p` projects, `g` grep, `l` lines, `t` todos, `s` symbols, `w` workspace symbols, `x` errors, `q` quickfix, `j` jumps, `m` marks, `y` registers, `u` undo history, `k` keys, `c` commands, `n` notifications, `h` start screen, `SPC` all pickers |
-| `SPC l` lsp / code | `a` actions, `r` rename, `f` format, `d` definition, `i` implementations, `u` usages, `k` hover, `c` colour wheel, `t` todo tag, `w` trim whitespace, `m` man pages; the server's lists are here as well as under find: `l` symbols, `p` project symbols, `x` errors |
-| `SPC b` buffer / file | `s` save, `a` save all, `w` save as, `r` rename / move, `c` copy to, `x` delete file, `y` yank path, `f` yank full path, `n` new file, `e` empty buffer, `k` kill, `o` kill others, `d` discard changes (revert), `b` flip to last |
-| `SPC g` git | `g` menu, `c` commit, `b` branches, `s` changed files, `r` restore hunk, `n` / `p` next / previous change, `l` this line's commit, `u` reload HEAD, `i` git init |
-| `SPC r` run | `r` runner history, `.` again, `c` multi-line, `o` output, `e` errors, `t` terminal popup, `w` terminal in this window |
-| `SPC w` window | `s` + `hjkl` split, `hjkl` focus, `w` next, `d` close, `o` only, `=` balance, `r` resize |
-| `SPC p` project | `p` switch, `s` save session, `l` restore session |
-| `SPC t` toggle | `t` theme, `s` scratch pad, `l` line wrap, `c` code lens, `g` ghost lines, `r` relative numbers, `d` diagnostic text, `p` pairs, `f` format on save, `a` AI, `h` highlights, `w` cursor word, `i` indent guide, `S` trailing space, `x` trim on save, `n` icons, `m` smooth scroll, `b` blame, `v` type hints, `=` `-` `0` zoom |
-| `SPC a` ai | `a` Claude panel, `s` send, `i` ask, `y` accept, `n` reject |
-| `SPC Q` quit | `s` save all and quit, `Q` quit without saving (also `QQ`) |
+| key | picker | its actions / rows |
+|---|---|---|
+| `SPC` | Leader menu | every row below, on its key; `i` filters |
+| `SPC SPC` (and `SPC .`) | Files: the explorer | starts as the project's folder (`SPC .`: the current file's), its entries only; typing searches two ways at once: **here** (the folder's entries and every file below it, the ones you visit most first; instant, ranked by the file name then nearness) and, under a line, **elsewhere** (`files_global`, a second engine run per query: files you opened in other places, then `fd --fixed-strings` over `$HOME`, skipping `.git`, `node_modules`, caches and build output unless `SPC t` turns that off), so `main.zig` shows this project's first and `zshrc` finds `~/.zshrc` from any project; Create is the last row; `src/` goes into a folder, `BS` on nothing goes up; `o n r m x yy p` the explorer's file operations; `C-t` scopes: folder · open · recent everywhere · whole disk |
+| `SPC b` | Files, open scope | `x` / `C-x` close, `n` new, `s` save, `S` save all, `r` rename / move, `w` save as, `c` copy to, `R` revert, `D` delete the file, `o` close the others, `y` / `Y` copy path |
+| `SPC w` | Windows | rows: the other windows (last used first), the one you're in last (`SPC w Enter` flips back), then `+ New window right… / below…` (pick what it shows in Files; cancel: no window) and `+ New terminal window`; the preview draws the layout (selected window double-lined, yours `*`); `w` (`SPC w w`) back to the previous window and again to toggle, `h j k l` the window that way from yours, `v` / `s` split the selected one, `x` close, `X` swap with yours, `z` maximise / back, `b` choose its buffer, `o` only, `=` equal, `>` `<` `+` `-` grow / shrink (stays open), `t` terminal in it |
+| `SPC t` | toggles | every setting with its on / off state; Enter flips it and the list stays; colour scheme, text size |
+| `SPC l` | code (menu) | `.` rename, `r` references, `a` actions, `f` format, `d` definition, `i` implementations, `k` docs, `l` symbols (`C-t`: project), `w` project symbols, `x` errors, `c` colour wheel, `m` man pages, `t` todo tag, `W` trim whitespace |
+| `SPC r` | runner | your commands, newest first: Enter runs, type a new one; `e` / `C-e` edit, `x` / `C-x` forget, `c` multi-line, `.` again, `o` output, `E` errors, `t` terminal, `T` terminal here, `s` / `S` SQL statement / file |
+| `SPC g` | Git: changed files | Enter opens one; `c` commit all, `p` push, `P` pull, `b` branches, `r` restore the change at the cursor, `l` this line's commit, `R` remote URL, `u` reload HEAD, `i` git init |
+| `SPC /` | Search | `C-t` scopes: project · this file · todos; `C-r` replace across the project |
+| `SPC f` | Find (menu) | few pickers, each with its scopes on `C-t`: `f` Files, `b` open buffers, `g` Search (project · this file · todos), `x` Problems (errors · last run · saved list), `j` Places (jumps · marks), `c` Commands (commands · keys), `e` explore, `p` projects, `y` registers, `u` undo history, `n` notifications, `h` start screen, `T` colour scheme, `M` man pages |
+| `SPC p` | Projects | the ones opened before (most recent first, yours last), then every project under the project folders; Enter switches (restoring its session if nothing of it is open, else the Files explorer at its root); `f` files in it, `g` search in it, `l` restore its session, `s` save this session, `x` forget it; `Tab`: into a split |
+| others (Leader rows) | | `.` browse, `;` shell command, `'` resume picker, `,` last jump (again: back), `s` save, `q` close; `SPC a` Claude (`a` `s` `i` `y` `n`), `SPC Q` quit (`s` `Q`) |
+
+In visual mode `SPC l a` (code actions), `SPC l f` (format the lines) and
+`SPC r s` (run the selected SQL) act on the selection.
 
 The table below is the history of what was built, with its keys in this layout.
 
@@ -130,6 +143,7 @@ The table below is the history of what was built, with its keys in this layout.
 | `/` `?` `n` `N` `*` `#` | in-buffer search (incremental, highlighted) | done |
 | `t` | **snipe** (ours, "teleport"): type text, jumps as soon as one match is left on screen; `RET` = first match, then `n`/`N`; in visual mode too. After an operator `t` is still vim's till, and `s` is the snipe motion (`gUs…`) | done |
 | `SPC /`, `SPC f g` | live fuzzy grep over every project line | done |
+| `<C-r>` in `SPC /` | search and replace across the project (grug-far, simpler): the query becomes an exact search (smart case, `rg --fixed-strings`), a prompt takes the replacement, and every line with matches shows as it is (red) and as it will be (green), grouped by file; `↑`/`↓` move, `Tab` skips a line, `S-Tab` a file, `Enter` replaces (each file one undo step; autosave writes them; a match whose text changed since the search is left alone), `Esc` goes back to the grep picker (`Replace.zig`) | done |
 | `gd` / `SPC l d`, `SPC l u` | definition, references (zls). `r` is vim's replace-character again and `gr` is replace-with-register | done |
 | `K` / `SPC l k` | hover docs (zls) | done |
 | `SPC f x` | diagnostics picker (zls) | done |
@@ -193,6 +207,24 @@ code actions, buffers, jumplist, registers, terminals.
   marks items; `C-q` freezes results into a resumable list (the quickfix
   replacement); `SPC '` resumes the last picker. (Ctrl keys *inside* the picker
   are list navigation, not commands.)
+- **What you're on goes last.** A picker never starts on the thing you
+  already have (unless it's the only row): buffers, windows, recent files,
+  projects and branches list the current one last, so `SPC b Enter` and
+  `SPC w Enter` flip back to the previous buffer / window.
+- **Scopes, not more pickers.** Pickers that differ only in what they
+  range over are one picker with scopes; `C-t` steps through them keeping
+  the query, and the bottom bar shows them (`C-t project · open · ...`).
+  Groups (`sources.scope_groups`): Files (folder, open, recent everywhere,
+  whole disk), Search (project, this file, todos), Symbols (this file,
+  project), Problems (errors, last run, saved list), Places (jumps, marks),
+  Commands (commands, keys).
+- **Vim keys on the query.** After `<Esc>` (normal mode), `j`/`k` still move
+  through the results and the rest edit the query like a line: `h l w b e W
+  B E 0 ^ $`, `x X D C s S`, `d c y` with those motions or `iw aw` (`dd cc
+  yy`: all of it), `p P`, `u`, and `i a I A` back to typing at the cursor.
+  The explorer, buffers, runner and quickfix keep `h l x dd p o n r m` for
+  their rows. While typing, `←` `→` `Home` `End` move the cursor
+  (`LineInput` has one).
 - **Preview pane** shows highlighted file contents at the target line, or the
   doc for help items. It collapses on narrow windows.
 - **Help is data.** Command docs, the keymap and `docs/*.md` (embedded, one
@@ -307,6 +339,14 @@ have a toggle under `SPC t`.
 | `gS` | split the bracketed list at the cursor one argument per line, or join it back; a trailing comma in zig, rust, python, go (splitjoin) | |
 | `in(` `an(` / `iN(` `aN(` | the next / previous object, for every text object but line and indent (ai's `n` / `l`; `l` is the line object here) | `commands.zig` (generated from the spec table) |
 | `ii` / `ai`, `[i` / `]i` | the indent scope (with its border lines); jump to its top / bottom border, again for the next scope out (indentscope) | `core/indent.zig` |
+| `is` / `as` | the statement: a `{ }` block with its header, as whole lines — `fn foo(...) {` (a signature over several lines too) or `if (x) {` through the closing `}`, a whole `} else {` / `} catch {` chain; on a header line that block, else the innermost around the cursor (`2is` one out); `as` adds the doc comments and attributes above and the blank lines after; `ins` / `iNs` the next / previous one | `core/textobjects.zig` |
+| `Alt-u` / `Alt-i` | grow the selection to the next node up the syntax tree (from a cursor: the node under it) / back down the way it grew (to the cursor at the end); helix's `Alt-o`/`Alt-i` (`syntax/objects.zig` `expand`) | `objects.zig` |
+| `Alt-n` / `Alt-p` | to the next / previous sibling node: the next argument, statement, field, JSX prop or function (from a cursor: the biggest node starting under it; climbs when there is none); a selection becomes the sibling | `objects.zig` |
+| `Alt-N` / `Alt-P` | carry the node (cursor or selection) past its next / previous sibling: `f(a, b)` -> `f(b, a)`; it stays under the cursor / selected, so again carries it further; one undo step; `.` repeats | `objects.zig` |
+| `Alt-f` / `Alt-F` | next / previous function (declarations, methods, named arrows like `const Foo = () =>`; not every callback); a jump | `objects.zig` |
+| `Alt-c` | cycle the name's case (or each name in the selection): snake_case -> camelCase -> PascalCase -> SCREAMING_CASE -> kebab-case; `_lead`/`trail_` underscores kept; `.` repeats | `core/case.zig` |
+| sticky context, `SPC t k` | the first lines of the scopes the top of the window is inside (function, class, `if`, JSX element, object...) pinned over its top rows, highlighted, up to 3, never over the cursor (treesitter-context) | `render.zig` `drawContext` |
+| `y`, `p` / `P`, `gp` / `gP` | a yank leaves the cursor where it is (in visual mode, where `v` was pressed; vim's goes to the start); paste; `p` leaves the cursor on the last pasted line (or character), `P` on the first, so pastes in a row with either stack in order; `gp` / `gP` paste inline (a line yanked whole goes inside `foo()` without its newline or indent) | `operators.zig` |
 | `g[` / `g]` + object key | to the first / last character of that object | |
 | `]b ]d ]h ]c ]x ]j ]q` and `[...` | next / previous buffer, diagnostic, git hunk, comment block, conflict marker, jump, quickfix entry (bracketed) | `Editor.jump*` |
 | `f` `t` `F` `T` | reach the next occurrence on any line, ignoring letter case (`fa` finds `A` too); the other targets are highlighted until the next key (jump) | `motions.findAcross` |
@@ -460,6 +500,17 @@ is a `#!` naming a shell (`languages.forShebang`, which also knows python,
 node, deno and bun). `#` comments, `shfmt` formatting. No server built in
 (`bash-language-server` isn't installed; add it in `languages.toml`).
 
+**Lua** (tree-sitter-lua v0.2.0, tree-sitter-grammars): `.lua`
+`.rockspec` `.luacheckrc` and `#!` lua / luajit; `--` comments;
+`lua-language-server`; `stylua` on save; `af`/`if` functions (also
+`local f = function() … end`), `ia` arguments, `ic` tables, folds for
+functions, blocks and tables.
+
+**`.env` files** (`.env`, `.env.local`, `.env.production`, `app.env`:
+`languages.isEnvFile`) use the bash grammar: keys, quoted values, `#`
+comments, `${VAR}`. They're not formatted on save (shfmt would rewrite
+`KEY=a b`) and no language server gets them.
+
 **SQL** (tree-sitter-sql, pinned to its `gh-pages` commit: only that branch
 carries the generated parser): `.sql` `.psql` `.pgsql`, `--` comments,
 `pg_format` formatting. `SPC r s` runs the statement at the cursor (from the
@@ -545,6 +596,10 @@ full-text `didChange` once per frame, diagnostics by path, request
 bookkeeping), `lsp/Completion.zig`. Servers are a built-in table in
 `Lsp.servers` (no config yet, see below); each starts when the first file of
 its language opens in a project.
+A server's error output goes to `$XDG_CACHE_HOME/zile/lsp/<name>.log`
+(replaced at each start). One that exits is started again on the next tick
+(its files reopened), up to 3 times; each notification says why, from the
+log's last line.
 Completion trigger characters come from each server's `initialize` reply;
 completion matching uses `filterText` (clangd labels carry a bullet or
 signature).
@@ -584,7 +639,10 @@ diagnostics of both are shown (the added lines' dropped), and our own "unclosed
 
 Grammars: tree-sitter html, css, javascript (also `.jsx`), typescript and tsx
 (`build.zig` rows may name a source folder and several highlight files; TS's
-queries add to JavaScript's). Formatting is prettier's (`prettierd`, else
+queries add to JavaScript's). zile's own `queries/jsx.scm` and
+`queries/html.scm` come last: element and component names (`div`, `View`),
+props / attributes and `<` `>` `</` `/>` get the `tag`, `tag_attribute` and
+`tag_delimiter` styles (night-owl: teal, green, teal). Formatting is prettier's (`prettierd`, else
 `prettier --stdin-filepath`), even where the server could format. Files with no
 indentation yet indent by two.
 
@@ -767,6 +825,16 @@ itself when a window opens.
    split layout, so it can move earlier.
 7. Completion, code actions, rename, formatting, splits, rope, help docs,
    config.
+
+## Building
+
+`zig build` installs a debug zile to `zig-out/bin/zile` (for development:
+safety checks, slow to start: ~0.65 s to the first frame of a 12k-line file).
+`zig build release` installs an optimized one to `zig-out/release/zile` for
+everyday use (on its own screen in 1 ms, first frame ~80 ms). In terminal
+mode zile switches to the alternate screen before loading anything, so a
+launcher that leaves its own screen first (yazi) doesn't show the old
+terminal contents meanwhile.
 
 ## Debugging
 

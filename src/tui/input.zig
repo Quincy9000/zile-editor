@@ -282,3 +282,9 @@ test "paste and mouse" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "Alt+Shift letters match the keymap's <A-N>" {
+    try expectKey("\x1bN", "<A-N>");
+    try expectKey("\x1bn", "<A-n>");
+    try expectKey("\x1bF", "<A-F>");
+}

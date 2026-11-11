@@ -68,6 +68,10 @@
             .url = "git+https://github.com/DerekStride/tree-sitter-sql#2d088525f3f986108d969dab526a0d7129281e24",
             .hash = "N-V-__8AADJ73QIi8mD0nhfvKYsOzwWloCCr9srwM90_wqZ2",
         },
+        .ts_lua = .{
+            .url = "git+https://github.com/tree-sitter-grammars/tree-sitter-lua?ref=v0.2.0#10fe0054734eec83049514ea2e718b2a56acd0c9",
+            .hash = "N-V-__8AAE5ZCQA-BW5BOioWVkGcPTjhC5x1Qv07BH3Xt3dR",
+        },
     },
     .paths = .{
         "build.zig",

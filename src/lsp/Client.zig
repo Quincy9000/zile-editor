@@ -28,9 +28,17 @@ next_id: i64 = 1,
 ready: bool = false,
 held: std.ArrayList([]u8) = .empty,
 
-pub fn start(gpa: Allocator, io: Io, argv: []const []const u8, wake: *const fn () void) !*Client {
+/// Starts the server; its error output goes to the file `log` (replaced),
+/// if given, so a crash can be looked into.
+pub fn start(gpa: Allocator, io: Io, argv: []const []const u8, wake: *const fn () void, log: ?[]const u8) !*Client {
     const c = try gpa.create(Client);
     errdefer gpa.destroy(c);
+    const log_file: ?Io.File = if (log) |path| blk: {
+        if (std.fs.path.dirname(path)) |d| Io.Dir.cwd().createDirPath(io, d) catch {};
+        break :blk Io.Dir.cwd().createFile(io, path, .{}) catch null;
+    } else null;
+    // The child has its own copy.
+    defer if (log_file) |f| f.close(io);
     c.* = .{
         .gpa = gpa,
         .io = io,
@@ -40,7 +48,7 @@ pub fn start(gpa: Allocator, io: Io, argv: []const []const u8, wake: *const fn (
             .argv = argv,
             .stdin = .pipe,
             .stdout = .pipe,
-            .stderr = .ignore,
+            .stderr = if (log_file) |f| .{ .file = f } else .ignore,
         }),
     };
     errdefer c.child.kill(io);

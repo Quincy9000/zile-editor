@@ -358,6 +358,50 @@ fn linkAt(ed: *Editor, pos: usize) ?Link {
             return l;
         }
     }
+    if (kind == .jsx) return emptyLink(root, pos, ed.buffer);
+    return emptyHtmlLink(t, pos, ed.buffer);
+}
+
+/// HTML has no empty tags to parse: `<>` (a name deleted) pairs with the
+/// nearest `</>` after it, and the other way round.
+fn emptyHtmlLink(t: *const Text, pos: usize, buffer: *const anyopaque) ?Link {
+    const src = t.slice(0, t.len());
+    if (pos >= 1 and pos < src.len and src[pos - 1] == '<' and src[pos] == '>' and !(pos >= 2 and src[pos - 2] == '/')) {
+        const close = std.mem.indexOfPos(u8, src, pos, "</>") orelse return null;
+        return .{ .buffer = buffer, .a_start = pos, .a_end = pos, .b_start = close + 2, .b_end = close + 2 };
+    }
+    if (pos >= 2 and pos < src.len and src[pos - 2] == '<' and src[pos - 1] == '/' and src[pos] == '>') {
+        const open = std.mem.lastIndexOf(u8, src[0 .. pos - 2], "<>") orelse return null;
+        return .{ .buffer = buffer, .a_start = pos, .a_end = pos, .b_start = open + 1, .b_end = open + 1 };
+    }
+    return null;
+}
+
+/// A JSX tag with no name yet (`<>`, or one whose name was deleted), the
+/// cursor right after its `<` / `</`, and a partner also without one: the
+/// names to come are linked, empty for now, so typing fills in both.
+fn emptyLink(root: ts.TSNode, pos: usize, buffer: *const anyopaque) ?Link {
+    for ([_]usize{ pos, pos -| 1 }) |p| {
+        var node = ts.ts_node_descendant_for_byte_range(root, @intCast(p), @intCast(p));
+        var up: usize = 0;
+        while (!ts.ts_node_is_null(node) and up < 3) : ({
+            node = ts.ts_node_parent(node);
+            up += 1;
+        }) {
+            const opening = typeIs(node, "jsx_opening_element");
+            if (!opening and !typeIs(node, "jsx_closing_element")) continue;
+            if (!ts.ts_node_is_null(field(node, "name"))) return null;
+            // Right after `<` (opening) or `</` (closing).
+            const name_at = ts.ts_node_start_byte(node) + @as(u32, if (opening) 1 else 2);
+            if (pos != name_at) return null;
+            const elem = ts.ts_node_parent(node);
+            if (!typeIs(elem, "jsx_element")) return null;
+            const other = field(elem, if (opening) "close_tag" else "open_tag");
+            if (ts.ts_node_is_null(other) or !ts.ts_node_is_null(field(other, "name"))) return null;
+            const b = ts.ts_node_start_byte(other) + @as(u32, if (opening) 2 else 1);
+            return .{ .buffer = buffer, .a_start = pos, .a_end = pos, .b_start = b, .b_end = b };
+        }
+    }
     return null;
 }
 

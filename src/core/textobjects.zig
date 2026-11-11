@@ -264,6 +264,116 @@ fn isBlank(t: *const Text, from: usize, to: usize) bool {
     return true;
 }
 
+const braces = [_][2]u8{.{ '{', '}' }};
+
+/// is / as: a `{ }` block with its header, as whole lines: from the line the
+/// statement starts on (`fn foo(...) {`, a signature over several lines,
+/// the `if` of an `} else {` chain) to the line of its closing `}`, the rest
+/// of an `} else {` / `} catch {` chain included. On a line that opens a
+/// block it's that block; otherwise the innermost one around the cursor
+/// (`count` levels out). `as` adds the comments and attributes just above
+/// and the blank lines after (or before, at the end of the text).
+pub fn statement(t: *const Text, pos: usize, scope: Scope, count: usize) ?Range {
+    if (t.len() == 0) return null;
+    const anchor = lineOpener(t, t.lineOf(pos)) orelse @min(pos, t.len() - 1);
+    const open = enclosingOpen(t, anchor, &braces, @max(count, 1)) orelse return null;
+    var close = matchForward(t, open, braces[0]) orelse return null;
+
+    // Back to where the header starts: a closer before the `{` on its line
+    // (`) void {` of a long signature, `} else {`) belongs to an earlier line.
+    var first = t.lineOf(open);
+    var at = open;
+    while (unmatchedCloser(t, t.lineStart(first), at)) |c| {
+        const pair = any_brackets[pairIndex(&any_brackets, t.byteAt(c), 1).?];
+        at = matchBackward(t, c, pair) orelse break;
+        first = t.lineOf(at);
+    }
+    // On through `} else {` and the like.
+    var last = t.lineOf(close);
+    while (lastUnmatchedOpen(t, close + 1, t.lineEnd(last))) |o| {
+        close = matchForward(t, o, braces[0]) orelse break;
+        last = t.lineOf(close);
+    }
+
+    if (scope == .around) {
+        while (first > 0 and isPreamble(t, first - 1)) first -= 1;
+        const n = t.lineCount();
+        if (last + 1 < n and t.lineLen(last + 1) == 0) {
+            while (last + 1 < n and t.lineLen(last + 1) == 0) last += 1;
+        } else {
+            while (first > 0 and t.lineLen(first - 1) == 0) first -= 1;
+        }
+    }
+    return .{ .start = t.lineStart(first), .end = t.lineEnd(last), .linewise = true };
+}
+
+/// The `{` a line opens (its last unclosed one); for a line that opens a
+/// `(` it doesn't close (`pub fn foo(`), the `{` after the matching `)`.
+fn lineOpener(t: *const Text, line: usize) ?usize {
+    const ls = t.lineStart(line);
+    const le = t.lineEnd(line);
+    if (lastUnmatchedOpen(t, ls, le)) |o| return o;
+    var depth: usize = 0;
+    var paren: ?usize = null;
+    for (ls..le) |i| switch (t.byteAt(i)) {
+        '(' => {
+            if (depth == 0) paren = i;
+            depth += 1;
+        },
+        ')' => {
+            depth -|= 1;
+            if (depth == 0) paren = null;
+        },
+        else => {},
+    };
+    if (paren) |p| {
+        const m = matchForward(t, p, .{ '(', ')' }) orelse return null;
+        return lastUnmatchedOpen(t, m + 1, t.lineEnd(t.lineOf(m)));
+    }
+    // A block opened and closed on the line (`while (x) {}`): that one.
+    for (ls..le) |i| if (t.byteAt(i) == '{') return i;
+    return null;
+}
+
+/// The last `{` in `[from, to)` not closed before `to`.
+fn lastUnmatchedOpen(t: *const Text, from: usize, to: usize) ?usize {
+    var depth: usize = 0;
+    var i = to;
+    while (i > from) {
+        i -= 1;
+        switch (t.byteAt(i)) {
+            '}' => depth += 1,
+            '{' => if (depth == 0) return i else {
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The first `)`, `]` or `}` in `[from, to)` whose opener is before `from`.
+fn unmatchedCloser(t: *const Text, from: usize, to: usize) ?usize {
+    var depth: [any_brackets.len]usize = @splat(0);
+    for (from..to) |i| {
+        const b = t.byteAt(i);
+        if (pairIndex(&any_brackets, b, 0)) |pi| depth[pi] += 1 else if (pairIndex(&any_brackets, b, 1)) |pi| {
+            if (depth[pi] == 0) return i;
+            depth[pi] -= 1;
+        }
+    }
+    return null;
+}
+
+/// A doc comment or attribute line that belongs to the statement below.
+fn isPreamble(t: *const Text, line: usize) bool {
+    const s = t.slice(motions.firstNonBlank(t, line), t.lineEnd(line));
+    for ([_][]const u8{ "//", "/*", "*", "#[", "#!", "@", "# ", "--" }) |p| {
+        if (std.mem.startsWith(u8, s, p)) return true;
+    }
+    return std.mem.eql(u8, s, "#");
+}
+
 /// ip / ap: the run of blank or non-blank lines around the cursor (linewise).
 /// `ap` adds the blank lines after it (or before it, at the end of the text).
 pub fn paragraph(t: *const Text, pos: usize, scope: Scope) ?Range {
@@ -649,4 +759,65 @@ test "arguments: any brackets, nested lists and strings, first / middle / last" 
     try expectArgument("f(\n    one,\n    two,\n)", "one", .around, "    one,");
     try expectArgument("f(\n    one,\n    two\n)", "two", .around, ",\n    two");
     try expectArgument("f(\n    one,\n    two,\n)", "one", .inner, "one");
+}
+
+test "statement: a block with its header, as whole lines" {
+    const src =
+        \\const std = @import("std");
+        \\
+        \\/// Doc.
+        \\pub fn foo(
+        \\    a: u8,
+        \\) void {
+        \\    if (a > 1) {
+        \\        bar();
+        \\    } else if (a == 0) {
+        \\        baz();
+        \\    } else {
+        \\        qux();
+        \\    }
+        \\    while (true) {}
+        \\}
+        \\
+        \\fn tail() void {}
+    ;
+    var t = try Text.init(testing.allocator, src);
+    defer t.deinit(testing.allocator);
+    const at = struct {
+        fn f(tt: *const Text, needle: []const u8) usize {
+            return std.mem.indexOf(u8, tt.slice(0, tt.len()), needle).?;
+        }
+    }.f;
+    const chain =
+        \\    if (a > 1) {
+        \\        bar();
+        \\    } else if (a == 0) {
+        \\        baz();
+        \\    } else {
+        \\        qux();
+        \\    }
+    ;
+    // On the header line, from anywhere on it: that block (not the parent).
+    try testing.expectEqualStrings(chain, sliceOf(&t, statement(&t, at(&t, "if (a > 1)"), .inner, 1)));
+    try testing.expectEqualStrings(chain, sliceOf(&t, statement(&t, at(&t, "if (a > 1)") - 4, .inner, 1)));
+    // Inside an else branch, on its `} else {` line, on the closing line: the whole chain.
+    try testing.expectEqualStrings(chain, sliceOf(&t, statement(&t, at(&t, "baz"), .inner, 1)));
+    try testing.expectEqualStrings(chain, sliceOf(&t, statement(&t, at(&t, "} else {"), .inner, 1)));
+    try testing.expectEqualStrings(chain, sliceOf(&t, statement(&t, at(&t, "qux();\n    }") + 11, .inner, 1)));
+    // The function, from its first line, its `) void {` line or `count` out.
+    const func = t.slice(at(&t, "pub fn"), at(&t, "\n\nfn tail"));
+    try testing.expectEqualStrings(func, sliceOf(&t, statement(&t, at(&t, "pub fn"), .inner, 1)));
+    try testing.expectEqualStrings(func, sliceOf(&t, statement(&t, at(&t, ") void {"), .inner, 1)));
+    try testing.expectEqualStrings(func, sliceOf(&t, statement(&t, at(&t, "bar"), .inner, 2)));
+    try testing.expectEqualStrings(func, sliceOf(&t, statement(&t, at(&t, "while"), .inner, 2)));
+    // A one-line block is its line.
+    try testing.expectEqualStrings("    while (true) {}", sliceOf(&t, statement(&t, at(&t, "while"), .inner, 1)));
+    // `as`: with the doc comment and the blank line after.
+    const r = statement(&t, at(&t, "pub fn"), .around, 1).?;
+    try testing.expectEqualStrings(t.slice(at(&t, "/// Doc."), at(&t, "fn tail") - 1), t.slice(r.start, r.end));
+    try testing.expect(r.linewise);
+    // At the end of the text: the blank lines before instead.
+    try testing.expectEqualStrings("\nfn tail() void {}", sliceOf(&t, statement(&t, at(&t, "tail"), .around, 1)));
+    // Outside every block.
+    try testing.expect(statement(&t, at(&t, "@import"), .inner, 1) == null);
 }

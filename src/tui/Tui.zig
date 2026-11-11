@@ -295,6 +295,21 @@ fn frame(gpa: Allocator, out: *std.ArrayList(u8), g: *const Grid, prev: []const 
     try out.appendSlice(gpa, "\x1b[?2026l");
 }
 
+/// Switches to the alternate screen at once, before the editor loads
+/// anything: opened from a program that leaves its own screen to start us
+/// (yazi), the terminal's old contents would otherwise show meanwhile.
+/// `run` keeps it (asking again is harmless); `leaveEarly` undoes it if we
+/// never get there.
+pub fn enterEarly() bool {
+    if (std.c.isatty(stdin) != 1 or std.c.isatty(stdout) != 1) return false;
+    writeAll("\x1b[?1049h\x1b[?25l\x1b[2J");
+    return true;
+}
+
+pub fn leaveEarly() void {
+    writeAll("\x1b[?25h\x1b[?1049l");
+}
+
 fn writeAll(bytes: []const u8) void {
     var rest = bytes;
     while (rest.len > 0) {

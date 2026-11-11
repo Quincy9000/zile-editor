@@ -26,18 +26,19 @@ const grammars = [_]struct {
     .{
         .name = "bash",
         .dep = "ts_bash",
-        .extensions = &.{ "sh", "bash", "zsh", "bashrc", "bash_profile", "bash_logout", "profile", "zshrc", "zprofile", "zshenv", "zlogin", "xinitrc", "xprofile", "envrc", "PKGBUILD", "install" },
+        .extensions = &.{ "sh", "bash", "zsh", "bashrc", "bash_profile", "bash_logout", "profile", "zshrc", "zprofile", "zshenv", "zlogin", "xinitrc", "xprofile", "envrc", "PKGBUILD", "install", "env" },
         .scanner = true,
     },
+    .{ .name = "lua", .dep = "ts_lua", .extensions = &.{ "lua", "rockspec", "luacheckrc" }, .scanner = true },
     .{ .name = "sql", .dep = "ts_sql", .extensions = &.{ "sql", "psql", "pgsql" }, .scanner = true },
-    .{ .name = "html", .dep = "ts_html", .extensions = &.{ "html", "htm" }, .scanner = true },
+    .{ .name = "html", .dep = "ts_html", .extensions = &.{ "html", "htm" }, .scanner = true, .highlights = &.{ .{}, .{ .path = "queries/html.scm", .own = true } } },
     .{ .name = "css", .dep = "ts_css", .extensions = &.{"css"}, .scanner = true },
     .{
         .name = "javascript",
         .dep = "ts_javascript",
         .extensions = &.{ "js", "mjs", "cjs", "jsx" },
         .scanner = true,
-        .highlights = &.{ .{}, .{ .path = "queries/highlights-jsx.scm" } },
+        .highlights = &.{ .{}, .{ .path = "queries/highlights-jsx.scm" }, .{ .path = "queries/jsx.scm", .own = true } },
     },
     .{
         .name = "typescript",
@@ -53,47 +54,30 @@ const grammars = [_]struct {
         .extensions = &.{"tsx"},
         .scanner = true,
         .src = "tsx/src",
-        .highlights = &.{ .{ .dep = "ts_javascript" }, .{ .dep = "ts_javascript", .path = "queries/highlights-jsx.scm" }, .{} },
+        .highlights = &.{ .{ .dep = "ts_javascript" }, .{ .dep = "ts_javascript", .path = "queries/highlights-jsx.scm" }, .{}, .{ .path = "queries/jsx.scm", .own = true } },
     },
 };
 
 /// A query file: in the grammar's own repo unless `dep` says another.
-const Query = struct { dep: ?[]const u8 = null, path: []const u8 = "queries/highlights.scm" };
+/// A highlight query: a file in a grammar's repo (this grammar's, or `dep`'s),
+/// or, with `own`, one of zile's (`queries/` here).
+const Query = struct { dep: ?[]const u8 = null, path: []const u8 = "queries/highlights.scm", own: bool = false };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // raylib is built from source (with its bundled GLFW, statically linked) rather
-    // than using the system shared library: we need direct access to GLFW symbols
-    // for ordered key/char input and for waking the event loop from other threads.
-    const raylib_dep = b.dependency("raylib", .{
-        .target = target,
-        .optimize = optimize,
-        .raudio = false,
-        .rmodels = false,
-        // Image clipboard is the one raylib feature calling X11 directly;
-        // without it nothing needs libX11 at startup (GLFW loads X11 and GL
-        // itself when a window opens), so the same binary starts on a
-        // server and draws in the terminal instead.
-        .config = @as([]const u8, "-DSUPPORT_CLIPBOARD_IMAGE=0"),
-    });
-
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    exe_mod.addImport("raylib", raylib_dep.module("raylib"));
-    addSyntax(b, exe_mod, target, optimize);
-    addTerminal(b, exe_mod, target, optimize);
-
-    const exe = b.addExecutable(.{
-        .name = "zile",
-        .root_module = exe_mod,
-    });
+    const exe = zileExe(b, target, optimize);
     b.installArtifact(exe);
+
+    // `zig build release`: an optimized zile in zig-out/release/zile, apart
+    // from the debug one `zig build` installs, for everyday use (it starts
+    // in a millisecond and opens a big file in a fraction of the time).
+    const release = b.addInstallArtifact(zileExe(b, target, .ReleaseFast), .{
+        .dest_dir = .{ .override = .{ .custom = "release" } },
+    });
+    const release_step = b.step("release", "Build an optimized zile into zig-out/release/zile");
+    release_step.dependOn(&release.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -112,11 +96,43 @@ pub fn build(b: *std.Build) void {
     addSyntax(b, test_mod, target, optimize);
     addTerminal(b, test_mod, target, optimize);
     // For the terminal-mode grid's color type (no window code runs in tests).
-    test_mod.addImport("raylib", raylib_dep.module("raylib"));
+    test_mod.addImport("raylib", raylibDep(b, target, optimize).module("raylib"));
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+}
+
+/// raylib, built from source (with its bundled GLFW, statically linked)
+/// rather than the system shared library: we need direct access to GLFW
+/// symbols for ordered key/char input and for waking the event loop from
+/// other threads.
+fn raylibDep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
+    return b.dependency("raylib", .{
+        .target = target,
+        .optimize = optimize,
+        .raudio = false,
+        .rmodels = false,
+        // Image clipboard is the one raylib feature calling X11 directly;
+        // without it nothing needs libX11 at startup (GLFW loads X11 and GL
+        // itself when a window opens), so the same binary starts on a
+        // server and draws in the terminal instead.
+        .config = @as([]const u8, "-DSUPPORT_CLIPBOARD_IMAGE=0"),
+    });
+}
+
+/// The editor executable, built with `optimize`.
+fn zileExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    exe_mod.addImport("raylib", raylibDep(b, target, optimize).module("raylib"));
+    addSyntax(b, exe_mod, target, optimize);
+    addTerminal(b, exe_mod, target, optimize);
+    return b.addExecutable(.{ .name = "zile", .root_module = exe_mod });
 }
 
 /// Links libghostty-vt (terminal emulation, C API) and provides it as the
@@ -171,7 +187,7 @@ fn addSyntax(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTa
         for (g.highlights, 0..) |q, k| {
             const from = if (q.dep) |d| b.dependency(d, .{}) else dep;
             const name = b.fmt("{s}-{d}.scm", .{ g.name, k });
-            _ = files.addCopyFile(from.path(q.path), name);
+            _ = files.addCopyFile(if (q.own) b.path(q.path) else from.path(q.path), name);
             table.appendSlice(b.allocator, b.fmt(" ++ @embedFile(\"{s}\") ++ \"\\n\"", .{name})) catch @panic("OOM");
         }
         table.appendSlice(b.allocator, " },\n") catch @panic("OOM");

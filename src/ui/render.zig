@@ -129,7 +129,6 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     drawCompletion(ed, font, theme, fl);
     gfx.popOffset();
     drawPopup(ed, font, theme, l);
-    drawWhichKey(ed, font, theme, l);
     gfx.pushOffset(fl.x0, fl.y0);
     drawColorPicker(ed, font, theme, fl);
     gfx.popOffset();
@@ -137,62 +136,12 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     drawToasts(ed, font, theme, l);
     if (ed.picker) |p| picker_view.draw(p, font, theme, l);
     if (ed.search_prompt) |*sp| if (sp.kind.boxed()) {
-        picker_view.drawPromptBox(font, theme, l, sp.kind.title(), sp.input.items());
+        if (sp.kind == .replace) {
+            if (ed.replace) |r| picker_view.drawReplace(r, font, theme, l, sp.input.items());
+        } else picker_view.drawPromptBox(font, theme, l, sp.kind.title(), sp.input.items());
     };
 }
 
-/// The which-key menu: a grid of `key → label` above the status line while a
-/// key sequence is pending. Groups show as "+name".
-fn drawWhichKey(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
-    var buf: [128]keymap.Continuation = undefined;
-    const items = ed.whichKey(&buf);
-    if (items.len == 0) return;
-
-    // Column width from the widest entry: key, " → ", label (+ "+" for groups).
-    var key_w: usize = 1;
-    var label_w: usize = 1;
-    for (items) |it| {
-        key_w = @max(key_w, keyCells(it.key));
-        label_w = @max(label_w, cells(it.label) + @intFromBool(it.kind == .group));
-    }
-    const pad = 2;
-    const col_w = key_w + 3 + label_w + pad;
-    const total_cols: usize = @intFromFloat(l.width / font.cell_w);
-    const columns = @max((total_cols -| pad) / col_w, 1);
-    const rows = (items.len + columns - 1) / columns;
-
-    // Padding above and below: half a row in a window; a whole row in a
-    // terminal, which has no half rows (it would all end up on one side).
-    const vpad = if (font.grid_mode) font.cell_h else font.cell_h / 2;
-    const h = @as(f32, @floatFromInt(rows)) * font.cell_h + 2 * vpad;
-    const y0 = l.status_y - h;
-    rect(0, y0, l.width, h, theme.popup_bg);
-    rect(0, y0, l.width, 1, theme.popup_border);
-
-    for (items, 0..) |it, i| {
-        // Fill down columns first, like which-key.
-        const col = i / rows;
-        const row = i % rows;
-        var x = @as(f32, @floatFromInt(pad + col * col_w)) * font.cell_w;
-        const y = y0 + vpad + @as(f32, @floatFromInt(row)) * font.cell_h;
-
-        var key_buf: [32]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&key_buf);
-        keys.formatDisplay(it.key, &w) catch {};
-        const key_text = w.buffered();
-        // Right-align keys so the arrows line up.
-        x += @as(f32, @floatFromInt(key_w - cells(key_text))) * font.cell_w;
-        x = font.drawText(key_text, x, y, theme.whichkey_key);
-        x = font.drawText(" → ", x, y, theme.popup_border);
-        switch (it.kind) {
-            .group => {
-                x = font.drawText("+", x, y, theme.whichkey_group);
-                _ = font.drawText(it.label, x, y, theme.whichkey_group);
-            },
-            .command => _ = font.drawText(it.label, x, y, theme.whichkey_command),
-        }
-    }
-}
 
 pub fn cells(s: []const u8) usize {
     return std.unicode.utf8CountCodepoints(s) catch s.len;
@@ -324,8 +273,11 @@ fn drawTerminalScreen(t: *Editor.Terminal, font: *const Font, theme: *const Them
         font: *const Font,
         x0: f32,
         y0: f32,
+        /// The character under the cursor, to draw on its block.
+        under: *?u21,
         pub fn cell(self: @This(), cl: Editor.Terminal.Cell) void {
             const f = self.font;
+            if (cl.cursor and cl.text.len > 0) self.under.* = std.math.cast(u21, cl.text[0]);
             const x = self.x0 + @as(f32, @floatFromInt(cl.x)) * f.cell_w;
             const y = self.y0 + @as(f32, @floatFromInt(cl.y)) * f.cell_h;
             const w = @as(f32, @floatFromInt(cl.width)) * f.cell_w;
@@ -336,7 +288,8 @@ fn drawTerminalScreen(t: *Editor.Terminal, font: *const Font, theme: *const Them
             if (cl.underline) rect(x, y + f.cell_h - 2, w, 1, fg);
         }
     };
-    const cur = t.draw(Ctx{ .font = font, .x0 = x0, .y0 = y0 }) orelse return;
+    var under: ?u21 = null;
+    const cur = t.draw(Ctx{ .font = font, .x0 = x0, .y0 = y0, .under = &under }) orelse return;
     const x = x0 + @as(f32, @floatFromInt(cur.x)) * cw;
     const y = y0 + @as(f32, @floatFromInt(cur.y)) * ch;
     var c = theme.cursor;
@@ -349,12 +302,14 @@ fn drawTerminalScreen(t: *Editor.Terminal, font: *const Font, theme: *const Them
         .underline => .underline,
         .block, .hollow => .block,
     });
+    // In a terminal its own cursor is drawn over the cell (see drawCursorAt).
+    if (gfx.grid != null) return;
     switch (cur.style) {
         .block => {
-            c.a = 150;
             rect(x, y, cw, ch, c);
+            if (under) |cp| if (cp != ' ') font.drawCodepoint(cp, x, y, theme.cursor_text);
         },
-        .bar => if (gfx.grid == null) rect(x, y, 2, ch, c),
+        .bar => rect(x, y, 2, ch, c),
         .underline => rect(x, y + ch - 2, cw, 2, c),
         .hollow => {
             rect(x, y, cw, 1, c);
@@ -737,6 +692,8 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         }
     }
 
+    drawContext(ed, font, theme, l);
+
     // Extra cursors: the same shape, a little dimmer.
     var extra = theme.cursor;
     extra.a = 150;
@@ -995,9 +952,14 @@ fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
         .operator => .underline,
         else => .block,
     });
+    // In a terminal the real cursor is the focused one, drawn over the cell
+    // as it is: painting our block under it too would hand the terminal a
+    // cursor-colored cell, and a terminal whose cursor text is "the cell's
+    // background" (kitty's `cursor_text_color background`) would then draw
+    // the letter in the cursor's own color.
+    if (gfx.grid != null and color.a == 255) return;
     switch (ed.mode) {
-        // In a terminal the real (bar) cursor is the focused one.
-        .insert => if (gfx.grid == null or color.a != 255) rect(x, y, 2, font.cell_h, color),
+        .insert => rect(x, y, 2, font.cell_h, color),
         // Half block: an operator is waiting for its motion.
         .operator => rect(x, y + font.cell_h / 2, font.cell_w, font.cell_h / 2, color),
         .normal, .picker, .picker_normal, .visual, .search => {
@@ -1034,6 +996,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
             .snipe => .{ " SNIPE ", theme.mode_visual },
             .select_in => .{ " SELECT ", theme.mode_visual },
             .rename => .{ " RENAME ", theme.mode_insert },
+            .replace => .{ " REPLACE ", theme.mode_insert },
             .git_commit, .git_remote => .{ " GIT ", theme.mode_insert },
             .new_file, .save_as, .rename_file, .copy_file => .{ " FILE ", theme.mode_insert },
             .run_command => .{ " RUN ", theme.mode_insert },
@@ -1422,4 +1385,99 @@ fn drawGitSign(ed: *Editor, theme: *const Theme, line: usize, y: f32, h: f32) vo
             return;
         }
     }
+}
+
+test "terminal mode: the focused cursor's cell keeps its colors" {
+    // The terminal draws its own cursor over the cell; a cursor-colored
+    // cell under it turns `cursor_text_color background` into blue on blue.
+    const Grid = @import("../tui/Grid.zig");
+    const gpa = std.testing.allocator;
+    var ed = try Editor.init(gpa, std.testing.io);
+    defer ed.deinit();
+    try ed.text().insert(gpa, 0, "hello\n");
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 40, 10);
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    const theme = Theme.get(ed.theme_index);
+    const l = prepare(&ed, &font, 40 * Grid.cell_w, 10 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    const cur = grid.cursor orelse return error.NoCursor;
+    const cell = grid.cells[cur.row * grid.cols + cur.col];
+    try std.testing.expectEqual('h', cell.cp);
+    try std.testing.expect(!std.meta.eql(cell.bg, theme.cursor));
+    try std.testing.expect(!std.meta.eql(cell.fg, cell.bg));
+}
+
+test "terminal mode: a popup over the cursor hides the terminal's cursor" {
+    const Grid = @import("../tui/Grid.zig");
+    const gpa = std.testing.allocator;
+    var ed = try Editor.init(gpa, std.testing.io);
+    defer ed.deinit();
+    try ed.text().insert(gpa, 0, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n");
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 60, 12);
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    const theme = Theme.get(ed.theme_index);
+    try ed.feed("9G");
+    var l = prepare(&ed, &font, 60 * Grid.cell_w, 12 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    try std.testing.expect(grid.cursor != null);
+    // SPC: which-key fills the rows above the status line, over line 9.
+    try ed.feed("<Space>");
+    l = prepare(&ed, &font, 60 * Grid.cell_w, 12 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    try std.testing.expect(grid.cursor == null);
+    try ed.feed("<Esc>");
+    l = prepare(&ed, &font, 60 * Grid.cell_w, 12 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    try std.testing.expect(grid.cursor != null);
+}
+
+/// Sticky context: the first lines of the scopes the top of the window is
+/// inside (function, `if`, JSX element...) pinned over its top rows,
+/// highlighted, with a line under them.
+fn drawContext(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
+    var buf: [3]usize = undefined;
+    const lines = ed.contextLines(&buf);
+    if (lines.len == 0) return;
+    const t = ed.text();
+    const syntax = ed.buffer.syntax;
+    for (lines, 0..) |line, i| {
+        const y = @as(f32, @floatFromInt(i)) * font.cell_h;
+        rect(0, y, l.width, font.cell_h, theme.fold_bg);
+        // Its line number in the gutter.
+        var num_buf: [24]u8 = undefined;
+        const num = std.fmt.bufPrint(&num_buf, "{d}", .{line + 1}) catch "";
+        const nx = l.text_x - @as(f32, @floatFromInt(num.len + 1)) * font.cell_w;
+        if (nx >= 0) _ = font.drawText(num, nx, y, theme.gutter_fg);
+        // The line, highlighted on its own (tabs as spaces, from `view.left`).
+        const text = t.lineSlice(line);
+        var styles: std.ArrayList(Syntax.Style) = .empty;
+        defer styles.deinit(ed.gpa);
+        if (syntax) |sx| Syntax.highlightText(ed.gpa, sx.lang, text, &styles) catch {};
+        var it = Font.Utf8Lossy{ .bytes = text };
+        var col: usize = 0;
+        while (true) {
+            const off = it.i;
+            const cp = it.next() orelse break;
+            if (cp == '\t') {
+                col = (col / ed.options.tab_width + 1) * ed.options.tab_width;
+                continue;
+            }
+            defer col += 1;
+            if (col < ed.view.left) continue;
+            const c = col - ed.view.left;
+            if (c >= l.cols) break;
+            const color = if (off < styles.items.len) theme.syntax.get(styles.items[off]) else theme.fg;
+            if (cp != ' ') font.drawCodepoint(cp, l.text_x + @as(f32, @floatFromInt(c)) * font.cell_w, y, color);
+        }
+    }
+    const bottom = @as(f32, @floatFromInt(lines.len)) * font.cell_h;
+    rect(0, bottom - 1, l.width, 1, theme.popup_border);
 }

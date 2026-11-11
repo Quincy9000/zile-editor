@@ -179,8 +179,10 @@ const base = [_]Command{
     .{ .name = "substitute_line", .doc = "Substitute line", .run = opLines(.change), .repeat = true },
 
     // Editing
-    .{ .name = "paste_after", .doc = "Paste after", .run = paste(false), .repeat = true },
-    .{ .name = "paste_before", .doc = "Paste before", .run = paste(true), .repeat = true },
+    .{ .name = "paste_after", .doc = "Paste after", .run = pasteMode(false, false), .repeat = true },
+    .{ .name = "paste_before", .doc = "Paste before", .run = pasteMode(true, false), .repeat = true },
+    .{ .name = "paste_inline_after", .doc = "Paste inline after (a yanked line without its newline)", .run = pasteMode(false, true), .repeat = true },
+    .{ .name = "paste_inline_before", .doc = "Paste inline before (a yanked line without its newline)", .run = pasteMode(true, true), .repeat = true },
     .{ .name = "replace_char", .doc = "Replace character", .run = replaceChar, .repeat = true, .takes_char = true },
     .{ .name = "shift_text_down", .doc = "Move line/selection down", .run = moveCmd(.down) },
     .{ .name = "shift_text_up", .doc = "Move line/selection up", .run = moveCmd(.up) },
@@ -210,6 +212,14 @@ const base = [_]Command{
 
     // Git (in a repository)
     .{ .name = "git_menu", .doc = "Git menu", .run = openPicker(.git_actions) },
+    .{ .name = "pick_windows", .doc = "Windows (split, close, resize, focus)", .run = openPicker(.windows) },
+    .{ .name = "pick_toggles", .doc = "Toggles (every setting, the colour scheme, text size)", .run = openPicker(.toggles) },
+    .{ .name = "jump_toggle", .doc = "Back to the last jump, and again: back here", .run = jumpToggle, .once = true },
+    .{ .name = "leader_menu", .doc = "Leader menu (everything)", .run = openPicker(.leader), .once = true },
+    .{ .name = "projects_menu", .doc = "Projects and sessions", .run = openPicker(.leader_projects) },
+    .{ .name = "claude_menu", .doc = "Claude", .run = openPicker(.leader_claude) },
+    .{ .name = "quit_menu", .doc = "Quit", .run = openPicker(.leader_quit) },
+    .{ .name = "code_menu", .doc = "Code (rename, actions, format, definitions, symbols...)", .run = openPicker(.code_menu) },
     .{ .name = "git_commit", .doc = "Commit all changes", .run = gitAction(.commit) },
     .{ .name = "git_push", .doc = "Push", .run = gitAction(.push) },
     .{ .name = "git_pull", .doc = "Pull", .run = gitAction(.pull) },
@@ -275,7 +285,7 @@ const base = [_]Command{
     .{ .name = "delete_file", .doc = "Delete file from disk", .run = fileCmd(.delete) },
     .{ .name = "yank_file_path", .doc = "Copy file path", .run = fileCmd(.yank_path) },
     .{ .name = "yank_absolute_path", .doc = "Copy absolute file path", .run = fileCmd(.yank_absolute_path) },
-    .{ .name = "find_file", .doc = "Find file", .run = openPicker(.files) },
+    .{ .name = "find_file", .doc = "Files (the project's folder; type to search below it)", .run = findFile },
     .{ .name = "switch_buffer", .doc = "Switch buffer", .run = openPicker(.buffers) },
     .{ .name = "kill_buffer", .doc = "Kill buffer", .run = killBuffer },
     .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) , .jump = true },
@@ -363,6 +373,17 @@ const base = [_]Command{
     .{ .name = "toggle_indent_scope", .doc = "Indent scope guide", .run = toggle("indent_scope", "indent scope guide") },
     .{ .name = "toggle_wrap", .doc = "Line wrap", .run = toggle("wrap", "line wrap") },
     .{ .name = "toggle_code_lens", .doc = "Code lens", .run = toggle("code_lens", "code lens") },
+    .{ .name = "toggle_home_filter", .doc = "Home search skips .git, node_modules, caches, build output", .run = toggle("home_filter", "home search filter") },
+    .{ .name = "toggle_sticky_context", .doc = "Sticky context (the scope headers above the window)", .run = toggle("sticky_context", "sticky context") },
+    .{ .name = "grow_selection", .doc = "Select the next node up the syntax tree", .run = structureCmd(.grow), .once = true },
+    .{ .name = "shrink_selection", .doc = "Back to the selection before growing it", .run = structureCmd(.shrink), .once = true },
+    .{ .name = "next_sibling", .doc = "To the next sibling node (argument, statement, field...)", .run = structureCmd(.next) },
+    .{ .name = "previous_sibling", .doc = "To the previous sibling node", .run = structureCmd(.previous) },
+    .{ .name = "swap_next", .doc = "Swap the node with the next sibling (carry it right)", .run = structureCmd(.swap_next), .repeat = true },
+    .{ .name = "swap_previous", .doc = "Swap the node with the previous sibling (carry it left)", .run = structureCmd(.swap_previous), .repeat = true },
+    .{ .name = "next_function", .doc = "To the next function", .run = structureCmd(.function_next), .jump = true },
+    .{ .name = "previous_function", .doc = "To the previous function", .run = structureCmd(.function_previous), .jump = true },
+    .{ .name = "cycle_case", .doc = "Next case: snake_case, camelCase, PascalCase, SCREAMING_CASE, kebab-case", .run = structureCmd(.case), .repeat = true },
     .{ .name = "toggle_trailing_space", .doc = "Trailing whitespace", .run = toggle("trailing_space", "trailing whitespace highlight") },
     .{ .name = "toggle_trim_on_save", .doc = "Trim whitespace on save", .run = toggle("trim_on_save", "trim trailing whitespace on save") },
     .{ .name = "toggle_icons", .doc = "File icons", .run = toggle("icons", "file icons") },
@@ -394,6 +415,11 @@ const base = [_]Command{
     .{ .name = "picker_page_down", .doc = "Page down", .run = pickerMove(10, .clamp), .hidden = true },
     .{ .name = "picker_page_up", .doc = "Page up", .run = pickerMove(-10, .clamp), .hidden = true },
     .{ .name = "picker_to_quickfix", .doc = "Send results to quickfix", .run = qfCmd(.from_picker), .hidden = true },
+    .{ .name = "picker_scope", .doc = "Picker: the next scope (project, open, file...)", .run = pickerScope, .once = true, .hidden = true },
+    .{ .name = "picker_replace", .doc = "Grep picker: replace the matches across the project", .run = replaceCmd(.start), .once = true, .hidden = true },
+    .{ .name = "replace_next", .doc = "Replace: next line", .run = replaceCmd(.next), .once = true, .hidden = true },
+    .{ .name = "replace_previous", .doc = "Replace: previous line", .run = replaceCmd(.previous), .once = true, .hidden = true },
+    .{ .name = "replace_skip_file", .doc = "Replace: skip (or take back) the whole file", .run = replaceCmd(.skip_file), .once = true, .hidden = true },
     .{ .name = "picker_accept", .doc = "Open the selection", .run = pickerAccept, .hidden = true },
     .{ .name = "picker_open_menu", .doc = "Open in... (split)", .run = pickerOpen(null), .hidden = true },
     .{ .name = "picker_open_right", .doc = "Open in a split to the right", .run = pickerOpen(.right), .hidden = true },
@@ -420,6 +446,10 @@ const base = [_]Command{
     .{ .name = "input_delete_char", .doc = "Delete a character", .run = inputEdit(.char), .hidden = true },
     .{ .name = "input_delete_word", .doc = "Delete a word", .run = inputEdit(.word), .hidden = true },
     .{ .name = "input_clear", .doc = "Clear the input", .run = inputEdit(.all), .hidden = true },
+    .{ .name = "input_left", .doc = "Cursor left in the query", .run = inputMove(.left), .hidden = true },
+    .{ .name = "input_right", .doc = "Cursor right in the query", .run = inputMove(.right), .hidden = true },
+    .{ .name = "input_home", .doc = "Query start", .run = inputMove(.home), .hidden = true },
+    .{ .name = "input_end", .doc = "Query end", .run = inputMove(.end), .hidden = true },
 };
 
 // ---------------------------------------------------------------------------
@@ -439,6 +469,8 @@ pub const ObjectKind = union(enum) {
     syntax: syntax_objects.Object,
     /// The cursor's indent scope (`ai`: with its border lines).
     indent,
+    /// A `{ }` block with its header line(s), as whole lines.
+    statement,
     /// One item of a bracketed, comma-separated list (by the text alone).
     argument,
 };
@@ -470,6 +502,7 @@ pub const text_object_specs = [_]ObjectSpec{
     .{ .name = "paragraph", .doc = "paragraph", .keys = "p", .kind = .paragraph },
     .{ .name = "line", .doc = "line", .keys = "l", .kind = .line, .labels = .{ "in line", "all lines" }, .seek = false },
     .{ .name = "indent", .doc = "indent scope", .keys = "i", .kind = .indent, .seek = false },
+    .{ .name = "statement", .doc = "statement (header + block)", .keys = "s", .kind = .statement },
     .{ .name = "tag", .doc = "<tag> block", .keys = "t", .kind = .tag },
     .{ .name = "function", .doc = "function", .keys = "f", .kind = .{ .syntax = .function } },
     .{ .name = "class", .doc = "class/struct", .keys = "c", .kind = .{ .syntax = .class } },
@@ -528,6 +561,7 @@ fn objectAt(ed: *Editor, comptime kind: ObjectKind, scope: textobjects.Scope, po
         .tag => textobjects.tag(t, pos, scope, count),
         .syntax => |obj| if (ed.buffer.syntax) |*s| syntax_objects.find(s, t, pos, obj, scope, count) else null,
         .argument => textobjects.argument(t, pos, scope),
+        .statement => textobjects.statement(t, pos, scope, count),
         .indent => blk: {
             const s = indents.scope(t, t.lineOf(pos), ed.options.tab_width, true) orelse break :blk null;
             if (scope == .inner) break :blk operators.linesRange(t, s.first, s.last);
@@ -544,6 +578,8 @@ fn objectCandidate(comptime kind: ObjectKind, b: u8, forward: bool) bool {
         .any_bracket => std.mem.indexOfScalar(u8, if (forward) "([{" else ")]}", b) != null,
         .quote => |q| b == q,
         .any_quote => b == '"' or b == '\'' or b == '`',
+        // A block starts at its `{` (the header is found from there).
+        .statement => b == @as(u8, if (forward) '{' else '}'),
         // Arguments start after a bracket or comma, and end before one.
         .argument => true,
         else => b != ' ' and b != '\t' and b != '\n',
@@ -759,6 +795,12 @@ const by_name: std.StaticStringMap(*const Command) = .initComptime(blk: {
 });
 
 /// Runtime lookup, e.g. for user keymaps and the command picker.
+/// The index of command `name` in `all`.
+pub fn indexOf(name: []const u8) ?usize {
+    for (&all, 0..) |*c, i| if (std.mem.eql(u8, c.name, name)) return i;
+    return null;
+}
+
 pub fn find(name: []const u8) ?*const Command {
     return by_name.get(name);
 }
@@ -1258,6 +1300,8 @@ fn operator(comptime op: Operator) Handler {
                     const r = ed.visualRange();
                     ed.exitVisual();
                     try operators.apply(ed, op, r, c.register);
+                    // A yank leaves the cursor where it was before `v`.
+                    if (op == .yank) ed.setCursor(@min(ed.visual_origin, ed.text().len()));
                 },
                 .normal => ed.beginOperator(op, c),
                 else => {},
@@ -1462,23 +1506,84 @@ fn gitCmd(comptime action: enum { restore, next, previous, reload }) Handler {
 // ---------------------------------------------------------------------------
 // Editing
 
-fn paste(comptime before: bool) Handler {
+/// `p` / `P`; `gp` / `gP` (`inline`): as text within the line, so a line
+/// yanked whole goes inside `foo()` instead of below: without its newline
+/// and its first line's indent.
+fn pasteMode(comptime before: bool, comptime inline_: bool) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             const v = ed.registers.get(c.register) orelse return ed.setMessage(.err, "nothing to paste", .{});
             // Copy it: replacing a selection below may overwrite registers.
-            const text = try ed.gpa.dupe(u8, v.text);
+            const text = try ed.gpa.dupe(u8, if (inline_) inlineText(v.text) else v.text);
             defer ed.gpa.free(text);
-            const value: @TypeOf(v) = .{ .text = text, .linewise = v.linewise };
+            if (text.len == 0) return;
+            const value: @TypeOf(v) = .{ .text = text, .linewise = v.linewise and !inline_ };
             if (ed.mode == .visual) {
                 // Replace the selection, keeping the pasted text in the register.
                 const r = ed.visualRange();
                 ed.exitVisual();
                 try operators.apply(ed, .delete, r, '_');
-                return operators.paste(ed, value, c.count, true);
+                return operators.paste(ed, value, c.count, true, true);
             }
-            try operators.paste(ed, value, c.count, before);
+            try operators.paste(ed, value, c.count, before, !before);
+        }
+    }.run;
+}
+
+/// Text for an inline paste: no leading indent, no trailing newline.
+fn inlineText(text: []const u8) []const u8 {
+    return std.mem.trimStart(u8, std.mem.trimEnd(u8, text, "\r\n"), " \t");
+}
+
+fn structureCmd(comptime action: enum { grow, shrink, next, previous, swap_next, swap_previous, function_next, function_previous, case }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            for (0..@max(c.count, 1)) |_| switch (action) {
+                .grow => try ed.growSelection(),
+                .shrink => ed.shrinkSelection(),
+                .next => ed.siblingNode(true),
+                .previous => ed.siblingNode(false),
+                .swap_next => try ed.swapNode(true),
+                .swap_previous => try ed.swapNode(false),
+                .function_next => ed.functionJump(true),
+                .function_previous => ed.functionJump(false),
+                .case => try ed.cycleCase(),
+            };
+        }
+    }.run;
+}
+
+/// `SPC SPC`: the explorer at the project's root; typing searches every
+/// file below it as well as its own entries.
+fn findFile(c: Context) !void {
+    const root = try c.ed.gpa.dupe(u8, c.ed.projectRoot());
+    defer c.ed.gpa.free(root);
+    try c.ed.setBrowseDir(root);
+    try openPicker(.browse)(c);
+}
+
+fn jumpToggle(c: Context) !void {
+    try c.ed.jumpToggle();
+}
+
+fn pickerScope(c: Context) !void {
+    try c.ed.pickerNextScope();
+}
+
+fn replaceCmd(comptime action: enum { start, next, previous, skip_file }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            if (action == .start) return ed.startReplace();
+            const r = ed.replace orelse return;
+            switch (action) {
+                .start => unreachable,
+                .next => r.move(1),
+                .previous => r.move(-1),
+                .skip_file => r.toggleFile(),
+            }
         }
     }.run;
 }
@@ -2164,7 +2269,9 @@ fn openPicker(comptime kind: Picker.Kind) Handler {
             // From a selection (within one line): it is the query.
             var buf: [200]u8 = undefined;
             var query: []const u8 = "";
-            if (ed.mode == .visual) {
+            // A menu keeps the selection for the row it runs.
+            const menu = @import("picker/sources.zig").rowKeys(kind).len > 0;
+            if (ed.mode == .visual and !menu) {
                 const r = ed.visualRange();
                 const text = std.mem.trim(u8, ed.text().slice(r.start, r.end), " \t");
                 if (!r.linewise and text.len > 0 and text.len < buf.len and std.mem.indexOfScalar(u8, text, '\n') == null) {
@@ -2209,8 +2316,12 @@ fn cycleBuffer(comptime delta: isize) Handler {
 fn pickerMode(comptime m: enum { normal, insert }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            if (c.ed.picker == null) return;
+            const p = c.ed.picker orelse return;
             c.ed.mode = if (m == .normal) .picker_normal else .picker;
+            // Like vim, <Esc> leaves the cursor on the last character typed.
+            if (m == .normal) p.query.cursor = p.query.prev(p.query.cursor);
+            c.ed.query_op = null;
+            c.ed.query_obj = null;
         }
     }.run;
 }
@@ -2293,6 +2404,19 @@ fn browserKey(comptime char: u8) Handler {
                 const empty = p.query.items().len == 0;
                 switch (char) {
                     '/' => {
+                        // What you typed names a folder here (`src`,
+                        // `src/core`): into it.
+                        if (!empty) {
+                            const typed = try ed.browsePath(p.query.items());
+                            defer ed.gpa.free(typed);
+                            if (std.Io.Dir.cwd().openDir(ed.io, typed, .{})) |d| {
+                                var dir = d;
+                                dir.close(ed.io);
+                                const name = try ed.gpa.dupe(u8, p.query.items());
+                                defer ed.gpa.free(name);
+                                return ed.browseInto(name);
+                            } else |_| {}
+                        }
                         p.sync();
                         if (p.itemAt(p.selected)) |item| if (std.mem.endsWith(u8, item.text, "/")) {
                             const name = try ed.gpa.dupe(u8, item.text);
@@ -2309,6 +2433,20 @@ fn browserKey(comptime char: u8) Handler {
             }
             try p.query.insert(ed.gpa, char);
             try ed.inputChanged();
+        }
+    }.run;
+}
+
+fn inputMove(comptime to: enum { left, right, home, end }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const input = c.ed.activeInput() orelse return;
+            input.cursor = switch (to) {
+                .left => input.prev(input.cursor),
+                .right => input.next(input.cursor),
+                .home => 0,
+                .end => input.items().len,
+            };
         }
     }.run;
 }

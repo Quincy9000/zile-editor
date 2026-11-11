@@ -78,6 +78,11 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     const args = try parseArgs(init);
+    // Terminal mode: our own screen first thing, before loading anything.
+    const env0 = init.environ_map;
+    const tui_mode = args.tui or (env0.get("DISPLAY") == null and env0.get("WAYLAND_DISPLAY") == null);
+    const early = tui_mode and init.environ_map.get("ZILE_TEST_KEYS") == null and Tui.enterEarly();
+    errdefer if (early) Tui.leaveEarly();
     // Languages from the config, before any file opens.
     const config_report = config.load(io);
     const test_keys = init.environ_map.get("ZILE_TEST_KEYS");

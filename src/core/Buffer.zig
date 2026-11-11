@@ -145,7 +145,10 @@ fn stripCr(gpa: Allocator, raw: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-pub const Lens = struct { line: u32, text: []u8 };
+/// `stale`: the previous answer's title, kept while the new one is resolved
+/// (so the row doesn't vanish and come back).
+/// `gone`: its line was deleted (not shown; dropped at the next answer).
+pub const Lens = struct { line: u32, text: []u8, stale: bool = false, gone: bool = false };
 
 pub fn clearLenses(b: *Buffer, gpa: Allocator) void {
     for (b.lenses.items) |l| gpa.free(l.text);
@@ -176,6 +179,7 @@ pub fn insert(b: *Buffer, gpa: Allocator, pos: usize, bytes: []const u8) Allocat
     for (b.hints.items) |*h| if (h.pos >= pos) {
         h.pos += bytes.len;
     };
+    b.shiftLensesForInsert(pos, bytes);
     try b.text.insert(gpa, pos, bytes);
     b.edit_version += 1;
 }
@@ -186,8 +190,37 @@ pub fn delete(b: *Buffer, start: usize, end: usize) void {
     for (b.hints.items) |*h| {
         if (h.pos >= end) h.pos -= end - start else if (h.pos > start) h.pos = start;
     }
+    b.shiftLensesForDelete(start, end);
     b.text.delete(start, end);
     b.edit_version += 1;
+}
+
+/// Lenses stay on their lines as lines are added above them (a newline at
+/// the very start of a lens's line moves it down too).
+fn shiftLensesForInsert(b: *Buffer, pos: usize, bytes: []const u8) void {
+    if (b.lenses.items.len == 0) return;
+    const added: u32 = @intCast(std.mem.count(u8, bytes, "\n"));
+    if (added == 0) return;
+    const line = b.text.lineOf(pos);
+    const at_start = pos == b.text.lineStart(line);
+    for (b.lenses.items) |*l| {
+        if (l.line > line or (l.line == line and at_start)) l.line += added;
+    }
+}
+
+/// And as lines are deleted; a lens on a deleted line goes with it.
+fn shiftLensesForDelete(b: *Buffer, start: usize, end: usize) void {
+    if (b.lenses.items.len == 0) return;
+    const first = b.text.lineOf(start);
+    const last = b.text.lineOf(end);
+    if (last == first) return;
+    const removed: u32 = @intCast(last - first);
+    for (b.lenses.items) |*l| {
+        if (l.line > first and l.line <= last) {
+            l.gone = true;
+            l.line = @intCast(first);
+        } else if (l.line > last) l.line -= removed;
+    }
 }
 
 pub fn displayName(b: *const Buffer) []const u8 {

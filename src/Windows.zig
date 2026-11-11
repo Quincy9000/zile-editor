@@ -49,6 +49,9 @@ pub const Window = struct {
     /// Esc Esc put the terminal in normal mode: keys go to the editor
     /// (SPC commands), not the program, until i/a.
     term_normal: bool = false,
+    /// When it last had focus (`Editor.use_counter`): the windows picker
+    /// lists the last used first.
+    used: u64 = 0,
 };
 
 pub const Node = struct {

@@ -183,18 +183,6 @@ pub const leader = "<Space>";
 
 /// Normal-mode leader menus. Every group must lead somewhere (checked below).
 const group_table = [_]struct { []const u8, []const u8 }{
-    .{ leader ++ "f", "find" },
-    .{ leader ++ "l", "lsp / code" },
-    .{ leader ++ "b", "buffer / file" },
-    .{ leader ++ "g", "git" },
-    .{ leader ++ "r", "run" },
-    .{ leader ++ "w", "window" },
-    .{ leader ++ "p", "project" },
-    .{ leader ++ "t", "toggle" },
-    .{ leader ++ "a", "ai" },
-    .{ leader ++ "Q", "quit" },
-    .{ leader ++ "ws", "split" },
-    .{ leader ++ "wr", "resize" },
     .{ "q", "cursors" },
 };
 
@@ -213,6 +201,9 @@ const PN = &[_]Mode{.picker_normal};
 const PA = &[_]Mode{ .picker, .picker_normal };
 
 const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
+    // The leader is a menu (a picker): everything else is a row in it, or
+    // in the pickers it opens. No which-key.
+    .{ NV, leader, "leader_menu" },
     // Motions: move in normal/visual mode, give an operator its range.
     .{ NVO, "h", "move_left" },
     .{ NVO, "<Left>", "move_left" },
@@ -287,6 +278,14 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ S, "<CR>", "search_accept" },
     .{ S, "<Esc>", "search_cancel" },
     .{ S, "<C-g>", "search_cancel" },
+    // The replace prompt's list (no-ops in a search).
+    .{ S, "<Down>", "replace_next" },
+    .{ S, "<C-n>", "replace_next" },
+    .{ S, "<C-j>", "replace_next" },
+    .{ S, "<Up>", "replace_previous" },
+    .{ S, "<C-p>", "replace_previous" },
+    .{ S, "<C-k>", "replace_previous" },
+    .{ S, "<S-Tab>", "replace_skip_file" },
 
     .{ NV, "<C-d>", "half_page_down" },
     .{ NV, "<C-u>", "half_page_up" },
@@ -294,14 +293,24 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ NV, "<PageDown>", "page_down" },
     .{ NV, "<C-b>", "page_up" },
     .{ NV, "<PageUp>", "page_up" },
-    .{ NV, "<C-j>", "page_down" },
-    .{ NV, "<C-k>", "page_up" },
+    .{ NV, "<C-j>", "half_page_down" },
+    .{ NV, "<C-k>", "half_page_up" },
     .{ NVO, "<C-h>", "first_non_blank" },
     .{ NVO, "<C-l>", "line_end" },
     .{ NV, "<A-j>", "shift_text_down" },
     .{ NV, "<A-k>", "shift_text_up" },
     .{ NV, "<A-h>", "shift_text_left" },
     .{ NV, "<A-l>", "shift_text_right" },
+    // The shape of the code: up / down the tree, along it, carrying a node.
+    .{ NV, "<A-u>", "grow_selection" },
+    .{ NV, "<A-i>", "shrink_selection" },
+    .{ NV, "<A-n>", "next_sibling" },
+    .{ NV, "<A-p>", "previous_sibling" },
+    .{ NV, "<A-N>", "swap_next" },
+    .{ NV, "<A-P>", "swap_previous" },
+    .{ NV, "<A-f>", "next_function" },
+    .{ NV, "<A-F>", "previous_function" },
+    .{ NV, "<A-c>", "cycle_case" },
     .{ NV, "<C-e>", "scroll_down" },
     .{ NV, "<C-y>", "scroll_up" },
     .{ N, "zc", "fold_close" },
@@ -353,6 +362,8 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ N, "S", "substitute_line" },
     .{ NV, "p", "paste_after" },
     .{ N, "P", "paste_before" },
+    .{ NV, "gp", "paste_inline_after" },
+    .{ N, "gP", "paste_inline_before" },
     // Our own: `r` finds references (vim's replace-char is in the command picker).
     .{ N, "r", "replace_char" },
     .{ NV, "J", "join_lines" },
@@ -431,149 +442,19 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     // ------------------------------------------------------------------
     // Leader menus, by what you are doing. Top level: only what is done
     // constantly, all without shift.
-    .{ NV, leader ++ "<Space>", "find_file" },
-    .{ NV, leader ++ "/", "search_project" },
-    .{ N, leader ++ ",", "switch_buffer" },
-    .{ N, leader ++ ".", "browse_files" },
-    .{ N, leader ++ ";", "run_shell" },
-    .{ N, leader ++ "'", "resume_picker" },
-    .{ N, leader ++ "s", "save_file" },
-    .{ N, leader ++ "q", "smart_close" },
-    .{ N, leader ++ "`", "last_buffer" },
+    // Pickers that are menus: everything about buffers, windows, settings,
+    // the code, running and git is a row or an action in them.
     // SPC f, find: every picker, one letter each.
-    .{ N, leader ++ "ff", "find_file" },
-    .{ N, leader ++ "fr", "recent_files" },
-    .{ N, leader ++ "fv", "frecent_files" },
-    .{ N, leader ++ "fa", "find_file_anywhere" },
-    .{ N, leader ++ "fd", "find_folder" },
-    .{ N, leader ++ "fe", "browse_files" },
-    .{ N, leader ++ "fb", "switch_buffer" },
-    .{ N, leader ++ "fp", "switch_project" },
-    .{ N, leader ++ "fg", "search_project" },
-    .{ N, leader ++ "fl", "search_buffer" },
-    .{ N, leader ++ "ft", "search_todos" },
-    .{ N, leader ++ "fs", "goto_symbol" },
-    .{ N, leader ++ "fw", "workspace_symbols" },
-    .{ N, leader ++ "fx", "list_diagnostics" },
-    .{ N, leader ++ "fq", "quickfix_list" },
-    .{ N, leader ++ "fj", "jump_list" },
-    .{ N, leader ++ "fm", "pick_mark" },
-    .{ N, leader ++ "fy", "pick_register" },
-    .{ N, leader ++ "fu", "undo_history" },
-    .{ N, leader ++ "fk", "help_keys" },
-    .{ N, leader ++ "fc", "command_picker" },
-    .{ N, leader ++ "fn", "message_history" },
-    .{ N, leader ++ "fh", "start_screen" },
-    .{ N, leader ++ "f<Space>", "all_pickers" },
     // SPC l, lsp / code: acting on the code under the cursor.
-    .{ NV, leader ++ "la", "code_action" },
-    .{ N, leader ++ "lr", "rename_symbol" },
-    .{ NV, leader ++ "lf", "format_buffer" },
-    .{ N, leader ++ "ld", "goto_definition" },
-    .{ N, leader ++ "li", "goto_implementation" },
-    .{ N, leader ++ "lu", "find_references" },
-    .{ N, leader ++ "lk", "hover" },
-    .{ N, leader ++ "lc", "pick_color" },
-    .{ N, leader ++ "lt", "todo_tag" },
-    .{ N, leader ++ "lw", "trim_trailing_whitespace" },
-    .{ N, leader ++ "lm", "man_pages" },
     // What the server lists is here too (as well as under find).
-    .{ N, leader ++ "ll", "goto_symbol" },
-    .{ N, leader ++ "lp", "workspace_symbols" },
-    .{ N, leader ++ "lx", "list_diagnostics" },
     // SPC b, buffer and file: housekeeping for what is open.
-    .{ N, leader ++ "bs", "save_file" },
-    .{ N, leader ++ "ba", "save_all" },
-    .{ N, leader ++ "bw", "save_file_as" },
-    .{ N, leader ++ "br", "rename_file" },
-    .{ N, leader ++ "bc", "copy_file" },
-    .{ N, leader ++ "bx", "delete_file" },
-    .{ N, leader ++ "by", "yank_file_path" },
-    .{ N, leader ++ "bf", "yank_absolute_path" },
-    .{ N, leader ++ "bn", "new_file" },
-    .{ N, leader ++ "be", "new_buffer" },
-    .{ N, leader ++ "bk", "kill_buffer" },
-    .{ N, leader ++ "bo", "kill_other_buffers" },
-    .{ N, leader ++ "bd", "revert_buffer" },
-    .{ N, leader ++ "bb", "last_buffer" },
     // SPC g, git.
-    .{ N, leader ++ "gg", "git_menu" },
-    .{ N, leader ++ "gc", "git_commit" },
-    .{ N, leader ++ "gb", "git_branches" },
-    .{ N, leader ++ "gs", "git_changed_files" },
-    .{ N, leader ++ "gr", "git_restore_hunk" },
-    .{ N, leader ++ "gn", "git_next_hunk" },
-    .{ N, leader ++ "gp", "git_previous_hunk" },
-    .{ N, leader ++ "gl", "git_line_commit" },
-    .{ N, leader ++ "gu", "git_reload" },
-    .{ N, leader ++ "gi", "git_init" },
     // SPC r, run: shell commands and terminals.
-    .{ N, leader ++ "rr", "run_runner" },
-    .{ N, leader ++ "r.", "run_again" },
-    .{ NV, leader ++ "rs", "run_sql" },
-    .{ N, leader ++ "rf", "run_sql_file" },
-    .{ N, leader ++ "rc", "run_command" },
-    .{ N, leader ++ "ro", "run_output" },
-    .{ N, leader ++ "re", "run_errors" },
-    .{ N, leader ++ "rt", "terminal_toggle" },
-    .{ N, leader ++ "rw", "terminal_window" },
     // SPC w, window.
-    .{ N, leader ++ "wsh", "split_left" },
-    .{ N, leader ++ "wsj", "split_down" },
-    .{ N, leader ++ "wsk", "split_up" },
-    .{ N, leader ++ "wsl", "split_right" },
-    .{ N, leader ++ "wh", "window_left" },
-    .{ N, leader ++ "wj", "window_down" },
-    .{ N, leader ++ "wk", "window_up" },
-    .{ N, leader ++ "wl", "window_right" },
-    .{ N, leader ++ "ww", "window_next" },
-    .{ N, leader ++ "wd", "window_close" },
-    .{ N, leader ++ "wc", "window_close" },
-    .{ N, leader ++ "wo", "window_only" },
-    .{ N, leader ++ "w=", "window_balance" },
-    .{ N, leader ++ "w>", "window_border_right" },
-    .{ N, leader ++ "w<lt>", "window_border_left" },
-    .{ N, leader ++ "wrh", "window_border_left" },
-    .{ N, leader ++ "wrj", "window_border_down" },
-    .{ N, leader ++ "wrk", "window_border_up" },
-    .{ N, leader ++ "wrl", "window_border_right" },
-    .{ N, leader ++ "wr=", "window_balance_stay" },
     // SPC p, project.
-    .{ N, leader ++ "pp", "switch_project" },
-    .{ N, leader ++ "ps", "save_session" },
-    .{ N, leader ++ "pl", "load_session" },
     // SPC t, toggle (and the theme).
-    .{ N, leader ++ "tt", "pick_theme" },
-    .{ N, leader ++ "tg", "toggle_ghost_lines" },
-    .{ N, leader ++ "tr", "toggle_relative_numbers" },
-    .{ N, leader ++ "td", "toggle_diagnostic_text" },
-    .{ N, leader ++ "tp", "toggle_auto_pairs" },
-    .{ N, leader ++ "tf", "toggle_format_on_save" },
-    .{ N, leader ++ "ta", "toggle_ai_complete" },
-    .{ N, leader ++ "th", "toggle_highlight_patterns" },
-    .{ N, leader ++ "tw", "toggle_cursor_word" },
-    .{ N, leader ++ "ti", "toggle_indent_scope" },
-    .{ N, leader ++ "ts", "toggle_scratch" },
-    .{ N, leader ++ "tS", "toggle_trailing_space" },
-    .{ N, leader ++ "tl", "toggle_wrap" },
-    .{ N, leader ++ "tc", "toggle_code_lens" },
-    .{ N, leader ++ "tx", "toggle_trim_on_save" },
-    .{ N, leader ++ "tn", "toggle_icons" },
-    .{ N, leader ++ "tm", "toggle_smooth_scroll" },
-    .{ N, leader ++ "tb", "toggle_git_blame" },
-    .{ N, leader ++ "tv", "toggle_inlay_hints" },
-    .{ N, leader ++ "t=", "zoom_in" },
-    .{ N, leader ++ "t-", "zoom_out" },
-    .{ N, leader ++ "t0", "zoom_reset" },
     // SPC a, ai.
-    .{ N, leader ++ "aa", "claude_panel" },
-    .{ NV, leader ++ "as", "claude_send" },
-    .{ NV, leader ++ "ai", "claude_ask" },
-    .{ N, leader ++ "ay", "claude_accept" },
-    .{ N, leader ++ "an", "claude_reject" },
     // SPC Q, quit (shifted on purpose).
-    .{ N, leader ++ "Qs", "save_and_quit" },
-    .{ N, leader ++ "QQ", "quit_without_saving" },
 
     .{ I, "<Esc>", "normal_mode" },
     .{ I, "<CR>", "completion_accept_or_newline" },
@@ -609,10 +490,16 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ PA, "<CR>", "picker_accept" },
     .{ PA, "<Tab>", "picker_open_menu" },
     .{ PA, "<C-q>", "picker_to_quickfix" },
+    .{ PA, "<C-r>", "picker_replace" },
+    .{ PA, "<C-t>", "picker_scope" },
     .{ PA, "<C-v>", "picker_open_right" },
     .{ PA, "<C-s>", "picker_open_below" },
     .{ P, "/", "picker_slash" },
     .{ P, "~", "picker_tilde" },
+    .{ P, "<Left>", "input_left" },
+    .{ P, "<Right>", "input_right" },
+    .{ P, "<Home>", "input_home" },
+    .{ P, "<End>", "input_end" },
     .{ PA, "<Down>", "picker_next" },
     .{ PA, "<C-n>", "picker_next" },
     .{ PA, "<C-j>", "picker_next" },
@@ -740,20 +627,9 @@ test "which-key continuations" {
     var buf: [max_sequence]KeyEvent = undefined;
     var out: [32]Continuation = undefined;
 
-    const top = km.continuations(.normal, try keys.parseSequence(leader, &buf), &out);
-    var found_file = false;
-    for (top) |c| {
-        if (c.key.eql(KeyEvent.char('f'))) {
-            try testing.expectEqualStrings("find", c.label);
-            try testing.expectEqual(.group, c.kind);
-            found_file = true;
-        }
-    }
-    try testing.expect(found_file);
-
-    const quit = km.continuations(.normal, try keys.parseSequence(leader ++ "Q", &buf), &out);
-    try testing.expectEqual(2, quit.len);
-    try testing.expect(quit[0].key.eql(KeyEvent.char('Q')));
-    try testing.expect(quit[1].key.eql(KeyEvent.char('s')));
-    try testing.expectEqual(.command, quit[0].kind);
+    // SPC is one command (the leader menu); prefixes like `q` still list
+    // what follows them (the keys picker uses that).
+    try testing.expectEqual(0, km.continuations(.normal, try keys.parseSequence(leader, &buf), &out).len);
+    const cursors = km.continuations(.normal, try keys.parseSequence("q", &buf), &out);
+    try testing.expect(cursors.len >= 4);
 }

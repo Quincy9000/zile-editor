@@ -22,6 +22,11 @@ pub const Style = enum(u8) {
     attribute,
     label,
     module,
+    /// HTML / JSX: element and component names, their attributes (props),
+    /// and the `<` `>` `</` `/>` around them.
+    tag,
+    tag_attribute,
+    tag_delimiter,
 };
 
 /// Capture name -> style. The longest matching dotted prefix wins, so
@@ -58,8 +63,7 @@ const capture_map = [_]struct { []const u8, Style }{
     .{ "label", .label },
     .{ "module", .module },
     .{ "namespace", .module },
-    // HTML / JSX: element names like keywords (components are `@constructor`,
-    // a type); CSS at-rules (`@media`, `@keyframes`...) are keywords too.
+    // CSS at-rules (`@media`, `@keyframes`...) are keywords.
     // Older nvim-treesitter names (SQL's queries use them).
     .{ "conditional", .keyword },
     .{ "repeat", .keyword },
@@ -68,7 +72,9 @@ const capture_map = [_]struct { []const u8, Style }{
     .{ "storageclass", .keyword },
     .{ "float", .number },
     .{ "parameter", .parameter },
-    .{ "tag", .keyword },
+    .{ "tag", .tag },
+    .{ "tag.attribute", .tag_attribute },
+    .{ "tag.delimiter", .tag_delimiter },
     .{ "tag.error", .none },
     .{ "media", .keyword },
     .{ "supports", .keyword },

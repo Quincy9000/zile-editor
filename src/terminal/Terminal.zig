@@ -281,6 +281,8 @@ pub const Cell = struct {
     italic: bool,
     underline: bool,
     faint: bool,
+    /// The cursor is on this cell.
+    cursor: bool = false,
 };
 
 pub const Cursor = struct {
@@ -296,6 +298,12 @@ pub fn draw(t: *Terminal, ctx: anytype) ?Cursor {
     _ = c.ghostty_render_state_begin_update(t.render, t.vt);
     t.mutex.unlock(t.io);
     _ = c.ghostty_render_state_end_update(t.render);
+
+    // The cursor first, so the cell under it can say so.
+    var cur = std.mem.zeroes(c.GhosttyRenderStateCursor);
+    cur.size = @sizeOf(c.GhosttyRenderStateCursor);
+    _ = c.ghostty_render_state_get(t.render, c.GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur);
+    const cur_shown = cur.visible and cur.viewport_has_value;
 
     var colors = std.mem.zeroes(c.GhosttyRenderStateColors);
     colors.size = @sizeOf(c.GhosttyRenderStateColors);
@@ -339,15 +347,13 @@ pub fn draw(t: *Terminal, ctx: anytype) ?Cursor {
                 .italic = flags & c.GHOSTTY_STYLE_FLAG_ITALIC != 0,
                 .underline = (flags >> 8) & 7 != 0,
                 .faint = flags & c.GHOSTTY_STYLE_FLAG_FAINT != 0,
+                .cursor = cur_shown and x == cur.viewport_x and y == cur.viewport_y,
             });
         }
     }
 
-    var cur = std.mem.zeroes(c.GhosttyRenderStateCursor);
-    cur.size = @sizeOf(c.GhosttyRenderStateCursor);
-    _ = c.ghostty_render_state_get(t.render, c.GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur);
     _ = c.ghostty_render_state_clean(t.render);
-    if (!cur.visible or !cur.viewport_has_value) return null;
+    if (!cur_shown) return null;
     return .{
         .x = cur.viewport_x,
         .y = cur.viewport_y,

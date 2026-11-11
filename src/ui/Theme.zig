@@ -128,6 +128,9 @@ pub const default: Theme = .{
         .attribute = hex("#e6c384"),
         .label = hex("#56b6c2"),
         .module = hex("#e6c384"),
+        .tag = hex("#e06c75"),
+        .tag_attribute = hex("#e5a06b"),
+        .tag_delimiter = hex("#8a8da5"),
     }),
 };
 
@@ -238,6 +241,9 @@ pub fn fromPalette(comptime p: Palette) Theme {
             .attribute = yellow,
             .label = cyan,
             .module = yellow,
+            .tag = red,
+            .tag_attribute = orange,
+            .tag_delimiter = mix(bg, fg, 0.62),
         }),
     };
 }
@@ -264,6 +270,10 @@ const night_owl = blk: {
     t.syntax.set(.property, hex("#78ccf0"));
     t.syntax.set(.parameter, hex("#d7dbe0"));
     t.syntax.set(.operator, hex("#c792ea"));
+    // JSX / HTML as night-owl.nvim: teal tags and brackets, green props.
+    t.syntax.set(.tag, hex("#7fdbca"));
+    t.syntax.set(.tag_attribute, hex("#c5e478"));
+    t.syntax.set(.tag_delimiter, hex("#7fdbca"));
     t.gutter_fg = hex("#4b6479");
     t.gutter_current_fg = hex("#c5e4fc");
     t.cursor = hex("#80a4c2");

@@ -29,6 +29,8 @@ comptime {
     _ = @import("config/config.zig");
     _ = @import("sql.zig");
     _ = @import("ZigCheck.zig");
+    _ = @import("Replace.zig");
+    _ = @import("core/case.zig");
     _ = @import("lsp/Snippet.zig");
     _ = @import("picker/sources.zig");
     _ = @import("picker/fuzzy.zig");
@@ -55,5 +57,6 @@ comptime {
     _ = @import("Session.zig");
     _ = @import("git/Blame.zig");
     _ = @import("ui/icons.zig");
+    _ = @import("ui/render.zig");
     _ = @import("ColorPicker.zig");
 }

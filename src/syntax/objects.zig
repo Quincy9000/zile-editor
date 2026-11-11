@@ -102,6 +102,16 @@ const specs = std.StaticStringMap(Spec).initComptime(.{
             "mod_item",      "block",     "match_block", "block_comment",
         },
     } },
+    .{ "lua", Spec{
+        .functions = &.{ "function_declaration", "function_definition" },
+        .classes = &.{"table_constructor"},
+        .lists = &.{ "parameters", "arguments" },
+        .folds = &.{
+            "function_declaration", "function_definition", "if_statement",     "for_statement",
+            "while_statement",      "repeat_statement",    "do_statement",     "table_constructor",
+            "comment",
+        },
+    } },
     .{ "python", Spec{
         .functions = &.{"function_definition"},
         .classes = &.{"class_definition"},
@@ -443,4 +453,239 @@ test "python bodies are indented blocks" {
     const got = try objectText(src, "t.py", std.mem.indexOf(u8, src, "return").?, .function, .inner);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("        return y", got);
+}
+
+// ---------------------------------------------------------------------------
+// Moving by the shape of the code (helix's Alt keys, nvim-treesitter's
+// incremental selection and swap): the tree around a selection.
+
+fn rootOf(s: *Syntax, t: *const Text) ?c.TSNode {
+    s.update(t);
+    const tree = s.tree orelse return null;
+    return c.ts_tree_root_node(tree);
+}
+
+fn rangeOf(n: c.TSNode) Range {
+    return .{ .start = startOf(n), .end = endOf(n) };
+}
+
+fn sameRange(a: c.TSNode, b: c.TSNode) bool {
+    return startOf(a) == startOf(b) and endOf(a) == endOf(b);
+}
+
+/// The node `[start, end)` is: the smallest named one covering it, then the
+/// outermost of the nodes with exactly its range (an argument rather than
+/// the identifier that is all of it), so siblings are the list's items.
+fn nodeAt(root: c.TSNode, start: usize, end: usize) ?c.TSNode {
+    const e: u32 = @intCast(@max(end, start + 1) - 1);
+    var n = c.ts_node_named_descendant_for_byte_range(root, @intCast(start), e);
+    if (c.ts_node_is_null(n)) return null;
+    while (true) {
+        const p = c.ts_node_parent(n);
+        if (c.ts_node_is_null(p) or !sameRange(p, n)) break;
+        n = p;
+    }
+    return n;
+}
+
+/// `Alt-u`: the selection grown to the next node up the tree (from a cursor,
+/// the node under it).
+pub fn expand(s: *Syntax, t: *const Text, sel: Range) ?Range {
+    const root = rootOf(s, t) orelse return null;
+    var n = nodeAt(root, sel.start, sel.end) orelse return null;
+    while (startOf(n) >= sel.start and endOf(n) <= sel.end) {
+        const p = c.ts_node_parent(n);
+        if (c.ts_node_is_null(p)) return null;
+        n = p;
+    }
+    return rangeOf(n);
+}
+
+fn isComment(n: c.TSNode) bool {
+    return std.mem.indexOf(u8, typeOf(n), "comment") != null;
+}
+
+fn namedSibling(n: c.TSNode, forward: bool) ?c.TSNode {
+    var m = n;
+    while (true) {
+        m = if (forward) c.ts_node_next_named_sibling(m) else c.ts_node_prev_named_sibling(m);
+        if (c.ts_node_is_null(m)) return null;
+        if (!isComment(m)) return m;
+    }
+}
+
+/// The node a sibling move starts from. A selection: the node it is. A
+/// cursor: the biggest node starting where the one under it starts (at an
+/// argument's first letter, the argument; at a statement's, the statement).
+fn moveNode(root: c.TSNode, sel: Range, cursor_only: bool) ?c.TSNode {
+    var n = nodeAt(root, sel.start, sel.end) orelse return null;
+    if (!cursor_only) return n;
+    while (true) {
+        const p = c.ts_node_parent(n);
+        if (c.ts_node_is_null(p) or c.ts_node_is_null(c.ts_node_parent(p)) or startOf(p) != startOf(n)) break;
+        n = p;
+    }
+    return n;
+}
+
+/// `Alt-n` / `Alt-p`: the next / previous sibling of the node at the
+/// selection (or cursor), climbing to a parent that has one.
+pub fn sibling(s: *Syntax, t: *const Text, sel: Range, cursor_only: bool, forward: bool) ?Range {
+    const root = rootOf(s, t) orelse return null;
+    var n = moveNode(root, sel, cursor_only) orelse return null;
+    while (true) {
+        if (namedSibling(n, forward)) |m| return rangeOf(m);
+        const p = c.ts_node_parent(n);
+        if (c.ts_node_is_null(p) or c.ts_node_is_null(c.ts_node_parent(p))) return null;
+        n = p;
+    }
+}
+
+/// `Alt-N` / `Alt-P`: the node at the selection (or cursor) and the sibling
+/// it trades places with: `{ node, other }`.
+pub fn swapPair(s: *Syntax, t: *const Text, sel: Range, cursor_only: bool, forward: bool) ?[2]Range {
+    const root = rootOf(s, t) orelse return null;
+    var n = moveNode(root, sel, cursor_only) orelse return null;
+    while (true) {
+        if (namedSibling(n, forward)) |m| return .{ rangeOf(n), rangeOf(m) };
+        // From a cursor, a node with no sibling that way stands for its parent.
+        if (!cursor_only) return null;
+        const p = c.ts_node_parent(n);
+        if (c.ts_node_is_null(p) or c.ts_node_is_null(c.ts_node_parent(p))) return null;
+        n = p;
+    }
+}
+
+/// Whether `n` is a function worth jumping to: a declaration or method, or
+/// an arrow / function expression given a name (`const Foo = () => ...`),
+/// not every callback.
+fn isNamedFunction(spec: Spec, n: c.TSNode) bool {
+    if (!isOneOf(n, spec.functions)) return false;
+    const ty = typeOf(n);
+    const anonymous = std.mem.eql(u8, ty, "arrow_function") or std.mem.eql(u8, ty, "function_expression") or
+        std.mem.eql(u8, ty, "function") or std.mem.eql(u8, ty, "closure_expression");
+    if (!anonymous) return true;
+    const p = c.ts_node_parent(n);
+    return !c.ts_node_is_null(p) and isOneOf(p, &.{ "variable_declarator", "pair", "public_field_definition", "assignment_expression" });
+}
+
+/// `Alt-f` / `Alt-F`: the start of the next / previous function's line.
+pub fn functionStart(s: *Syntax, t: *const Text, pos: usize, forward: bool) ?usize {
+    const spec = specs.get(s.lang.name) orelse return null;
+    const root = rootOf(s, t) orelse return null;
+    const line = t.lineOf(@min(pos, t.len()));
+    var best: ?usize = null;
+    findFunction(spec, t, root, line, forward, &best);
+    return if (best) |l| motions.firstNonBlank(t, l) else null;
+}
+
+fn findFunction(spec: Spec, t: *const Text, n: c.TSNode, line: usize, forward: bool, best: *?usize) void {
+    // Nothing in a node that ends before (forward) / starts after it.
+    const first = t.lineOf(startOf(n));
+    const last = t.lineOf(@min(endOf(n), t.len()));
+    if (forward and last <= line) return;
+    if (!forward and first >= line) return;
+    if (isNamedFunction(spec, n)) {
+        if (forward and first > line and (best.* == null or first < best.*.?)) best.* = first;
+        if (!forward and first < line and (best.* == null or first > best.*.?)) best.* = first;
+    }
+    const count = c.ts_node_named_child_count(n);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) findFunction(spec, t, c.ts_node_named_child(n, i), line, forward, best);
+}
+
+/// Sticky context: the first lines of the scopes `line` is inside that
+/// start above it (function, class, `if`, JSX element...), outermost first,
+/// at most `out.len` (the innermost ones).
+pub fn contextLines(s: *Syntax, t: *const Text, line: usize, out: []usize) []usize {
+    const spec = specs.get(s.lang.name) orelse return out[0..0];
+    const root = rootOf(s, t) orelse return out[0..0];
+    if (line >= t.lineCount()) return out[0..0];
+    const pos: u32 = @intCast(motions.firstNonBlank(t, line));
+    var n = c.ts_node_descendant_for_byte_range(root, pos, pos);
+    // Innermost first, into a scratch list, then the last `out.len` reversed.
+    var found: [32]usize = undefined;
+    var k: usize = 0;
+    while (!c.ts_node_is_null(n) and k < found.len) : (n = c.ts_node_parent(n)) {
+        if (!isOneOf(n, spec.folds) or isOneOf(n, &.{ "comment", "block_comment", "template_string", "import_statement" })) continue;
+        const first = t.lineOf(startOf(n));
+        if (first >= line) continue;
+        if (k > 0 and found[k - 1] == first) continue;
+        found[k] = first;
+        k += 1;
+    }
+    const n_out = @min(k, out.len);
+    for (0..n_out) |i| out[i] = found[n_out - 1 - i];
+    return out[0..n_out];
+}
+
+test "structure: grow the selection, siblings, swaps, functions, context" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\fn add(a: u8, b: u8) u8 {
+        \\    if (a > b) {
+        \\        return foo(a, b, 3);
+        \\    }
+        \\    return a + b;
+        \\}
+        \\
+        \\fn two() void {}
+    ;
+    var t = try Text.init(gpa, src);
+    defer t.deinit(gpa);
+    var s = Syntax.forPath("x.zig").?;
+    defer s.deinit(gpa);
+    const at = struct {
+        fn f(needle: []const u8) usize {
+            return std.mem.indexOf(u8, src, needle).?;
+        }
+    }.f;
+    const slice = struct {
+        fn f(r: ?Range) []const u8 {
+            const rr = r orelse return "<null>";
+            return src[rr.start..rr.end];
+        }
+    }.f;
+    // From the cursor on `a` in `foo(a, ...`: `a` is all of the cursor, so
+    // straight to the call; from `foo`'s `f`, the name first.
+    const a = at("a, b, 3");
+    var r = expand(&s, &t, .{ .start = a, .end = a + 1 }).?;
+    try std.testing.expectEqualStrings("foo(a, b, 3)", slice(r));
+    r = expand(&s, &t, .{ .start = at("foo"), .end = at("foo") + 1 }).?;
+    try std.testing.expectEqualStrings("foo", slice(r));
+    r = expand(&s, &t, r).?;
+    try std.testing.expectEqualStrings("foo(a, b, 3)", slice(r));
+    // Siblings of an argument, from a cursor and from a selection.
+    try std.testing.expectEqualStrings("b", slice(sibling(&s, &t, .{ .start = a, .end = a + 1 }, true, true)));
+    try std.testing.expectEqualStrings("3", slice(sibling(&s, &t, .{ .start = at("b, 3"), .end = at("b, 3") + 1 }, false, true)));
+    // A statement's next sibling is the next statement.
+    const if_at = at("if (a");
+    try std.testing.expectEqualStrings("return a + b", slice(sibling(&s, &t, .{ .start = if_at, .end = if_at + 1 }, true, true))[0..12]);
+    // Swap: `a` with `b`.
+    const pair = swapPair(&s, &t, .{ .start = a, .end = a + 1 }, true, true).?;
+    try std.testing.expectEqualStrings("a", slice(pair[0]));
+    try std.testing.expectEqualStrings("b", slice(pair[1]));
+    // Functions.
+    try std.testing.expectEqual(at("fn two"), functionStart(&s, &t, a, true).?);
+    try std.testing.expectEqual(0, functionStart(&s, &t, at("fn two"), false).?);
+    try std.testing.expectEqual(null, functionStart(&s, &t, at("fn two"), true));
+    // Context of the `return foo` line: the function, then the `if`.
+    var buf: [3]usize = undefined;
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, contextLines(&s, &t, 2, &buf));
+    try std.testing.expectEqualSlices(usize, &.{0}, contextLines(&s, &t, 4, &buf));
+}
+
+test "lua: functions as text objects, folds and outline" {
+    const gpa = std.testing.allocator;
+    const src = "local M = {}\n\nfunction M.add(a, b)\n  return a + b\nend\n\nlocal f = function(x)\n  return x\nend\n\nreturn M\n";
+    var t = try Text.init(gpa, src);
+    defer t.deinit(gpa);
+    var s = Syntax.forPath("m.lua").?;
+    defer s.deinit(gpa);
+    const at = std.mem.indexOf(u8, src, "return a").?;
+    const r = find(&s, &t, at, .function, .around, 1).?;
+    try std.testing.expectEqualStrings("function M.add(a, b)\n  return a + b\nend", src[r.start..r.end]);
+    const arg = find(&s, &t, std.mem.indexOf(u8, src, "b)").?, .argument, .inner, 1).?;
+    try std.testing.expectEqualStrings("b", src[arg.start..arg.end]);
+    try std.testing.expectEqual(std.mem.indexOf(u8, src, "local f").?, functionStart(&s, &t, at, true).?);
 }

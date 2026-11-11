@@ -59,6 +59,21 @@ thread: ?std.Thread = null,
 /// The folder producers list and search (a project root); results are
 /// relative to it. Borrowed: outlives the engine.
 root: []const u8 = ".",
+/// With an empty query only the first this many items show (the explorer:
+/// the folder's own entries; the files below it only come up as you type).
+empty_limit: usize = std.math.maxInt(usize),
+/// Items from this index on match by their last path component only, unless
+/// the query has a `/` (the explorer's files from your home folder: a loose
+/// match across a long path elsewhere isn't what you meant).
+strict_from: usize = std.math.maxInt(usize),
+/// The explorer's home search skips `.git`, `node_modules`, caches and
+/// build output (the `home_filter` option, read on the main thread).
+home_filter: bool = false,
+/// Rank paths by their file name, then by how close they are (the explorer):
+/// an exact name, then a name starting with the query, then one containing
+/// it, then the rest by fuzzy score; within each, rows of the folder before
+/// rows from elsewhere, fewer folders deep, shorter.
+path_rank: bool = false,
 
 /// A child process the producer is reading from (e.g. rg), killed on destroy
 /// so the worker's read ends promptly. 0 when none.
@@ -202,8 +217,8 @@ fn matchPass(e: *Engine, done: bool) void {
             // Narrowing: only previous matches can still match.
             var kept: usize = 0;
             for (e.w_matches.items) |r| {
-                if (fuzzy.score(q, e.items.get(r.index).text, &e.w_scratch)) |s| {
-                    e.w_matches.items[kept] = .{ .index = r.index, .score = s };
+                if (fuzzy.score(q, e.matchText(r.index, query), &e.w_scratch)) |s| {
+                    e.w_matches.items[kept] = .{ .index = r.index, .score = e.rankScore(r.index, query, s) };
                     kept += 1;
                 }
             }
@@ -213,7 +228,10 @@ fn matchPass(e: *Engine, done: bool) void {
             e.w_matches.clearRetainingCapacity();
             e.scoreRange(q, 0, n);
         }
-        std.mem.sort(Result, e.w_matches.items, @as(*const Items, &e.items), betterThan);
+        if (e.path_rank)
+            std.mem.sort(Result, e.w_matches.items, e, closerThan)
+        else
+            std.mem.sort(Result, e.w_matches.items, @as(*const Items, &e.items), betterThan);
     } else {
         e.w_matches.clearRetainingCapacity();
     }
@@ -223,11 +241,53 @@ fn matchPass(e: *Engine, done: bool) void {
     e.publish(n, done);
 }
 
+/// What item `i` is matched against: its text, or for a strict item (see
+/// `strict_from`) its name.
+fn matchText(e: *const Engine, i: usize, query: []const u8) []const u8 {
+    const text = e.items.get(i).text;
+    if (i < e.strict_from or std.mem.indexOfScalar(u8, query, '/') != null) return text;
+    return std.fs.path.basename(text);
+}
+
 fn scoreRange(e: *Engine, q: fuzzy.Query, from: usize, to: usize) void {
+    const query = e.w_query[0..e.w_query_len];
     for (from..to) |i| {
-        const s = fuzzy.score(q, e.items.get(i).text, &e.w_scratch) orelse continue;
+        const s = e.rankScore(i, query, fuzzy.score(q, e.matchText(i, query), &e.w_scratch) orelse continue);
         e.w_matches.append(e.gpa, .{ .index = @intCast(i), .score = s }) catch return;
     }
+}
+
+/// With `path_rank`: how well the file name matches decides (the fuzzy score
+/// only among names that don't contain the query), so the copies of a file
+/// tie and `closerThan` puts the nearest first.
+fn rankScore(e: *const Engine, i: usize, query: []const u8, fuzzy_score: i32) i32 {
+    if (!e.path_rank or query.len == 0) return fuzzy_score;
+    const name = std.fs.path.basename(e.items.get(i).text);
+    const tier: i32 = if (std.ascii.eqlIgnoreCase(name, query))
+        3
+    else if (std.ascii.startsWithIgnoreCase(name, query))
+        2
+    else if (std.ascii.findIgnoreCase(name, query) != null)
+        1
+    else
+        return fuzzy_score;
+    return 1_000_000 * tier;
+}
+
+/// `path_rank` order: score, then the folder's own rows before ones from
+/// elsewhere, then fewer folders deep, then shorter, then source order.
+fn closerThan(e: *const Engine, a: Result, b: Result) bool {
+    if (a.score != b.score) return a.score > b.score;
+    const far_a = a.index >= e.strict_from;
+    const far_b = b.index >= e.strict_from;
+    if (far_a != far_b) return far_b;
+    const ta = e.items.get(a.index).text;
+    const tb = e.items.get(b.index).text;
+    const da = std.mem.count(u8, ta, "/");
+    const db = std.mem.count(u8, tb, "/");
+    if (da != db) return da < db;
+    if (ta.len != tb.len) return ta.len < tb.len;
+    return a.index < b.index;
 }
 
 /// Higher score first, then shorter text, then original order.
@@ -245,10 +305,11 @@ fn publish(e: *Engine, n: usize, done: bool) void {
         defer e.mutex.unlock(e.io);
         const out = &e.out;
         if (e.w_query_len == 0) {
-            // Empty query: everything, in source order.
-            out.len = @min(n, max_results);
+            // Empty query: everything (up to `empty_limit`), in source order.
+            const shown = @min(n, e.empty_limit);
+            out.len = @min(shown, max_results);
             for (out.results[0..out.len], 0..) |*r, i| r.* = .{ .index = @intCast(i), .score = 0 };
-            out.matched = n;
+            out.matched = shown;
         } else {
             out.len = @min(e.w_matches.items.len, max_results);
             @memcpy(out.results[0..out.len], e.w_matches.items[0..out.len]);
@@ -292,4 +353,31 @@ test "static items: match, narrow, widen" {
     _ = e.poll(&snap);
     try testing.expectEqual(4, snap.matched);
     try testing.expect(snap.done);
+}
+
+test "path ranking: the file name first, then the nearest copy" {
+    const testing = std.testing;
+    const e = try create(testing.allocator, testing.io, noWake);
+    defer e.destroy();
+    e.path_rank = true;
+    for ([_][]const u8{ "x/y/z/main.zig", "game4/main.zig", "src/main_test.zig", "domain.zig" }) |t| {
+        try e.items.append(.{ .text = t });
+    }
+    // From elsewhere (matched by name): after the folder's own copies.
+    e.strict_from = e.items.count();
+    try e.items.append(.{ .text = "~/main.zig" });
+    try e.start(null);
+    var snap: Snapshot = .{};
+    e.waitFor(e.setQuery("main.zig"));
+    _ = e.poll(&snap);
+    const order = snap.slice();
+    try testing.expectEqualStrings("game4/main.zig", e.items.get(order[0].index).text);
+    try testing.expectEqualStrings("x/y/z/main.zig", e.items.get(order[1].index).text);
+    try testing.expectEqualStrings("~/main.zig", e.items.get(order[2].index).text);
+    // A name starting with the query beats one that only has its letters.
+    e.waitFor(e.setQuery("main"));
+    _ = e.poll(&snap);
+    try testing.expectEqualStrings("game4/main.zig", e.items.get(snap.slice()[0].index).text);
+    const last = e.items.get(snap.slice()[snap.len - 1].index).text;
+    try testing.expect(std.mem.eql(u8, last, "domain.zig") or std.mem.eql(u8, last, "~/main.zig"));
 }

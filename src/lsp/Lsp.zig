@@ -15,6 +15,7 @@ const Text = @import("../core/Text.zig");
 
 const Lsp = @This();
 const balance = @import("balance.zig");
+const config = @import("../config/config.zig");
 
 gpa: Allocator,
 client: *Client,
@@ -147,6 +148,7 @@ const builtin_servers = [_]Server{
     .{ .languages = &.{.{ "zig", "zig" }}, .name = "zls", .command = &.{"zls"} },
     .{ .languages = &.{.{ "c", "c" }}, .name = "clangd", .command = &.{"clangd"} },
     .{ .languages = &.{.{ "rust", "rust" }}, .name = "rust-analyzer", .command = &.{"rust-analyzer"} },
+    .{ .languages = &.{.{ "lua", "lua" }}, .name = "lua-language-server", .command = &.{"lua-language-server"} },
     .{
         .languages = &.{ .{ "javascript", "javascript" }, .{ "typescript", "typescript" }, .{ "tsx", "typescriptreact" } },
         .name = "vtsls",
@@ -220,7 +222,9 @@ pub fn serverFor(b: *const Buffer) ?usize {
 /// Whether server `index` is for `b`'s language (main server or linter).
 pub fn serves(index: usize, b: *const Buffer) bool {
     const s = b.syntax orelse return false;
-    if (b.path == null) return false;
+    const path = b.path orelse return false;
+    // A shell server would check `.env` files as scripts.
+    if (@import("../syntax/languages.zig").isEnvFile(path)) return false;
     for (servers[index].languages) |lang| if (std.mem.eql(u8, lang[0], s.lang.name)) return true;
     return false;
 }
@@ -266,7 +270,9 @@ pub fn isSignatureTrigger(l: *const Lsp, cp: u21, open: bool) bool {
 /// Starts server `index` for the project at `root_path` (which must outlive it).
 pub fn start(ed: *Editor, index: usize, root_path: []const u8) !*Lsp {
     const gpa = ed.gpa;
-    const client = try Client.start(gpa, ed.io, servers[index].command, ed.wake_fn);
+    const log = logPath(gpa, index);
+    defer if (log) |p| gpa.free(p);
+    const client = try Client.start(gpa, ed.io, servers[index].command, ed.wake_fn, log);
     errdefer client.deinit();
     const l = try gpa.create(Lsp);
     l.* = .{ .gpa = gpa, .client = client, .index = index, .root = root_path, .cwd = ed.cwd };
@@ -301,6 +307,29 @@ pub fn start(ed: *Editor, index: usize, root_path: []const u8) !*Lsp {
     });
     try l.pending.put(gpa, id, .initialize);
     return l;
+}
+
+/// A placeholder for `line` while its lens is resolved: the title it had
+/// (if any, and none is there yet), marked stale.
+fn keepOldLens(gpa: Allocator, b: *Buffer, old: []const Buffer.Lens, line: u32) !void {
+    var i: usize = 0;
+    while (i < b.lenses.items.len and b.lenses.items[i].line < line) i += 1;
+    if (i < b.lenses.items.len and b.lenses.items[i].line == line) return;
+    const prev = for (old) |o| {
+        if (o.line == line and !o.gone) break o;
+    } else return;
+    const text = try gpa.dupe(u8, prev.text);
+    errdefer gpa.free(text);
+    try b.lenses.insert(gpa, i, .{ .line = line, .text = text, .stale = true });
+}
+
+/// `$XDG_CACHE_HOME/zile/lsp/<server>.log`: the server's error output from
+/// its last start (none in tests). Caller frees.
+pub fn logPath(gpa: Allocator, index: usize) ?[]u8 {
+    if (@import("builtin").is_test) return null;
+    var buf: [128]u8 = undefined;
+    const name = std.fmt.bufPrint(&buf, "lsp/{s}.log", .{servers[index].name}) catch return null;
+    return config.dir(gpa, .cache, name);
 }
 
 pub fn deinit(l: *Lsp) void {
@@ -875,7 +904,15 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
         .code_lens => |cl| {
             cl.buffer.lens_pending = false;
             if (!ed.bufferAlive(cl.buffer) or cl.version != cl.buffer.edit_version) return;
-            cl.buffer.clearLenses(l.gpa);
+            // The new set replaces the old, but a lens still to be resolved
+            // keeps its old title meanwhile: rows don't vanish and come back
+            // (everything below would jump) on every refresh.
+            var old = cl.buffer.lenses;
+            cl.buffer.lenses = .empty;
+            defer {
+                for (old.items) |o| l.gpa.free(o.text);
+                old.deinit(l.gpa);
+            }
             if (result != .array) return;
             for (result.array.items) |lens| {
                 const line = int(field(field(field(lens, "range"), "start"), "line")) orelse continue;
@@ -885,6 +922,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                 } else if (l.can_resolve_lens) {
                     const rid = try l.client.request("codeLens/resolve", lens);
                     try l.pending.put(l.gpa, rid, .{ .code_lens_resolve = .{ .buffer = cl.buffer, .version = cl.version, .line = @intCast(line) } });
+                    try keepOldLens(l.gpa, cl.buffer, old.items, @intCast(line));
                 }
             }
             ed.wake_fn();

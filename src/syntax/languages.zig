@@ -72,8 +72,9 @@ pub fn register(lang: Language) error{TooManyLanguages}!*Language {
 
 pub fn forPath(path: []const u8) ?*Language {
     const base = std.fs.path.basename(path);
-    // No dot: the whole name (`PKGBUILD`).
-    const ext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[dot + 1 ..] else base;
+    // No dot: the whole name (`PKGBUILD`). `.env.local` and the like are
+    // `.env` files too.
+    const ext = if (isEnvFile(path)) "env" else if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[dot + 1 ..] else base;
     // Later entries first: an extension given in the config wins over a
     // built-in language's.
     var i = registry_len;
@@ -82,6 +83,13 @@ pub fn forPath(path: []const u8) ?*Language {
         for (registry[i].extensions) |e| if (std.mem.eql(u8, e, ext)) return &registry[i];
     }
     return null;
+}
+
+/// A dotenv file: `.env`, `.env.local`, `.env.production`, `app.env`.
+/// Highlighted as shell, but not formatted or checked as a script.
+pub fn isEnvFile(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    return std.mem.eql(u8, base, ".env") or std.mem.startsWith(u8, base, ".env.") or std.mem.endsWith(u8, base, ".env");
 }
 
 /// The language a `#!` first line names (`#!/bin/bash`,
@@ -100,7 +108,7 @@ pub fn forShebang(first_line: []const u8) ?*Language {
     const lang: []const u8 = for ([_][2][]const u8{
         .{ "bash", "bash" }, .{ "sh", "bash" },     .{ "zsh", "bash" },         .{ "dash", "bash" },
         .{ "ksh", "bash" },  .{ "python", "python" }, .{ "node", "javascript" }, .{ "deno", "typescript" },
-        .{ "bun", "typescript" },
+        .{ "bun", "typescript" }, .{ "lua", "lua" }, .{ "luajit", "lua" },
     }) |m| {
         if (std.mem.eql(u8, m[0], name)) break m[1];
     } else return null;

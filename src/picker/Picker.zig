@@ -16,6 +16,7 @@ const LineInput = @import("../input/LineInput.zig");
 const Picker = @This();
 
 pub const Kind = sources.Kind;
+pub const ItemsStore = Items;
 
 ed: *Editor,
 /// The source this picker was opened as.
@@ -46,6 +47,12 @@ want_select: ?[]u8 = null,
 /// Item id to select once the results arrive (e.g. the current quickfix
 /// entry).
 want_id: ?u32 = null,
+/// The explorer's second search, files elsewhere (`files_global`), run per
+/// query and listed under its own rows; `global_shown` keeps showing the
+/// last answer until the new one comes, like `shown`.
+global: ?*Engine = null,
+global_shown: ?*Engine = null,
+gsnap: Engine.Snapshot = .{},
 
 pub fn create(ed: *Editor, kind: Kind, query: []const u8) !*Picker {
     const gpa = ed.gpa;
@@ -57,13 +64,42 @@ pub fn create(ed: *Editor, kind: Kind, query: []const u8) !*Picker {
     p.kind = p.kindForQuery();
     p.engine = try p.startEngine(p.kind, p.activeQuery());
     p.shown = p.engine;
+    try p.restartGlobal();
     return p;
+}
+
+/// A new search elsewhere for the current query (the explorer only).
+fn restartGlobal(p: *Picker) !void {
+    if (p.kind != .browse) return p.dropGlobal();
+    const e = try Engine.create(p.ed.gpa, p.ed.io, p.ed.wake_fn);
+    errdefer e.destroy();
+    const producer = try sources.setup(.files_global, p.ed, e);
+    _ = e.setQuery(p.activeQuery());
+    try e.start(producer);
+    if (p.global) |g| if (p.global != p.global_shown) g.destroy();
+    p.global = e;
+    if (p.global_shown == null) p.global_shown = e;
+}
+
+fn dropGlobal(p: *Picker) void {
+    if (p.global_shown) |g| if (p.global_shown != p.global) g.destroy();
+    if (p.global) |g| g.destroy();
+    p.global = null;
+    p.global_shown = null;
+    p.gsnap = .{};
+}
+
+/// Rows found elsewhere (after the local ones).
+pub fn globalLen(p: *const Picker) usize {
+    if (p.global_shown == null or p.activeQuery().len == 0) return 0;
+    return p.gsnap.len;
 }
 
 pub fn destroy(p: *Picker) void {
     const gpa = p.ed.gpa;
     if (p.shown != p.engine) p.shown.destroy();
     p.engine.destroy();
+    p.dropGlobal();
     p.query.deinit(gpa);
     if (p.want_select) |w| gpa.free(w);
     p.preview.text.deinit(gpa);
@@ -114,6 +150,7 @@ pub fn restart(p: *Picker, select: ?[]const u8) !void {
     p.top = 0;
     if (p.want_select) |w| p.ed.gpa.free(w);
     p.want_select = if (select) |s| try p.ed.gpa.dupe(u8, s) else null;
+    try p.restartGlobal();
 }
 
 fn applyWantSelect(p: *Picker) void {
@@ -161,6 +198,7 @@ pub fn queryChanged(p: *Picker) !void {
     }
     p.selected = 0;
     p.top = 0;
+    try p.restartGlobal();
 }
 
 /// Lists the source again, keeping the query (its items changed: a language
@@ -177,6 +215,7 @@ pub fn refill(p: *Picker) !void {
 
 /// Picks up new results from the engine.
 pub fn poll(p: *Picker) void {
+    p.pollGlobal();
     if (p.shown != p.engine) {
         // Switch over once the new engine has published something.
         var fresh: Engine.Snapshot = .{};
@@ -196,6 +235,19 @@ pub fn poll(p: *Picker) void {
     p.applyWantSelect();
 }
 
+fn pollGlobal(p: *Picker) void {
+    const g = p.global orelse return;
+    if (p.global_shown != g) {
+        var fresh: Engine.Snapshot = .{};
+        if (!g.poll(&fresh)) return;
+        if (p.global_shown) |old| old.destroy();
+        p.global_shown = g;
+        p.gsnap = fresh;
+        return;
+    }
+    _ = g.poll(&p.gsnap);
+}
+
 /// Blocks until results reflect the current query (used before accepting).
 pub fn sync(p: *Picker) void {
     p.engine.waitFor(p.want_gen);
@@ -208,7 +260,7 @@ pub fn isCurrent(p: *const Picker) bool {
 }
 
 pub fn rowCount(p: *const Picker) usize {
-    return p.snap.len + @intFromBool(p.createRow() != null);
+    return p.snap.len + p.globalLen() + @intFromBool(p.createRow() != null);
 }
 
 /// Row index of the "Create <query>" row: first when nothing matches, else last.
@@ -219,7 +271,10 @@ pub fn createRow(p: *const Picker) ?usize {
     for (p.snap.slice()[0..@min(p.snap.len, 64)]) |r| {
         if (std.mem.eql(u8, p.shown.items.get(r.index).text, q)) return null;
     }
-    return if (sources.createFirst(p.kind)) 0 else p.snap.len;
+    if (sources.createFirst(p.kind)) return 0;
+    // The explorer: after everything found here and elsewhere (Enter on
+    // something that matched opens it), or the only row.
+    return p.snap.len + p.globalLen();
 }
 
 /// Which result `row` shows, or null for the create row (it may be the
@@ -233,10 +288,24 @@ fn resultAt(p: *const Picker, row: usize) ?usize {
     return if (i < p.snap.len) i else null;
 }
 
+/// Which of the rows found elsewhere `row` is, if it's one.
+fn globalAt(p: *const Picker, row: usize) ?usize {
+    if (p.createRow()) |c| if (c == 0 and p.snap.len + p.globalLen() > 0) return null;
+    if (row < p.snap.len) return null;
+    const g = row - p.snap.len;
+    return if (g < p.globalLen()) g else null;
+}
+
 /// The item at `row`, or null for the create row.
 pub fn itemAt(p: *const Picker, row: usize) ?*const Items.Item {
-    const i = p.resultAt(row) orelse return null;
-    return p.shown.items.get(p.snap.results[i].index);
+    if (p.resultAt(row)) |i| return p.shown.items.get(p.snap.results[i].index);
+    const g = p.globalAt(row) orelse return null;
+    return p.global_shown.?.items.get(p.gsnap.results[g].index);
+}
+
+/// Whether `row` is one found elsewhere (drawn under a line).
+pub fn isGlobalRow(p: *const Picker, row: usize) bool {
+    return p.globalAt(row) != null;
 }
 
 pub fn move(p: *Picker, delta: isize) void {
@@ -261,7 +330,7 @@ pub fn updatePreview(p: *Picker) void {
         p.preview_for = null;
         return;
     };
-    const index = p.snap.results[p.resultAt(p.selected).?].index;
+    const index = if (p.resultAt(p.selected)) |i| p.snap.results[i].index else (1 << 31) | p.gsnap.results[p.globalAt(p.selected).?].index;
     if (p.preview_for == index) return;
     p.preview_for = index;
     sources.preview(p.kind, p.ed, item, &p.preview) catch |err| {
