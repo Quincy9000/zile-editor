@@ -34,6 +34,13 @@ pub fn forPath(path: []const u8) ?Syntax {
     return init(lang);
 }
 
+/// By the file's name, else by its `#!` line.
+pub fn forFile(path: []const u8, text: []const u8) ?Syntax {
+    if (forPath(path)) |s| return s;
+    const first = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    return init(languages.forShebang(first) orelse return null);
+}
+
 pub fn init(lang: *languages.Language) ?Syntax {
     const parser = c.ts_parser_new() orelse return null;
     if (!c.ts_parser_set_language(parser, lang.ts())) {

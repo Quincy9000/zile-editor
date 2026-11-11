@@ -60,6 +60,14 @@ const capture_map = [_]struct { []const u8, Style }{
     .{ "namespace", .module },
     // HTML / JSX: element names like keywords (components are `@constructor`,
     // a type); CSS at-rules (`@media`, `@keyframes`...) are keywords too.
+    // Older nvim-treesitter names (SQL's queries use them).
+    .{ "conditional", .keyword },
+    .{ "repeat", .keyword },
+    .{ "include", .keyword },
+    .{ "exception", .keyword },
+    .{ "storageclass", .keyword },
+    .{ "float", .number },
+    .{ "parameter", .parameter },
     .{ "tag", .keyword },
     .{ "tag.error", .none },
     .{ "media", .keyword },

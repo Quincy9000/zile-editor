@@ -68,7 +68,7 @@ only what is done constantly, without shift (the other letters stay free).
 | `SPC r` run | `r` runner history, `.` again, `c` multi-line, `o` output, `e` errors, `t` terminal popup, `w` terminal in this window |
 | `SPC w` window | `s` + `hjkl` split, `hjkl` focus, `w` next, `d` close, `o` only, `=` balance, `r` resize |
 | `SPC p` project | `p` switch, `s` save session, `l` restore session |
-| `SPC t` toggle | `t` theme, `g` ghost lines, `r` relative numbers, `d` diagnostic text, `p` pairs, `f` format on save, `a` AI, `h` highlights, `w` cursor word, `i` indent guide, `s` trailing space, `x` trim on save, `n` icons, `m` smooth scroll, `b` blame, `v` type hints, `=` `-` `0` zoom |
+| `SPC t` toggle | `t` theme, `s` scratch pad, `l` line wrap, `c` code lens, `g` ghost lines, `r` relative numbers, `d` diagnostic text, `p` pairs, `f` format on save, `a` AI, `h` highlights, `w` cursor word, `i` indent guide, `S` trailing space, `x` trim on save, `n` icons, `m` smooth scroll, `b` blame, `v` type hints, `=` `-` `0` zoom |
 | `SPC a` ai | `a` Claude panel, `s` send, `i` ask, `y` accept, `n` reject |
 | `SPC Q` quit | `s` save all and quit, `Q` quit without saving (also `QQ`) |
 
@@ -432,6 +432,46 @@ formatter wins over the server's formatting; comment and indent override the
 defaults. Problems (bad TOML with its line, a grammar not built yet, a parser
 of the wrong ABI) show as notifications at startup. Not configurable yet: folds
 and text objects (`objects.zig` specs) for new languages.
+
+## Everyday (from the nvim config)
+
+| What | Does |
+|---|---|
+| autosave | a modified file is written when you leave it (another buffer or window) or zile loses focus (the window's focus; in a terminal, its focus reports, mode 1004). Not on quit: `QQ` still discards. Claude's proposals are never saved behind your back. `options.autosave` |
+| reopen where you were | the cursor's line and column are kept per file in the visits file (`count last line col path`), and a file opens there |
+| persistent undo | on every save the undo tree is written to `$XDG_STATE_HOME/zile/undo/<hash of path>` with a hash of the text; opening the file brings it back if the text still matches (else a fresh history) |
+| line wrap | on by default (`SPC t l`): long lines break at word boundaries, later rows under the line's indentation (`Editor.segments`; inlay hints count). Each line has rows (`Row.sub`): its code lens row, then its pieces. `j`/`k` move by screen row keeping the screen column (as `gj`/`gk`), a count moves whole lines; operators and visual mode stay linewise. No sideways scrolling while wrapping. The renderer draws each row through a column window (`win_left`, `win_right`, `win_indent`). |
+| code lens | `textDocument/codeLens` once the text is still (as inlay hints), titles filled in with `codeLens/resolve`; a dim row above the line, several joined with ` \| ` (`SPC t c`). vtsls is asked for reference and implementation counts. The cursor steps over lens rows. |
+| mouse | a drag selects (visual), a double-click selects the word, a triple-click the line; letting go copies the selection to the clipboard, with a flash and a note (as kitty and the nvim config) |
+| `U` | redo (`<C-r>` too) |
+| insert `<C-;>` | a `;` at the end of the line, the cursor staying |
+| `gV` | selects the text last changed or yanked |
+| `SPC t s` | the scratch pad: `$XDG_DATA_HOME/zile/scratch.md` in a window at the bottom; again saves and closes it |
+| standalone Zig | a `.zig` file with no `build.zig` above it is checked on open and save in the background: `zig ast-check`, then `build-exe` (if it has `pub fn main`) and `test` (if it has tests) with `-fno-emit-bin`, again with `-lc` when it needs libc; its errors become diagnostics (`ZigCheck.zig`) |
+| saving JS/TS | eslint's `source.fixAll.eslint`, then vtsls's organize imports, then prettier, then write; each step waits at most 2 s for its server |
+| JSON | `vscode-json-language-server` with schemas for `package.json`, `tsconfig*.json`, `app.json` (Expo) and `eas.json`; prettier formats JSON (and YAML) |
+| SQL completion | keywords, tables and columns of the database (loaded in the background with psql / sqlite3 when a SQL file is shown, again after a statement that creates, alters or drops); after `name.` only that table's columns, aliases (`from users u`) included; the file's words too |
+
+## Shell and SQL
+
+**Bash** (tree-sitter-bash): `.sh` `.bash` `.zsh`, dotfiles (`.bashrc`,
+`.zshrc`, `.profile`, `.xinitrc`...), `PKGBUILD`, and any file whose first line
+is a `#!` naming a shell (`languages.forShebang`, which also knows python,
+node, deno and bun). `#` comments, `shfmt` formatting. No server built in
+(`bash-language-server` isn't installed; add it in `languages.toml`).
+
+**SQL** (tree-sitter-sql, pinned to its `gh-pages` commit: only that branch
+carries the generated parser): `.sql` `.psql` `.pgsql`, `--` comments,
+`pg_format` formatting. `SPC r s` runs the statement at the cursor (from the
+`;` before it to its own; quotes and `--` comments skipped), or the selected
+lines in visual mode; `SPC r f` the whole file (`sql.zig`). The database, as
+the nvim config: `$DATABASE_URL`, else `DATABASE_URL` in the nearest `.env`
+above the file, then above the working folder. `postgres://` runs `psql -X -v
+ON_ERROR_STOP=1`, `sqlite:path` (or a `.db` / `.sqlite` path) `sqlite3 -header
+-column -bail`, in the run popup (`r` again, `y` yank, timing). The URL reaches
+the command as `$ZILE_DB`, so a password never shows in the command line or
+messages (`sql.redact` hides it in the "psql on ..." message). Not yet: table
+and column completion from the database.
 
 ## Config files: TOML, YAML, JSON
 

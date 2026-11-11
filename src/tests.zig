@@ -27,6 +27,8 @@ comptime {
     _ = @import("snippets.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/config.zig");
+    _ = @import("sql.zig");
+    _ = @import("ZigCheck.zig");
     _ = @import("lsp/Snippet.zig");
     _ = @import("picker/sources.zig");
     _ = @import("picker/fuzzy.zig");

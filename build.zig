@@ -21,6 +21,15 @@ const grammars = [_]struct {
     .{ .name = "rust", .dep = "ts_rust", .extensions = &.{"rs"}, .scanner = true },
     .{ .name = "toml", .dep = "ts_toml", .extensions = &.{"toml"}, .scanner = true },
     .{ .name = "yaml", .dep = "ts_yaml", .extensions = &.{ "yaml", "yml" }, .scanner = true },
+    // Shell: scripts, dotfiles (`.bashrc` -> "bashrc") and names without a
+    // dot (`PKGBUILD`); scripts without either are found by their `#!`.
+    .{
+        .name = "bash",
+        .dep = "ts_bash",
+        .extensions = &.{ "sh", "bash", "zsh", "bashrc", "bash_profile", "bash_logout", "profile", "zshrc", "zprofile", "zshenv", "zlogin", "xinitrc", "xprofile", "envrc", "PKGBUILD", "install" },
+        .scanner = true,
+    },
+    .{ .name = "sql", .dep = "ts_sql", .extensions = &.{ "sql", "psql", "pgsql" }, .scanner = true },
     .{ .name = "html", .dep = "ts_html", .extensions = &.{ "html", "htm" }, .scanner = true },
     .{ .name = "css", .dep = "ts_css", .extensions = &.{"css"}, .scanner = true },
     .{

@@ -120,6 +120,7 @@ fn yank(ed: *Editor, r: Range, register: ?u8, kind: Registers.Kind) !void {
     // With several cursors the registers keep what the primary cursor yanked.
     if (ed.replaying) return;
     const body = ed.text().slice(r.start, r.end);
+    if (kind == .yank) ed.noteYank(r.start, r.end, r.linewise);
     if (kind == .yank) ed.yank_flash = .{ .buffer = ed.buffer, .start = r.start, .end = r.end, .linewise = r.linewise, .born = ed.now };
     if (!r.linewise) return ed.registers.store(register, kind, body, false);
     const with_nl = try std.mem.concat(ed.gpa, u8, &.{ body, "\n" });

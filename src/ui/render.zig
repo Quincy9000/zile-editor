@@ -436,6 +436,30 @@ fn drawWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Wi
 /// helpers below read it so every column on the line allows for them).
 var line_hints: []const Editor.LineHint = &.{};
 
+/// The part of the line on the row being drawn: visual columns
+/// `[win_left, win_right)`, drawn `win_indent` cells in (one row of a
+/// wrapped line). Unwrapped: from `view.left` across the window.
+var win_left: usize = 0;
+var win_right: usize = std.math.maxInt(usize);
+var win_indent: usize = 0;
+
+/// The first visual column past what this row shows.
+fn winEnd(l: Layout) usize {
+    return @min(win_right, win_left + (l.cols -| win_indent));
+}
+
+/// Where visual column `c` (at or after `win_left`) is drawn.
+fn colX(font: *const Font, l: Layout, c: usize) f32 {
+    return l.text_x + @as(f32, @floatFromInt(c - win_left + win_indent)) * font.cell_w;
+}
+
+/// The whole width, from `view.left` (ghost rows, which don't wrap).
+fn unwrappedWindow(ed: *const Editor) void {
+    win_left = ed.view.left;
+    win_right = std.math.maxInt(usize);
+    win_indent = 0;
+}
+
 /// The screen column of byte `off` of the line being drawn: where its
 /// character is, after the hints in front of it.
 fn dcol(bytes: []const u8, off: usize, tab: usize) usize {
@@ -450,6 +474,8 @@ fn dcolEnd(bytes: []const u8, off: usize, tab: usize) usize {
 
 fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focused: bool) void {
     defer line_hints = &.{};
+    unwrappedWindow(ed);
+    defer unwrappedWindow(ed);
     const selection: ?operators.Range = if (ed.mode == .visual) ed.visualRange() else null;
     const syntax: ?*const Syntax = if (ed.buffer.syntax) |*s| s else null;
     const diags = ed.diagnostics(ed.buffer);
@@ -514,11 +540,30 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         if (y >= area_h) break;
         if (r.ghost) |k| {
             line_hints = &.{};
+            unwrappedWindow(ed);
             drawGhostRow(ed, font, theme, l, r.line, k, y);
             continue;
         }
         const line = r.line;
         if (line >= t.lineCount()) break;
+        // A code lens row: the server's note above the line, at its indent.
+        const lens_n = ed.lensRows(line);
+        if (r.sub < lens_n) {
+            const lb = t.lineSlice(line);
+            const ind = motions.displayCol(lb, std.mem.indexOfNone(u8, lb, " \t") orelse 0, tab_width) -| v.left;
+            if (ed.lensText(line)) |lt| _ = font.drawText(clip(lt, l.cols -| ind), l.text_x + @as(f32, @floatFromInt(ind)) * font.cell_w, y, theme.inlay_fg);
+            continue;
+        }
+        var seg_buf: [Editor.max_segments]Editor.Seg = undefined;
+        const segs = ed.segments(line, &seg_buf);
+        const piece = @min(@as(usize, r.sub) - lens_n, segs.len - 1);
+        const first_piece = piece == 0;
+        const last_piece = piece + 1 == segs.len;
+        if (ed.options.wrap) {
+            win_left = segs[piece].start;
+            win_right = segs[piece].end;
+            win_indent = segs[piece].indent;
+        } else unwrappedWindow(ed);
         var hint_buf: [Editor.max_line_hints]Editor.LineHint = undefined;
         const hints = ed.lineHints(ed.buffer, line, &hint_buf);
         line_hints = hints;
@@ -554,7 +599,8 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         const num_x = @as(f32, @floatFromInt(l.gutter_cols - 1 - num.len)) * font.cell_w;
         const line_diag = firstDiagnostic(diags, line);
         const num_color = if (line_diag) |d| diagColor(theme, d.severity) else if (fold != null) theme.fold_fg else if (is_current) theme.gutter_current_fg else theme.gutter_fg;
-        _ = font.drawText(num, num_x, y, num_color);
+        // The number on a line's first row only (later rows continue it).
+        if (first_piece) _ = font.drawText(num, num_x, y, num_color);
         drawGitSign(ed, theme, line, y, font.cell_h);
 
         if (ed.search_highlight) drawSearchMatches(ed, font, theme, l, line, y);
@@ -607,7 +653,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         // The indent scope's guide: a line down the scope at its border's indent.
         // It grows out from where the cursor was, a row at a time: the rows
         // it has reached are whole, the one it is in is part drawn.
-        if (guide) |g| if (line >= g.scope.first and line <= g.scope.last and g.scope.guide_col >= v.left and g.scope.guide_col < v.left + l.cols) {
+        if (guide) |g| if (line >= g.scope.first and line <= g.scope.last and g.scope.guide_col >= v.left and g.scope.guide_col < v.left + l.cols and (first_piece or g.scope.guide_col < win_indent)) {
             const below = line >= g.origin;
             const away: f32 = @floatFromInt(if (below) line - g.origin else g.origin - line);
             // The origin's own row is there from the start.
@@ -635,10 +681,10 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             const next_col = if (cp == '\t') motions.nextTabStop(col, tab_width) else col + 1;
             defer col = next_col;
             const shift: usize = (if (offset >= ghost_at) ghost_cells else 0) + Editor.hintShift(hints, offset);
-            if (next_col + shift <= v.left) continue;
-            if (col + shift >= v.left + l.cols) break;
+            if (next_col + shift <= win_left) continue;
+            if (col + shift >= winEnd(l)) break;
             if (cp == '\t' or cp == ' ') continue;
-            const x = l.text_x + @as(f32, @floatFromInt(col + shift - v.left)) * font.cell_w;
+            const x = colX(font, l, col + shift);
             const style = if (syntax) |s| s.styleAt(ls + offset) else .none;
             var color = theme.syntax.get(style);
             // On a todo word or a colour: text that reads on that background.
@@ -654,27 +700,27 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         for (hints, 0..) |h, j| {
             const c = motions.displayCol(bytes, @min(h.off, bytes.len), tab_width) + Editor.hintShift(hints[0..j], std.math.maxInt(usize));
             const w = h.cells();
-            if (c < v.left or c >= v.left + l.cols) continue;
-            const hx = l.text_x + @as(f32, @floatFromInt(c - v.left)) * font.cell_w;
+            if (c < win_left or c >= winEnd(l)) continue;
+            const hx = colX(font, l, c);
             rect(hx, y, @as(f32, @floatFromInt(w)) * font.cell_w, font.cell_h, theme.inlay_bg);
-            _ = font.drawText(clip(h.text, v.left + l.cols - c), hx, y, theme.inlay_fg);
+            _ = font.drawText(clip(h.text, winEnd(l) - c), hx, y, theme.inlay_fg);
         }
         if (ghost) |g| {
             const gc = motions.displayCol(bytes, ghost_at, tab_width);
-            if (gc >= v.left) _ = font.drawText(ghost_first, l.text_x + @as(f32, @floatFromInt(gc - v.left)) * font.cell_w, y, theme.ai_fg);
+            if (gc >= win_left and gc <= winEnd(l)) _ = font.drawText(ghost_first, colX(font, l, gc), y, theme.ai_fg);
             if (g.len > ghost_first.len) ghost_below = .{ .text = g[ghost_first.len + 1 ..], .y = y };
         }
         if (fold) |f| {
             // "… 12 lines" after the fold's first line.
             const end_col = dcol(bytes, bytes.len, tab_width) + 2;
-            if (end_col >= v.left and end_col < v.left + l.cols) {
+            if (end_col >= win_left and end_col < winEnd(l)) {
                 var buf: [32]u8 = undefined;
                 const label = std.fmt.bufPrint(&buf, "… {d} lines", .{f.last - f.first}) catch "…";
-                _ = font.drawText(label, l.text_x + @as(f32, @floatFromInt(end_col - v.left)) * font.cell_w, y, theme.fold_fg);
+                _ = font.drawText(label, colX(font, l, end_col), y, theme.fold_fg);
             }
-        } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, diags, line, y);
+        } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, diags, line, y, last_piece);
         // Inline blame: who last changed the cursor's line.
-        if (focused and is_current and ed.options.git_blame and fold == null and ghost == null and ed.ghost == null and
+        if (last_piece and focused and is_current and ed.options.git_blame and fold == null and ghost == null and ed.ghost == null and
             !(line_diag != null and ed.options.diagnostic_text)) drawBlame(ed, font, theme, l, bytes, line, y);
 
         // The suggestion's further lines: rows of their own under this one
@@ -736,12 +782,11 @@ fn todoColor(theme: *const Theme, class: hipatterns.Class) rl.Color {
 /// A rectangle of height `h` at `y` behind bytes `[a, b)` of the line `bytes`.
 fn drawSpan(ed: *Editor, font: *const Font, l: Layout, bytes: []const u8, a: usize, b: usize, y: f32, h: f32, color: rl.Color) void {
     const tab = ed.options.tab_width;
-    const left = ed.view.left;
     const c0 = dcol(bytes, a, tab);
-    const c1 = dcolEnd(bytes, b, tab);
-    if (c1 <= left or c0 >= left + l.cols) return;
-    const start = @max(c0, left);
-    rect(l.text_x + @as(f32, @floatFromInt(start - left)) * font.cell_w, y, @as(f32, @floatFromInt(c1 - start)) * font.cell_w, h, color);
+    const c1 = @min(dcolEnd(bytes, b, tab), winEnd(l));
+    if (c1 <= win_left or c0 >= winEnd(l)) return;
+    const start = @max(c0, win_left);
+    rect(colX(font, l, start), y, @as(f32, @floatFromInt(c1 - start)) * font.cell_w, h, color);
 }
 
 /// "author, 3 days ago · summary" after the end of the line.
@@ -754,9 +799,8 @@ fn drawBlame(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, byt
         .commit => |c| std.fmt.bufPrint(&buf, "{s}, {s} \u{b7} {s}", .{ c.author, Blame.ago(&ago_buf, ed.unixNow() - c.time), c.summary }) catch return,
     };
     const end_col = dcol(bytes, bytes.len, ed.options.tab_width) + 4;
-    const left = ed.view.left;
-    if (end_col < left or end_col >= left + l.cols) return;
-    _ = font.drawText(clip(text, left + l.cols - end_col), l.text_x + @as(f32, @floatFromInt(end_col - left)) * font.cell_w, y, theme.ai_fg);
+    if (end_col < win_left or end_col >= winEnd(l)) return;
+    _ = font.drawText(clip(text, winEnd(l) - end_col), colX(font, l, end_col), y, theme.ai_fg);
 }
 
 fn rlColor(c: Editor.ColorPicker.Rgba) rl.Color {
@@ -914,17 +958,36 @@ fn faded(c: rl.Color, alpha: f32) rl.Color {
     return out;
 }
 
-fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, pos: usize, color: rl.Color) void {
-    const v = &ed.view;
-    const t0 = ed.text();
-    const line = t0.lineOf(pos);
-    const row = ed.screenRow(line) orelse return;
-    var hint_buf: [Editor.max_line_hints]Editor.LineHint = undefined;
-    const hints = ed.lineHints(ed.buffer, line, &hint_buf);
-    const col = motions.displayCol(t0.lineSlice(line), pos - t0.lineStart(line), ed.options.tab_width) + Editor.hintShift(hints, pos - t0.lineStart(line));
-    if (col < v.left or col >= v.left + l.cols) return;
+/// The screen row of text position `pos` and its visual column, with the
+/// column window set to the row it is on (a wrapped line's piece).
+fn posRow(ed: *Editor, pos: usize) ?struct { row: usize, col: usize } {
+    const t = ed.text();
+    const line = t.lineOf(pos);
+    const col = ed.visualCol(line, pos - t.lineStart(line));
+    if (!ed.layered()) {
+        unwrappedWindow(ed);
+        return .{ .row = ed.screenRow(line) orelse return null, .col = col };
+    }
+    var seg_buf: [Editor.max_segments]Editor.Seg = undefined;
+    const vis = ed.visibleLine(line);
+    const segs = ed.segments(vis, &seg_buf);
+    const k = if (vis == line) Editor.segmentIndex(segs, col) else 0;
+    if (ed.options.wrap) {
+        win_left = segs[k].start;
+        win_right = segs[k].end;
+        win_indent = segs[k].indent;
+    } else unwrappedWindow(ed);
+    const row = ed.rowOnScreen(.{ .line = vis, .sub = @intCast(ed.lensRows(vis) + k) }) orelse return null;
+    return .{ .row = row, .col = col };
+}
 
-    const x = l.text_x + @as(f32, @floatFromInt(col - v.left)) * font.cell_w;
+fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, pos: usize, color: rl.Color) void {
+    const at = posRow(ed, pos) orelse return;
+    const row = at.row;
+    const col = at.col;
+    // At the end of a wrapped row the cursor sits at its last cell.
+    if (col < win_left or col > winEnd(l) or (col == winEnd(l) and win_right == std.math.maxInt(usize))) return;
+    const x = colX(font, l, @min(col, winEnd(l)));
     const y = @as(f32, @floatFromInt(row)) * font.cell_h + scrollPx(ed, font);
     // The terminal's own cursor goes on the focused one (a no-op in a window).
     if (color.a == 255) gfx.cursor(x, y, switch (ed.mode) {
@@ -941,7 +1004,7 @@ fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
             rect(x, y, font.cell_w, font.cell_h, color);
             // Redraw the character under the block in the contrasting color.
             const t = ed.text();
-            if (pos < t.lineEnd(line)) {
+            if (pos < t.lineEnd(t.lineOf(pos))) {
                 var it = Font.Utf8Lossy{ .bytes = t.slice(pos, @min(pos + 4, t.len())) };
                 if (it.next()) |cp| {
                     if (cp != '\t' and cp != ' ') font.drawCodepoint(cp, x, y, theme.cursor_text);
@@ -1064,10 +1127,12 @@ fn drawRange(ed: *Editor, font: *const Font, l: Layout, sel: operators.Range, li
     const c0 = dcol(bytes, @max(sel.start, ls) - ls, tab);
     // Selecting past the end of the line covers one extra cell for the break.
     const c1 = if (sel_end > le) dcol(bytes, bytes.len, tab) + 1 else dcolEnd(bytes, sel_end - ls, tab);
-    const left = ed.view.left;
-    if (c1 <= left) return;
-    const x0 = l.text_x + @as(f32, @floatFromInt(@max(c0, left) - left)) * font.cell_w;
-    const w = @as(f32, @floatFromInt(c1 - @max(c0, left))) * font.cell_w;
+    // On a wrapped line's row: the part of the range on that row (the line
+    // break's extra cell goes on its last row).
+    const end = @min(c1, winEnd(l));
+    if (end <= win_left or c0 >= winEnd(l)) return;
+    const x0 = colX(font, l, @max(c0, win_left));
+    const w = @as(f32, @floatFromInt(end - @max(c0, win_left))) * font.cell_w;
     rect(x0, y, w, font.cell_h, color);
 }
 
@@ -1090,10 +1155,10 @@ fn drawMatchesIn(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout,
     while (pattern.forward(bytes, i)) |m| : (i = m + 1) {
         const c0 = dcol(bytes, m, tab);
         const c1 = dcolEnd(bytes, m + pattern.needle.len, tab);
-        if (c1 <= ed.view.left or c0 >= ed.view.left + l.cols) continue;
-        const start = @max(c0, ed.view.left);
-        const x = l.text_x + @as(f32, @floatFromInt(start - ed.view.left)) * font.cell_w;
-        const w = @as(f32, @floatFromInt(c1 - start)) * font.cell_w;
+        if (c1 <= win_left or c0 >= winEnd(l)) continue;
+        const start = @max(c0, win_left);
+        const x = colX(font, l, start);
+        const w = @as(f32, @floatFromInt(@min(c1, winEnd(l)) - start)) * font.cell_w;
         const current = cursor_col != null and cursor_col.? == m;
         rect(x, y, w, font.cell_h, if (current) theme.search_current else theme.search_match);
     }
@@ -1114,10 +1179,10 @@ fn drawYankFlash(ed: *Editor, font: *const Font, _: *const Theme, l: Layout, lin
     const c0 = dcol(bytes, from, tab);
     // An empty line, or one whose break is yanked, still shows a cell.
     const c1 = @max(dcolEnd(bytes, to, tab), c0 + 1);
-    if (c1 <= ed.view.left or c0 >= ed.view.left + l.cols) return;
-    const start = @max(c0, ed.view.left);
-    const x = l.text_x + @as(f32, @floatFromInt(start - ed.view.left)) * font.cell_w;
-    const w = @as(f32, @floatFromInt(c1 - start)) * font.cell_w;
+    if (c1 <= win_left or c0 >= winEnd(l)) return;
+    const start = @max(c0, win_left);
+    const x = colX(font, l, start);
+    const w = @as(f32, @floatFromInt(@min(c1, winEnd(l)) - start)) * font.cell_w;
     // Yellow on any theme, see-through enough to read the text under it.
     const alpha: u8 = @intFromFloat(140 * f.strength(ed.now));
     rect(x, y, w, font.cell_h, .{ .r = 255, .g = 214, .b = 51, .a = alpha });
@@ -1143,29 +1208,28 @@ fn firstDiagnostic(diags: []const Lsp.Diagnostic, line: usize) ?*const Lsp.Diagn
 
 /// Underlines each diagnostic's range on `line` and shows the first message
 /// after the end of the line.
-fn drawDiagnostics(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, diags: []const Lsp.Diagnostic, line: usize, y: f32) void {
+fn drawDiagnostics(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, diags: []const Lsp.Diagnostic, line: usize, y: f32, last_piece: bool) void {
     const t = ed.text();
     const bytes = t.lineSlice(line);
     const tab = ed.options.tab_width;
-    const left = ed.view.left;
     for (diags) |d| {
         if (d.line != line) continue;
         const end_byte = if (d.end_line == d.line) @max(d.end_col, d.col + 1) else bytes.len;
         const c0 = dcol(bytes, @min(d.col, bytes.len), tab);
-        const c1 = @max(dcolEnd(bytes, @min(end_byte, bytes.len), tab), c0 + 1);
-        if (c1 <= left) continue;
-        const x = l.text_x + @as(f32, @floatFromInt(@max(c0, left) - left)) * font.cell_w;
-        const w = @as(f32, @floatFromInt(c1 - @max(c0, left))) * font.cell_w;
+        const c1 = @min(@max(dcolEnd(bytes, @min(end_byte, bytes.len), tab), c0 + 1), winEnd(l));
+        if (c1 <= win_left or c0 >= winEnd(l)) continue;
+        const x = colX(font, l, @max(c0, win_left));
+        const w = @as(f32, @floatFromInt(c1 - @max(c0, win_left))) * font.cell_w;
         rect(x, y + font.cell_h - 2, w, 2, diagColor(theme, d.severity));
     }
     // Virtual text: the first (most severe) message, after the line.
-    if (!ed.options.diagnostic_text) return;
+    if (!ed.options.diagnostic_text or !last_piece) return;
     const d = firstDiagnostic(diags, line).?;
     const end_col = dcol(bytes, bytes.len, tab) + 3;
-    if (end_col >= left + l.cols) return;
-    const x = l.text_x + @as(f32, @floatFromInt(end_col - left)) * font.cell_w;
+    if (end_col < win_left or end_col >= winEnd(l)) return;
+    const x = colX(font, l, end_col);
     const msg = std.mem.sliceTo(d.message, '\n');
-    const room = left + l.cols - end_col;
+    const room = winEnd(l) - end_col;
     var color = diagColor(theme, d.severity);
     color.a = 200;
     _ = font.drawText(clip(msg, room), x, y, color);
@@ -1181,17 +1245,11 @@ fn clip(s: []const u8, max_cells: usize) []const u8 {
 
 /// Screen position of a text position, if visible.
 fn cellPos(ed: *Editor, font: *const Font, l: Layout, pos: usize) ?struct { x: f32, y: f32 } {
-    const t = ed.text();
-    const line = t.lineOf(pos);
-    const row = ed.screenRow(line) orelse return null;
-    if (row >= l.rows) return null;
-    var hint_buf: [Editor.max_line_hints]Editor.LineHint = undefined;
-    const hints = ed.lineHints(ed.buffer, line, &hint_buf);
-    const col = motions.displayCol(t.lineSlice(line), pos - t.lineStart(line), ed.options.tab_width) + Editor.hintShift(hints, pos - t.lineStart(line));
-    if (col < ed.view.left) return null;
+    const at = posRow(ed, pos) orelse return null;
+    if (at.row >= l.rows or at.col < win_left) return null;
     return .{
-        .x = l.text_x + @as(f32, @floatFromInt(col - ed.view.left)) * font.cell_w,
-        .y = @as(f32, @floatFromInt(row)) * font.cell_h,
+        .x = colX(font, l, @min(at.col, winEnd(l))),
+        .y = @as(f32, @floatFromInt(at.row)) * font.cell_h,
     };
 }
 

@@ -15,8 +15,11 @@ const formatters = [_]Row{
     .{ .lang = "rust", .argv = &.{ "rustfmt", "--emit", "stdout" } },
     .{ .lang = "c", .argv = &.{"clang-format"} },
     .{ .lang = "python", .argv = &.{ "ruff", "format", "-" } },
+} ++ prettier("json") ++ [_]Row{
     .{ .lang = "json", .argv = &.{ "jq", "." } },
     .{ .lang = "toml", .argv = &.{ "taplo", "fmt", "-" } },
+    .{ .lang = "bash", .argv = &.{ "shfmt", "--filename", "{path}" } },
+    .{ .lang = "sql", .argv = &.{ "pg_format", "-" } },
 } ++ prettier("yaml") ++ prettier("javascript") ++ prettier("typescript") ++ prettier("tsx") ++ prettier("html") ++ prettier("css");
 
 fn prettier(comptime lang: []const u8) [2]Row {
@@ -30,7 +33,7 @@ fn prettier(comptime lang: []const u8) [2]Row {
 /// could do it: the web languages go through prettier, as in most projects.
 pub fn preferred(lang: []const u8) bool {
     if (config.settingsFor(lang)) |s| if (s.formatter != null) return true;
-    for ([_][]const u8{ "javascript", "typescript", "tsx", "html", "css" }) |l| if (std.mem.eql(u8, l, lang)) return true;
+    for ([_][]const u8{ "javascript", "typescript", "tsx", "html", "css", "json", "yaml" }) |l| if (std.mem.eql(u8, l, lang)) return true;
     return false;
 }
 

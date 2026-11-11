@@ -21,6 +21,8 @@ pub const Event = union(enum) {
     /// Bracketed paste: the text (a slice of the input).
     paste: []const u8,
     mouse: Mouse,
+    /// The terminal gained (true) or lost focus (mode 1004).
+    focus: bool,
 };
 
 pub const Result = union(enum) {
@@ -134,6 +136,8 @@ fn csi(bytes: []const u8, final: bool) Result {
         const end = std.mem.indexOf(u8, bytes[len..], end_marker) orelse return .incomplete;
         return .{ .event = .{ .ev = .{ .paste = bytes[len .. len + end] }, .len = len + end + end_marker.len } };
     }
+    // Focus reports: ESC[I in, ESC[O out.
+    if (params.len == 0 and (fin == 'I' or fin == 'O')) return .{ .event = .{ .ev = .{ .focus = fin == 'I' }, .len = len } };
     // SGR mouse: ESC[<b;x;yM (press) / m (release).
     if (params.len > 0 and params[0] == '<' and (fin == 'M' or fin == 'm')) {
         var it = std.mem.splitScalar(u8, params[1..], ';');
@@ -251,6 +255,13 @@ test "xterm and kitty sequences" {
     try expectKey("\x1b[Z", "<S-Tab>");
     try testing.expectEqual(Result.incomplete, decode("\x1b[1;5", true));
     try testing.expectEqual(Result{ .skip = 4 }, decode("\x1b[?u", true));
+}
+
+test "focus reports" {
+    switch (decode("\x1b[O", false)) {
+        .event => |e| try testing.expectEqual(false, e.ev.focus),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "paste and mouse" {

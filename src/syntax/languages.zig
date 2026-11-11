@@ -72,8 +72,8 @@ pub fn register(lang: Language) error{TooManyLanguages}!*Language {
 
 pub fn forPath(path: []const u8) ?*Language {
     const base = std.fs.path.basename(path);
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
-    const ext = base[dot + 1 ..];
+    // No dot: the whole name (`PKGBUILD`).
+    const ext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[dot + 1 ..] else base;
     // Later entries first: an extension given in the config wins over a
     // built-in language's.
     var i = registry_len;
@@ -82,6 +82,29 @@ pub fn forPath(path: []const u8) ?*Language {
         for (registry[i].extensions) |e| if (std.mem.eql(u8, e, ext)) return &registry[i];
     }
     return null;
+}
+
+/// The language a `#!` first line names (`#!/bin/bash`,
+/// `#!/usr/bin/env python3`), if it is one we have.
+pub fn forShebang(first_line: []const u8) ?*Language {
+    if (!std.mem.startsWith(u8, first_line, "#!")) return null;
+    var words = std.mem.tokenizeAny(u8, first_line[2..], " \t\r");
+    var prog = std.fs.path.basename(words.next() orelse return null);
+    if (std.mem.eql(u8, prog, "env")) {
+        prog = words.next() orelse return null;
+        if (std.mem.eql(u8, prog, "-S")) prog = words.next() orelse return null;
+    }
+    // `python3.12` -> `python`, `bash5` -> `bash`.
+    const end = std.mem.indexOfAny(u8, prog, "0123456789.") orelse prog.len;
+    const name = prog[0..end];
+    const lang: []const u8 = for ([_][2][]const u8{
+        .{ "bash", "bash" }, .{ "sh", "bash" },     .{ "zsh", "bash" },         .{ "dash", "bash" },
+        .{ "ksh", "bash" },  .{ "python", "python" }, .{ "node", "javascript" }, .{ "deno", "typescript" },
+        .{ "bun", "typescript" },
+    }) |m| {
+        if (std.mem.eql(u8, m[0], name)) break m[1];
+    } else return null;
+    return byName(lang);
 }
 
 pub fn byName(name: []const u8) ?*Language {
@@ -266,4 +289,11 @@ test "every grammar's highlight query compiles" {
     try std.testing.expectEqualStrings("zig", forPath("src/main.zig").?.name);
     try std.testing.expectEqualStrings("rust", forPath("/x/lib.rs").?.name);
     try std.testing.expectEqual(null, forPath("README"));
+    try std.testing.expectEqualStrings("bash", forPath("/home/x/.bashrc").?.name);
+    try std.testing.expectEqualStrings("bash", forPath("pkg/PKGBUILD").?.name);
+    try std.testing.expectEqualStrings("sql", forPath("q.sql").?.name);
+    try std.testing.expectEqualStrings("bash", forShebang("#!/usr/bin/env bash").?.name);
+    try std.testing.expectEqualStrings("bash", forShebang("#!/bin/sh -e").?.name);
+    try std.testing.expectEqualStrings("python", forShebang("#!/usr/bin/env python3.12").?.name);
+    try std.testing.expectEqual(null, forShebang("echo hi"));
 }

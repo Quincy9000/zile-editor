@@ -2,7 +2,9 @@
 //! recently each was opened. Ranks the recent-files picker (`SPC f r`) and
 //! puts the files you use first in the file picker.
 //!
-//! Kept in `$XDG_STATE_HOME/zile/visits` as "count\tlast\tpath" lines.
+//! Kept in `$XDG_STATE_HOME/zile/visits` as "count\tlast\tline\tcol\tpath"
+//! lines (older "count\tlast\tpath" ones still read). The line and column
+//! are where the cursor was: the file reopens there.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,6 +21,9 @@ pub const Entry = struct {
     /// The order of visits within this run (0: not visited in it), to tell
     /// apart two in the same second.
     seq: u64 = 0,
+    /// Where the cursor was when the file was last left (0-based).
+    line: u32 = 0,
+    col: u32 = 0,
 };
 
 /// More than this and the lowest-ranked entries are dropped.
@@ -56,6 +61,23 @@ pub fn record(v: *Visits, gpa: Allocator, path: []const u8, now: i64) Allocator.
     const owned = try gpa.dupe(u8, path);
     errdefer gpa.free(owned);
     try v.entries.append(gpa, .{ .path = owned, .count = 1, .last = now, .seq = v.visit_count });
+}
+
+/// Where the cursor was left in `path` (a file not visited yet is skipped).
+pub fn setPosition(v: *Visits, path: []const u8, line: usize, col: usize) void {
+    for (v.entries.items) |*e| if (std.mem.eql(u8, e.path, path)) {
+        const l: u32 = @intCast(@min(line, std.math.maxInt(u32)));
+        const c: u32 = @intCast(@min(col, std.math.maxInt(u32)));
+        if (e.line != l or e.col != c) v.unsaved += 1;
+        e.line = l;
+        e.col = c;
+        return;
+    };
+}
+
+pub fn get(v: *const Visits, path: []const u8) ?Entry {
+    for (v.entries.items) |e| if (std.mem.eql(u8, e.path, path)) return e;
+    return null;
 }
 
 /// Renames an entry (the file moved); a no-op if it isn't known.
@@ -98,10 +120,23 @@ pub fn load(v: *Visits, gpa: Allocator, io: Io, path: []const u8) void {
         var it = std.mem.splitScalar(u8, line, '\t');
         const count = std.fmt.parseInt(u32, it.next() orelse continue, 10) catch continue;
         const last = std.fmt.parseInt(i64, it.next() orelse continue, 10) catch continue;
-        const p = it.rest();
+        // The position, when the line has one (older files don't).
+        var p = it.rest();
+        var at_line: u32 = 0;
+        var at_col: u32 = 0;
+        var probe = std.mem.splitScalar(u8, p, '\t');
+        const f1 = probe.next() orelse "";
+        const f2 = probe.next() orelse "";
+        const l = std.fmt.parseInt(u32, f1, 10) catch null;
+        const c_ = std.fmt.parseInt(u32, f2, 10) catch null;
+        if (l != null and c_ != null) {
+            at_line = l.?;
+            at_col = c_.?;
+            p = probe.rest();
+        }
         if (p.len == 0) continue;
         const owned = gpa.dupe(u8, p) catch return;
-        v.entries.append(gpa, .{ .path = owned, .count = count, .last = last }) catch return gpa.free(owned);
+        v.entries.append(gpa, .{ .path = owned, .count = count, .last = last, .line = at_line, .col = at_col }) catch return gpa.free(owned);
     }
 }
 
@@ -110,7 +145,7 @@ pub fn save(v: *Visits, gpa: Allocator, io: Io, path: []const u8, now: i64) void
     while (v.entries.items.len > max_entries) gpa.free(v.entries.pop().?.path);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    for (v.entries.items) |e| out.print(gpa, "{d}\t{d}\t{s}\n", .{ e.count, e.last, e.path }) catch return;
+    for (v.entries.items) |e| out.print(gpa, "{d}\t{d}\t{d}\t{d}\t{s}\n", .{ e.count, e.last, e.line, e.col, e.path }) catch return;
     if (std.fs.path.dirname(path)) |dir| Io.Dir.cwd().createDirPath(io, dir) catch return;
     Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items }) catch return;
     v.unsaved = 0;
@@ -138,4 +173,26 @@ test "recent beats frequent-but-old; counts add up" {
     try std.testing.expectEqualStrings("/mid", v.entries.items[0].path);
     try std.testing.expectEqualStrings("/old", v.entries.items[1].path);
     try std.testing.expectEqualStrings("/new", v.entries.items[2].path);
+}
+
+test "positions are kept, and old files still read" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "visits", .data = "3\t100\t/old/file\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const path = try std.fs.path.join(gpa, &.{ dir, "visits" });
+    defer gpa.free(path);
+    var v: Visits = .{};
+    defer v.deinit(gpa);
+    v.load(gpa, std.testing.io, path);
+    try std.testing.expectEqualStrings("/old/file", v.entries.items[0].path);
+    v.setPosition("/old/file", 41, 7);
+    v.save(gpa, std.testing.io, path, 200);
+    var w: Visits = .{};
+    defer w.deinit(gpa);
+    w.load(gpa, std.testing.io, path);
+    try std.testing.expectEqual(41, w.get("/old/file").?.line);
+    try std.testing.expectEqual(7, w.get("/old/file").?.col);
 }

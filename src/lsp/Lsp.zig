@@ -32,6 +32,9 @@ can_format: bool = false,
 can_format_range: bool = false,
 can_implement: bool = false,
 can_inlay: bool = false,
+/// The server offers code lens (and fills them in on request).
+can_lens: bool = false,
+can_resolve_lens: bool = false,
 can_resolve_action: bool = false,
 /// The latest workspace-symbol request: answers to older ones are stale.
 ws_request: i64 = -1,
@@ -96,6 +99,12 @@ const Pending = union(enum) {
     /// `workspace/applyEdit` request; this reply carries nothing.
     execute_command,
     workspace_symbols,
+    /// A source action asked for before saving (fix all, organize imports).
+    save_action,
+    save_action_resolve,
+    /// Code lens for a buffer as it was at `version`, and one filled in.
+    code_lens: struct { buffer: *Buffer, version: u64 },
+    code_lens_resolve: struct { buffer: *Buffer, version: u64, line: u32 },
 };
 
 /// One edit of a WorkspaceEdit, by file (0-based positions).
@@ -127,6 +136,9 @@ pub const Server = struct {
     linter: bool = false,
     /// A linter runs only in projects with one of these files at the root.
     markers: []const []const u8 = &.{},
+    /// Settings sent once it has started (`workspace/didChangeConfiguration`),
+    /// as JSON.
+    settings: ?[]const u8 = null,
 };
 
 /// The built-in servers. One row per server; one server for a project
@@ -140,9 +152,30 @@ const builtin_servers = [_]Server{
         .name = "vtsls",
         .command = &.{ "vtsls", "--stdio" },
         .react_ids = true,
+        // As the nvim config: reference and implementation counts (code
+        // lens), function calls completed with their arguments.
+        .settings =
+        \\{"typescript":{"referencesCodeLens":{"enabled":true,"showOnAllFunctions":true},"implementationsCodeLens":{"enabled":true},"suggest":{"completeFunctionCalls":true}},
+        \\ "javascript":{"referencesCodeLens":{"enabled":true,"showOnAllFunctions":true},"suggest":{"completeFunctionCalls":true}}}
+        ,
     },
     .{ .languages = &.{.{ "html", "html" }}, .name = "html", .command = &.{ "vscode-html-language-server", "--stdio" } },
     .{ .languages = &.{.{ "css", "css" }}, .name = "css", .command = &.{ "vscode-css-language-server", "--stdio" } },
+    .{
+        .languages = &.{.{ "json", "json" }},
+        .name = "json",
+        .command = &.{ "vscode-json-language-server", "--stdio" },
+        // The schemas the nvim config gives it: completion, hover and
+        // checking for these files.
+        .settings =
+        \\{"json":{"validate":{"enable":true},"schemas":[
+        \\{"fileMatch":["package.json"],"url":"https://json.schemastore.org/package.json"},
+        \\{"fileMatch":["tsconfig.json","tsconfig.*.json"],"url":"https://json.schemastore.org/tsconfig.json"},
+        \\{"fileMatch":["app.json","app.config.json"],"url":"https://www.schemastore.org/expo-53.0.0.json"},
+        \\{"fileMatch":["eas.json"],"url":"https://raw.githubusercontent.com/expo/eas-cli/main/packages/eas-json/schema/eas.schema.json"}
+        \\]}}
+        ,
+    },
     .{
         .languages = &.{ .{ "javascript", "javascript" }, .{ "typescript", "typescript" }, .{ "tsx", "typescriptreact" } },
         .name = "eslint",
@@ -248,9 +281,10 @@ pub fn start(ed: *Editor, index: usize, root_path: []const u8) !*Lsp {
             .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} },
             // Indexing and the like show as notifications.
             .window = .{ .workDoneProgress = true },
-            .workspace = .{ .inlayHint = .{ .refreshSupport = true } },
+            .workspace = .{ .inlayHint = .{ .refreshSupport = true }, .codeLens = .{ .refreshSupport = true } },
             .textDocument = .{
                 .inlayHint = .{ .dynamicRegistration = false },
+                .codeLens = .{ .dynamicRegistration = false },
                 .synchronization = .{ .didSave = true },
                 // Snippets: function arguments arrive as placeholders.
                 .completion = .{ .completionItem = .{ .snippetSupport = true } },
@@ -475,6 +509,16 @@ pub fn requestInlayHints(l: *Lsp, ed: *Editor, b: *Buffer, first: usize, last: u
     try l.pending.put(l.gpa, id, .{ .inlay_hints = .{ .buffer = b, .version = b.edit_version, .first = first, .last = last } });
 }
 
+/// The code lens of `b` (its text as the server has it).
+pub fn requestCodeLens(l: *Lsp, b: *Buffer) !void {
+    const doc = l.docs.get(b) orelse return;
+    if (doc.synced != b.edit_version) return;
+    const id = try l.client.request("textDocument/codeLens", .{ .textDocument = .{ .uri = doc.uri } });
+    b.lens_pending = true;
+    b.lens_version = b.edit_version;
+    try l.pending.put(l.gpa, id, .{ .code_lens = .{ .buffer = b, .version = b.edit_version } });
+}
+
 /// The hints of an inlay-hint answer, as labels at byte offsets of `t`. A
 /// label is a string or a list of parts (their texts joined); padding the
 /// server asks for becomes a space. The caller owns the texts.
@@ -550,6 +594,21 @@ pub fn requestCodeActions(l: *Lsp, ed: *Editor, first: usize, last: usize) !void
         .context = .{ .diagnostics = diags.items },
     });
     try l.pending.put(l.gpa, id, .code_actions);
+}
+
+/// Before saving `b`: the whole-file action of `kind` (`source.fixAll.eslint`,
+/// `source.organizeImports`); the answer moves the editor's save on.
+pub fn requestSourceAction(l: *Lsp, ed: *Editor, b: *Buffer, kind: []const u8) !void {
+    const doc = l.docs.get(b) orelse return error.NotOpen;
+    try l.sync(ed);
+    const Pos = struct { line: usize, character: usize };
+    const last = b.text.lineCount() - 1;
+    const id = try l.client.request("textDocument/codeAction", .{
+        .textDocument = .{ .uri = doc.uri },
+        .range = .{ .start = Pos{ .line = 0, .character = 0 }, .end = Pos{ .line = last, .character = b.text.lineLen(last) } },
+        .context = .{ .diagnostics = &[_]u8{}, .only = &[_][]const u8{kind} },
+    });
+    try l.pending.put(l.gpa, id, .save_action);
 }
 
 /// Carries out a code action (its JSON as the server sent it): applies its
@@ -709,6 +768,11 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
     const result = obj.get("result") orelse .null;
     if (obj.get("error")) |e| {
         if (req == .completion) ed.completion_pending = false;
+        // A save waiting on this goes on without it.
+        if (req == .save_action or req == .save_action_resolve) {
+            ed.saveChainNext();
+            return;
+        }
         // A failed hint request isn't repeated until the text changes.
         if (req == .inlay_hints) {
             req.inlay_hints.buffer.hint_pending = false;
@@ -742,6 +806,8 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             l.can_format = provides(field(caps, "documentFormattingProvider"));
             l.can_implement = provides(field(caps, "implementationProvider"));
             l.can_inlay = provides(field(caps, "inlayHintProvider"));
+            l.can_lens = field(caps, "codeLensProvider") != null;
+            l.can_resolve_lens = provides(field(field(caps, "codeLensProvider"), "resolveProvider"));
             l.can_resolve_action = provides(field(field(caps, "codeActionProvider"), "resolveProvider"));
             l.can_format_range = provides(field(caps, "documentRangeFormattingProvider"));
             const sig = field(caps, "signatureHelpProvider");
@@ -752,6 +818,11 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             }
             // `.{}` would serialize as `[]` (an empty tuple); the spec wants `{}`.
             try l.client.notifyNow("initialized", struct {}{});
+            if (l.server().settings) |json| {
+                var parsed = try std.json.parseFromSlice(std.json.Value, l.gpa, json, .{});
+                defer parsed.deinit();
+                try l.client.notifyNow("workspace/didChangeConfiguration", .{ .settings = parsed.value });
+            }
             try l.client.markReady();
         },
         .definition, .references, .implementation => {
@@ -789,6 +860,45 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             try ed.showCodeActions();
         },
         .code_action_resolve => try l.finishCodeAction(ed, result),
+        .save_action => {
+            // The first action offered (there is one of each kind, if any).
+            const action: ?std.json.Value = if (result == .array and result.array.items.len > 0) result.array.items[0] else null;
+            if (action) |a| {
+                if (field(a, "edit") == null and str(field(a, "command")) == null and l.can_resolve_action) {
+                    const rid = try l.client.request("codeAction/resolve", a);
+                    return l.pending.put(l.gpa, rid, .save_action_resolve);
+                }
+                l.finishCodeAction(ed, a) catch {};
+            }
+            ed.saveChainNext();
+        },
+        .code_lens => |cl| {
+            cl.buffer.lens_pending = false;
+            if (!ed.bufferAlive(cl.buffer) or cl.version != cl.buffer.edit_version) return;
+            cl.buffer.clearLenses(l.gpa);
+            if (result != .array) return;
+            for (result.array.items) |lens| {
+                const line = int(field(field(field(lens, "range"), "start"), "line")) orelse continue;
+                if (line < 0) continue;
+                if (str(field(field(lens, "command"), "title"))) |title| {
+                    try ed.addLens(cl.buffer, @intCast(line), title);
+                } else if (l.can_resolve_lens) {
+                    const rid = try l.client.request("codeLens/resolve", lens);
+                    try l.pending.put(l.gpa, rid, .{ .code_lens_resolve = .{ .buffer = cl.buffer, .version = cl.version, .line = @intCast(line) } });
+                }
+            }
+            ed.wake_fn();
+        },
+        .code_lens_resolve => |cl| {
+            if (!ed.bufferAlive(cl.buffer) or cl.version != cl.buffer.edit_version) return;
+            const title = str(field(field(result, "command"), "title")) orelse return;
+            try ed.addLens(cl.buffer, cl.line, title);
+            ed.wake_fn();
+        },
+        .save_action_resolve => {
+            l.finishCodeAction(ed, result) catch {};
+            ed.saveChainNext();
+        },
         .execute_command => {},
         .workspace_symbols => {
             ed.clearWorkspaceSymbols();
@@ -871,6 +981,11 @@ fn answerServerRequest(l: *Lsp, ed: *Editor, id: std.json.Value, method: []const
         try ed.applyEdits(edits.items);
         return l.client.respond(id, .{ .applied = true });
     }
+    if (std.mem.eql(u8, method, "workspace/codeLens/refresh")) {
+        for (ed.buffers.items) |b| b.lens_version = std.math.maxInt(u64);
+        ed.wake_fn();
+        return l.client.respond(id, null);
+    }
     // The server's picture changed (it finished indexing, say): ask again.
     if (std.mem.eql(u8, method, "workspace/inlayHint/refresh")) {
         for (ed.buffers.items) |b| b.hint_version = std.math.maxInt(u64);
@@ -880,6 +995,23 @@ fn answerServerRequest(l: *Lsp, ed: *Editor, id: std.json.Value, method: []const
     if (std.mem.eql(u8, method, "workspace/configuration")) {
         const n = if (field(params orelse .null, "items")) |items| (if (items == .array) items.array.items.len else 0) else 0;
         if (std.mem.eql(u8, l.server().name, "eslint")) return l.respondEslintSettings(id, n);
+        // A server with settings of ours: each section asked for.
+        if (l.server().settings) |json| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, l.gpa, json, .{});
+            defer parsed.deinit();
+            var answers: std.ArrayList(std.json.Value) = .empty;
+            defer answers.deinit(l.gpa);
+            const items = field(params orelse .null, "items") orelse .null;
+            if (items == .array) for (items.array.items) |item| {
+                var v: std.json.Value = parsed.value;
+                if (str(field(item, "section"))) |section| {
+                    var parts = std.mem.splitScalar(u8, section, '.');
+                    while (parts.next()) |part| v = field(v, part) orelse .null;
+                }
+                try answers.append(l.gpa, v);
+            };
+            return l.client.respond(id, answers.items);
+        }
         const nulls: [32]?u8 = @splat(null);
         return l.client.respond(id, nulls[0..@min(n, nulls.len)]);
     }

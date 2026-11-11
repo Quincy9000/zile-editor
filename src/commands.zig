@@ -190,6 +190,9 @@ const base = [_]Command{
     .{ .name = "toggle_case_char", .doc = "Toggle case of character", .run = toggleCaseChar, .repeat = true },
     .{ .name = "undo", .doc = "Undo", .run = undo , .once = true },
     .{ .name = "redo", .doc = "Redo", .run = redo , .once = true },
+    .{ .name = "append_semicolon", .doc = "Add ; at the end of the line", .run = appendSemicolon },
+    .{ .name = "select_last_change", .doc = "Select the last change or yank", .run = selectLastChange, .once = true },
+    .{ .name = "toggle_scratch", .doc = "Scratch pad", .run = toggleScratch, .once = true },
     .{ .name = "repeat_change", .doc = "Repeat last change", .run = repeatChange , .once = true },
     .{ .name = "record_macro", .doc = "Record macro (Q again to stop; QQ quits without saving)", .run = recordMacro, .takes_char = true, .once = true },
     .{ .name = "play_macro", .doc = "Play macro (@@ for the last one)", .run = playMacro, .takes_char = true , .once = true },
@@ -289,6 +292,8 @@ const base = [_]Command{
     .{ .name = "run_shell", .doc = "Run a shell command (one-off)", .run = termCmd(.shell), .once = true },
     .{ .name = "run_command", .doc = "Run a command (multi-line editor)", .run = termCmd(.command), .once = true },
     .{ .name = "run_again", .doc = "Run the runner command again", .run = termCmd(.again), .once = true },
+    .{ .name = "run_sql", .doc = "Run the SQL statement (or selection)", .run = runSql(false), .once = true },
+    .{ .name = "run_sql_file", .doc = "Run the whole SQL file", .run = runSql(true), .once = true },
     .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
     .{ .name = "run_errors", .doc = "Errors from the last run", .run = termCmd(.errors), .once = true },
     .{ .name = "quickfix_next", .doc = "Next quickfix entry", .run = qfCmd(.next), .once = true, .jump = true },
@@ -356,6 +361,8 @@ const base = [_]Command{
     .{ .name = "toggle_highlight_patterns", .doc = "Todo words and colours", .run = toggle("highlight_patterns", "todo and colour highlights") },
     .{ .name = "toggle_cursor_word", .doc = "Word under cursor", .run = toggle("cursor_word", "word under cursor highlight") },
     .{ .name = "toggle_indent_scope", .doc = "Indent scope guide", .run = toggle("indent_scope", "indent scope guide") },
+    .{ .name = "toggle_wrap", .doc = "Line wrap", .run = toggle("wrap", "line wrap") },
+    .{ .name = "toggle_code_lens", .doc = "Code lens", .run = toggle("code_lens", "code lens") },
     .{ .name = "toggle_trailing_space", .doc = "Trailing whitespace", .run = toggle("trailing_space", "trailing whitespace highlight") },
     .{ .name = "toggle_trim_on_save", .doc = "Trim whitespace on save", .run = toggle("trim_on_save", "trim trailing whitespace on save") },
     .{ .name = "toggle_icons", .doc = "File icons", .run = toggle("icons", "file icons") },
@@ -1320,6 +1327,29 @@ fn verticalRow(comptime dir: isize) Handler {
                 return text_motion(c);
             }
             const delta = dir * @as(isize, @intCast(c.count));
+            // Wrapped lines and lens rows: a row at a time on screen (lens
+            // rows skipped); a count moves whole lines.
+            if (ed.layered() and ed.mode == .normal and ed.ghost == null) {
+                if (c.has_count) {
+                    const t = ed.text();
+                    const line = ed.stepVisible(t.lineOf(ed.view.cursor), delta);
+                    return ed.setCursorRow(.{ .line = line, .sub = @intCast(ed.lensRows(line)) });
+                }
+                var r = ed.cursorRow();
+                var n = @abs(delta);
+                while (n > 0) : (n -= 1) {
+                    var next = if (dir > 0) ed.nextRow(r) else ed.prevRow(r);
+                    // Over a lens row (it isn't text).
+                    while (next.ghost == null and next.sub < ed.lensRows(next.line)) {
+                        const further = if (dir > 0) ed.nextRow(next) else ed.prevRow(next);
+                        if (further.eql(next)) break;
+                        next = further;
+                    }
+                    if (next.eql(r) or (next.ghost == null and next.sub < ed.lensRows(next.line))) break;
+                    r = next;
+                }
+                return ed.setCursorRow(r);
+            }
             var target = ed.stepRows(ed.cursorRow(), delta);
             if (ed.mode == .visual) {
                 // A selection of ghost lines stays within its hunk.
@@ -2322,6 +2352,34 @@ fn startSearch(comptime forward: bool, comptime kind: Editor.PromptKind) Handler
 
 fn selectIn(c: Context) !void {
     c.ed.startSelectIn();
+}
+
+fn runSql(comptime whole: bool) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            try c.ed.runSql(whole);
+        }
+    }.run;
+}
+
+/// Insert-mode <C-;>: a `;` at the end of the line (unless one is there),
+/// the cursor staying where it is.
+fn appendSemicolon(c: Context) !void {
+    const ed = c.ed;
+    const t = ed.text();
+    const line = ed.cursorLine();
+    const ls = t.lineStart(line);
+    const body = std.mem.trimEnd(u8, t.slice(ls, t.lineEnd(line)), " \t");
+    if (std.mem.endsWith(u8, body, ";")) return;
+    try ed.insertAt(ls + body.len, ";");
+}
+
+fn selectLastChange(c: Context) !void {
+    c.ed.selectLastChange();
+}
+
+fn toggleScratch(c: Context) !void {
+    try c.ed.toggleScratch();
 }
 
 fn gotoSymbol(c: Context) !void {

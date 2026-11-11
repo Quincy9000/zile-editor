@@ -29,10 +29,13 @@ const tags = @import("tags.zig");
 const emmet = @import("emmet.zig");
 const snippets = @import("snippets.zig");
 const config = @import("config/config.zig");
+const sql = @import("sql.zig");
+const ZigCheck = @import("ZigCheck.zig");
 const format = @import("format.zig");
 const Ghost = @import("ai/Ghost.zig");
 pub const Claude = @import("ai/Claude.zig");
 const Syntax = @import("syntax/Syntax.zig");
+const History = @import("core/History.zig");
 const Snippet = @import("lsp/Snippet.zig");
 pub const Windows = @import("Windows.zig");
 pub const Project = @import("core/Project.zig");
@@ -83,6 +86,14 @@ pub const Options = struct {
     trailing_space: bool = true,
     /// Remove trailing whitespace when saving.
     trim_on_save: bool = false,
+    /// Code lens: the server's notes above definitions (`3 references`).
+    code_lens: bool = true,
+    /// Long lines wrap onto more rows, at word boundaries, keeping their
+    /// indent (`SPC t l`); no sideways scrolling then.
+    wrap: bool = true,
+    /// A modified file is written when you leave it (another buffer or
+    /// window) or zile loses focus, as the nvim config's autosave.
+    autosave: bool = true,
     /// File-type icons in pickers (needs a Nerd Font).
     icons: bool = true,
     /// Scrolling glides instead of jumping (windows only, not terminals).
@@ -114,6 +125,8 @@ pub const View = struct {
     anchor: usize = 0,
     /// When set, the top row is this ghost line shown before line `top`.
     top_ghost: ?u32 = null,
+    /// Which of `top`'s rows is at the top (wrapped lines, code lens).
+    top_sub: u16 = 0,
     /// Smooth scrolling: rows the drawn text still is from `top` (positive
     /// after scrolling down: it is drawn that much lower, gliding to 0).
     scroll_offset: f32 = 0,
@@ -138,19 +151,35 @@ pub const View = struct {
 pub const Row = struct {
     line: usize,
     ghost: ?u32 = null,
+    /// Which screen row of the line: its code lens row first (if any), then
+    /// the pieces it wraps into (0 for a line on one row; always 0 for a
+    /// ghost row).
+    sub: u16 = 0,
 
     pub fn eql(a: Row, b: Row) bool {
-        return a.line == b.line and a.ghost == b.ghost;
+        return a.line == b.line and a.ghost == b.ghost and a.sub == b.sub;
     }
 
     /// Whether `a` is above `b` on screen.
     pub fn before(a: Row, b: Row) bool {
         if (a.line != b.line) return a.line < b.line;
-        const ka = a.ghost orelse return false;
-        const kb = b.ghost orelse return true;
-        return ka < kb;
+        // Ghost rows come before their line's own rows.
+        if (a.ghost) |ka| {
+            const kb = b.ghost orelse return true;
+            return ka < kb;
+        }
+        if (b.ghost != null) return false;
+        return a.sub < b.sub;
     }
 };
+
+/// One screen row of a line: visual columns `[start, end)` (inlay hints
+/// counted), drawn `indent` cells in (a wrapped line's later rows line up
+/// under its indentation).
+pub const Seg = struct { start: usize, end: usize, indent: usize };
+
+/// Most rows a line wraps into (longer lines get a last, cut-off row).
+pub const max_segments = 64;
 
 /// The cursor while it is on a ghost line (read-only; yankable).
 pub const GhostCursor = struct {
@@ -610,6 +639,17 @@ find_dot: bool = false,
 snipe_dot: bool = false,
 /// What was just yanked, lit for a moment.
 yank_flash: ?YankFlash = null,
+/// The screen column kept while moving up and down through wrapped lines,
+/// valid while the cursor is still where that move left it.
+wrap_want: ?struct { cursor: usize, screen: usize } = null,
+/// A mouse press in progress: where it went down, and whether it has
+/// selected anything (copied on release).
+mouse_drag: ?struct { anchor: usize, selected: bool = false } = null,
+/// The text last changed or yanked (`gV` selects it); edits made by one
+/// command add up.
+last_changed: ?struct { buffer: *Buffer, start: usize, end: usize, linewise: bool, group: u64 } = null,
+/// Counts finished commands (one edit group each, for `last_changed`).
+command_seq: u64 = 0,
 /// A tag name being edited and its partner's (`tags.zig`): the partner
 /// follows.
 tag_link: ?tags.Link = null,
@@ -665,6 +705,18 @@ search_highlight: bool = false,
 
 /// Running language servers, by index into `Lsp.servers`, started on demand.
 lsps: std.ArrayList(*Lsp) = .empty,
+/// SQL completion's tables and columns, the SQL buffer they were last
+/// looked up for, and whether a statement that changes tables has run.
+sql_schema: ?*sql.Schema = null,
+sql_checked: ?*const Buffer = null,
+sql_reload: bool = false,
+sql_fresh: bool = false,
+/// A JS/TS save in progress (`saveChainNext`).
+save_chain: ?struct { buffer: *Buffer, step: enum { start, fix_all, organize, done }, started: Io.Timestamp } = null,
+/// Compile checks of standalone Zig files running, and their results by
+/// buffer (merged into `diagnostics`).
+zig_checks: std.ArrayList(struct { buffer: *Buffer, job: *ZigCheck }) = .empty,
+check_results: std.ArrayList(struct { buffer: *Buffer, diags: []Lsp.Diagnostic, libc: bool }) = .empty,
 /// Diagnostics of several servers for one file, merged (`diagnostics`).
 merged_diagnostics: std.ArrayList(Lsp.Diagnostic) = .empty,
 /// Linters looked for per project ("index:root" -> absent there).
@@ -803,6 +855,11 @@ pub fn deinit(ed: *Editor) void {
     for (ed.lsps.items) |l| l.deinit();
     ed.lsps.deinit(ed.gpa);
     ed.merged_diagnostics.deinit(ed.gpa);
+    for (ed.zig_checks.items) |zc| zc.job.destroy();
+    if (ed.sql_schema) |sc| sc.destroy(ed.gpa);
+    ed.zig_checks.deinit(ed.gpa);
+    for (ed.check_results.items) |r| freeDiagnosticList(ed.gpa, r.diags);
+    ed.check_results.deinit(ed.gpa);
     var lc = ed.linter_checked.keyIterator();
     while (lc.next()) |key| ed.gpa.free(key.*);
     ed.linter_checked.deinit(ed.gpa);
@@ -923,6 +980,11 @@ pub fn unpeekWindow(ed: *Editor, p: Peek) void {
 /// picks up picker results from the worker.
 pub fn tick(ed: *Editor) void {
     ed.now = Io.Timestamp.now(ed.io, .awake);
+    ed.keepUndoHistories();
+    ed.tickZigChecks();
+    ed.tickSaveChain();
+    ed.tickSqlSchema();
+    ed.tickCodeLens();
     if (ed.yank_flash) |f| if (f.strength(ed.now) <= 0) {
         ed.yank_flash = null;
     };
@@ -1073,6 +1135,7 @@ fn afterKey(ed: *Editor) void {
     // A renamed tag's partner follows as you type, in the same undo step.
     tags.sync(ed);
     if (!ed.isIdle()) return;
+    ed.command_seq +%= 1;
     const b = ed.buffer;
     b.history.commit(ed.gpa) catch {};
     b.modified = b.history.isModified();
@@ -1330,8 +1393,12 @@ pub fn languageServer(ed: *Editor) ?*Lsp {
 /// its linters'. The slice is good until the next call.
 pub fn diagnostics(ed: *const Editor, b: *const Buffer) []const Lsp.Diagnostic {
     const path = b.path orelse return &.{};
-    var lists: [4][]const Lsp.Diagnostic = undefined;
+    var lists: [5][]const Lsp.Diagnostic = undefined;
     var n: usize = 0;
+    for (ed.check_results.items) |r| if (r.buffer == b and r.diags.len > 0) {
+        lists[n] = r.diags;
+        n += 1;
+    };
     for (ed.lsps.items) |l| if (l.wants(b) and n < lists.len) {
         const d = l.diagnosticsFor(path);
         if (d.len == 0) continue;
@@ -1490,6 +1557,14 @@ fn afterTyped(ed: *Editor, cp: u21) void {
     if (ed.cursors.items.len > 0 or ed.replaying) return; // completion is single-cursor
     // Signature help: `(` opens it, `,` updates it, `)` closes it.
     if (cp == ')') ed.closeSignature();
+    if (ed.isSql()) {
+        // Our own list: the database's tables and columns.
+        if (cp == '.') ed.closeCompletion();
+        if (ed.completion != null) return;
+        const start = ed.wordStart();
+        if (cp == '.' or (cp < 0x80 and isIdent(@intCast(cp)) and ed.view.cursor > start)) ed.sqlCompletion(start);
+        return;
+    }
     const l = ed.lspFor(ed.buffer) orelse return;
     // A `,` asks again even if the popup was closed meanwhile (by a nested
     // call, say): the server answers with nothing outside a call.
@@ -1505,6 +1580,58 @@ fn afterTyped(ed: *Editor, cp: u21) void {
     const ask = trigger or (cp < 0x80 and isIdent(@intCast(cp)) and ed.view.cursor > start);
     if (!ask) return;
     ed.askCompletion(l, start);
+}
+
+/// The current file's folder (absolute), else the working folder. Caller
+/// frees.
+fn fileFolder(ed: *Editor) ![]u8 {
+    const path = ed.buffer.path orelse return ed.gpa.dupe(u8, ed.cwd);
+    const abs = try ed.absolutePath(path);
+    defer ed.gpa.free(abs);
+    return ed.gpa.dupe(u8, std.fs.path.dirname(abs) orelse ed.cwd);
+}
+
+fn isSql(ed: *const Editor) bool {
+    const syn = ed.buffer.syntax orelse return false;
+    return std.mem.eql(u8, syn.lang.name, "sql");
+}
+
+/// SQL completion, built here: keywords, the database's tables and columns
+/// (after `name.` that table's columns), and the file's words.
+fn sqlCompletion(ed: *Editor, start: usize) void {
+    const t = ed.text();
+    const tables: []const sql.Table = if (ed.sql_schema) |sc| (if (sc.done.load(.acquire)) sc.tables else &.{}) else &.{};
+    const json = sql.completionJson(ed.gpa, tables, t.slice(0, t.len()), start) catch return;
+    defer ed.gpa.free(json);
+    var parsed = std.json.parseFromSlice(std.json.Value, ed.gpa, json, .{}) catch return;
+    defer parsed.deinit();
+    ed.showCompletion(ed.buffer, start, parsed.value) catch {};
+}
+
+/// The schema for SQL completion: loaded (in the background) when a SQL
+/// file is first shown, from the database it would run on; again after a
+/// statement that changes tables has run.
+fn tickSqlSchema(ed: *Editor) void {
+    if (ed.sql_reload and ed.run_reported) {
+        ed.sql_reload = false;
+        ed.sql_checked = null;
+    }
+    if (!ed.isSql() or ed.sql_checked == ed.buffer) return;
+    // A load still running finishes first.
+    if (ed.sql_schema) |sc| if (!sc.done.load(.acquire)) return;
+    ed.sql_checked = ed.buffer;
+    const folder = ed.fileFolder() catch return;
+    defer ed.gpa.free(folder);
+    const found = sql.findUrl(ed.gpa, ed.io, folder, ed.cwd) orelse return;
+    defer ed.gpa.free(found.url);
+    defer ed.gpa.free(found.from);
+    if (ed.sql_schema) |sc| {
+        if (std.mem.eql(u8, sc.url, found.url) and !sc.failed and ed.sql_fresh) return;
+        sc.destroy(ed.gpa);
+        ed.sql_schema = null;
+    }
+    ed.sql_schema = sql.Schema.load(ed.gpa, ed.io, found.url, ed.wake_fn) catch null;
+    ed.sql_fresh = true;
 }
 
 /// Asks for completions for the word starting at `start`, unless the answer
@@ -1523,6 +1650,14 @@ fn askCompletion(ed: *Editor, l: *Lsp, start: usize) void {
 /// retyped from its start.
 fn afterDeleted(ed: *Editor) void {
     if (ed.cursors.items.len > 0 or ed.replaying) return;
+    if (ed.isSql()) {
+        if (ed.completion != null) return;
+        const start = ed.wordStart();
+        const t = ed.text();
+        const after_dot = ed.view.cursor > 0 and t.byteAt(ed.view.cursor - 1) == '.';
+        if (ed.view.cursor > start or after_dot) ed.sqlCompletion(start);
+        return;
+    }
     const l = ed.lspFor(ed.buffer) orelse return;
     // A list is still held for this word: it was refiltered already.
     if (ed.completion) |c| {
@@ -3100,6 +3235,129 @@ pub fn ghostText(ed: *const Editor, line: usize, k: u32) []const u8 {
     return ed.buffer.git.?.baseLine(h.old_start + k);
 }
 
+// Rows within a line: its code lens row, then its wrapped pieces.
+
+/// Whether some line can take more than one row (then rows can't be
+/// counted as lines).
+pub fn layered(ed: *const Editor) bool {
+    return ed.options.wrap or ed.hasLenses();
+}
+
+/// The rows (wrapped pieces) of `line`, written into `buf`: at least one.
+/// A closed fold's line is one row.
+pub fn segments(ed: *const Editor, line: usize, buf: *[max_segments]Seg) []Seg {
+    const t = &ed.buffer.text;
+    const cols = @max(ed.view.cols, 8);
+    if (!ed.options.wrap or line >= t.lineCount() or ed.foldAt(line) != null) {
+        buf[0] = .{ .start = 0, .end = std.math.maxInt(usize), .indent = 0 };
+        return buf[0..1];
+    }
+    const bytes = t.lineSlice(line);
+    const tab = ed.options.tab_width;
+    var hint_buf: [max_line_hints]LineHint = undefined;
+    const hints = ed.lineHints(ed.buffer, line, &hint_buf);
+    // Later rows start under the line's indentation (at most half the width).
+    const lead = bytes[0 .. std.mem.indexOfNone(u8, bytes, " \t") orelse bytes.len];
+    const indent = @min(motions.displayCol(bytes, lead.len, tab), cols / 2);
+    var n: usize = 0;
+    var row_start: usize = 0;
+    var width = cols;
+    var last_break: usize = 0; // visual column after the last space in this row
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 1;
+        const cp_end = @min(i + len, bytes.len);
+        const next_col = if (bytes[i] == '\t') motions.nextTabStop(col, tab) else col + 1;
+        const v0 = col + hintShift(hints, i);
+        const v1 = next_col + hintShift(hints, i);
+        if (v1 > row_start + width and v0 > row_start and n + 1 < max_segments) {
+            const at = if (last_break > row_start) last_break else v0;
+            buf[n] = .{ .start = row_start, .end = at, .indent = if (n == 0) 0 else indent };
+            n += 1;
+            row_start = at;
+            width = cols - indent;
+            last_break = row_start;
+        }
+        if (bytes[i] == ' ' or bytes[i] == '\t') last_break = v1;
+        col = next_col;
+        i = cp_end;
+    }
+    buf[n] = .{ .start = row_start, .end = std.math.maxInt(usize), .indent = if (n == 0) 0 else indent };
+    return buf[0 .. n + 1];
+}
+
+/// The visual column (inlay hints counted) of byte `off` of `line`.
+pub fn visualCol(ed: *const Editor, line: usize, off: usize) usize {
+    const t = &ed.buffer.text;
+    const bytes = t.lineSlice(line);
+    var hint_buf: [max_line_hints]LineHint = undefined;
+    const hints = ed.lineHints(ed.buffer, line, &hint_buf);
+    return motions.displayCol(bytes, @min(off, bytes.len), ed.options.tab_width) + hintShift(hints, off);
+}
+
+/// Which of `segs` visual column `vcol` is on.
+pub fn segmentIndex(segs: []const Seg, vcol: usize) usize {
+    var k: usize = 0;
+    while (k + 1 < segs.len and vcol >= segs[k + 1].start) k += 1;
+    return k;
+}
+
+/// A code lens title for `line` of `b`: joined to the line's others.
+pub fn addLens(ed: *Editor, b: *Buffer, line: u32, title: []const u8) !void {
+    const clean = std.mem.trim(u8, title, " ");
+    if (clean.len == 0) return;
+    var i: usize = 0;
+    while (i < b.lenses.items.len and b.lenses.items[i].line < line) i += 1;
+    if (i < b.lenses.items.len and b.lenses.items[i].line == line) {
+        const old = b.lenses.items[i].text;
+        b.lenses.items[i].text = try std.mem.concat(ed.gpa, u8, &.{ old, " | ", clean });
+        ed.gpa.free(old);
+        return;
+    }
+    const owned = try ed.gpa.dupe(u8, clean);
+    errdefer ed.gpa.free(owned);
+    try b.lenses.insert(ed.gpa, i, .{ .line = line, .text = owned });
+}
+
+/// Each frame: code lens for the buffers on screen, asked for once their
+/// text has been still a moment (as inlay hints).
+fn tickCodeLens(ed: *Editor) void {
+    if (!ed.options.code_lens) return;
+    for (ed.window_list.items) |w| {
+        if (w.term != null) continue;
+        const b = ed.windowBuffer(w);
+        const l = ed.lspFor(b) orelse continue;
+        if (!l.can_lens or b.lens_pending or b.lens_version == b.edit_version or b.path == null) continue;
+        if (b.hint_changed.durationTo(ed.now).nanoseconds < hint_debounce_ms * std.time.ns_per_ms and b.hint_seen == b.edit_version) continue;
+        l.requestCodeLens(b) catch {};
+    }
+}
+
+pub fn hasLenses(ed: *const Editor) bool {
+    return ed.options.code_lens and ed.buffer.lenses.items.len > 0;
+}
+
+/// The code lens text shown above `line`, if any.
+pub fn lensText(ed: *const Editor, line: usize) ?[]const u8 {
+    if (!ed.options.code_lens) return null;
+    for (ed.buffer.lenses.items) |l| {
+        if (l.line == line) return l.text;
+        if (l.line > line) break;
+    }
+    return null;
+}
+
+pub fn lensRows(ed: *const Editor, line: usize) usize {
+    return @intFromBool(ed.lensText(line) != null);
+}
+
+/// Rows `line` takes on screen.
+pub fn subRows(ed: *const Editor, line: usize) usize {
+    var buf: [max_segments]Seg = undefined;
+    return ed.lensRows(line) + ed.segments(line, &buf).len;
+}
+
 pub fn nextRow(ed: *const Editor, r: Row) Row {
     const n = ed.buffer.text.lineCount();
     if (r.ghost) |k| {
@@ -3107,6 +3365,7 @@ pub fn nextRow(ed: *const Editor, r: Row) Row {
         if (k + 1 < h.old_count) return .{ .line = r.line, .ghost = k + 1 };
         return if (r.line < n) .{ .line = r.line } else r;
     }
+    if (ed.layered() and r.line < n and r.sub + 1 < ed.subRows(r.line)) return .{ .line = r.line, .sub = r.sub + 1 };
     const after = (if (ed.foldAt(r.line)) |f| f.last else r.line) + 1;
     if (ed.ghostHunk(after) != null) return .{ .line = after, .ghost = 0 };
     return if (after < n) .{ .line = after } else r;
@@ -3115,15 +3374,22 @@ pub fn nextRow(ed: *const Editor, r: Row) Row {
 pub fn prevRow(ed: *const Editor, r: Row) Row {
     if (r.ghost) |k| {
         if (k > 0) return .{ .line = r.line, .ghost = k - 1 };
-        return if (r.line == 0) r else .{ .line = ed.visibleLine(r.line - 1) };
+        return if (r.line == 0) r else ed.lastRowOf(ed.visibleLine(r.line - 1));
     }
+    if (r.sub > 0) return .{ .line = r.line, .sub = r.sub - 1 };
     if (ed.ghostHunk(r.line)) |h| return .{ .line = r.line, .ghost = h.old_count - 1 };
-    return if (r.line == 0) r else .{ .line = ed.visibleLine(r.line - 1) };
+    return if (r.line == 0) r else ed.lastRowOf(ed.visibleLine(r.line - 1));
+}
+
+/// The bottom row of `line` (its last wrapped piece).
+fn lastRowOf(ed: *const Editor, line: usize) Row {
+    if (!ed.layered()) return .{ .line = line };
+    return .{ .line = line, .sub = @intCast(ed.subRows(line) - 1) };
 }
 
 /// The row `delta` rows away from `r` (stops at the ends).
 pub fn stepRows(ed: *const Editor, r: Row, delta: isize) Row {
-    if (ed.buffer.folds.isEmpty() and !ed.hasGhosts() and r.ghost == null) {
+    if (ed.buffer.folds.isEmpty() and !ed.hasGhosts() and r.ghost == null and !ed.layered()) {
         return .{ .line = ed.stepVisible(r.line, delta) };
     }
     var cur = r;
@@ -3139,7 +3405,7 @@ pub fn stepRows(ed: *const Editor, r: Row, delta: isize) Row {
 /// Screen rows from `a` down to `b`, counting at most `cap`.
 pub fn rowsFrom(ed: *const Editor, a: Row, b: Row, cap: usize) usize {
     if (!a.before(b)) return 0;
-    if (ed.buffer.folds.isEmpty() and !ed.hasGhosts() and a.ghost == null and b.ghost == null) {
+    if (ed.buffer.folds.isEmpty() and !ed.hasGhosts() and a.ghost == null and b.ghost == null and !ed.layered()) {
         return @min(b.line - a.line, cap);
     }
     var cur = a;
@@ -3158,17 +3424,24 @@ pub fn rowsBetween(ed: *const Editor, a: usize, b: usize, cap: usize) usize {
 }
 
 pub fn topRow(ed: *const Editor) Row {
-    return .{ .line = ed.view.top, .ghost = ed.view.top_ghost };
+    return .{ .line = ed.view.top, .ghost = ed.view.top_ghost, .sub = if (ed.view.top_ghost == null) ed.view.top_sub else 0 };
 }
 
 pub fn setTop(ed: *Editor, r: Row) void {
     ed.view.top = r.line;
     ed.view.top_ghost = r.ghost;
+    ed.view.top_sub = r.sub;
 }
 
 pub fn cursorRow(ed: *const Editor) Row {
     if (ed.ghost) |g| return .{ .line = g.line, .ghost = g.k };
-    return .{ .line = ed.visibleLine(ed.buffer.text.lineOf(ed.view.cursor)) };
+    const t = &ed.buffer.text;
+    const line = ed.visibleLine(t.lineOf(ed.view.cursor));
+    if (!ed.layered()) return .{ .line = line };
+    var buf: [max_segments]Seg = undefined;
+    const segs = ed.segments(line, &buf);
+    const k = if (line == t.lineOf(ed.view.cursor)) segmentIndex(segs, ed.visualCol(line, ed.view.cursor - t.lineStart(line))) else 0;
+    return .{ .line = line, .sub = @intCast(ed.lensRows(line) + k) };
 }
 
 /// The screen row of `r`, if it is on screen.
@@ -3194,9 +3467,46 @@ pub fn setCursorRow(ed: *Editor, r: Row) void {
         ed.view.want_col = col;
     } else {
         ed.ghost = null;
+        if (ed.layered() and ed.options.wrap) return ed.setCursorScreenRow(r);
         ed.gotoLine(r.line);
         ed.view.want_col = col;
     }
+}
+
+/// Onto a wrapped line's row `r` (a lens row counts as its first piece):
+/// at the screen column the cursor was on, which sticks while moving up
+/// and down (as `gj` / `gk`).
+fn setCursorScreenRow(ed: *Editor, r: Row) void {
+    const screen = ed.wantScreenCol();
+    const t = ed.text();
+    const line = @min(r.line, t.lineCount() - 1);
+    var buf: [max_segments]Seg = undefined;
+    const segs = ed.segments(line, &buf);
+    const lens = ed.lensRows(line);
+    const k = @min(@as(usize, r.sub) -| lens, segs.len - 1);
+    const seg = segs[k];
+    var vcol = seg.start + (screen -| seg.indent);
+    // Not past this row's end (its last column, or the line's end).
+    if (k + 1 < segs.len and vcol >= seg.end) vcol = seg.end -| 1;
+    const bytes = t.lineSlice(line);
+    var hint_buf: [max_line_hints]LineHint = undefined;
+    const hints = ed.lineHints(ed.buffer, line, &hint_buf);
+    const text_col = hintVisualToText(hints, bytes, vcol, ed.options.tab_width);
+    ed.setCursor(t.lineStart(line) + motions.byteAtCol(bytes, text_col, ed.options.tab_width));
+    ed.wrap_want = .{ .cursor = ed.view.cursor, .screen = screen };
+}
+
+/// The screen column the cursor is on (within its row), or the one kept
+/// from the last move up or down if the cursor hasn't moved since.
+fn wantScreenCol(ed: *Editor) usize {
+    if (ed.wrap_want) |w| if (w.cursor == ed.view.cursor) return w.screen;
+    const t = ed.text();
+    const line = t.lineOf(ed.view.cursor);
+    var buf: [max_segments]Seg = undefined;
+    const segs = ed.segments(line, &buf);
+    const vcol = ed.visualCol(line, ed.view.cursor - t.lineStart(line));
+    const seg = segs[segmentIndex(segs, vcol)];
+    return vcol - seg.start + seg.indent;
 }
 
 /// Drops the ghost cursor if its hunk went away (edits, restore, toggle).
@@ -3235,6 +3545,60 @@ pub fn extendToFolds(ed: *const Editor, r: operators.Range) operators.Range {
     return operators.linesRange(t, first, last);
 }
 
+/// A mouse button went down on a text cell (`clicks`: 1, 2 or 3 in a
+/// row). One places the cursor (dragging from there selects), two select
+/// the word, three the line; the selection goes to the clipboard on
+/// release, as in kitty.
+pub fn mousePress(ed: *Editor, row: usize, col: usize, clicks: u8) void {
+    if (ed.mode == .insert) ed.setMode(.normal);
+    if (ed.mode == .visual) ed.exitVisual();
+    ed.clickCell(row, col);
+    ed.mouse_drag = .{ .anchor = ed.view.cursor };
+    if (ed.ghost != null) return;
+    const t = ed.text();
+    switch (clicks) {
+        0, 1 => {},
+        2 => if (textobjects.word(t, ed.view.cursor, .inner, false, 1)) |r| if (r.end > r.start) {
+            ed.enterVisual(false);
+            ed.selectRange(r);
+            ed.mouse_drag.?.selected = true;
+        },
+        else => {
+            ed.enterVisual(true);
+            ed.mouse_drag.?.selected = true;
+        },
+    }
+}
+
+/// The pointer moved with the button down: the selection follows it.
+pub fn mouseDrag(ed: *Editor, row: usize, col: usize) void {
+    const d = &(ed.mouse_drag orelse return);
+    if (ed.ghost != null) return;
+    const anchor = if (ed.mode == .visual) ed.view.anchor else d.anchor;
+    ed.clickCell(row, col);
+    if (ed.mode != .visual) {
+        if (ed.view.cursor == d.anchor) return;
+        ed.enterVisual(false);
+    }
+    ed.view.anchor = anchor;
+    d.selected = true;
+}
+
+/// The button came up: a selection made with the mouse is copied.
+pub fn mouseRelease(ed: *Editor) void {
+    const d = ed.mouse_drag orelse return;
+    ed.mouse_drag = null;
+    if (!d.selected or ed.mode != .visual) return;
+    const r = ed.visualRange();
+    const t = ed.text();
+    const end = if (ed.visual_line) @min(r.end + 1, t.len()) else r.end;
+    if (end <= r.start) return;
+    ed.registers.store('+', .yank, t.slice(r.start, end), ed.visual_line) catch return;
+    ed.yank_flash = .{ .buffer = ed.buffer, .start = r.start, .end = end, .linewise = ed.visual_line, .born = ed.now };
+    const lines = t.lineOf(end -| 1) - t.lineOf(r.start) + 1;
+    if (lines > 1) ed.notify(.info, "copied {d} lines", .{lines}) else ed.notify(.info, "copied {d} characters", .{end - r.start});
+}
+
 /// Places the cursor at a cell of the text area (mouse click).
 pub fn clickCell(ed: *Editor, row: usize, col: usize) void {
     const t = ed.text();
@@ -3245,11 +3609,26 @@ pub fn clickCell(ed: *Editor, row: usize, col: usize) void {
     }
     ed.ghost = null;
     // A cell on a line with inlay hints is further along the text than it
-    // looks; one on a hint itself is the text right after it.
+    // looks; one on a hint itself is the text right after it. On a wrapped
+    // line's later row, the columns go on from the row before (a lens row
+    // is the line's start).
     var hint_buf: [max_line_hints]LineHint = undefined;
     const hints = ed.lineHints(ed.buffer, r.line, &hint_buf);
     const bytes = t.lineSlice(r.line);
-    const text_col = hintVisualToText(hints, bytes, ed.view.left + col, ed.options.tab_width);
+    var vcol = ed.view.left + col;
+    if (ed.layered()) {
+        var seg_buf: [max_segments]Seg = undefined;
+        const segs = ed.segments(r.line, &seg_buf);
+        const lens = ed.lensRows(r.line);
+        if (r.sub < lens) {
+            vcol = 0;
+        } else {
+            const k = @min(r.sub - lens, segs.len - 1);
+            vcol = segs[k].start + (col -| segs[k].indent);
+            if (k + 1 < segs.len and vcol >= segs[k].end) vcol = segs[k].end -| 1;
+        }
+    }
+    const text_col = hintVisualToText(hints, bytes, vcol, ed.options.tab_width);
     const off = motions.byteAtCol(bytes, text_col, ed.options.tab_width);
     ed.setCursor(t.lineStart(r.line) + off);
 }
@@ -3279,6 +3658,9 @@ pub fn scrollToCursor(ed: *Editor) void {
         const h = ed.ghostHunk(top.line);
         if (h == null or k >= h.?.old_count) top.ghost = null;
     }
+    if (top.ghost != null or !ed.layered()) {
+        top.sub = 0;
+    } else top.sub = @intCast(@min(top.sub, ed.subRows(top.line) - 1));
     ed.setTop(top);
     if (cur.before(top) or ed.rowsFrom(top, cur, so) < so) {
         ed.setTop(ed.stepRows(cur, -@as(isize, @intCast(so))));
@@ -3293,6 +3675,11 @@ pub fn scrollToCursor(ed: *Editor) void {
         }
     }
 
+    // Wrapped lines fit the width: no sideways scrolling.
+    if (ed.options.wrap and ed.ghost == null) {
+        v.left = 0;
+        return;
+    }
     const col = if (ed.ghost) |g| g.col else ed.cursorCol();
     if (col < v.left) v.left = col;
     if (col >= v.left + v.cols) v.left = col + 1 - v.cols;
@@ -3318,10 +3705,81 @@ pub fn scrollLines(ed: *Editor, delta: isize) void {
 // ---------------------------------------------------------------------------
 // Editing primitives
 
+/// Keeps `last_changed` up to date for an edit replacing `[start, end)`
+/// with `inserted` bytes: within one command the ranges merge.
+fn noteChange(ed: *Editor, start: usize, end: usize, inserted: usize) void {
+    if (ed.replaying) return;
+    const removed = end - start;
+    if (ed.last_changed) |*lc| if (lc.buffer == ed.buffer and lc.group == ed.command_seq and !lc.linewise) {
+        // Shift the old range like the text around it, then take in the edit.
+        const shift = struct {
+            fn at(p: usize, s: usize, e: usize, ins: usize) usize {
+                if (p <= s) return p;
+                if (p >= e) return p - (e - s) + ins;
+                return s + ins;
+            }
+        }.at;
+        lc.start = @min(shift(lc.start, start, end, inserted), start);
+        lc.end = @max(shift(lc.end, start, end, inserted), start + inserted);
+        return;
+    };
+    _ = removed;
+    ed.last_changed = .{ .buffer = ed.buffer, .start = start, .end = start + inserted, .linewise = false, .group = ed.command_seq };
+}
+
+/// A yank is the last change too, for `gV`.
+pub fn noteYank(ed: *Editor, start: usize, end: usize, linewise: bool) void {
+    ed.last_changed = .{ .buffer = ed.buffer, .start = start, .end = end, .linewise = linewise, .group = ed.command_seq -% 1 };
+}
+
+/// `gV`: visual mode over the text last changed or yanked.
+pub fn selectLastChange(ed: *Editor) void {
+    const lc = ed.last_changed orelse return ed.setMessage(.info, "nothing changed yet", .{});
+    if (lc.buffer != ed.buffer) return ed.setMessage(.info, "the last change was in another file", .{});
+    const t = ed.text();
+    const start = @min(lc.start, t.len());
+    const end = @min(lc.end, t.len());
+    ed.enterVisual(lc.linewise);
+    ed.view.anchor = start;
+    ed.view.cursor = if (end > start) motions.prevChar(t, end) else start;
+    ed.view.want_col = null;
+}
+
+/// `SPC t s`: the scratch pad (one markdown file for every project) in a
+/// window at the bottom, or that window closed (saved) if it is open.
+pub fn toggleScratch(ed: *Editor) !void {
+    const path = ed.scratchPath() orelse return ed.setMessage(.err, "nowhere to keep the scratch pad", .{});
+    defer ed.gpa.free(path);
+    for (ed.window_list.items) |w| {
+        const b = ed.windowBuffer(w);
+        const bp = b.path orelse continue;
+        const abs = ed.absolutePath(bp) catch continue;
+        defer ed.gpa.free(abs);
+        if (!std.mem.eql(u8, abs, path)) continue;
+        if (b.modified) _ = b.save(ed.gpa, ed.io) catch {};
+        ed.focusWindow(w);
+        if (ed.window_list.items.len > 1) ed.closeWindow();
+        return;
+    }
+    if (std.fs.path.dirname(path)) |d| Io.Dir.cwd().createDirPath(ed.io, d) catch {};
+    try ed.splitWindow(.down);
+    Windows.resize(ed.window, .vertical, -0.25);
+    try ed.openFile(path);
+}
+
+/// Where the scratch pad is kept (`$XDG_DATA_HOME/zile/scratch.md`; in
+/// tests, the state folder). Caller frees.
+pub fn scratchPath(ed: *Editor) ?[]u8 {
+    if (ed.state_dir) |d| return std.fs.path.join(ed.gpa, &.{ d, "scratch.md" }) catch null;
+    if (@import("builtin").is_test) return null;
+    return config.dir(ed.gpa, .data, "scratch.md");
+}
+
 /// Inserts at `pos`, recording it for undo. Leaves the cursor alone.
 pub fn insertAt(ed: *Editor, pos: usize, bytes: []const u8) !void {
     if (bytes.len == 0) return;
     tags.beforeEdit(ed, pos, pos, bytes.len);
+    ed.noteChange(pos, pos, bytes.len);
     try ed.buffer.history.recordInsert(ed.gpa, pos, bytes, ed.view.cursor);
     try ed.buffer.insert(ed.gpa, pos, bytes);
     ed.buffer.modified = true;
@@ -3353,6 +3811,7 @@ pub fn deleteRange(ed: *Editor, start: usize, end: usize) !void {
 pub fn deleteRangeKeepCursor(ed: *Editor, start: usize, end: usize) !void {
     if (start >= end) return;
     tags.beforeEdit(ed, start, end, 0);
+    ed.noteChange(start, end, 0);
     const t = ed.text();
     try ed.buffer.history.recordDelete(ed.gpa, start, t.slice(start, end), ed.view.cursor);
     ed.buffer.delete(start, end);
@@ -3387,6 +3846,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
     if (cur.path == null and !cur.modified and cur.text.len() == 0) {
         ed.lspCloseBuffer(cur);
         cur.deinit(ed.gpa);
+        ed.restoreFileState(&loaded);
         cur.* = loaded;
         ed.use_counter += 1;
         cur.last_used = ed.use_counter;
@@ -3396,6 +3856,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
         return;
     }
     errdefer loaded.deinit(ed.gpa);
+    ed.restoreFileState(&loaded);
     const b = try ed.gpa.create(Buffer);
     errdefer ed.gpa.destroy(b);
     b.* = loaded;
@@ -3461,6 +3922,7 @@ pub fn openArg(ed: *Editor, path: []const u8) void {
 pub fn switchTo(ed: *Editor, b: *Buffer) void {
     if (b == ed.buffer) return;
     ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
+    ed.leaveBuffer(ed.buffer);
     ed.use_counter += 1;
     b.last_used = ed.use_counter;
     ed.activate(b);
@@ -4189,6 +4651,52 @@ fn finishRunPrompt(ed: *Editor, kind: PromptKind) !void {
     try ed.startRun(cmd);
 }
 
+const libcSetenv = @extern(*const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) c_int, .{ .name = "setenv" });
+
+
+/// `SPC r s` (`SPC r f` with `whole`): SQL against the project's database,
+/// the results in the run popup: the statement at the cursor, the selected
+/// lines in visual mode, or the whole file.
+pub fn runSql(ed: *Editor, whole: bool) !void {
+    const lang = if (ed.buffer.syntax) |syn| syn.lang.name else "";
+    if (!std.mem.eql(u8, lang, "sql")) return ed.setMessage(.info, "not a SQL file", .{});
+    const t = ed.text();
+    const all = t.slice(0, t.len());
+    const statement: []const u8 = if (ed.mode == .visual) blk: {
+        const first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
+        const last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
+        ed.exitVisual();
+        break :blk t.slice(t.lineStart(first), t.lineEnd(last));
+    } else if (whole) all else sql.statementAt(all, ed.view.cursor);
+    if (std.mem.trim(u8, statement, " \t\r\n;").len == 0) return ed.setMessage(.info, "no statement here", .{});
+    const folder = try ed.fileFolder();
+    defer ed.gpa.free(folder);
+    const found = sql.findUrl(ed.gpa, ed.io, folder, ed.cwd) orelse
+        return ed.setMessage(.err, "no database: set DATABASE_URL (environment, or a .env above the file)", .{});
+    defer ed.gpa.free(found.url);
+    defer ed.gpa.free(found.from);
+    const shown = try sql.redact(ed.gpa, found.url);
+    defer ed.gpa.free(shown);
+    const client = sql.clientFor(found.url) orelse
+        return ed.setMessage(.err, "can't run SQL on {s} (postgres:// or sqlite: URLs)", .{shown});
+    // The database by the environment, so a password stays out of the
+    // command line (and out of messages).
+    const target = try ed.gpa.dupeSentinel(u8, client.target, 0);
+    defer ed.gpa.free(target);
+    _ = libcSetenv("ZILE_DB", target, 1);
+    const cmd = try sql.command(ed.gpa, client.client, statement);
+    defer ed.gpa.free(cmd);
+    try ed.startRun(cmd);
+    // Tables may change: completion reloads them once it has run.
+    for ([_][]const u8{ "create", "alter", "drop", "rename" }) |w| {
+        if (motions.indexOfFold(statement, 0, w) != null) {
+            ed.sql_reload = true;
+            ed.sql_fresh = false;
+        }
+    }
+    ed.setMessage(.info, "{s} on {s} (from {s})", .{ @tagName(client.client), shown, found.from });
+}
+
 /// `SPC r .`: the runner's command again, without asking.
 pub fn runAgain(ed: *Editor) !void {
     const cmd = ed.loadRunnerCommand() orelse return ed.runPrompt(true);
@@ -4239,7 +4747,14 @@ fn yankRunOutput(ed: *Editor, t: *Terminal, all: bool) void {
         if (std.mem.indexOf(u8, body[nl..], "exited ") != null) body = std.mem.trimEnd(u8, body[0..nl], " \t\r\n");
     }
     var errors_only = false;
-    if (!all) if (std.mem.indexOf(u8, body, "error:")) |at| {
+    // Zig/C/TS write `error:`, Rust `error[E0425]:`.
+    const first_error: ?usize = blk: {
+        const a = std.mem.indexOf(u8, body, "error:");
+        const b = std.mem.indexOf(u8, body, "error[");
+        if (a != null and b != null) break :blk @min(a.?, b.?);
+        break :blk a orelse b;
+    };
+    if (!all) if (first_error) |at| {
         const line = if (std.mem.lastIndexOfScalar(u8, body[0..at], '\n')) |nl| nl + 1 else 0;
         body = body[line..];
         errors_only = true;
@@ -5404,6 +5919,7 @@ pub fn focusWindow(ed: *Editor, w: *Windows.Window) void {
     ed.window.view = ed.view;
     ed.window.buffer = ed.buffer;
     ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
+    if (w.buffer != ed.buffer) ed.leaveBuffer(ed.buffer);
     ed.loadWindow(w);
 }
 
@@ -5659,8 +6175,65 @@ pub fn saveCurrent(ed: *Editor) !void {
         return ed.setMessage(.info, "this is Claude's proposal: SPC a y accepts it, SPC a n rejects it", .{});
     if (b.path == null) return ed.filePrompt(.save_as);
     if (ed.options.trim_on_save) _ = try textops.trimTrailing(ed);
-    if (ed.options.format_on_save and b.syntax != null) return ed.formatBuffer(null, true);
+    // JavaScript / TypeScript: eslint's fixes and organized imports first.
+    const lang = if (b.syntax) |sx| sx.lang.name else "";
+    if (ed.save_chain == null and (std.mem.eql(u8, lang, "javascript") or std.mem.eql(u8, lang, "typescript") or std.mem.eql(u8, lang, "tsx"))) {
+        ed.save_chain = .{ .buffer = b, .step = .start, .started = ed.now };
+        return ed.saveChainNext();
+    }
+    ed.finishSave(b);
+}
+
+/// The last part of saving: formatted (format on save), then written.
+fn finishSave(ed: *Editor, b: *Buffer) void {
+    if (ed.options.format_on_save and b.syntax != null and b == ed.buffer) {
+        ed.formatBuffer(null, true) catch ed.saveBufferNow(b);
+        return;
+    }
     ed.saveBufferNow(b);
+}
+
+/// The save of a JS/TS file, a step at a time: eslint's "fix all", then
+/// "organize imports", then format and write. Each server's answer (or 2
+/// seconds without one) moves it on; a server not running is skipped.
+pub fn saveChainNext(ed: *Editor) void {
+    const chain = &(ed.save_chain orelse return);
+    const b = chain.buffer;
+    if (!ed.bufferAlive(b)) {
+        ed.save_chain = null;
+        return;
+    }
+    while (true) {
+        chain.step = switch (chain.step) {
+            .start => .fix_all,
+            .fix_all => .organize,
+            .organize, .done => .done,
+        };
+        chain.started = ed.now;
+        switch (chain.step) {
+            .start => unreachable,
+            .fix_all => for (ed.lsps.items) |l| {
+                if (l.server().linter and std.mem.eql(u8, l.server().name, "eslint") and l.wants(b)) {
+                    if (l.requestSourceAction(ed, b, "source.fixAll.eslint")) |_| return else |_| {}
+                }
+            },
+            .organize => if (ed.lspFor(b)) |l| {
+                if (l.requestSourceAction(ed, b, "source.organizeImports")) |_| return else |_| {}
+            },
+            .done => {
+                ed.save_chain = null;
+                ed.finishSave(b);
+                return;
+            },
+        }
+    }
+}
+
+/// A step waiting too long on its server: on without it.
+fn tickSaveChain(ed: *Editor) void {
+    const chain = ed.save_chain orelse return;
+    const ms = @divTrunc(chain.started.durationTo(ed.now).nanoseconds, std.time.ns_per_ms);
+    if (ms > 2000) ed.saveChainNext();
 }
 
 /// Writes `b` as it is.
@@ -6526,6 +7099,145 @@ pub fn loadedVisits(ed: *Editor) *Visits {
     return &ed.visits;
 }
 
+fn freeDiagnosticList(gpa: Allocator, list: []Lsp.Diagnostic) void {
+    for (list) |d| gpa.free(d.message);
+    gpa.free(list);
+}
+
+/// Standalone Zig files (no build.zig): compile-checked when opened and
+/// saved; finished checks become the file's diagnostics.
+fn tickZigChecks(ed: *Editor) void {
+    var i: usize = 0;
+    while (i < ed.zig_checks.items.len) {
+        const zc = ed.zig_checks.items[i];
+        if (!zc.job.done.load(.acquire)) {
+            i += 1;
+            continue;
+        }
+        _ = ed.zig_checks.swapRemove(i);
+        defer zc.job.destroy();
+        if (!ed.bufferAlive(zc.buffer)) continue;
+        const diags = zc.job.diagnostics.toOwnedSlice(ed.gpa) catch continue;
+        for (ed.check_results.items) |*r| if (r.buffer == zc.buffer) {
+            freeDiagnosticList(ed.gpa, r.diags);
+            r.diags = diags;
+            r.libc = zc.job.needed_libc;
+            break;
+        } else ed.check_results.append(ed.gpa, .{ .buffer = zc.buffer, .diags = diags, .libc = zc.job.needed_libc }) catch freeDiagnosticList(ed.gpa, diags);
+    }
+    // Results of closed buffers go.
+    var k: usize = 0;
+    while (k < ed.check_results.items.len) {
+        if (ed.bufferAlive(ed.check_results.items[k].buffer)) {
+            k += 1;
+        } else freeDiagnosticList(ed.gpa, ed.check_results.swapRemove(k).diags);
+    }
+    for (ed.buffers.items) |b| {
+        if (b.checked == b.saves) continue;
+        const path = b.path orelse continue;
+        if (!std.mem.endsWith(u8, path, ".zig")) continue;
+        const running = for (ed.zig_checks.items) |zc| {
+            if (zc.buffer == b) break true;
+        } else false;
+        if (running) continue; // the next tick after it, for the newer save
+        b.checked = b.saves;
+        const abs = ed.absolutePath(path) catch continue;
+        defer ed.gpa.free(abs);
+        if (!ZigCheck.wanted(ed.io, abs)) continue;
+        const libc = for (ed.check_results.items) |r| {
+            if (r.buffer == b) break r.libc;
+        } else false;
+        // The file as it is on disk is what the compiler reads.
+        const job = ZigCheck.start(ed.gpa, ed.io, abs, b.text.slice(0, b.text.len()), libc, ed.wake_fn) catch continue;
+        ed.zig_checks.append(ed.gpa, .{ .buffer = b, .job = job }) catch job.destroy();
+    }
+}
+
+/// Leaving `b` (for another buffer or window): it is saved if modified
+/// (autosave) and its cursor position remembered.
+fn leaveBuffer(ed: *Editor, b: *Buffer) void {
+    ed.rememberPosition(b);
+    ed.autosave(b);
+}
+
+/// zile lost focus: every modified file is saved.
+pub fn focusLost(ed: *Editor) void {
+    for (ed.buffers.items) |b| ed.autosave(b);
+}
+
+fn autosave(ed: *Editor, b: *Buffer) void {
+    if (!ed.options.autosave or !b.modified or b.path == null or ed.replaying) return;
+    // Claude's proposals are reviewed, not saved behind your back.
+    if (ed.claude) |c| if (c.diffFor(b) != null) return;
+    if (!ed.bufferAlive(b)) return;
+    _ = b.save(ed.gpa, ed.io) catch return;
+    if (ed.lspFor(b)) |l| l.didSave(b);
+}
+
+pub fn bufferAlive(ed: *const Editor, b: *const Buffer) bool {
+    return std.mem.indexOfScalar(*Buffer, ed.buffers.items, @constCast(b)) != null;
+}
+
+/// Notes where `b`'s cursor is (the reopen position).
+fn rememberPosition(ed: *Editor, b: *Buffer) void {
+    const path = b.path orelse return;
+    const cursor = if (b == ed.buffer) ed.view.cursor else b.saved.cursor;
+    const t = &b.text;
+    const pos = @min(cursor, t.len());
+    const line = t.lineOf(pos);
+    const abs = ed.absolutePath(path) catch return;
+    defer ed.gpa.free(abs);
+    ed.loadedVisits().setPosition(abs, line, pos - t.lineStart(line));
+}
+
+/// A file just loaded: the cursor where it was left, and its undo history
+/// from the last session (if the file is still as it was then).
+fn restoreFileState(ed: *Editor, b: *Buffer) void {
+    const path = b.path orelse return;
+    const abs = ed.absolutePath(path) catch return;
+    defer ed.gpa.free(abs);
+    if (ed.loadedVisits().get(abs)) |e| {
+        const t = &b.text;
+        const line = @min(@as(usize, e.line), t.lineCount() - 1);
+        const cursor = t.lineStart(line) + @min(@as(usize, e.col), t.lineLen(line));
+        b.saved = .{ .cursor = cursor, .top = line -| 10 };
+    }
+    const undo_path = ed.undoPath(abs) orelse return;
+    defer ed.gpa.free(undo_path);
+    const data = Io.Dir.cwd().readFileAlloc(ed.io, undo_path, ed.gpa, .limited(64 << 20)) catch return;
+    defer ed.gpa.free(data);
+    const hash = std.hash.Wyhash.hash(0, b.text.slice(0, b.text.len()));
+    const h = (History.deserialize(ed.gpa, data, hash) catch return) orelse return;
+    b.history.deinit(ed.gpa);
+    b.history = h;
+}
+
+/// `$XDG_STATE_HOME/zile/undo/<hash of the path>`. Caller frees.
+fn undoPath(ed: *Editor, abs: []const u8) ?[]u8 {
+    var name: [32]u8 = undefined;
+    const n = std.fmt.bufPrint(&name, "undo/{x:0>16}", .{std.hash.Wyhash.hash(0, abs)}) catch return null;
+    return ed.statePath(n);
+}
+
+/// Each frame: the undo history of every file saved since is written
+/// out, so it survives closing the file.
+fn keepUndoHistories(ed: *Editor) void {
+    for (ed.buffers.items) |b| {
+        if (b.saves == b.undo_kept) continue;
+        const path = b.path orelse continue;
+        const data = (b.history.serialize(ed.gpa, std.hash.Wyhash.hash(0, b.text.slice(0, b.text.len()))) catch continue) orelse continue;
+        defer ed.gpa.free(data);
+        b.undo_kept = b.saves;
+        if (data.len > 32 << 20) continue;
+        const abs = ed.absolutePath(path) catch continue;
+        defer ed.gpa.free(abs);
+        const undo_path = ed.undoPath(abs) orelse continue;
+        defer ed.gpa.free(undo_path);
+        if (std.fs.path.dirname(undo_path)) |d| Io.Dir.cwd().createDirPath(ed.io, d) catch continue;
+        Io.Dir.cwd().writeFile(ed.io, .{ .sub_path = undo_path, .data = data }) catch {};
+    }
+}
+
 fn recordVisit(ed: *Editor, b: *const Buffer) void {
     const path = b.path orelse return;
     const abs = ed.absolutePath(path) catch return;
@@ -6533,6 +7245,12 @@ fn recordVisit(ed: *Editor, b: *const Buffer) void {
     const v = ed.loadedVisits();
     v.record(ed.gpa, abs, ed.unixNow()) catch return;
     if (v.unsaved >= 8) ed.saveVisits();
+}
+
+/// Where each open file's cursor is, for next time (on the way out, while
+/// the buffers are still there).
+pub fn rememberPositions(ed: *Editor) void {
+    for (ed.buffers.items) |b| ed.rememberPosition(b);
 }
 
 pub fn saveVisits(ed: *Editor) void {
@@ -7390,6 +8108,222 @@ test "snippets: the exact trigger first, indented like its line" {
     }
 }
 
+test "U redoes; <C-;> ends the line with ;, the cursor staying" {
+    var ed = try testEditor("foo(1)");
+    defer ed.deinit();
+    try ed.feed("xu");
+    try expectText(&ed, "foo(1)");
+    try ed.feed("U");
+    try expectText(&ed, "oo(1)");
+    try ed.feed("$i<C-;>");
+    try expectText(&ed, "oo(1);");
+    try testing.expectEqual(4, ed.view.cursor); // still before the `)`
+    try ed.feed("<C-;><Esc>"); // already ends in `;`
+    try expectText(&ed, "oo(1);");
+}
+
+test "gV selects the last change, or the last yank" {
+    var ed = try testEditor("one two three\nfour");
+    defer ed.deinit();
+    try ed.feed("wcwTWO<Esc>gV");
+    try testing.expectEqual(Mode.visual, ed.mode);
+    try ed.feed("y");
+    try testing.expectEqualStrings("TWO", ed.registers.get(null).?.text);
+    try ed.feed("jyygV"); // a linewise yank: the line, linewise
+    try testing.expect(ed.visual_line);
+    try testing.expectEqual(1, ed.cursorLine());
+}
+
+test "scratch pad: SPC t s opens it below, again closes it (saved)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    var ed = try testEditor("code");
+    defer ed.deinit();
+    ed.state_dir = dir;
+    try ed.feed("<Space>ts");
+    try testing.expectEqual(2, ed.window_list.items.len);
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "scratch.md"));
+    try ed.feed("inote<Esc><Space>ts");
+    try testing.expectEqual(1, ed.window_list.items.len);
+    try expectText(&ed, "code");
+    const saved = try tmp.dir.readFileAlloc(testing.io, "scratch.md", testing.allocator, .limited(1024));
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings("note\n", saved);
+}
+
+test "autosave on leaving a file; the cursor and undo come back next time" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const a = try std.fs.path.join(gpa, &.{ dir, "a.txt" });
+    defer gpa.free(a);
+    const b = try std.fs.path.join(gpa, &.{ dir, "b.txt" });
+    defer gpa.free(b);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "one\ntwo\nthree\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.txt", .data = "other\n" });
+    {
+        var ed = try testEditor("");
+        defer ed.deinit();
+        ed.state_dir = dir;
+        try ed.openFile(a);
+        try ed.feed("jjAx<Esc>");
+        try ed.openFile(b); // leaving a.txt saves it
+        ed.tick(); // ...and keeps its undo history
+        const saved = try tmp.dir.readFileAlloc(testing.io, "a.txt", gpa, .limited(1024));
+        defer gpa.free(saved);
+        try testing.expectEqualStrings("one\ntwo\nthreex\n", saved);
+        ed.rememberPositions();
+        ed.saveVisits();
+    }
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.state_dir = dir;
+    try ed.openFile(a);
+    try testing.expectEqual(2, ed.cursorLine()); // where it was left
+    try ed.feed("u"); // the edit from last time undoes
+    try expectText(&ed, "one\ntwo\nthree");
+}
+
+test "mouse: drag selects and copies on release; double-click a word, triple a line" {
+    var ed = try testEditor("hello world\nsecond line");
+    defer ed.deinit();
+    ed.setViewSize(10, 40);
+    const Fake = struct {
+        var buf: [64]u8 = undefined;
+        var len: usize = 0;
+        fn get(_: Allocator) ?[]u8 {
+            return null;
+        }
+        fn set(_: Allocator, data: []const u8) void {
+            len = @min(data.len, buf.len);
+            @memcpy(buf[0..len], data[0..len]);
+        }
+        fn copied() []const u8 {
+            return buf[0..len];
+        }
+    };
+    ed.registers.clipboard = .{ .get = Fake.get, .set = Fake.set };
+    ed.mousePress(0, 0, 1);
+    ed.mouseDrag(0, 4);
+    try testing.expectEqual(Mode.visual, ed.mode);
+    ed.mouseRelease();
+    try testing.expectEqualStrings("hello", Fake.copied());
+    try testing.expectEqual(Mode.visual, ed.mode); // still selected, as in nvim
+    ed.mousePress(0, 7, 2);
+    ed.mouseRelease();
+    try testing.expectEqualStrings("world", Fake.copied());
+    ed.mousePress(1, 2, 3);
+    ed.mouseRelease();
+    try testing.expectEqualStrings("second line", std.mem.trimEnd(u8, Fake.copied(), "\n"));
+    ed.mousePress(0, 3, 1); // a plain click: no selection, nothing copied
+    ed.mouseRelease();
+    try testing.expectEqual(Mode.normal, ed.mode);
+    try testing.expectEqual(3, ed.view.cursor);
+}
+
+test "saving a TypeScript file with no servers running still saves" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "a.ts" });
+    defer testing.allocator.free(path);
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.options.format_on_save = false;
+    try ed.openFile(path);
+    try ed.feed("iconst x = 1;<Esc><Space>s");
+    try testing.expect(ed.save_chain == null);
+    const saved = try tmp.dir.readFileAlloc(testing.io, "a.ts", testing.allocator, .limited(64));
+    defer testing.allocator.free(saved);
+    try testing.expectEqualStrings("const x = 1;\n", saved);
+}
+
+test "SQL completion: tables and columns from the database, after an alias its columns" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const db = try std.fs.path.join(gpa, &.{ dir, "app.db" });
+    defer gpa.free(db);
+    const made = std.process.run(gpa, testing.io, .{ .argv = &.{ "sqlite3", db, "create table users(id integer, email text); create table orders(id integer, total real);" } }) catch return error.SkipZigTest;
+    gpa.free(made.stdout);
+    gpa.free(made.stderr);
+    const env = try std.fmt.allocPrint(gpa, "DATABASE_URL=sqlite:{s}\n", .{db});
+    defer gpa.free(env);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = ".env", .data = env });
+    const path = try std.fs.path.join(gpa, &.{ dir, "q.sql" });
+    defer gpa.free(path);
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile(path);
+    ed.tick();
+    ed.sql_schema.?.wait();
+    try testing.expectEqual(2, ed.sql_schema.?.tables.len);
+    try ed.feed("iselect  from users u;<Esc>0f a"); // between `select` and `from`
+    try ed.feed("u.");
+    const c = ed.completionShown().?;
+    try testing.expectEqual(2, c.shown.items.len); // users' columns only
+    try ed.feed("em");
+    try testing.expectEqualStrings("email", ed.completionShown().?.current().?.label);
+    try ed.feed("<Esc>o");
+    try ed.feed("ord");
+    try testing.expectEqualStrings("orders", ed.completionShown().?.current().?.label);
+}
+
+test "wrap: long lines break at words, keep their indent; j/k go by screen row" {
+    var ed = try testEditor("  alpha beta gamma delta epsilon\nshort");
+    defer ed.deinit();
+    ed.setViewSize(10, 16);
+    var buf: [max_segments]Seg = undefined;
+    const segs = ed.segments(0, &buf);
+    try testing.expectEqual(3, segs.len);
+    try testing.expectEqual(13, segs[1].start); // after "  alpha beta "
+    try testing.expectEqual(2, segs[1].indent); // under the indentation
+    try testing.expectEqual(3, ed.subRows(0));
+    try testing.expectEqual(1, ed.subRows(1));
+    try ed.feed("j"); // a screen row down: still line 0
+    try testing.expectEqual(0, ed.cursorLine());
+    try testing.expectEqual(1, ed.cursorRow().sub);
+    try ed.feed("jj");
+    try testing.expectEqual(1, ed.cursorLine());
+    try ed.feed("k");
+    try testing.expectEqual(2, ed.cursorRow().sub);
+    try ed.feed("gg2j"); // a count: whole lines
+    try testing.expectEqual(1, ed.cursorLine());
+    // A click on a later row lands in that piece.
+    ed.clickCell(1, 4);
+    try testing.expectEqual(0, ed.cursorLine());
+    try testing.expectEqual(15, ed.view.cursor); // col 13 + (4 - indent 2)
+    ed.options.wrap = false;
+    try testing.expectEqual(1, ed.segments(0, &buf).len);
+}
+
+test "code lens: a row above its line that the cursor steps over" {
+    var ed = try testEditor("a\nfn f() {}\nb");
+    defer ed.deinit();
+    try ed.addLens(ed.buffer, 1, "2 references");
+    try ed.addLens(ed.buffer, 1, "1 implementation");
+    try testing.expectEqualStrings("2 references | 1 implementation", ed.lensText(1).?);
+    try testing.expectEqual(2, ed.subRows(1)); // the lens row and the line
+    try ed.feed("j");
+    try testing.expectEqual(1, ed.cursorLine());
+    try testing.expectEqual(1, ed.cursorRow().sub); // on the text, not the lens
+    try ed.feed("k");
+    try testing.expectEqual(0, ed.cursorLine());
+    try ed.feed("jj");
+    try testing.expectEqual(2, ed.cursorLine());
+    ed.clickCell(1, 0); // the lens row: its line
+    try testing.expectEqual(1, ed.cursorLine());
+    ed.options.code_lens = false;
+    try testing.expectEqual(1, ed.subRows(1));
+}
+
 test "registers: named, append, black hole" {
     var ed = try testEditor("alpha beta");
     defer ed.deinit();
@@ -7890,7 +8824,9 @@ test "files: save as, rename, copy, delete, new" {
     try tmp.dir.access(io, "sub/b.zig", .{});
 
     // Copy: writes a copy (unsaved edits included) and opens it; the
-    // original keeps its unsaved state.
+    // original keeps its unsaved state (with autosave off: else leaving it
+    // saves it).
+    ed.options.autosave = false;
     try ed.feed("A!<Esc><Space>bc");
     try ed.search_prompt.?.input.set(gpa, c);
     try ed.feed("<CR>");

@@ -63,6 +63,18 @@ final_newline: bool = true,
 crlf: bool = false,
 /// View state while this buffer is not shown.
 saved: struct { cursor: usize = 0, top: usize = 0, left: usize = 0 } = .{},
+/// Times written to disk; the editor keeps the undo history on disk in
+/// step (`undo_kept` is the count it last did that for).
+saves: u64 = 0,
+undo_kept: u64 = 0,
+/// Code lens: a line of the server's notes (`3 references`) shown above a
+/// line, sorted by line. Kept until the next answer replaces them.
+lenses: std.ArrayList(Lens) = .empty,
+/// The text version lenses were last asked for, and whether an answer is due.
+lens_version: u64 = std.math.maxInt(u64),
+lens_pending: bool = false,
+/// The save count the last compile check (standalone Zig) was for.
+checked: u64 = std.math.maxInt(u64),
 /// Editor.use_counter when last shown, for most-recently-used ordering.
 last_used: u64 = 0,
 
@@ -113,7 +125,7 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8) !Buffer {
         .indent_style = indent.detect(&text),
         .text = text,
         .history = try .init(gpa),
-        .syntax = Syntax.forPath(path),
+        .syntax = Syntax.forFile(path, content),
         .path = owned_path,
         // An empty file has no final newline, but saving it after adding text
         // should produce one, as vim's 'fixeol' does.
@@ -133,7 +145,16 @@ fn stripCr(gpa: Allocator, raw: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+pub const Lens = struct { line: u32, text: []u8 };
+
+pub fn clearLenses(b: *Buffer, gpa: Allocator) void {
+    for (b.lenses.items) |l| gpa.free(l.text);
+    b.lenses.clearRetainingCapacity();
+}
+
 pub fn deinit(b: *Buffer, gpa: Allocator) void {
+    b.clearLenses(gpa);
+    b.lenses.deinit(gpa);
     b.text.deinit(gpa);
     b.history.deinit(gpa);
     if (b.syntax) |*s| s.deinit(gpa);
@@ -180,6 +201,7 @@ pub const SaveError = error{NoPath} || Allocator.Error || Io.Dir.CreateFileAtomi
 /// permissions. Returns the number of bytes written.
 pub fn save(b: *Buffer, gpa: Allocator, io: Io) SaveError!usize {
     const path = b.path orelse return error.NoPath;
+    defer b.saves += 1;
     const dir = Io.Dir.cwd();
 
     const permissions: Io.File.Permissions = if (dir.statFile(io, path, .{})) |st|

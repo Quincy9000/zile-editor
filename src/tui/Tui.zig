@@ -75,11 +75,12 @@ pub fn run(gpa: Allocator, io: Io, ed: *Editor, opts: Options) !void {
         raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
         _ = std.c.tcsetattr(stdin, .FLUSH, &raw);
         // Alternate screen, kitty keys (disambiguate), bracketed paste,
-        // mouse clicks and wheel (SGR), cursor hidden while drawing.
-        writeAll("\x1b[?1049h\x1b[>1u\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?25l");
+        // mouse clicks, drags and wheel (SGR), focus reports (autosave),
+        // cursor hidden while drawing.
+        writeAll("\x1b[?1049h\x1b[>1u\x1b[?2004h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?25l");
     }
     defer if (tty) {
-        writeAll("\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[<u\x1b[0 q\x1b[?25h\x1b[?1049l");
+        writeAll("\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?2004l\x1b[<u\x1b[0 q\x1b[?25h\x1b[?1049l");
         _ = std.c.tcsetattr(stdin, .FLUSH, &saved);
     };
 
@@ -175,6 +176,7 @@ fn handleInput(ed: *Editor, font: *const Font, pending: *std.ArrayList(u8), idle
                     .key => |k| ed.handleKey(k),
                     .paste => |text| paste(ed, text),
                     .mouse => |m| mouse(ed, font, m),
+                    .focus => |in| if (!in) ed.focusLost(),
                 }
             },
         }
@@ -230,11 +232,33 @@ fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
         .press => {
             ed.focusWindow(w);
             const l = render.windowLayout(ed, font, w);
-            if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| ed.clickCell(cell.row, cell.col);
+            const now = @as(f64, @floatFromInt(Io.Timestamp.now(ed.io, .awake).toNanoseconds())) / std.time.ns_per_s;
+            if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| ed.mousePress(cell.row, cell.col, clicks.count(cell.row, cell.col, now));
         },
-        else => {},
+        .drag => {
+            const l = render.windowLayout(ed, font, ed.window);
+            if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| ed.mouseDrag(cell.row, cell.col);
+        },
+        .release => ed.mouseRelease(),
     }
 }
+
+/// Double and triple clicks (as in the window).
+var clicks: struct {
+    last_time: f64 = -10,
+    row: usize = 0,
+    col: usize = 0,
+    n: u8 = 0,
+
+    fn count(c: *@This(), row: usize, col: usize, now: f64) u8 {
+        const again = now - c.last_time < 0.4 and row == c.row and col == c.col;
+        c.n = if (again) @min(c.n + 1, 3) else 1;
+        c.last_time = now;
+        c.row = row;
+        c.col = col;
+        return c.n;
+    }
+} = .{};
 
 /// The escape sequences that turn the previous frame into this one.
 fn frame(gpa: Allocator, out: *std.ArrayList(u8), g: *const Grid, prev: []const Grid.Cell) !void {

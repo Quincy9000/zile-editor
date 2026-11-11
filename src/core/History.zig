@@ -177,7 +177,136 @@ pub fn goTo(h: *History, gpa: Allocator, node: u32, target: anytype) Allocator.E
     return cursor;
 }
 
+// ---------------------------------------------------------------------------
+// On disk: the tree kept between sessions, for a file whose text is still
+// `text_hash` (the text at the current node).
+
+const magic = "zile-undo-1\n";
+
+/// The tree as bytes (nothing while a group is open: it isn't a state of the
+/// text yet). Caller frees.
+pub fn serialize(h: *const History, gpa: Allocator, text_hash: u64) Allocator.Error!?[]u8 {
+    if (h.pending.items.len > 0) return null;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, magic);
+    const W = struct {
+        fn int(o: *std.ArrayList(u8), a: Allocator, v: u64) !void {
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, v, .little);
+            try o.appendSlice(a, &b);
+        }
+    };
+    try W.int(&out, gpa, text_hash);
+    try W.int(&out, gpa, h.nodes.items.len);
+    try W.int(&out, gpa, h.current);
+    for (h.nodes.items) |n| {
+        try W.int(&out, gpa, n.parent);
+        try W.int(&out, gpa, n.cursor);
+        try W.int(&out, gpa, if (n.redo_child) |c| c else std.math.maxInt(u64));
+        try W.int(&out, gpa, n.ops.len);
+        for (n.ops) |op| {
+            try W.int(&out, gpa, @intFromEnum(op.kind));
+            try W.int(&out, gpa, op.pos);
+            try W.int(&out, gpa, op.text.len);
+            try out.appendSlice(gpa, op.text);
+        }
+    }
+    return try out.toOwnedSlice(gpa);
+}
+
+/// A tree read back, if `data` is one for a text hashing to `text_hash`
+/// (else null: the file changed elsewhere, or the data is damaged). Its
+/// current node is the saved state.
+pub fn deserialize(gpa: Allocator, data: []const u8, text_hash: u64) Allocator.Error!?History {
+    return readTree(gpa, data, text_hash) catch |err| switch (err) {
+        error.Invalid => null,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+fn readTree(gpa: Allocator, data: []const u8, text_hash: u64) error{ Invalid, OutOfMemory }!History {
+    if (!std.mem.startsWith(u8, data, magic)) return error.Invalid;
+    var r: Reader = .{ .data = data, .i = magic.len };
+    if ((r.int() orelse return error.Invalid) != text_hash) return error.Invalid;
+    const count = r.int() orelse return error.Invalid;
+    const current = r.int() orelse return error.Invalid;
+    if (count == 0 or count > 1 << 24 or current >= count) return error.Invalid;
+    var h: History = .{};
+    errdefer h.deinit(gpa);
+    try h.nodes.ensureTotalCapacity(gpa, @intCast(count));
+    for (0..@intCast(count)) |_| {
+        const parent = r.int() orelse return error.Invalid;
+        const cursor = r.int() orelse return error.Invalid;
+        const redo_raw = r.int() orelse return error.Invalid;
+        const n_ops = r.int() orelse return error.Invalid;
+        if (parent >= count or n_ops > data.len or (redo_raw != std.math.maxInt(u64) and redo_raw >= count)) return error.Invalid;
+        var ops: std.ArrayList(Op) = .empty;
+        errdefer {
+            for (ops.items) |op| gpa.free(op.text);
+            ops.deinit(gpa);
+        }
+        for (0..@intCast(n_ops)) |_| {
+            const kind = r.int() orelse return error.Invalid;
+            const pos = r.int() orelse return error.Invalid;
+            const len = r.int() orelse return error.Invalid;
+            if (kind > 1 or len > data.len - r.i) return error.Invalid;
+            const text = try gpa.dupe(u8, data[r.i..][0..@intCast(len)]);
+            r.i += @intCast(len);
+            ops.append(gpa, .{ .kind = if (kind == 0) .insert else .delete, .pos = @intCast(pos), .text = text }) catch |err| {
+                gpa.free(text);
+                return err;
+            };
+        }
+        h.nodes.appendAssumeCapacity(.{
+            .parent = @intCast(parent),
+            .cursor = @intCast(cursor),
+            .redo_child = if (redo_raw == std.math.maxInt(u64)) null else @intCast(redo_raw),
+            .ops = try ops.toOwnedSlice(gpa),
+        });
+    }
+    h.current = @intCast(current);
+    h.saved = h.current;
+    return h;
+}
+
+const Reader = struct {
+    data: []const u8,
+    i: usize,
+
+    fn int(r: *Reader) ?u64 {
+        if (r.i + 8 > r.data.len) return null;
+        const v = std.mem.readInt(u64, r.data[r.i..][0..8], .little);
+        r.i += 8;
+        return v;
+    }
+};
+
 const testing = std.testing;
+
+test "the tree survives being written out and read back" {
+    const gpa = testing.allocator;
+    var t = try Text.init(gpa, "ab");
+    defer t.deinit(gpa);
+    var h = try History.init(gpa);
+    defer h.deinit(gpa);
+    try apply(&h, &t, .ins, 2, "c");
+    try h.commit(gpa);
+    try apply(&h, &t, .del, 0, "a");
+    try h.commit(gpa); // "bc"
+    const data = (try h.serialize(gpa, 42)).?;
+    defer gpa.free(data);
+    try testing.expectEqual(null, try deserialize(gpa, data, 7)); // another text
+    var back = (try deserialize(gpa, data, 42)).?;
+    defer back.deinit(gpa);
+    _ = try back.undo(gpa, &t);
+    try expectText(&t, "abc");
+    _ = try back.undo(gpa, &t);
+    try expectText(&t, "ab");
+    _ = try back.redo(gpa, &t);
+    try expectText(&t, "abc");
+    try testing.expectEqual(null, try deserialize(gpa, data[0 .. data.len - 1], 42)); // cut short
+}
 
 test "goTo reaches a state on another branch" {
     const gpa = testing.allocator;

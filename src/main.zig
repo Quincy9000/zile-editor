@@ -89,6 +89,7 @@ pub fn main(init: std.process.Init) !void {
     // the way out (however we leave).
     defer {
         ed.saveSession(false);
+        ed.rememberPositions();
         ed.saveVisits();
     }
     for (config_report.problems) |p| ed.notify(.err, "{s}", .{p});
@@ -145,7 +146,12 @@ pub fn main(init: std.process.Init) !void {
 
     var title: TitleCache = .{};
     var frame: usize = 0;
+    var focused = true;
     while (!rl.WindowShouldClose() and !ed.should_quit) : (frame += 1) {
+        // Autosave: modified files are written when zile loses focus.
+        const now_focused = rl.IsWindowFocused();
+        if (focused and !now_focused) ed.focusLost();
+        focused = now_focused;
         if (frame == next_segment_frame and screenshot_frame == null) {
             if (script.next()) |segment| {
                 ed.feed(segment) catch |err| std.log.err("ZILE_TEST_KEYS: {s}", .{@errorName(err)});
@@ -277,6 +283,15 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
         return;
     }
     const clicked = rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
+    // A press that started on text: dragging selects, letting go copies.
+    if (ed.mouse_drag != null and !clicked) {
+        if (rl.IsMouseButtonReleased(rl.MOUSE_BUTTON_LEFT) or !rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) {
+            ed.mouseRelease();
+        } else if (rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) {
+            const l = render.windowLayout(ed, font, ed.window);
+            if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.mouseDrag(cell.row, cell.col);
+        }
+    }
     if (wheel == 0 and !clicked) return;
     const lines = wheelLines(wheel);
     // The command editor keeps focus while it is open.
@@ -299,9 +314,27 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
     ed.scrollSmooth(-wheel * 3);
     if (clicked) {
         const l = render.windowLayout(ed, font, w);
-        if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.clickCell(cell.row, cell.col);
+        if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.mousePress(cell.row, cell.col, clicks.count(cell.row, cell.col, rl.GetTime()));
     }
 }
+
+/// Double and triple clicks: presses on the same cell close together.
+pub const ClickCounter = struct {
+    last_time: f64 = -10,
+    row: usize = 0,
+    col: usize = 0,
+    n: u8 = 0,
+
+    pub fn count(c: *ClickCounter, row: usize, col: usize, now: f64) u8 {
+        const again = now - c.last_time < 0.4 and row == c.row and col == c.col;
+        c.n = if (again) @min(c.n + 1, 3) else 1;
+        c.last_time = now;
+        c.row = row;
+        c.col = col;
+        return c.n;
+    }
+};
+var clicks: ClickCounter = .{};
 
 /// Keeps the window title in sync without calling into GLFW every frame.
 const TitleCache = struct {
