@@ -828,6 +828,9 @@ action_query: std.ArrayList(u8) = .empty,
 /// The picker was opened from visual mode (and how): menus give the
 /// selection back to the row they run.
 picker_visual: ?struct { line: bool } = null,
+/// A folder chosen to work in (`c` in Files): the project root from then
+/// on (owned).
+work_dir: ?[]u8 = null,
 /// A maximised window's saved sizes (`toggleZoom`).
 zoom: ?Zoom = null,
 /// Where the file picked next opens (a project opened into a split).
@@ -954,6 +957,7 @@ pub fn deinit(ed: *Editor) void {
     if (ed.replace) |r| r.destroy();
     ed.grow_stack.deinit(ed.gpa);
     ed.format_missing_told.deinit(ed.gpa);
+    if (ed.work_dir) |w| ed.gpa.free(w);
     ed.action_query.deinit(ed.gpa);
     for (ed.query_undo.items) |u| ed.gpa.free(u.text);
     ed.query_undo.deinit(ed.gpa);
@@ -6295,7 +6299,20 @@ pub fn project(ed: *const Editor) ?*const Project {
 
 /// Where project-wide things happen: the current project, else the cwd.
 pub fn projectRoot(ed: *const Editor) []const u8 {
+    if (ed.work_dir) |w| return w;
     return if (ed.project()) |p| p.root else ed.cwd;
+}
+
+/// `c` in Files ("work here", a cd): `dir` is where Files, search, the
+/// runner and the terminal work from now on.
+pub fn workIn(ed: *Editor, dir: []const u8) !void {
+    const owned = try ed.gpa.dupe(u8, dir);
+    if (ed.work_dir) |old| ed.gpa.free(old);
+    ed.work_dir = owned;
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const home = std.mem.span(std.c.getenv("HOME") orelse "");
+    const shown = if (home.len > 0 and std.mem.startsWith(u8, owned, home)) std.fmt.bufPrint(&buf, "~{s}", .{owned[home.len..]}) catch owned else owned;
+    ed.setMessage(.info, "working in {s}", .{shown});
 }
 
 /// The current project's repository root, if it is one.
@@ -6795,8 +6812,10 @@ fn tickSaveChain(ed: *Editor) void {
 
 /// Writes `b` as it is.
 pub fn saveBufferNow(ed: *Editor, b: *Buffer) void {
-    const n = b.save(ed.gpa, ed.io) catch |err|
+    const n = b.save(ed.gpa, ed.io) catch |err| {
+        if (err == error.InvalidHex) return ed.setMessage(.err, "not saved: a line of the hex view isn't hex (an odd digit, or a letter past f)", .{});
         return ed.setMessage(.err, "could not save \"{s}\": {s}", .{ b.displayName(), @errorName(err) });
+    };
     ed.setMessage(.info, "\"{s}\" {d}L, {d}B written", .{ b.displayName(), b.text.lineCount(), n });
     if (ed.lspFor(b)) |l| l.didSave(b);
 }
@@ -7335,7 +7354,13 @@ pub fn browse(ed: *Editor) !void {
 
 /// Enters folder `name` (relative to the browsed one, or absolute).
 pub fn browseInto(ed: *Editor, name: []const u8) !void {
-    const target = try std.fs.path.resolve(ed.gpa, &.{ ed.browse_dir.items, name });
+    // `~/x` is in your home folder.
+    var home_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const named = if (std.mem.eql(u8, name, "~") or std.mem.startsWith(u8, name, "~/"))
+        std.fmt.bufPrint(&home_buf, "{s}{s}", .{ std.mem.span(std.c.getenv("HOME") orelse ""), name[1..] }) catch name
+    else
+        name;
+    const target = try std.fs.path.resolve(ed.gpa, &.{ ed.browse_dir.items, named });
     defer ed.gpa.free(target);
     var dir = Io.Dir.cwd().openDir(ed.io, target, .{ .iterate = true }) catch |err|
         return ed.setMessage(.err, "can't open {s}: {s}", .{ target, @errorName(err) });
@@ -9631,6 +9656,79 @@ test "missing tools: quiet until an action needs them, then said plainly" {
     try testing.expectEqualStrings("zile-no-such-program isn't installed", ed.message.text());
 }
 
+test "start screen: a menu; q quits zile, f finds a file, Esc leaves it" {
+    {
+        var ed = try testEditor("");
+        defer ed.deinit();
+        try ed.openStarter();
+        settlePicker(&ed);
+        try ed.feed("q");
+        try testing.expect(ed.should_quit);
+    }
+    {
+        var ed = try testEditor("");
+        defer ed.deinit();
+        try ed.openStarter();
+        settlePicker(&ed);
+        try ed.feed("f");
+        try testing.expectEqual(.browse, ed.picker.?.kind);
+        try ed.feed("<Esc><Esc>");
+        try ed.openStarter();
+        try ed.feed("<Esc>");
+        try testing.expectEqual(null, ed.picker);
+        try testing.expect(!ed.should_quit);
+    }
+}
+
+test "files: a typed folder path goes there (/ or Enter); c works there (cd)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "one/two");
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("<Space><Space>");
+    var typed: [Io.Dir.max_path_bytes + 16]u8 = undefined;
+    // An absolute path, then /: into it.
+    try ed.feed(try std.fmt.bufPrint(&typed, "<C-u>{s}/one/", .{dir}));
+    try testing.expect(std.mem.endsWith(u8, ed.browse_dir.items, "/one"));
+    // A path typed out, then Enter: into it (not a new file named so).
+    try ed.feed(try std.fmt.bufPrint(&typed, "{s}/one/two<CR>", .{dir}));
+    try testing.expect(ed.picker != null);
+    try testing.expect(std.mem.endsWith(u8, ed.browse_dir.items, "/one/two"));
+    // c: work here.
+    try ed.feed("<Esc>c");
+    try testing.expect(std.mem.endsWith(u8, ed.projectRoot(), "/one/two"));
+    try ed.feed("<Esc>");
+}
+
+test "hex: a binary file opens as a hex dump; saving writes the bytes" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.bin", .data = "\x00\x01ABC\xff" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const path = try std.fs.path.join(gpa, &.{ dir, "a.bin" });
+    defer gpa.free(path);
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile(path);
+    try testing.expect(ed.buffer.hex);
+    try expectText(&ed, "00000000: 0001 4142 43ff                           ..ABC.");
+    // Change the byte `41` (A) to `61` (a): `r6` on its first digit.
+    try ed.feed("0f4r6");
+    try ed.feed("<cmd:save_file>");
+    const back = try tmp.dir.readFileAlloc(testing.io, "a.bin", gpa, .limited(64));
+    defer gpa.free(back);
+    try testing.expectEqualSlices(u8, "\x00\x01aBC\xff", back);
+    // Not hex: refused, the file as it was.
+    try ed.feed("0f6rz");
+    try ed.feed("<cmd:save_file>");
+    try testing.expect(std.mem.startsWith(u8, ed.message.text(), "not saved"));
+}
+
 test "registers: named, append, black hole" {
     var ed = try testEditor("alpha beta");
     defer ed.deinit();
@@ -10227,9 +10325,10 @@ test "file browser: into folders, up, open, create" {
     try testing.expectEqualStrings("src/", rows(&ed, 0));
     try testing.expectEqualStrings("readme.txt", rows(&ed, 1));
 
-    // `/` on a folder goes in; typing filters; <BS> edits, then goes up and
-    // selects the folder we came from.
-    try ed.feed("/");
+    // Enter on a folder goes in (`/` with nothing typed starts a path at
+    // the root); typing filters; <BS> edits, then goes up and selects the
+    // folder we came from.
+    try ed.feed("<CR>");
     try testing.expect(std.mem.endsWith(u8, ed.browse_dir.items, "/src"));
     try testing.expectEqualStrings("deep/", rows(&ed, 0));
     try ed.feed("ma");
@@ -11907,6 +12006,10 @@ test "pickers: the list of pickers opens one; code actions and project symbols l
     try testing.expectEqualStrings("Undo history", ed.picker.?.itemAt(0).?.text);
     try ed.feed("<CR>");
     try testing.expectEqual(.undo, ed.picker.?.kind);
+    try ed.feed("<Esc><Esc>");
+    // SPC f r: recent files, a picker of its own.
+    try ed.feed("<Space>fr");
+    try testing.expectEqual(.recent, ed.picker.?.kind);
     try ed.feed("<Esc><Esc>");
     // C-t: the same picker in its next scope, the query kept.
     try ed.feed("<Space><Space>main");

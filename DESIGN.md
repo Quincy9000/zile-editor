@@ -70,7 +70,7 @@ the row, `/` types to filter.
 | key | picker | its actions / rows |
 |---|---|---|
 | `SPC` | Leader menu | every row below, on its key; `i` filters |
-| `SPC SPC` (and `SPC .`) | Files: the explorer | starts as the project's folder (`SPC .`: the current file's), its entries only; typing searches two ways at once: **here** (the folder's entries and every file below it, the ones you visit most first; instant, ranked by the file name then nearness) and, under a line, **elsewhere** (`files_global`, a second engine run per query: files you opened in other places, then `fd --fixed-strings` over `$HOME`, skipping `.git`, `node_modules`, caches and build output unless `SPC t` turns that off), so `main.zig` shows this project's first and `zshrc` finds `~/.zshrc` from any project; Create is the last row; `src/` goes into a folder, `BS` on nothing goes up; `o n r m x yy p` the explorer's file operations; `C-t` scopes: folder · buffers · recent everywhere · whole disk |
+| `SPC SPC` (and `SPC .`) | Files: the explorer | starts as the project's folder (`SPC .`: the current file's), its entries only; typing searches two ways at once: **here** (the folder's entries and every file below it, the ones you visit most first; instant, ranked by the file name then nearness) and, under a line, **elsewhere** (`files_global`, a second engine run per query: files you opened in other places, then `fd --fixed-strings` over `$HOME`, skipping `.git`, `node_modules`, caches and build output unless `SPC t` turns that off), so `main.zig` shows this project's first and `zshrc` finds `~/.zshrc` from any project; Create is the last row; a folder path typed out (`src/`, `~/code/x`, `/etc`, `../y`) goes there with `/` or Enter, `/` with nothing typed starts at the root, `BS` on nothing goes up; `c` works here (a cd: Files, search, the runner and the terminal start from this folder from now on); `o n r m x yy p` the explorer's file operations; `C-t` scopes: folder · buffers · recent everywhere · whole disk |
 | `SPC b` | Files, open scope | `x` / `C-x` close, `n` new, `s` save, `S` save all, `r` rename / move, `w` save as, `c` copy to, `R` revert, `D` delete the file, `o` close the others, `y` / `Y` copy path |
 | `SPC w` | Windows | rows: the other windows (last used first), the one you're in last (`SPC w Enter` flips back), then `+ New window right… / below…` (pick what it shows in Files; cancel: no window) and `+ New terminal window`; the preview draws the layout (selected window double-lined, yours `*`); `w` (`SPC w w`) back to the previous window and again to toggle, `h j k l` the window that way from yours, `v` / `s` split the selected one, `x` close, `X` swap with yours, `z` maximise / back, `b` choose its buffer, `o` only, `=` equal, `>` `<` `+` `-` grow / shrink (stays open), `t` terminal in it |
 | `SPC t` | toggles | every setting with its on / off state; Enter flips it and the list stays; colour scheme, text size |
@@ -78,7 +78,7 @@ the row, `/` types to filter.
 | `SPC r` | runner | your commands, newest first: Enter runs, type a new one; `e` / `C-e` edit, `x` / `C-x` forget, `c` multi-line, `.` again, `o` output, `E` errors, `t` terminal, `T` terminal here, `s` / `S` SQL statement / file |
 | `SPC g` | Git: changed files | Enter opens one; `c` commit all, `p` push, `P` pull, `b` branches, `r` restore the change at the cursor, `l` this line's commit, `R` remote URL, `u` reload HEAD, `i` git init |
 | `SPC /` | Search | `C-t` scopes: project · this file · todos; `C-r` replace across the project |
-| `SPC f` | Find (menu) | few pickers, each with its scopes on `C-t`: `f` Files, `b` open buffers, `g` Search (project · this file · todos), `x` Problems (errors · last run · saved list), `j` Places (jumps · marks), `c` Commands (commands · keys), `e` explore, `p` projects, `y` registers, `u` undo history, `n` notifications, `h` start screen, `T` colour scheme, `M` man pages |
+| `SPC f` | Find (menu) | few pickers, each with its scopes on `C-t`: `f` Files, `b` buffers, `r` recent files, `g` Search (project · this file · todos), `x` Problems (errors · last run · saved list), `j` Places (jumps · marks), `c` Commands (commands · keys), `e` explore, `p` projects, `y` registers, `u` undo history, `n` notifications, `h` start screen, `T` colour scheme, `M` man pages |
 | `SPC p` | Projects | the ones opened before (most recent first, yours last), then every project under the project folders; Enter switches (restoring its session if nothing of it is open, else the Files explorer at its root); `f` files in it, `g` search in it, `l` restore its session, `s` save this session, `x` forget it; `Tab`: into a split |
 | others (Leader rows) | | `.` browse, `;` shell command, `'` resume picker, `,` last jump (again: back), `s` save, `q` close; `SPC a` Claude (`a` `s` `i` `y` `n`), `SPC Q` quit (`s` `Q`) |
 
@@ -499,6 +499,13 @@ and text objects (`objects.zig` specs) for new languages.
 is a `#!` naming a shell (`languages.forShebang`, which also knows python,
 node, deno and bun). `#` comments, `shfmt` formatting. No server built in
 (`bash-language-server` isn't installed; add it in `languages.toml`).
+
+**Binary files** open as a hex dump (`core/hex.zig`, the `xxd` layout:
+offset, 16 bytes in pairs, their text); `[hex]` in the status line. Edit
+the hex digits with the usual keys; saving reads the hex back, top to
+bottom, into the file's bytes (the offsets and text column are only for
+reading, so bytes can be added or removed), and refuses a line that isn't
+hex. Binary = a NUL byte in the first 8 KB; up to 16 MB.
 
 **Go** (tree-sitter-go v0.23.4): `.go`; `gopls`; `gofmt` on save; tabs
 in a new file; `af` functions and methods, `ac` structs / interfaces with

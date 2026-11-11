@@ -1032,6 +1032,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
             x += font.cell_w * 2;
         }
         x = font.drawText(projectPath(ed, &path_buf), x, y, theme.status_fg);
+        if (ed.buffer.hex) x = font.drawText(" [hex]", x, y, theme.whichkey_group);
         if (ed.buffer.modified) _ = font.drawText(" [+]", x, y, theme.status_fg);
     }
 

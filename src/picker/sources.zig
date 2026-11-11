@@ -1015,7 +1015,29 @@ const Browse = struct {
     /// A new file in this folder ("sub/name" makes the folder on save).
     /// A name ending in `/` is a new folder (made now, and entered);
     /// anything else is a new file.
+    /// `c`: work in the folder shown (a cd: Files, search, the runner and
+    /// the terminal start there).
+    fn workHere(ed: *Editor, _: ?Item) anyerror!void {
+        const dir = try ed.gpa.dupe(u8, ed.browse_dir.items);
+        defer ed.gpa.free(dir);
+        try ed.workIn(dir);
+    }
+
+    pub const item_actions = [_]Action{
+        .{ .label = "work here (cd)", .key = 'c', .stay = true, .any = true, .run = workHere },
+    };
+
     pub fn create(ed: *Editor, query: []const u8) !void {
+        // A folder typed out (`~/code/x`, `/etc`): into it, not a new file.
+        {
+            const typed = try ed.browsePath(query);
+            defer ed.gpa.free(typed);
+            if (Io.Dir.cwd().openDir(ed.io, typed, .{})) |d| {
+                var dir = d;
+                dir.close(ed.io);
+                return ed.browseInto(query);
+            } else |_| {}
+        }
         const path = try ed.browsePath(query);
         defer ed.gpa.free(path);
         if (std.mem.endsWith(u8, query, "/")) {
@@ -1263,15 +1285,23 @@ const Start = struct {
     /// Ids at and above this are recent files (the visit's index added).
     pub const recent_base = 1000;
 
+    /// Each with its key (a menu: the key runs the row; `q` quits, as on a
+    /// dashboard).
     const actions = [_]struct { []const u8, []const u8, []const u8, []const u8 }{
-        .{ "Find file", "SPC SPC", "find_file", "Search this project's files by name." },
-        .{ "Explore files", "SPC .", "browse_files", "Walk through folders, one at a time." },
-        .{ "Recent files", "SPC f r", "recent_files", "Every file opened before, the most used first." },
-        .{ "Search project", "SPC /", "search_project", "Search the text of every file in the project." },
-        .{ "Switch project", "SPC p p", "switch_project", "Projects opened before. One with a saved session comes back as you left it." },
-        .{ "Restore session", "SPC p l", "load_session", "Reopen this project's files and splits as they were when you left." },
-        .{ "Colour scheme", "SPC t t", "pick_theme", "Pick the editor's colours." },
-        .{ "Quit", "SPC q", "quit", "Leave zile." },
+        .{ "Find file", "f", "find_file", "The project's folder; type to search every file below it, and elsewhere." },
+        .{ "Explore files", "e", "browse_files", "Walk through folders, one at a time." },
+        .{ "Recent files", "r", "recent_files", "Every file opened before, the most recent first." },
+        .{ "Search project", "/", "search_project", "Search the text of every file in the project." },
+        .{ "Switch project", "p", "switch_project", "Projects opened before. One with a saved session comes back as you left it." },
+        .{ "Restore session", "l", "load_session", "Reopen this project's files and splits as they were when you left." },
+        .{ "Colour scheme", "c", "pick_theme", "Pick the editor's colours." },
+        .{ "Quit", "q", "quit", "Leave zile." },
+    };
+    pub const row_keys: []const u8 = blk: {
+        var k: [actions.len]u8 = undefined;
+        for (actions, 0..) |a, i| k[i] = a[1][0];
+        const r = k;
+        break :blk &r;
     };
 
     pub fn fill(ed: *Editor, items: *Items) !void {
@@ -2554,6 +2584,7 @@ const Help = struct {
 const Pickers = Menu("Find", &.{
     .{ .key = 'f', .label = "Files (C-t: buffers, recent, whole disk)", .command = "find_file" },
     .{ .key = 'b', .label = "Buffers", .command = "switch_buffer" },
+    .{ .key = 'r', .label = "Recent files (everywhere, latest first)", .command = "recent_files" },
     .{ .key = 'g', .label = "Search (C-t: this file, todos)", .command = "search_project" },
     .{ .key = 'x', .label = "Problems (C-t: last run, saved list)", .command = "list_diagnostics" },
     .{ .key = 'j', .label = "Places (C-t: marks)", .command = "jump_list" },

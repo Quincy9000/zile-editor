@@ -31,6 +31,7 @@ comptime {
     _ = @import("ZigCheck.zig");
     _ = @import("Replace.zig");
     _ = @import("core/case.zig");
+    _ = @import("core/hex.zig");
     _ = @import("lsp/Snippet.zig");
     _ = @import("picker/sources.zig");
     _ = @import("picker/fuzzy.zig");

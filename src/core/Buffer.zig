@@ -11,6 +11,7 @@ const Project = @import("Project.zig");
 const Folds = @import("Folds.zig");
 const diff = @import("../git/diff.zig");
 const indent = @import("indent.zig");
+const hexdump = @import("hex.zig");
 
 const Buffer = @This();
 
@@ -57,6 +58,9 @@ git: ?diff.State = null,
 /// Owned. Relative to the cwd or absolute; null for a scratch buffer.
 path: ?[]u8 = null,
 modified: bool = false,
+/// A binary file, shown as a hex dump (`core/hex.zig`): saving writes the
+/// bytes the hex stands for.
+hex: bool = false,
 /// The file ended with a newline (vim's 'eol'); restored on save. New files get one.
 final_newline: bool = true,
 /// The file used CRLF line endings; stored as LF, restored on save.
@@ -79,6 +83,9 @@ checked: u64 = std.math.maxInt(u64),
 last_used: u64 = 0,
 
 const max_file_size = 512 * 1024 * 1024;
+/// Binary files larger than this aren't opened as hex (the dump is four
+/// times the size).
+const max_hex_size = 16 * 1024 * 1024;
 
 pub fn initEmpty(gpa: Allocator) Allocator.Error!Buffer {
     var text = try Text.init(gpa, "");
@@ -101,6 +108,17 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8) !Buffer {
         else => return err,
     };
     defer gpa.free(raw);
+
+    // A binary file: its hex dump to edit.
+    if (hexdump.isBinary(raw)) {
+        if (raw.len > max_hex_size) return error.TooBigForHexView;
+        const d = try hexdump.dump(gpa, raw);
+        defer gpa.free(d);
+        var text = try Text.init(gpa, d);
+        errdefer text.deinit(gpa);
+        const mtime: ?Io.Timestamp = if (Io.Dir.cwd().statFile(io, path, .{})) |st| st.mtime else |_| null;
+        return .{ .disk_mtime = mtime, .text = text, .history = try .init(gpa), .path = owned_path, .final_newline = false, .hex = true };
+    }
 
     var content: []const u8 = raw;
     var crlf = false;
@@ -227,7 +245,7 @@ pub fn displayName(b: *const Buffer) []const u8 {
     return b.path orelse b.label orelse "[scratch]";
 }
 
-pub const SaveError = error{NoPath} || Allocator.Error || Io.Dir.CreateFileAtomicError ||
+pub const SaveError = error{ NoPath, InvalidHex } || Allocator.Error || Io.Dir.CreateFileAtomicError ||
     Io.File.Writer.Error || Io.File.Atomic.ReplaceError;
 
 /// Writes the buffer atomically (temp file + rename), keeping the file's
@@ -245,7 +263,12 @@ pub fn save(b: *Buffer, gpa: Allocator, io: Io) SaveError!usize {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     const body = b.text.slice(0, b.text.len());
-    if (b.crlf) {
+    if (b.hex) {
+        // The bytes the hex stands for.
+        const bytes = try hexdump.parse(gpa, body);
+        defer gpa.free(bytes);
+        try out.appendSlice(gpa, bytes);
+    } else if (b.crlf) {
         try out.ensureTotalCapacity(gpa, body.len + b.text.lineCount() + 2);
         for (body) |c| {
             if (c == '\n') out.appendAssumeCapacity('\r');

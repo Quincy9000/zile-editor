@@ -2407,9 +2407,11 @@ fn browserKey(comptime char: u8) Handler {
                 const empty = p.query.items().len == 0;
                 switch (char) {
                     '/' => {
+                        // Nothing typed: the start of a path from the root.
+                        if (empty) return ed.browseInto("/");
                         // What you typed names a folder here (`src`,
-                        // `src/core`): into it.
-                        if (!empty) {
+                        // `src/core`, `~/code`): into it.
+                        {
                             const typed = try ed.browsePath(p.query.items());
                             defer ed.gpa.free(typed);
                             if (std.Io.Dir.cwd().openDir(ed.io, typed, .{})) |d| {
@@ -2426,7 +2428,6 @@ fn browserKey(comptime char: u8) Handler {
                             defer ed.gpa.free(name);
                             return ed.browseInto(name);
                         };
-                        if (empty) return ed.browseInto("/");
                     },
                     '~' => if (empty) {
                         if (std.c.getenv("HOME")) |h| return ed.browseInto(std.mem.span(h));
