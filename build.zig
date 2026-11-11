@@ -109,7 +109,7 @@ pub fn build(b: *std.Build) void {
 /// symbols for ordered key/char input and for waking the event loop from
 /// other threads.
 fn raylibDep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
-    return b.dependency("raylib", .{
+    const dep = b.dependency("raylib", .{
         .target = target,
         .optimize = optimize,
         .raudio = false,
@@ -120,6 +120,19 @@ fn raylibDep(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         // server and draws in the terminal instead.
         .config = @as([]const u8, "-DSUPPORT_CLIPBOARD_IMAGE=0"),
     });
+    // A portable build (`-Dtarget=x86_64-linux-gnu.2.31` for a release)
+    // doesn't search the system: raylib's X11 / GL libraries are found in
+    // /usr/lib (they end up unneeded: GLFW loads them when a window opens).
+    if (!target.query.isNative()) {
+        const m = dep.artifact("raylib").root_module;
+        m.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+        // GLFW's X11 headers, and only those (not the system's libc headers,
+        // which are newer than the glibc the build targets).
+        const x11 = b.addWriteFiles();
+        _ = x11.addCopyDirectory(.{ .cwd_relative = "/usr/include/X11" }, "X11", .{});
+        m.addIncludePath(x11.getDirectory());
+    }
+    return dep;
 }
 
 /// The editor executable, built with `optimize`.
@@ -131,6 +144,8 @@ fn zileExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .link_libc = true,
     });
     exe_mod.addImport("raylib", raylibDep(b, target, optimize).module("raylib"));
+    // raylib's X11 / GL libraries, for the final link of a portable build.
+    if (!target.query.isNative()) exe_mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
     addSyntax(b, exe_mod, target, optimize);
     addTerminal(b, exe_mod, target, optimize);
     return b.addExecutable(.{ .name = "zile", .root_module = exe_mod });
