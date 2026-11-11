@@ -17,6 +17,7 @@ const textobjects = @import("core/textobjects.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
+const tags = @import("tags.zig");
 const Picker = @import("picker/Picker.zig");
 const textops = @import("textops.zig");
 const indents = @import("core/indent.zig");
@@ -99,6 +100,7 @@ const base = [_]Command{
     // Search
     .{ .name = "search_forward", .doc = "Search forward", .run = startSearch(true, .search) },
     .{ .name = "search_backward", .doc = "Search backward", .run = startSearch(false, .search) },
+    .{ .name = "cursors_in_selection", .doc = "Cursors on matches in the selection", .run = selectIn },
     .{ .name = "snipe", .doc = "Jump to text on screen", .run = startSearch(true, .snipe) },
     .{ .name = "search_word_forward", .doc = "Search word under cursor", .run = searchWord(true) , .jump = true },
     .{ .name = "search_word_backward", .doc = "Search word under cursor backward", .run = searchWord(false) , .jump = true },
@@ -112,6 +114,14 @@ const base = [_]Command{
     .{ .name = "goto_definition", .doc = "Go to definition", .run = lspRequest(.definition) },
     .{ .name = "find_references", .doc = "Find references", .run = lspRequest(.references) },
     .{ .name = "hover", .doc = "Show documentation", .run = lspRequest(.hover) },
+    .{ .name = "goto_implementation", .doc = "Go to implementations", .run = lspRequest(.implementation) },
+    .{ .name = "code_action", .doc = "Code actions (fixes, refactors)", .run = lspRequest(.code_actions), .once = true },
+    .{ .name = "workspace_symbols", .doc = "Symbols in the project", .run = lspRequest(.workspace_symbols), .once = true },
+    .{ .name = "find_file_anywhere", .doc = "Find a file anywhere on disk", .run = openPicker(.files_anywhere), .once = true },
+    .{ .name = "find_folder", .doc = "Find a folder anywhere (work there)", .run = openPicker(.folders_anywhere), .once = true },
+    .{ .name = "todo_tag", .doc = "Write a todo tag (TODO, FIXME...)", .run = openPicker(.todo_tags), .once = true },
+    .{ .name = "man_pages", .doc = "Manual pages (C functions, system calls)", .run = openPicker(.man), .once = true },
+    .{ .name = "all_pickers", .doc = "Every picker", .run = openPicker(.pickers), .once = true },
     .{ .name = "rename_symbol", .doc = "Rename symbol", .run = renameSymbol },
     .{ .name = "goto_symbol", .doc = "Go to symbol", .run = gotoSymbol },
     .{ .name = "list_diagnostics", .doc = "List errors", .run = openPicker(.diagnostics) },
@@ -181,7 +191,7 @@ const base = [_]Command{
     .{ .name = "undo", .doc = "Undo", .run = undo , .once = true },
     .{ .name = "redo", .doc = "Redo", .run = redo , .once = true },
     .{ .name = "repeat_change", .doc = "Repeat last change", .run = repeatChange , .once = true },
-    .{ .name = "record_macro", .doc = "Record macro (Q again to stop)", .run = recordMacro, .takes_char = true, .once = true },
+    .{ .name = "record_macro", .doc = "Record macro (Q again to stop; QQ quits without saving)", .run = recordMacro, .takes_char = true, .once = true },
     .{ .name = "play_macro", .doc = "Play macro (@@ for the last one)", .run = playMacro, .takes_char = true , .once = true },
 
     // Visual mode
@@ -202,6 +212,7 @@ const base = [_]Command{
     .{ .name = "git_pull", .doc = "Pull", .run = gitAction(.pull) },
     .{ .name = "git_branches", .doc = "Switch / new branch", .run = openPicker(.git_branches) },
     .{ .name = "git_changed_files", .doc = "Changed files", .run = openPicker(.git_changes) },
+    .{ .name = "git_init", .doc = "Make this a git repository", .run = gitAction(.init) },
     .{ .name = "git_set_remote", .doc = "Set remote URL", .run = gitAction(.remote) },
     .{ .name = "git_restore_hunk", .doc = "Restore hunk from HEAD", .run = gitCmd(.restore), .ghost = true },
     .{ .name = "git_next_hunk", .doc = "Next change", .run = gitCmd(.next), .ghost = true , .jump = true },
@@ -213,8 +224,8 @@ const base = [_]Command{
     .{ .name = "insert_after", .doc = "Insert after cursor", .run = insertAt(afterCursorPos), .repeat = true },
     .{ .name = "insert_line_start", .doc = "Insert at line start", .run = insertAt(firstNonBlankPos), .repeat = true },
     .{ .name = "insert_line_end", .doc = "Insert at line end", .run = insertAt(lineEndPos), .repeat = true },
-    .{ .name = "open_below", .doc = "Open line below", .run = openLine(.below), .repeat = true },
-    .{ .name = "open_above", .doc = "Open line above", .run = openLine(.above), .repeat = true },
+    .{ .name = "open_below", .doc = "Open line below", .run = openLine(.below), .repeat = true, .ghost = true },
+    .{ .name = "open_above", .doc = "Open line above", .run = openLine(.above), .repeat = true, .ghost = true },
     .{ .name = "normal_mode", .doc = "Normal mode", .run = normalMode },
 
     // Insert-mode editing
@@ -274,14 +285,16 @@ const base = [_]Command{
     .{ .name = "claude_reject", .doc = "Reject Claude's change", .run = claudeCmd(.reject), .once = true },
     .{ .name = "terminal_window", .doc = "Terminal here (in this window)", .run = termCmd(.window), .once = true },
     .{ .name = "terminal_toggle", .doc = "Terminal popup", .run = termCmd(.toggle), .once = true },
-    .{ .name = "run_runner", .doc = "Code runner (repeat with Enter)", .run = termCmd(.runner), .once = true },
+    .{ .name = "run_runner", .doc = "Code runner (commands run here)", .run = termCmd(.runner), .once = true },
+    .{ .name = "run_shell", .doc = "Run a shell command (one-off)", .run = termCmd(.shell), .once = true },
     .{ .name = "run_command", .doc = "Run a command (multi-line editor)", .run = termCmd(.command), .once = true },
     .{ .name = "run_again", .doc = "Run the runner command again", .run = termCmd(.again), .once = true },
     .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
     .{ .name = "run_errors", .doc = "Errors from the last run", .run = termCmd(.errors), .once = true },
     .{ .name = "quickfix_next", .doc = "Next quickfix entry", .run = qfCmd(.next), .once = true, .jump = true },
     .{ .name = "quickfix_previous", .doc = "Previous quickfix entry", .run = qfCmd(.previous), .once = true, .jump = true },
-    .{ .name = "quickfix_list", .doc = "Quickfix list (j/k, Enter)", .run = qfCmd(.list), .once = true },
+    .{ .name = "quickfix_list", .doc = "Quickfix list: errors, a run's or the project's", .run = qfCmd(.list), .once = true },
+    .{ .name = "quickfix_clear", .doc = "Back to the project's errors", .run = qfCmd(.clear), .once = true },
     .{ .name = "jump_older", .doc = "Back (jumplist)", .run = jumpCmd(.older), .once = true },
     .{ .name = "jump_newer", .doc = "Forward (jumplist)", .run = jumpCmd(.newer), .once = true },
     .{ .name = "jump_list", .doc = "Jumplist", .run = openPicker(.jumps), .once = true },
@@ -308,7 +321,7 @@ const base = [_]Command{
     .{ .name = "window_border_up", .doc = "Border up", .run = windowCmd(.{ .border = .up }), .once = true, .sticky = true },
     .{ .name = "window_border_right", .doc = "Border right", .run = windowCmd(.{ .border = .right }), .once = true, .sticky = true },
     .{ .name = "window_balance_stay", .doc = "Equal sizes", .run = windowCmd(.balance), .once = true, .sticky = true },
-    .{ .name = "command_picker", .doc = "Run a command", .run = openPicker(.commands) },
+    .{ .name = "command_picker", .doc = "Editor commands", .run = openPicker(.commands) },
     .{ .name = "resume_picker", .doc = "Resume last picker", .run = resumePicker },
     .{ .name = "smart_close", .doc = "Close (window, else buffer, else quit)", .run = smartClose, .once = true },
     .{ .name = "quit", .doc = "Quit", .run = quit },
@@ -347,15 +360,25 @@ const base = [_]Command{
     .{ .name = "toggle_trim_on_save", .doc = "Trim whitespace on save", .run = toggle("trim_on_save", "trim trailing whitespace on save") },
     .{ .name = "toggle_icons", .doc = "File icons", .run = toggle("icons", "file icons") },
     .{ .name = "toggle_smooth_scroll", .doc = "Smooth scrolling", .run = toggle("smooth_scroll", "smooth scrolling") },
+    .{ .name = "toggle_inlay_hints", .doc = "Type hints (from the server)", .run = toggle("inlay_hints", "inline type hints") },
     .{ .name = "toggle_git_blame", .doc = "Git blame on the cursor line", .run = toggle("git_blame", "inline git blame") },
     // Pickers and state
     .{ .name = "recent_files", .doc = "Recent files", .run = openPicker(.recent), .once = true },
+    .{ .name = "frecent_files", .doc = "Frecent files (most used lately)", .run = openPicker(.frecent), .once = true },
     .{ .name = "search_todos", .doc = "Todo comments in project", .run = openPicker(.todos), .once = true },
     .{ .name = "pick_theme", .doc = "Colour scheme", .run = openPicker(.themes), .once = true },
     .{ .name = "message_history", .doc = "Messages", .run = openPicker(.messages), .once = true },
     .{ .name = "start_screen", .doc = "Start screen", .run = openPicker(.start), .once = true },
     .{ .name = "save_session", .doc = "Save session", .run = sessionCmd(.save), .once = true },
     .{ .name = "load_session", .doc = "Restore session", .run = sessionCmd(.load), .once = true },
+    .{ .name = "set_mark", .doc = "Set mark (a-z here, A-Z anywhere)", .run = setMark, .takes_char = true, .once = true },
+    .{ .name = "goto_mark_line", .doc = "To a mark's line", .run = gotoMark(false), .takes_char = true, .jump = true },
+    .{ .name = "goto_mark", .doc = "To a mark", .run = gotoMark(true), .takes_char = true, .jump = true },
+    .{ .name = "pick_mark", .doc = "Marks", .run = openPicker(.marks), .once = true },
+    .{ .name = "pick_register", .doc = "Registers (Enter pastes)", .run = openPicker(.registers), .once = true },
+    .{ .name = "undo_history", .doc = "Undo history", .run = openPicker(.undo), .once = true },
+    .{ .name = "help_keys", .doc = "Keys and commands", .run = openPicker(.help), .once = true },
+    .{ .name = "pick_color", .doc = "Colour wheel (edit the colour here)", .run = pickColor, .once = true },
     .{ .name = "git_line_commit", .doc = "Commit that changed this line", .run = gitLineCommit, .once = true },
 
     // Inside the picker
@@ -377,6 +400,14 @@ const base = [_]Command{
     .{ .name = "picker_browse_up", .doc = "Explorer: up a folder", .run = browseStep(.up), .hidden = true },
     .{ .name = "picker_browse_in", .doc = "Explorer: into the folder / open", .run = browseStep(.in), .hidden = true },
     .{ .name = "picker_close", .doc = "Close the picker", .run = pickerClose, .hidden = true },
+    // Acting on the selected row (the file browser, the buffer list).
+    .{ .name = "picker_new_folder", .doc = "Browser: new folder (buffers: new buffer)", .run = pickerOp(.new_folder), .hidden = true },
+    .{ .name = "picker_new_file", .doc = "Browser: new file (buffers: new buffer)", .run = pickerOp(.new_file), .hidden = true },
+    .{ .name = "picker_rename", .doc = "Browser: rename", .run = pickerOp(.rename), .hidden = true },
+    .{ .name = "picker_move", .doc = "Browser: move", .run = pickerOp(.move), .hidden = true },
+    .{ .name = "picker_delete", .doc = "Browser: delete (buffers: close it)", .run = pickerOp(.delete), .hidden = true },
+    .{ .name = "picker_copy", .doc = "Browser: copy", .run = pickerOp(.copy), .hidden = true },
+    .{ .name = "picker_paste", .doc = "Browser: paste here", .run = pickerOp(.paste), .hidden = true },
 
     // Text inputs (picker query, search prompt)
     .{ .name = "input_delete_char", .doc = "Delete a character", .run = inputEdit(.char), .hidden = true },
@@ -401,6 +432,8 @@ pub const ObjectKind = union(enum) {
     syntax: syntax_objects.Object,
     /// The cursor's indent scope (`ai`: with its border lines).
     indent,
+    /// One item of a bracketed, comma-separated list (by the text alone).
+    argument,
 };
 
 pub const ObjectSpec = struct {
@@ -433,7 +466,7 @@ pub const text_object_specs = [_]ObjectSpec{
     .{ .name = "tag", .doc = "<tag> block", .keys = "t", .kind = .tag },
     .{ .name = "function", .doc = "function", .keys = "f", .kind = .{ .syntax = .function } },
     .{ .name = "class", .doc = "class/struct", .keys = "c", .kind = .{ .syntax = .class } },
-    .{ .name = "argument", .doc = "argument", .keys = "a", .kind = .{ .syntax = .argument } },
+    .{ .name = "argument", .doc = "argument", .keys = "a", .kind = .argument },
 };
 
 /// Which instance of an object: the one at the cursor (seeking ahead when
@@ -487,6 +520,7 @@ fn objectAt(ed: *Editor, comptime kind: ObjectKind, scope: textobjects.Scope, po
         .line => textobjects.lineObject(t, pos, scope),
         .tag => textobjects.tag(t, pos, scope, count),
         .syntax => |obj| if (ed.buffer.syntax) |*s| syntax_objects.find(s, t, pos, obj, scope, count) else null,
+        .argument => textobjects.argument(t, pos, scope),
         .indent => blk: {
             const s = indents.scope(t, t.lineOf(pos), ed.options.tab_width, true) orelse break :blk null;
             if (scope == .inner) break :blk operators.linesRange(t, s.first, s.last);
@@ -503,6 +537,8 @@ fn objectCandidate(comptime kind: ObjectKind, b: u8, forward: bool) bool {
         .any_bracket => std.mem.indexOfScalar(u8, if (forward) "([{" else ")]}", b) != null,
         .quote => |q| b == q,
         .any_quote => b == '"' or b == '\'' or b == '`',
+        // Arguments start after a bracket or comma, and end before one.
+        .argument => true,
         else => b != ' ' and b != '\t' and b != '\n',
     };
 }
@@ -568,7 +604,7 @@ fn objectEdge(comptime kind: ObjectKind, comptime end: bool) Handler {
 fn commentObject(c: Context) !void {
     const ed = c.ed;
     const t = ed.text();
-    const b = comment.block(t, ed.cursorLine(), textops.commentPrefix(ed)) orelse return fail(ed);
+    const b = comment.block(t, ed.cursorLine(), textops.commentStyle(ed, ed.cursorLine())) orelse return fail(ed);
     const r = operators.linesRange(t, b[0], b[1]);
     switch (ed.mode) {
         .operator => try ed.applyPending(r),
@@ -660,6 +696,39 @@ fn sessionCmd(comptime what: enum { save, load }) Handler {
             }
         }
     }.run;
+}
+
+fn setMark(c: Context) !void {
+    c.ed.setMark(c.char);
+}
+
+/// `'x` (the mark's line) and `` `x `` (the exact place): motions inside
+/// this buffer, a jump when the mark is in another file.
+fn gotoMark(comptime exact: bool) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const m = ed.findMark(c.char) orelse {
+                fail(ed);
+                return ed.setMessage(.info, "mark {u} is not set", .{c.char});
+            };
+            if (m.buffer != ed.buffer) {
+                if (ed.mode != .normal) return fail(ed);
+                try ed.goMark(m.*, exact);
+                return;
+            }
+            const t = ed.text();
+            const pos = @min(m.pos, t.len());
+            const from = ed.view.cursor;
+            ed.revealLine(t.lineOf(pos));
+            if (exact) return finishMotion(ed, from, pos, .exclusive, .reset);
+            try finishMotion(ed, from, motions.firstNonBlank(t, t.lineOf(pos)), .linewise, .reset);
+        }
+    }.run;
+}
+
+fn pickColor(c: Context) !void {
+    c.ed.openColorPicker();
 }
 
 fn gitLineCommit(c: Context) !void {
@@ -994,6 +1063,27 @@ fn findChar(comptime forward: bool, comptime till: bool) Target {
             const f = motions.Find.init(c.char, forward, till) orelse return null;
             ed.last_find = f;
             ed.find_shown = true;
+            if (ed.mode != .operator) {
+                ed.find_dot = true;
+                ed.snipe_dot = false;
+            }
+            // `f` as a motion looks along the line from its start, wherever
+            // the cursor is, so one key finds the first match and `;` walks
+            // on to the rest. (After an operator, `f` still starts at the
+            // cursor: `dfx` deletes forward.)
+            if (forward and !till and ed.mode != .operator) {
+                const t = ed.text();
+                const ls = t.lineStart(t.lineOf(from));
+                const le = t.lineEnd(t.lineOf(from));
+                const line = t.slice(ls, le);
+                var at: usize = 0;
+                var n: usize = 0;
+                while (motions.indexOfFold(line, at, f.needle())) |m| {
+                    n += 1;
+                    if (n == c.count) return ls + m;
+                    at = m + 1;
+                }
+            }
             return motions.findAcross(ed.text(), from, f, c.count, false);
         }
     }.target;
@@ -1003,11 +1093,17 @@ fn repeatFind(comptime reverse: bool) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
+            if (ed.snipe_dot) {
+                const next = comptime searchNextCmd(reverse);
+                return next(c);
+            }
             var f = ed.last_find orelse return fail(ed);
             if (reverse) f.forward = !f.forward;
             const from = ed.view.cursor;
             const to = motions.findAcross(ed.text(), from, f, c.count, true) orelse return fail(ed);
             ed.find_shown = true;
+            ed.find_dot = true;
+            ed.snipe_dot = false;
             try finishMotion(ed, from, to, if (f.forward) .inclusive else .exclusive, .reset);
         }
     }.run;
@@ -1284,7 +1380,7 @@ fn yankToLineEnd(c: Context) !void {
     try opMotion(.yank, lineEnd, .inclusive)(c);
 }
 
-fn gitAction(comptime action: enum { commit, push, pull, remote }) Handler {
+fn gitAction(comptime action: enum { commit, push, pull, remote, init }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             switch (action) {
@@ -1292,6 +1388,7 @@ fn gitAction(comptime action: enum { commit, push, pull, remote }) Handler {
                 .push => try c.ed.gitPush(),
                 .pull => try c.ed.gitPull(),
                 .remote => try c.ed.gitRemotePrompt(),
+                .init => try c.ed.gitInit(),
             }
         }
     }.run;
@@ -1504,11 +1601,24 @@ fn redo(c: Context) !void {
     try c.ed.redo(c.count);
 }
 
+/// `.`: the find just made again (`f` then `.` walks the matches), else the
+/// last change.
 fn repeatChange(c: Context) !void {
+    if (c.ed.snipe_dot) {
+        const next = comptime searchNextCmd(false);
+        return next(c);
+    }
+    if (c.ed.find_dot and c.ed.last_find != null) {
+        const again = comptime ghostFind(.repeat, repeatFind(false));
+        return again(c);
+    }
     try c.ed.repeatLastChange(c.count, c.has_count);
 }
 
 fn recordMacro(c: Context) !void {
+    // `QQ` quits at once, unsaved changes or not (like `SPC Q Q`). Macros
+    // record into lower-case registers: `Qq` is the one for register q.
+    if (c.char == 'Q') return quitWithoutSaving(c);
     c.ed.startMacro(c.char);
 }
 
@@ -1532,6 +1642,12 @@ fn visualMode(comptime line: bool) Handler {
                 return;
             }
             if (ed.mode != .visual) return ed.enterVisual(line);
+            // `v` again in charwise visual: line mode, over every line the
+            // selection touches.
+            if (!line and !ed.visual_line) {
+                ed.visual_line = true;
+                return;
+            }
             // Same key leaves visual mode; the other switches kind.
             if (ed.visual_line == line) ed.exitVisual() else ed.visual_line = line;
         }
@@ -1581,15 +1697,51 @@ fn firstNonBlankPos(ed: *Editor) usize {
     return motions.firstNonBlank(ed.text(), ed.cursorLine());
 }
 
-fn openLine(comptime where: enum { above, below }) Handler {
+const OpenWhere = enum { above, below };
+
+fn openLine(comptime asked: OpenWhere) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             const t = ed.text();
-            const line = ed.cursorLine();
-            // Copy the indent first: inserting may reallocate the text.
+            var where = asked;
+            var line = ed.cursorLine();
+            // On a ghost line (read-only): the new line goes in the text
+            // next to the ghost lines, `O` after the line above them and
+            // `o` before the line below them.
+            if (ed.ghost) |g| {
+                ed.ghost = null;
+                const last = t.lineCount() - 1;
+                if (asked == .above and g.line > 0) {
+                    line = g.line - 1;
+                    where = .below;
+                } else if (g.line <= last) {
+                    line = g.line;
+                    where = .above;
+                } else {
+                    line = last;
+                    where = .below;
+                }
+            }
+            // Copy the indent first: inserting may reallocate the text. Below a
+            // line that opens a block it is a level deeper, and so is a line
+            // above the one that closes it.
             var indent_buf: [256]u8 = undefined;
-            const indent = copyIndent(ed, line, &indent_buf);
+            var indent: []const u8 = undefined;
+            if (where == .below) {
+                indent = ed.newlineIndent(line, t.lineEnd(line), &indent_buf);
+            } else if (ed.isBlankLine(t, line)) {
+                // Above a blank line: where the code above it is.
+                indent = ed.contextIndent(line, &indent_buf);
+            } else {
+                const own = copyIndent(ed, line, &indent_buf);
+                const first = motions.firstNonBlank(t, line);
+                const closes = first < t.lineEnd(line) and std.mem.indexOfScalar(u8, "})]", t.byteAt(first)) != null;
+                var unit_buf: [16]u8 = undefined;
+                const unit: []const u8 = if (closes) ed.indentUnit(&unit_buf) else "";
+                if (own.len + unit.len <= indent_buf.len) @memcpy(indent_buf[own.len..][0..unit.len], unit);
+                indent = indent_buf[0..@min(own.len + unit.len, indent_buf.len)];
+            }
             ed.setMode(.insert);
             switch (where) {
                 .below => {
@@ -1619,6 +1771,8 @@ fn copyIndent(ed: *Editor, line: usize, buf: []u8) []const u8 {
 
 fn normalMode(c: Context) !void {
     const ed = c.ed;
+    // Arguments never filled in don't stay behind as text.
+    try ed.dropUnfilledPlaceholders();
     // Like vim, leaving insert mode steps back onto the last inserted char.
     const pos = leftInLine(ed.text(), ed.view.cursor);
     ed.setMode(.normal);
@@ -1645,9 +1799,11 @@ fn wordBackwardInLine(t: *const Text, p: usize) usize {
 }
 
 fn insertNewline(c: Context) !void {
+    if (try tags.splitTags(c.ed)) return;
     if (try pairs.splitPair(c.ed)) return;
+    // The line's indentation, a level deeper after an opening bracket.
     var indent_buf: [256]u8 = undefined;
-    const indent = copyIndent(c.ed, c.ed.cursorLine(), &indent_buf);
+    const indent = c.ed.newlineIndent(c.ed.cursorLine(), c.ed.view.cursor, &indent_buf);
     try c.ed.insertText("\n");
     try c.ed.insertText(indent);
 }
@@ -1674,7 +1830,7 @@ fn toggleAi(c: Context) !void {
     ed.setMessage(.info, "AI completion {s}", .{if (on) "on" else "off"});
 }
 
-/// `SPC c f`: the file, or in visual mode the selected lines.
+/// `SPC l f`: the file, or in visual mode the selected lines.
 fn formatCmd(c: Context) !void {
     const ed = c.ed;
     if (ed.mode == .visual) {
@@ -1701,6 +1857,10 @@ fn zoom(comptime how: enum { in, out, reset }) Handler {
 
 fn snippetOrTab(c: Context) !void {
     if (c.ed.snippetStep(true)) return;
+    // After an Emmet abbreviation in markup: its markup.
+    if (try c.ed.expandEmmet()) return;
+    // Before a closing bracket or quote: step over it (`f("x|")` -> `f("x"|)`).
+    if (try pairs.tabOut(c.ed)) return;
     try insertTab(c);
 }
 
@@ -1716,9 +1876,9 @@ fn deleteBackward(c: Context) !void {
 
 fn insertTab(c: Context) !void {
     const ed = c.ed;
-    if (!ed.options.expand_tab) return ed.insertText("\t");
+    if (ed.usesTabs()) return ed.insertText("\t");
     const col = ed.cursorCol();
-    const spaces = motions.nextTabStop(col, ed.options.tab_width) - col;
+    const spaces = motions.nextTabStop(col, @max(ed.indentWidth(), 1)) - col;
     const buf: [16]u8 = @splat(' ');
     try ed.insertText(buf[0..@min(spaces, buf.len)]);
 }
@@ -1793,7 +1953,7 @@ fn claudeCmd(comptime action: enum { panel, send, ask, accept, reject }) Handler
     }.run;
 }
 
-fn termCmd(comptime action: enum { toggle, window, runner, command, again, output, errors }) Handler {
+fn termCmd(comptime action: enum { toggle, window, runner, command, again, output, errors, shell }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
@@ -1801,6 +1961,7 @@ fn termCmd(comptime action: enum { toggle, window, runner, command, again, outpu
                 .toggle => try ed.toggleShell(),
                 .window => ed.openTermWindow() catch |err| ed.setMessage(.err, "could not start the shell: {s}", .{@errorName(err)}),
                 .runner => try ed.runPrompt(true),
+                .shell => ed.shellPrompt(),
                 .command => try ed.runPrompt(false),
                 .again => try ed.runAgain(),
                 .output => ed.showRunOutput(),
@@ -1810,7 +1971,7 @@ fn termCmd(comptime action: enum { toggle, window, runner, command, again, outpu
     }.run;
 }
 
-fn qfCmd(comptime action: enum { next, previous, list, from_picker }) Handler {
+fn qfCmd(comptime action: enum { next, previous, list, from_picker, clear }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             switch (action) {
@@ -1818,6 +1979,7 @@ fn qfCmd(comptime action: enum { next, previous, list, from_picker }) Handler {
                 .previous => try c.ed.stepQuickfix(false, c.count),
                 .list => try c.ed.showQuickfix(),
                 .from_picker => try c.ed.pickerToQuickfix(),
+                .clear => c.ed.resetQuickfix(),
             }
         }
     }.run;
@@ -1968,7 +2130,24 @@ fn quitWithoutSaving(c: Context) !void {
 fn openPicker(comptime kind: Picker.Kind) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            try c.ed.openPicker(kind, "");
+            const ed = c.ed;
+            // From a selection (within one line): it is the query.
+            var buf: [200]u8 = undefined;
+            var query: []const u8 = "";
+            if (ed.mode == .visual) {
+                const r = ed.visualRange();
+                const text = std.mem.trim(u8, ed.text().slice(r.start, r.end), " \t");
+                if (!r.linewise and text.len > 0 and text.len < buf.len and std.mem.indexOfScalar(u8, text, '\n') == null) {
+                    // A first character that would switch pickers (`@import`
+                    // is not a request for symbols) stays text behind a space.
+                    const guard = @intFromBool(@import("picker/sources.zig").byPrefix(text[0]) != null);
+                    buf[0] = ' ';
+                    @memcpy(buf[guard..][0..text.len], text);
+                    query = buf[0 .. text.len + guard];
+                }
+                ed.exitVisual();
+            }
+            try ed.openPicker(kind, query);
         }
     }.run;
 }
@@ -2028,6 +2207,35 @@ fn browseStep(comptime dir: enum { up, in }) Handler {
     }.run;
 }
 
+/// Keys that act on the selected row: file operations in the browser, and
+/// in the buffer list closing a buffer or starting a new one.
+fn pickerOp(comptime op: Editor.BrowseOp) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const p = ed.picker orelse return;
+            switch (p.kind) {
+                .browse => try ed.browseOp(op),
+                .runner => if (op == .delete) try ed.pickerForgetCommand(),
+                // The quickfix list: back to the project's live errors.
+                .quickfix => if (op == .delete) {
+                    ed.closePicker();
+                    ed.resetQuickfix();
+                },
+                .buffers => switch (op) {
+                    .delete => try ed.pickerKillBuffer(),
+                    .new_folder, .new_file => {
+                        ed.closePicker();
+                        try ed.newBuffer();
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+    }.run;
+}
+
 fn pickerMove(comptime delta: isize, comptime how: enum { wrap, clamp }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
@@ -2081,9 +2289,14 @@ fn inputEdit(comptime what: enum { char, word, all }) Handler {
             const ed = c.ed;
             const input = ed.activeInput() orelse return;
             if (what == .char and input.items().len == 0) {
-                // <BS> on an empty search prompt cancels it, like vim; in the
-                // file browser it goes up a folder.
-                if (ed.mode == .search) return ed.cancelSearch();
+                // <BS> on an empty `/` or snipe prompt cancels it, like vim; in
+                // the file browser it goes up a folder. Boxed prompts (run a
+                // command, rename, commit...) stay open: clearing the text is
+                // how you start over, and a held <BS> shouldn't close them.
+                if (ed.mode == .search) {
+                    if (ed.search_prompt) |sp| if (sp.kind.boxed()) return;
+                    return ed.cancelSearch();
+                }
                 if (ed.picker) |p| if (p.kind == .browse) return ed.browseUp();
             }
             switch (what) {
@@ -2105,6 +2318,10 @@ fn startSearch(comptime forward: bool, comptime kind: Editor.PromptKind) Handler
             c.ed.startSearch(forward, kind);
         }
     }.run;
+}
+
+fn selectIn(c: Context) !void {
+    c.ed.startSelectIn();
 }
 
 fn gotoSymbol(c: Context) !void {
@@ -2136,7 +2353,7 @@ fn searchWord(comptime forward: bool) Handler {
 // ---------------------------------------------------------------------------
 // Language server
 
-fn lspRequest(comptime what: enum { definition, references, hover }) Handler {
+fn lspRequest(comptime what: enum { definition, references, hover, implementation, code_actions, workspace_symbols }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const l = c.ed.languageServer() orelse return;
@@ -2144,6 +2361,21 @@ fn lspRequest(comptime what: enum { definition, references, hover }) Handler {
                 .definition => try l.requestDefinition(c.ed),
                 .references => try l.requestReferences(c.ed),
                 .hover => try l.requestHover(c.ed),
+                .implementation => try l.requestImplementation(c.ed),
+                .code_actions => {
+                    // The cursor's line, or the selected lines.
+                    const ed = c.ed;
+                    const t = ed.text();
+                    var first = ed.cursorLine();
+                    var last = first;
+                    if (ed.mode == .visual) {
+                        first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
+                        last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
+                        ed.exitVisual();
+                    }
+                    try l.requestCodeActions(ed, first, last);
+                },
+                .workspace_symbols => try c.ed.showWorkspaceSymbols(),
             }
         }
     }.run;
@@ -2155,7 +2387,7 @@ fn completionKey(comptime action: enum { next, previous, accept }, comptime fall
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            if (ed.completion) |*comp| return switch (action) {
+            if (ed.completionShown()) |comp| return switch (action) {
                 .next => comp.move(1),
                 .previous => comp.move(-1),
                 .accept => ed.acceptCompletion(),

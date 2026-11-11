@@ -26,7 +26,9 @@ fn isWord(b: u8) bool {
 
 /// Typing `cp` in insert mode with autopairs on. Returns false when it
 /// should be inserted as usual.
-///   - an opener inserts its pair (unless a word follows): `(` -> `(|)`
+///   - an opener inserts its pair (unless a word follows, or its own closer does with no
+///     opener before: `(|)` and `(` makes `((|))`, but `|)` stays `(|)`):
+///     `(` -> `(|)`
 ///   - a closer or quote right before the same character steps over it
 ///   - a quote pairs when not touching a word: `"` -> `"|"`, but `don't`
 pub fn typed(ed: *Editor, cp: u21) !bool {
@@ -44,7 +46,7 @@ pub fn typed(ed: *Editor, cp: u21) !bool {
         return true;
     }
     if (std.mem.indexOfScalar(u8, openers, c)) |i| {
-        if (next) |n| if (isWord(n) or std.mem.indexOfScalar(u8, quotes, n) != null) return false;
+        if (next) |n| if (isWord(n) or (n == closers[i] and prev != c) or std.mem.indexOfScalar(u8, quotes, n) != null) return false;
         try ed.insertText(&.{ c, closers[i] });
         ed.setCursor(pos + 1);
         return true;
@@ -57,6 +59,39 @@ pub fn typed(ed: *Editor, cp: u21) !bool {
         return true;
     }
     return false;
+}
+
+/// <Tab> right before a closing bracket or quote steps over it:
+/// `f("text|")` -> `f("text"|)` -> `f("text")|`, so the end of a call is a
+/// few Tabs away instead of a reach for the arrow keys. Only with autopairs
+/// on, only after something on the line (at the start of a line Tab
+/// indents), and a quote only when it ends a string, not when it starts one.
+/// Returns false when Tab should do what it usually does.
+pub fn tabOut(ed: *Editor) !bool {
+    if (!ed.options.auto_pairs) return false;
+    const t = ed.text();
+    const pos = ed.view.cursor;
+    if (pos >= t.len()) return false;
+    const c = t.byteAt(pos);
+    const is_quote = std.mem.indexOfScalar(u8, quotes, c) != null;
+    if (!is_quote and std.mem.indexOfScalar(u8, closers, c) == null) return false;
+    const ls = t.lineStart(t.lineOf(pos));
+    const before = t.slice(ls, pos);
+    if (std.mem.indexOfNone(u8, before, " \t") == null) return false;
+    if (is_quote) {
+        // Inside a string (an odd number of this quote so far, not counting
+        // escaped ones) means this one closes it.
+        var open = false;
+        var i: usize = 0;
+        while (i < before.len) : (i += 1) {
+            if (before[i] == '\\') {
+                i += 1;
+            } else if (before[i] == c) open = !open;
+        }
+        if (!open) return false;
+    }
+    ed.setCursor(pos + 1);
+    return true;
 }
 
 /// <CR> between an empty pair opens it up:
@@ -81,9 +116,8 @@ pub fn splitPair(ed: *Editor) !bool {
     const indent = t.slice(ls, ie);
     w.writeAll("\n") catch return false;
     w.writeAll(indent) catch return false;
-    if (ed.options.expand_tab) {
-        w.splatByteAll(' ', ed.options.tab_width) catch return false;
-    } else w.writeByte('\t') catch return false;
+    var unit_buf: [16]u8 = undefined;
+    w.writeAll(ed.indentUnit(&unit_buf)) catch return false;
     const inner_end = w.end;
     w.writeAll("\n") catch return false;
     w.writeAll(indent) catch return false;

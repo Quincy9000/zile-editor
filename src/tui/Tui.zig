@@ -146,7 +146,8 @@ pub fn run(gpa: Allocator, io: Io, ed: *Editor, opts: Options) !void {
             .{ .fd = if (tty) stdin else -1, .events = std.c.POLL.IN, .revents = 0 },
             .{ .fd = wake_fds[0], .events = std.c.POLL.IN, .revents = 0 },
         };
-        const timeout: c_int = if (pending.items.len > 0) 25 else if (!script_done) 60 else 250;
+        // Sooner when something on screen is due to change by itself.
+        const timeout: c_int = if (pending.items.len > 0) 25 else if (!script_done) 60 else if (ed.wantsFrames()) 40 else 250;
         const ready = std.c.poll(&fds, fds.len, timeout);
         if (fds[1].revents != 0) {
             var drain: [64]u8 = undefined;

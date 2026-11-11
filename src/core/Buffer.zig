@@ -10,8 +10,16 @@ const Syntax = @import("../syntax/Syntax.zig");
 const Project = @import("Project.zig");
 const Folds = @import("Folds.zig");
 const diff = @import("../git/diff.zig");
+const indent = @import("indent.zig");
 
 const Buffer = @This();
+
+/// A label to draw before the text at byte offset `pos`; `text` is owned
+/// (padding included).
+pub const Hint = struct {
+    pos: usize,
+    text: []u8,
+};
 
 text: Text,
 history: History,
@@ -28,6 +36,21 @@ disk_mtime: ?Io.Timestamp = null,
 edit_version: u64 = 0,
 /// Closed folds.
 folds: Folds = .{},
+/// Inlay hints from the language server (type and parameter labels drawn
+/// inside the code): sorted by position, kept in place through edits until
+/// the server's next answer replaces them.
+hints: std.ArrayList(Hint) = .empty,
+/// The `edit_version` the hints were asked for (max: never), the lines they
+/// cover, whether a request is out, and when the text last changed (hints
+/// are asked for again once it has been still for a moment).
+hint_version: u64 = std.math.maxInt(u64),
+hint_range: [2]usize = .{ 1, 0 },
+hint_pending: bool = false,
+hint_seen: u64 = 0,
+hint_changed: Io.Timestamp = .zero,
+/// How the file is indented, worked out when it was read (null: nothing in
+/// it is indented, so the editor's defaults apply).
+indent_style: ?indent.Style = null,
 /// Diff against the file's git HEAD version (null outside a repo or for
 /// untracked files).
 git: ?diff.State = null,
@@ -87,6 +110,7 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8) !Buffer {
     const mtime: ?Io.Timestamp = if (Io.Dir.cwd().statFile(io, path, .{})) |st| st.mtime else |_| null;
     return .{
         .disk_mtime = mtime,
+        .indent_style = indent.detect(&text),
         .text = text,
         .history = try .init(gpa),
         .syntax = Syntax.forPath(path),
@@ -114,6 +138,8 @@ pub fn deinit(b: *Buffer, gpa: Allocator) void {
     b.history.deinit(gpa);
     if (b.syntax) |*s| s.deinit(gpa);
     b.folds.deinit(gpa);
+    for (b.hints.items) |h| gpa.free(h.text);
+    b.hints.deinit(gpa);
     if (b.git) |*g| g.deinit(gpa);
     if (b.path) |p| gpa.free(p);
     if (b.label) |l| gpa.free(l);
@@ -125,6 +151,10 @@ pub fn deinit(b: *Buffer, gpa: Allocator) void {
 pub fn insert(b: *Buffer, gpa: Allocator, pos: usize, bytes: []const u8) Allocator.Error!void {
     if (b.syntax) |*s| s.noteInsert(&b.text, pos, bytes);
     b.folds.noteInsert(pos, bytes.len);
+    // A hint belongs to the text after it: typing in front of it moves it on.
+    for (b.hints.items) |*h| if (h.pos >= pos) {
+        h.pos += bytes.len;
+    };
     try b.text.insert(gpa, pos, bytes);
     b.edit_version += 1;
 }
@@ -132,6 +162,9 @@ pub fn insert(b: *Buffer, gpa: Allocator, pos: usize, bytes: []const u8) Allocat
 pub fn delete(b: *Buffer, start: usize, end: usize) void {
     if (b.syntax) |*s| s.noteDelete(&b.text, start, end);
     b.folds.noteDelete(start, end);
+    for (b.hints.items) |*h| {
+        if (h.pos >= end) h.pos -= end - start else if (h.pos > start) h.pos = start;
+    }
     b.text.delete(start, end);
     b.edit_version += 1;
 }

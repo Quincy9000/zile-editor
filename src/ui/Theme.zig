@@ -56,6 +56,9 @@ cursorword_bg: Color,
 trail_bg: Color,
 /// The indent scope's guide line.
 indent_guide: Color,
+/// Inlay hints (type and parameter labels from the language server).
+inlay_fg: Color,
+inlay_bg: Color,
 /// Text color for each syntax style (`.none` is plain text).
 syntax: std.EnumArray(Style, Color),
 
@@ -105,6 +108,8 @@ pub const default: Theme = .{
     .cursorword_bg = hex("#2b2d3c"),
     .trail_bg = hex("#5a2a32"),
     .indent_guide = hex("#4a4d63"),
+    .inlay_fg = hex("#7a7d96"),
+    .inlay_bg = hex("#1f2029"),
     .syntax = .init(.{
         .none = hex("#d4d6e4"),
         .comment = hex("#6c6f88"),
@@ -213,6 +218,8 @@ pub fn fromPalette(comptime p: Palette) Theme {
         .cursorword_bg = mix(bg, fg, 0.13),
         .trail_bg = mix(bg, red, 0.4),
         .indent_guide = mix(bg, fg, 0.28),
+        .inlay_fg = mix(bg, fg, 0.5),
+        .inlay_bg = mix(bg, fg, 0.08),
         .syntax = .init(.{
             .none = fg,
             .comment = dim,
@@ -245,19 +252,57 @@ const palettes = [_]Palette{
     .{ .name = "github-light", .light = true, .bg = "#ffffff", .fg = "#24292f", .red = "#cf222e", .orange = "#bc4c00", .yellow = "#9a6700", .green = "#116329", .cyan = "#1b7c83", .blue = "#0969da", .purple = "#8250df" },
 };
 
-/// Every built-in theme: "zile" first, then one per palette.
+/// Night Owl, with the colours of night-owl.nvim: derived like the others,
+/// then the places where it has a colour of its own (strings are peach, not
+/// green; the cursor is steel blue; its own selection and search blues).
+const night_owl = blk: {
+    var t = fromPalette(.{ .name = "night-owl", .bg = "#021727", .fg = "#d6deeb", .red = "#ef5350", .orange = "#f78c6c", .yellow = "#ffcb8b", .green = "#c5e478", .cyan = "#7fdbca", .blue = "#82aaff", .purple = "#c792ea" });
+    t.syntax.set(.string, hex("#ecc48d"));
+    t.syntax.set(.comment, hex("#637777"));
+    t.syntax.set(.constant, hex("#82aaff"));
+    t.syntax.set(.builtin, hex("#ff5874"));
+    t.syntax.set(.property, hex("#78ccf0"));
+    t.syntax.set(.parameter, hex("#d7dbe0"));
+    t.syntax.set(.operator, hex("#c792ea"));
+    t.gutter_fg = hex("#4b6479");
+    t.gutter_current_fg = hex("#c5e4fc");
+    t.cursor = hex("#80a4c2");
+    t.cursorline_bg = hex("#0b253a");
+    t.selection_bg = hex("#1d3b53");
+    t.search_match = hex("#063e5d");
+    t.search_current = hex("#234d70");
+    t.cursorword_bg = hex("#33384d");
+    t.indent_guide = hex("#7e97ac");
+    t.fold_bg = hex("#092135");
+    t.status_bg = hex("#0b2942");
+    t.popup_bg = hex("#01111d");
+    t.popup_border = hex("#5f7e97");
+    t.diff_add = hex("#9ccc65");
+    t.diff_change = hex("#e2b93d");
+    t.status_dim = hex("#5f7e97");
+    t.ai_fg = hex("#4b6479");
+    const result = t;
+    break :blk result;
+};
+
+/// Themes tuned by hand beyond their palette.
+const tuned = [_]struct { []const u8, Theme }{.{ "night-owl", night_owl }};
+
+/// Every built-in theme: "zile" first, then one per palette, then the tuned.
 pub const all = blk: {
-    var out: [palettes.len + 1]Theme = undefined;
+    var out: [1 + palettes.len + tuned.len]Theme = undefined;
     out[0] = default;
     for (palettes, 1..) |p, i| out[i] = fromPalette(p);
+    for (tuned, 1 + palettes.len..) |t, i| out[i] = t[1];
     const result = out;
     break :blk result;
 };
 
 pub const names = blk: {
-    var out: [palettes.len + 1][]const u8 = undefined;
+    var out: [1 + palettes.len + tuned.len][]const u8 = undefined;
     out[0] = "zile";
     for (palettes, 1..) |p, i| out[i] = p.name;
+    for (tuned, 1 + palettes.len..) |t, i| out[i] = t[0];
     const result = out;
     break :blk result;
 };

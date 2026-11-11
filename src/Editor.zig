@@ -25,6 +25,10 @@ const Completion = @import("lsp/Completion.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
+const tags = @import("tags.zig");
+const emmet = @import("emmet.zig");
+const snippets = @import("snippets.zig");
+const config = @import("config/config.zig");
 const format = @import("format.zig");
 const Ghost = @import("ai/Ghost.zig");
 pub const Claude = @import("ai/Claude.zig");
@@ -41,6 +45,8 @@ const textops = @import("textops.zig");
 const indents = @import("core/indent.zig");
 const comment = @import("core/comment.zig");
 const Visits = @import("Visits.zig");
+pub const ColorPicker = @import("ColorPicker.zig");
+const hipatterns = @import("core/hipatterns.zig");
 pub const Session = @import("Session.zig");
 pub const Blame = @import("git/Blame.zig");
 
@@ -83,6 +89,13 @@ pub const Options = struct {
     smooth_scroll: bool = true,
     /// Who last changed the cursor's line, after its end.
     git_blame: bool = false,
+    /// Type and parameter labels from the language server, drawn inside the
+    /// code (inlay hints).
+    inlay_hints: bool = true,
+    /// Folders searched (three levels deep) for projects to offer in
+    /// `SPC p p` besides the ones opened before. A setting once there is
+    /// config; nowhere in tests.
+    project_dirs: []const []const u8 = if (@import("builtin").is_test) &.{} else &.{"/mnt/code"},
 };
 
 pub const View = struct {
@@ -157,6 +170,32 @@ pub const Jump = struct {
     buffer: ?*Buffer,
     path: ?[]u8,
     pos: usize,
+};
+
+/// A mark (`m{letter}`): lower-case ones belong to their buffer, upper-case
+/// ones are global and remember their file. `path` is owned.
+pub const Mark = struct {
+    name: u8,
+    buffer: ?*Buffer,
+    path: ?[]u8,
+    pos: usize,
+};
+
+/// A code action offered by the language server (`SPC l a`). `title`,
+/// `kind` and `json` (the action as the server sent it) are owned.
+pub const CodeAction = struct {
+    title: []u8,
+    kind: []u8,
+    json: []u8,
+};
+
+/// A project-wide symbol from the language server (`SPC f w`); owned strings.
+pub const WorkspaceSymbol = struct {
+    name: []u8,
+    kind: []const u8,
+    path: []u8,
+    line: usize,
+    col: usize,
 };
 
 /// A quickfix entry: a place (0-based line/col) and what's there.
@@ -237,6 +276,9 @@ pub const SnippetSession = struct {
     at_end: bool = false,
     /// What was accepted is a call (a function), so it may end with `;`.
     is_call: bool = false,
+    /// Our own snippets' defaults are code (`catch (${2:err})`): <Esc>
+    /// keeps them. A server's argument placeholders go.
+    keep_defaults: bool = false,
 };
 
 /// A cursor besides the primary one: position, visual anchor, wanted column.
@@ -254,6 +296,24 @@ pub const PendingOp = struct {
     register: ?u8,
 };
 
+/// A yanked range, flashed (`flash_ms` long, fading) so you can see what
+/// was taken.
+pub const YankFlash = struct {
+    buffer: *Buffer,
+    start: usize,
+    end: usize,
+    linewise: bool,
+    born: Io.Timestamp,
+
+    pub const flash_ms = 250;
+
+    /// 1 at the start, 0 when done.
+    pub fn strength(f: YankFlash, now: Io.Timestamp) f32 {
+        const ms: f32 = @floatFromInt(@divTrunc(f.born.durationTo(now).nanoseconds, std.time.ns_per_ms));
+        return std.math.clamp(1 - @max(ms, 0) / flash_ms, 0, 1);
+    }
+};
+
 pub const SearchPrompt = struct {
     input: LineInput = .{},
     forward: bool,
@@ -265,6 +325,9 @@ pub const SearchPrompt = struct {
     return_mode: Mode,
     had_highlight: bool,
     kind: PromptKind = .search,
+    /// `select_in`: the selection the matches are looked for in.
+    within_start: usize = 0,
+    within_end: usize = 0,
 };
 
 pub const PromptKind = enum {
@@ -272,7 +335,10 @@ pub const PromptKind = enum {
     search,
     /// `s`: jump as soon as only one match is left on screen.
     snipe,
-    /// `SPC c r`: the new name for the symbol at `origin`.
+    /// Visual `qf` (Helix's `s`): a cursor on every match inside the
+    /// selection.
+    select_in,
+    /// `SPC l r`: the new name for the symbol at `origin`.
     rename,
     /// Git: the commit message (commits all changes).
     git_commit,
@@ -283,21 +349,25 @@ pub const PromptKind = enum {
     save_as,
     rename_file,
     copy_file,
-    /// `SPC r c`: any command; `SPC r r`: the code runner (prefilled with the
-    /// project's last command, so <CR> runs it again).
+    /// `SPC ;`: any one-off shell command.
     run_command,
-    run_runner,
     /// `SPC a i`: an instruction for Claude about the selection.
     ask_claude,
+    /// The file browser's own operations (`o` `n` `r` `m` in its list): a
+    /// name for a new folder or file, a new name, a new place.
+    browse_new_folder,
+    browse_new_file,
+    browse_rename,
+    browse_move,
 
     /// One-line prompts shown in a centered box (not incremental searches).
     pub fn boxed(k: PromptKind) bool {
-        return k != .search and k != .snipe;
+        return k != .search and k != .snipe and k != .select_in;
     }
 
     pub fn title(k: PromptKind) []const u8 {
         return switch (k) {
-            .search, .snipe => "",
+            .search, .snipe, .select_in => "",
             .rename => "Rename symbol",
             .git_commit => "Commit message (commits all changes)",
             .git_remote => "Remote URL (origin)",
@@ -306,8 +376,11 @@ pub const PromptKind = enum {
             .rename_file => "Rename / move file to",
             .copy_file => "Copy file to",
             .run_command => "Run command",
-            .run_runner => "Code runner (Enter runs it again)",
             .ask_claude => "Ask Claude (about the selection)",
+            .browse_new_folder => "New folder (name)",
+            .browse_new_file => "New file (name)",
+            .browse_rename => "Rename to",
+            .browse_move => "Move to (path)",
         };
     }
 };
@@ -319,6 +392,43 @@ const AwaitingChar = struct {
     has_count: bool,
     register: ?u8,
 };
+
+pub const IndentGuide = struct {
+    buffer: *const Buffer,
+    scope: indents.Scope,
+    /// The guide is drawn growing out from this line (where the cursor was
+    /// when it appeared), since this moment.
+    origin: usize = 0,
+    born: Io.Timestamp = .zero,
+
+    /// How many rows the guide has grown from its origin by `now`, each way
+    /// (a fraction while a row is part drawn).
+    pub fn reach(g: IndentGuide, now: Io.Timestamp) f32 {
+        const ms: f32 = @floatFromInt(@divTrunc(g.born.durationTo(now).nanoseconds, std.time.ns_per_ms));
+        return @max(ms, 0) / indent_guide_step_ms;
+    }
+
+    /// Still growing (as far as lines `top..bottom` on screen are concerned).
+    fn growing(g: IndentGuide, now: Io.Timestamp, top: usize, bottom: usize) bool {
+        const up = g.origin -| @max(g.scope.first, top);
+        const down = @min(g.scope.last, bottom) -| g.origin;
+        return g.reach(now) < @as(f32, @floatFromInt(@max(up, down)));
+    }
+
+    /// The same block (it may have grown or shrunk at its end while typing).
+    fn same(a: ?IndentGuide, b: ?IndentGuide) bool {
+        const x = a orelse return b == null;
+        const y = b orelse return false;
+        return x.buffer == y.buffer and x.scope.first == y.scope.first and x.scope.guide_col == y.scope.guide_col;
+    }
+};
+
+/// How long the cursor's scope must stay the same before its guide is drawn
+/// (mini.indentscope's `draw.delay`).
+pub const indent_guide_delay_ms = 100;
+/// The guide then grows a row every this many milliseconds (mini's
+/// animation: 20 ms a step).
+pub const indent_guide_step_ms = 20;
 
 /// A notification shown at the top right for a few seconds (mini.notify):
 /// things that happen on their own (a language server's progress, a git
@@ -347,7 +457,7 @@ pub const Toast = struct {
     }
 };
 
-/// A past message or notification (`SPC s m`). `text` is owned.
+/// A past message or notification (`SPC f n`). `text` is owned.
 pub const HistoryEntry = struct {
     kind: Message.Kind,
     text: []u8,
@@ -421,7 +531,7 @@ multi_once: bool = false,
 replaying: bool = false,
 /// The primary cursor, set aside while replaying (edits still shift it).
 primary_saved: ?Cursor = null,
-/// The terminal popup's shell (`SPC o t`), kept running while hidden.
+/// The terminal popup's shell (`SPC r t`), kept running while hidden.
 shell: ?*Terminal = null,
 /// The last command run (`SPC r`), its terminal, and when it started.
 run: ?*Terminal = null,
@@ -429,14 +539,23 @@ run_command: ?[]u8 = null,
 run_started: Io.Timestamp = .zero,
 /// Where the last run ran (its project root; borrowed).
 run_root: []const u8 = ".",
+/// The memory `run_root` points into, once a command has run.
+run_root_owned: ?[]u8 = null,
 /// The end of the run was reported (printed under its output).
 run_reported: bool = true,
-/// The quickfix list (`]q` / `[q`, `SPC x x`): places to step through,
+/// The quickfix list (`]q` / `[q`, `SPC f q`): places to step through,
 /// from a run's errors or a picker's results (`<C-q>`).
 quickfix: std.ArrayList(QuickfixItem) = .empty,
 quickfix_title: std.ArrayList(u8) = .empty,
 /// The entry last visited, if any.
 quickfix_index: ?usize = null,
+/// Where the list came from. With none of your own (`none`, `live`) it is
+/// the project's errors as the language server reports them right now,
+/// rebuilt each time it is used; a run's errors or a picker's results
+/// (`<C-q>`) stay until replaced or cleared (`x in the quickfix picker`).
+quickfix_origin: enum { none, live, run, picked } = .none,
+/// Stands in for the language servers' diagnostics (tests).
+live_errors_override: ?[]const QuickfixItem = null,
 /// Errors found in the last run's output (`SPC r e`).
 run_errors: std.ArrayList(run_errors_mod.Error) = .empty,
 /// The command editor (`SPC r c`): a small floating window with its own
@@ -457,11 +576,16 @@ term_fg: ?Terminal.Rgb = null,
 term_bg: ?Terminal.Rgb = null,
 /// Where the code runner remembers commands (null: the default location).
 run_memory_path: ?[]u8 = null,
-/// Jumplist (`<C-o>` / `<C-i>`, `SPC s j`): places left by jumps, oldest
+/// Jumplist (`<C-o>` / `<C-i>`, `SPC f j`): places left by jumps, oldest
 /// first. `jump_index` is the entry being visited, or `jumps.len` when not
 /// moving through the list.
 jumps: std.ArrayList(Jump) = .empty,
 jump_index: usize = 0,
+/// The language server's last answers for `SPC l a` and `SPC f w`.
+code_actions: std.ArrayList(CodeAction) = .empty,
+workspace_symbols: std.ArrayList(WorkspaceSymbol) = .empty,
+/// Marks (`m{letter}`, `'{letter}`, `SPC f m`).
+marks: std.ArrayList(Mark) = .empty,
 /// Surround in progress: the range `ys` will wrap, the pair `cs` replaces.
 surround_range: operators.Range = .{ .start = 0, .end = 0 },
 /// `ga{motion}`: the lines to align once the character is typed.
@@ -469,14 +593,34 @@ align_range: operators.Range = .{ .start = 0, .end = 0 },
 /// `gx`: the first of the two texts to exchange (dropped if the buffer is
 /// edited before the second is picked).
 exchange_mark: ?struct { buffer: *Buffer, version: u64, range: operators.Range } = null,
+/// The colour wheel (`SPC l c`), while it is open: it takes every key.
+color_picker: ?ColorPicker = null,
+/// The indent scope guide: the scope drawn, and the one waiting to be
+/// (a scope has to hold still for `indent_guide_delay_ms` before its guide
+/// appears, so travelling through a file doesn't flash one per block).
+indent_guide: ?IndentGuide = null,
+indent_candidate: ?IndentGuide = null,
+indent_since: Io.Timestamp = .zero,
 /// The last key was an f/t jump: its other targets are highlighted.
 find_shown: bool = false,
+/// The last thing done was a find (`f`, `t`, `,`...), no change since: `.`
+/// repeats the find instead of the last change.
+find_dot: bool = false,
+/// The same for a snipe (`t`): `.` / `,` go to the next / previous match.
+snipe_dot: bool = false,
+/// What was just yanked, lit for a moment.
+yank_flash: ?YankFlash = null,
+/// A tag name being edited and its partner's (`tags.zig`): the partner
+/// follows.
+tag_link: ?tags.Link = null,
+/// The partner is being changed (not an edit to link anew).
+tag_mirroring: bool = false,
 /// The colour scheme: an index into `theme_names` (set by the UI, which owns
 /// the themes), and the one to go back to if the theme picker is cancelled.
 theme_index: usize = 0,
 theme_names: []const []const u8 = &.{},
 theme_before: usize = 0,
-/// Notifications on screen, and every message so far (`SPC s m`).
+/// Notifications on screen, and every message so far (`SPC f n`).
 toasts: std.ArrayList(Toast) = .empty,
 history: std.ArrayList(HistoryEntry) = .empty,
 /// The time of the current frame (toasts expire against it).
@@ -521,12 +665,20 @@ search_highlight: bool = false,
 
 /// Running language servers, by index into `Lsp.servers`, started on demand.
 lsps: std.ArrayList(*Lsp) = .empty,
+/// Diagnostics of several servers for one file, merged (`diagnostics`).
+merged_diagnostics: std.ArrayList(Lsp.Diagnostic) = .empty,
+/// Linters looked for per project ("index:root" -> absent there).
+linter_checked: std.StringHashMapUnmanaged(bool) = .empty,
 /// A server could not be started or exited; don't keep retrying it.
-lsp_failed: [Lsp.servers.len]bool = @splat(false),
-/// The outline shown by the symbols picker (`SPC c l`).
+lsp_failed: [Lsp.max_servers]bool = @splat(false),
+/// The outline shown by the symbols picker (`SPC f s`).
 symbols: std.ArrayList(syntax_objects.Symbol) = .empty,
-/// The buffer a Yes/No confirmation (`SPC f D`) is about.
+/// The buffer a Yes/No confirmation (`SPC b x`) is about.
 confirm_target: ?*Buffer = null,
+/// The file browser's entry being renamed, moved or deleted, and the one
+/// copied with `yy` (absolute paths; owned).
+browse_target: ?[]u8 = null,
+browse_clip: ?[]u8 = null,
 /// Results of the last definition/references request, for the picker.
 locations: std.ArrayList(Lsp.Location) = .empty,
 /// Hover text shown near the cursor until the next key.
@@ -550,7 +702,7 @@ claude: ?*Claude = null,
 last_editor_window: ?*Windows.Window = null,
 /// When Esc last went to a terminal (a second one soon after leaves it).
 last_term_esc: Io.Timestamp = .zero,
-/// Shells in windows (`SPC o T`); closing a window ends its shell.
+/// Shells in windows (`SPC r w`); closing a window ends its shell.
 shells: std.ArrayList(*Terminal) = .empty,
 /// When open buffers were last checked for changes on disk.
 last_disk_check: Io.Timestamp = .zero,
@@ -558,8 +710,10 @@ last_disk_check: Io.Timestamp = .zero,
 claude_ask: ?struct { path: []u8, lines: ?[2]usize } = null,
 /// Tests never ask a model (they mustn't depend on one running).
 ai_offline: bool = @import("builtin").is_test,
-/// Word start a completion was last requested for (avoids re-asking per key).
+/// Word start a completion was last requested for, and whether its answer
+/// is still on the way (so a key doesn't ask again for the same thing).
 completion_asked: ?usize = null,
+completion_pending: bool = false,
 
 /// Repository root (found the first time a file opens), and whether we looked.
 /// Every project seen (owned; buffers point into it).
@@ -639,6 +793,7 @@ pub fn deinit(ed: *Editor) void {
     if (ed.shell) |t| t.destroy();
     if (ed.run) |t| t.destroy();
     if (ed.run_command) |cmd| ed.gpa.free(cmd);
+    if (ed.run_root_owned) |r| ed.gpa.free(r);
     for (ed.run_errors.items) |e| e.deinit(ed.gpa);
     ed.run_errors.deinit(ed.gpa);
     ed.clearQuickfix();
@@ -647,6 +802,10 @@ pub fn deinit(ed: *Editor) void {
     if (ed.run_memory_path) |path| ed.gpa.free(path);
     for (ed.lsps.items) |l| l.deinit();
     ed.lsps.deinit(ed.gpa);
+    ed.merged_diagnostics.deinit(ed.gpa);
+    var lc = ed.linter_checked.keyIterator();
+    while (lc.next()) |key| ed.gpa.free(key.*);
+    ed.linter_checked.deinit(ed.gpa);
     ed.clearLocations();
     ed.locations.deinit(ed.gpa);
     ed.clearSymbols();
@@ -661,6 +820,8 @@ pub fn deinit(ed: *Editor) void {
     for (ed.shells.items) |t| t.destroy();
     ed.shells.deinit(ed.gpa);
     if (ed.claude_ask) |a| ed.gpa.free(a.path);
+    if (ed.browse_target) |p| ed.gpa.free(p);
+    if (ed.browse_clip) |p| ed.gpa.free(p);
     for (ed.buffers.items) |b| {
         b.deinit(ed.gpa);
         ed.gpa.destroy(b);
@@ -696,6 +857,12 @@ pub fn deinit(ed: *Editor) void {
     ed.multi_keys.deinit(ed.gpa);
     for (ed.jumps.items) |j| if (j.path) |p| ed.gpa.free(p);
     ed.jumps.deinit(ed.gpa);
+    for (ed.marks.items) |m| if (m.path) |p| ed.gpa.free(p);
+    ed.marks.deinit(ed.gpa);
+    ed.clearCodeActions();
+    ed.code_actions.deinit(ed.gpa);
+    ed.clearWorkspaceSymbols();
+    ed.workspace_symbols.deinit(ed.gpa);
     ed.last_change.deinit(ed.gpa);
     ed.macro_keys.deinit(ed.gpa);
     ed.queue.deinit(ed.gpa);
@@ -756,9 +923,14 @@ pub fn unpeekWindow(ed: *Editor, p: Peek) void {
 /// picks up picker results from the worker.
 pub fn tick(ed: *Editor) void {
     ed.now = Io.Timestamp.now(ed.io, .awake);
+    if (ed.yank_flash) |f| if (f.strength(ed.now) <= 0) {
+        ed.yank_flash = null;
+    };
     ed.pruneToasts();
+    ed.tickIndentGuide();
     ed.ensureBlame();
     ed.tickLsp();
+    ed.tickInlayHints();
     ed.pollGitJob();
     ed.pollTerminals();
     ed.pollAi();
@@ -788,6 +960,7 @@ pub fn text(ed: *Editor) *Text {
 // Input
 
 pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
+    if (ed.colorKey(ev)) return;
     if (ed.popupKey(ev)) return;
     if (ed.cmdFloatKey(ev)) return;
     if (ed.macro_register != null) ed.macro_keys.append(ed.gpa, ev) catch {};
@@ -858,6 +1031,9 @@ fn processKey(ed: *Editor, ev: KeyEvent) void {
         ed.showcmd[ed.showcmd_len] = ev;
         ed.showcmd_len += 1;
     }
+    // To notice a deletion in insert mode (completion follows it).
+    const buffer_before = ed.buffer;
+    const len_before = ed.text().len();
     const multi = ed.cursors.items.len > 0;
     if (multi) {
         if (ed.multi_keys.items.len == 0) {
@@ -876,6 +1052,7 @@ fn processKey(ed: *Editor, ev: KeyEvent) void {
     // Typing text (insert mode, a prompt) isn't a pending command.
     if (ed.mode == .insert or ed.mode == .search) ed.showcmd_len = 0;
     if (ed.completion != null) ed.refreshCompletion() catch ed.closeCompletion();
+    if (ed.mode == .insert and ed.buffer == buffer_before and ed.text().len() < len_before) ed.afterDeleted();
     if (ed.mode != .insert) {
         ed.completion_asked = null;
         ed.closeSignature();
@@ -893,6 +1070,8 @@ fn isIdle(ed: *const Editor) bool {
 
 /// Ends a command: commits the undo group and finishes dot-repeat capture.
 fn afterKey(ed: *Editor) void {
+    // A renamed tag's partner follows as you type, in the same undo step.
+    tags.sync(ed);
     if (!ed.isIdle()) return;
     const b = ed.buffer;
     b.history.commit(ed.gpa) catch {};
@@ -902,6 +1081,8 @@ fn afterKey(ed: *Editor) void {
             ed.last_change.clearRetainingCapacity();
             ed.last_change.appendSlice(ed.gpa, ed.change_keys.items) catch {};
             ed.last_change_count = ed.capture_count;
+            ed.find_dot = false;
+            ed.snipe_dot = false;
         }
         ed.capturing = false;
     }
@@ -1045,8 +1226,11 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 .normal, .visual => ed.register = null,
                 .operator => ed.resetCommand(),
                 .insert => for (seq) |k| if (k.text()) |cp| {
+                    // `(` with the suggestions open takes the selected one first.
+                    if (cp == '(') try ed.commitCompletionName();
                     try ed.snippetTypeOver();
-                    if (!try pairs.typed(ed, cp)) try ed.insertCodepoint(cp);
+                    if (!try tags.typed(ed, cp) and !try pairs.typed(ed, cp)) try ed.insertCodepoint(cp);
+                    if (cp == '}' or cp == ')' or cp == ']') try ed.dedentCloser();
                     ed.afterTyped(cp);
                 },
                 // Unbound keys while moving through results do nothing.
@@ -1077,6 +1261,21 @@ fn tickLsp(ed: *Editor) void {
         };
         ed.lsps.append(ed.gpa, l) catch l.deinit();
     }
+    // Linters (eslint) beside them, in projects set up for them.
+    for (ed.buffers.items) |b| for (Lsp.servers, 0..) |srv, i| {
+        if (!srv.linter or ed.lsp_failed[i] or !Lsp.serves(i, b)) continue;
+        const root = Lsp.bufferRoot(b, ed.cwd);
+        const running = for (ed.lsps.items) |l| {
+            if (l.index == i and l.wants(b)) break true;
+        } else false;
+        if (running or ed.linterAbsent(i, root)) continue;
+        const l = Lsp.start(ed, i, root) catch |err| {
+            ed.lsp_failed[i] = true;
+            ed.notify(.err, "could not start {s}: {s}", .{ srv.name, @errorName(err) });
+            continue;
+        };
+        ed.lsps.append(ed.gpa, l) catch l.deinit();
+    };
     var k = ed.lsps.items.len;
     while (k > 0) {
         k -= 1;
@@ -1092,10 +1291,26 @@ fn tickLsp(ed: *Editor) void {
     }
 }
 
-/// The running server for `b` (its language, in its project), if any.
+/// Whether linter `index` has no config in project `root` (checked once
+/// per project: it isn't started there).
+fn linterAbsent(ed: *Editor, index: usize, root: []const u8) bool {
+    var key_buf: [Io.Dir.max_path_bytes + 8]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ index, root }) catch return true;
+    if (ed.linter_checked.get(key)) |absent| return absent;
+    const absent = for (Lsp.servers[index].markers) |m| {
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, m }) catch continue;
+        if (ed.fileExists(p)) break false;
+    } else true;
+    const owned = ed.gpa.dupe(u8, key) catch return absent;
+    ed.linter_checked.put(ed.gpa, owned, absent) catch ed.gpa.free(owned);
+    return absent;
+}
+
+/// The running main server for `b` (its language, in its project), if any.
 pub fn lspFor(ed: *const Editor, b: *const Buffer) ?*Lsp {
     _ = Lsp.serverFor(b) orelse return null;
-    for (ed.lsps.items) |l| if (l.wants(b)) return l;
+    for (ed.lsps.items) |l| if (!l.server().linter and l.wants(b)) return l;
     return null;
 }
 
@@ -1111,9 +1326,29 @@ pub fn languageServer(ed: *Editor) ?*Lsp {
     return null;
 }
 
+/// Everything the servers say about `b`, by line: its main server's and
+/// its linters'. The slice is good until the next call.
 pub fn diagnostics(ed: *const Editor, b: *const Buffer) []const Lsp.Diagnostic {
-    const l = ed.lspFor(b) orelse return &.{};
-    return l.diagnosticsFor(b.path orelse return &.{});
+    const path = b.path orelse return &.{};
+    var lists: [4][]const Lsp.Diagnostic = undefined;
+    var n: usize = 0;
+    for (ed.lsps.items) |l| if (l.wants(b) and n < lists.len) {
+        const d = l.diagnosticsFor(path);
+        if (d.len == 0) continue;
+        lists[n] = d;
+        n += 1;
+    };
+    if (n == 0) return &.{};
+    if (n == 1) return lists[0];
+    const self = @constCast(ed);
+    self.merged_diagnostics.clearRetainingCapacity();
+    for (lists[0..n]) |d| self.merged_diagnostics.appendSlice(ed.gpa, d) catch return lists[0];
+    std.mem.sort(Lsp.Diagnostic, self.merged_diagnostics.items, {}, struct {
+        fn lessThan(_: void, a: Lsp.Diagnostic, c: Lsp.Diagnostic) bool {
+            return if (a.line != c.line) a.line < c.line else @intFromEnum(a.severity) < @intFromEnum(c.severity);
+        }
+    }.lessThan);
+    return self.merged_diagnostics.items;
 }
 
 /// Tells every running server that `b` is going away.
@@ -1142,7 +1377,7 @@ fn clearSymbols(ed: *Editor) void {
     ed.symbols.clearRetainingCapacity();
 }
 
-/// `SPC c l`: the current file's symbols, from the language server when it
+/// `SPC f s`: the current file's symbols, from the language server when it
 /// handles this file, else from the syntax tree.
 pub fn showSymbols(ed: *Editor) !void {
     if (ed.lspFor(ed.buffer)) |l| return l.requestSymbols(ed);
@@ -1162,6 +1397,68 @@ pub fn setSymbols(ed: *Editor, list: []const syntax_objects.Symbol) !void {
 fn openSymbols(ed: *Editor) !void {
     if (ed.symbols.items.len == 0) return ed.setMessage(.info, "no symbols in this file", .{});
     try ed.openPicker(.symbols, "");
+}
+
+// Code actions (`SPC l a`) and workspace symbols (`SPC f w`): the server's
+// answers, kept for their pickers.
+
+pub fn clearCodeActions(ed: *Editor) void {
+    for (ed.code_actions.items) |a| {
+        ed.gpa.free(a.title);
+        ed.gpa.free(a.kind);
+        ed.gpa.free(a.json);
+    }
+    ed.code_actions.clearRetainingCapacity();
+}
+
+/// Adds an action; `json` is taken over, the rest copied.
+pub fn addCodeAction(ed: *Editor, title: []const u8, kind: []const u8, json: []u8) !void {
+    const t = try ed.gpa.dupe(u8, title);
+    errdefer ed.gpa.free(t);
+    const k = try ed.gpa.dupe(u8, kind);
+    errdefer ed.gpa.free(k);
+    try ed.code_actions.append(ed.gpa, .{ .title = t, .kind = k, .json = json });
+}
+
+pub fn showCodeActions(ed: *Editor) !void {
+    if (ed.code_actions.items.len == 0) return ed.setMessage(.info, "no code actions here", .{});
+    try ed.openPicker(.code_actions, "");
+}
+
+pub fn applyCodeAction(ed: *Editor, i: usize) !void {
+    if (i >= ed.code_actions.items.len) return;
+    const l = ed.lspFor(ed.buffer) orelse return;
+    try l.applyCodeAction(ed, ed.code_actions.items[i].json);
+}
+
+pub fn clearWorkspaceSymbols(ed: *Editor) void {
+    for (ed.workspace_symbols.items) |s| {
+        ed.gpa.free(s.name);
+        ed.gpa.free(s.path);
+    }
+    ed.workspace_symbols.clearRetainingCapacity();
+}
+
+pub fn addWorkspaceSymbol(ed: *Editor, name: []const u8, kind: []const u8, path: []const u8, line: usize, col: usize) !void {
+    const n = try ed.gpa.dupe(u8, name);
+    errdefer ed.gpa.free(n);
+    const p = try ed.gpa.dupe(u8, path);
+    errdefer ed.gpa.free(p);
+    try ed.workspace_symbols.append(ed.gpa, .{ .name = n, .kind = kind, .path = p, .line = line, .col = col });
+}
+
+/// `SPC f w`: the picker opens at once; the server fills it as you type.
+pub fn showWorkspaceSymbols(ed: *Editor) !void {
+    const l = ed.languageServer() orelse return;
+    ed.clearWorkspaceSymbols();
+    try ed.openPicker(.workspace_symbols, "");
+    try l.requestWorkspaceSymbols("");
+}
+
+/// The server answered: the open picker lists the new symbols.
+pub fn workspaceSymbolsArrived(ed: *Editor) !void {
+    const p = ed.picker orelse return;
+    if (p.kind == .workspace_symbols) try p.refill();
 }
 
 pub fn showHover(ed: *Editor, content: []const u8) !void {
@@ -1194,16 +1491,57 @@ fn afterTyped(ed: *Editor, cp: u21) void {
     // Signature help: `(` opens it, `,` updates it, `)` closes it.
     if (cp == ')') ed.closeSignature();
     const l = ed.lspFor(ed.buffer) orelse return;
-    if (l.isSignatureTrigger(cp, ed.signature != null)) l.requestSignature(ed) catch {};
+    // A `,` asks again even if the popup was closed meanwhile (by a nested
+    // call, say): the server answers with nothing outside a call.
+    // After a `)` too: the call around the one just closed takes over.
+    if (cp == ')' or l.isSignatureTrigger(cp, true)) l.requestSignature(ed) catch {};
     const trigger = l.isTrigger(cp);
     // A trigger starts a new list even if a popup is open.
     if (trigger) ed.closeCompletion();
-    if (ed.completion != null) return;
+    // A list we have is refiltered as you type (and comes back by itself
+    // when a typo is fixed); only a cut-short one needs asking for again.
+    if (ed.completion) |c| if (!c.incomplete) return;
     const start = ed.wordStart();
-    const ask = trigger or (cp < 0x80 and isIdent(@intCast(cp)) and ed.view.cursor - start >= 2);
-    if (!ask or ed.completion_asked == start) return;
+    const ask = trigger or (cp < 0x80 and isIdent(@intCast(cp)) and ed.view.cursor > start);
+    if (!ask) return;
+    ed.askCompletion(l, start);
+}
+
+/// Asks for completions for the word starting at `start`, unless the answer
+/// to that same question is still on its way.
+fn askCompletion(ed: *Editor, l: *Lsp, start: usize) void {
+    if (ed.completion_pending and ed.completion_asked == start) return;
     ed.completion_asked = start;
-    l.requestCompletion(ed, start) catch {};
+    ed.completion_pending = true;
+    l.requestCompletion(ed, start) catch {
+        ed.completion_pending = false;
+    };
+}
+
+/// After deleting in insert mode (<BS>, <C-w>): completion comes back for
+/// what is left of the word, instead of staying gone until the word is
+/// retyped from its start.
+fn afterDeleted(ed: *Editor) void {
+    if (ed.cursors.items.len > 0 or ed.replaying) return;
+    const l = ed.lspFor(ed.buffer) orelse return;
+    // A list is still held for this word: it was refiltered already.
+    if (ed.completion) |c| {
+        if (c.incomplete) ed.askCompletion(l, c.word_start);
+        return;
+    }
+    const t = ed.text();
+    const cur = ed.view.cursor;
+    const start = ed.wordStart();
+    const after_trigger = cur > t.lineStart(ed.cursorLine()) and l.isTrigger(t.byteAt(cur - 1));
+    if (cur == start and !after_trigger) return; // nothing here to complete
+    ed.askCompletion(l, start);
+}
+
+/// The completion popup, when it has something to show. (A list with no
+/// match for a typo is kept, out of sight, until the text matches again.)
+pub fn completionShown(ed: *Editor) ?*Completion {
+    const c = &(ed.completion orelse return null);
+    return if (c.shown.items.len > 0) c else null;
 }
 
 /// Manual trigger (<C-n> / <C-Space> in insert mode).
@@ -1211,16 +1549,68 @@ pub fn requestCompletion(ed: *Editor) !void {
     const l = ed.languageServer() orelse return;
     const start = ed.wordStart();
     ed.completion_asked = start;
+    ed.completion_pending = true;
     try l.requestCompletion(ed, start);
 }
 
 /// A completion reply arrived: show it if the cursor is still on that word.
 pub fn showCompletion(ed: *Editor, b: *Buffer, word_start: usize, result: std.json.Value) !void {
+    ed.completion_pending = false;
     if (b != ed.buffer or ed.mode != .insert or ed.view.cursor < word_start) return;
     if (ed.text().lineOf(word_start) != ed.cursorLine()) return;
     ed.closeCompletion();
     ed.completion = try Completion.fromJson(ed.gpa, result, word_start);
+    // The server's own idea of where the word starts wins over ours (zls
+    // completes builtins from after the `@`, and filters without it).
+    if (ed.completion.?.edit_col) |col| {
+        const start = ed.text().lineStart(ed.cursorLine()) + col;
+        if (start <= ed.view.cursor) ed.completion.?.word_start = start;
+    }
+    // Words of the file as well: the server may not have parsed it.
+    if (ed.text().len() <= 2 << 20) {
+        const t = ed.text();
+        const src = t.slice(0, t.len());
+        const ws = ed.completion.?.word_start;
+        // Between tags: elements, and in JSX the file's components
+        // (`view` -> `<View></View>`).
+        const kind = tags.kindOf(ed);
+        if (kind != .none and tags.childAt(ed, kind, src, ws)) {
+            var unit_buf: [16]u8 = undefined;
+            try ed.completion.?.addMarkup(src, ws, kind == .jsx, ed.indentUnit(&unit_buf));
+        }
+        try ed.completion.?.addWords(src, ws);
+        // Our snippets for this kind of file.
+        if (ed.buffer.syntax) |syn| {
+            const lists = snippets.forFile(syn.lang.name, ed.buffer.path orelse "");
+            const ls = t.lineStart(t.lineOf(ws));
+            const line = t.slice(ls, t.lineEnd(t.lineOf(ws)));
+            const indent = line[0 .. std.mem.indexOfNone(u8, line, " \t") orelse line.len];
+            var unit_buf: [16]u8 = undefined;
+            try ed.completion.?.addSnippets(lists, indent, ed.indentUnit(&unit_buf));
+        }
+    }
     try ed.refreshCompletion();
+}
+
+/// A type is expected at `pos`: after `name:` (maybe with `*`, `?`, `!`,
+/// `[]` or `const` in between), as in `fn f(a: *Actor)`.
+fn typeExpected(ed: *Editor, pos: usize) bool {
+    const t = ed.text();
+    const ls = t.lineStart(t.lineOf(pos));
+    var p = pos;
+    while (p > ls) {
+        const b = t.byteAt(p - 1);
+        if (b == ' ' or b == '*' or b == '?' or b == '!' or b == '[' or b == ']') {
+            p -= 1;
+            continue;
+        }
+        if (b == 't' and p - ls >= 5 and std.mem.eql(u8, t.slice(p - 5, p), "const")) {
+            p -= 5;
+            continue;
+        }
+        return b == ':' and !(p - 1 > ls and t.byteAt(p - 2) == ':');
+    }
+    return false;
 }
 
 /// Re-filters the popup for the text typed so far, closing it when the
@@ -1233,21 +1623,49 @@ fn refreshCompletion(ed: *Editor) !void {
     if (!valid) return ed.closeCompletion();
     const typed = t.slice(c.word_start, ed.view.cursor);
     for (typed) |b| if (!isIdent(b)) return ed.closeCompletion();
-    try c.filter(ed.gpa, typed);
-    if (c.shown.items.len == 0) ed.closeCompletion();
+    try c.filter(ed.gpa, typed, ed.typeExpected(c.word_start));
+    // No match for what is typed (a typo, say): the list is kept, hidden,
+    // and returns as soon as the text matches again. An empty answer has
+    // nothing to bring back.
+    if (c.items.len == 0) ed.closeCompletion();
 }
 
 /// Replaces the typed word with the selected item.
+/// Typing `(` while the suggestions are open takes the selected one, as
+/// Enter would, but only its name: the `(` that follows is the call's own
+/// (with its closing pair), so `drawtex(` becomes `drawText(|)`, not
+/// `drawText(args)(`.
+pub fn commitCompletionName(ed: *Editor) !void {
+    const c = ed.completionShown() orelse return;
+    const item = c.current() orelse return;
+    const start = c.word_start;
+    var snip: ?Snippet = null;
+    defer if (snip) |s| s.deinit(ed.gpa);
+    // What the suggestion inserts, up to where its arguments begin.
+    var full: []const u8 = item.insert;
+    if (item.snippet) {
+        snip = try Snippet.parse(ed.gpa, item.insert);
+        full = snip.?.text;
+    }
+    const name_end = std.mem.indexOfScalar(u8, full, '(') orelse full.len;
+    const name = try ed.gpa.dupe(u8, if (name_end > 0) full[0..name_end] else item.label);
+    defer ed.gpa.free(name);
+    ed.closeCompletion();
+    try ed.deleteRange(start, ed.view.cursor);
+    try ed.insertText(name);
+}
+
 pub fn acceptCompletion(ed: *Editor) !void {
     const c = &(ed.completion orelse return);
     const item = c.current() orelse return ed.closeCompletion();
     const insert = try ed.gpa.dupe(u8, item.insert);
     defer ed.gpa.free(insert);
     const is_snippet = item.snippet;
+    const ours = item.user_snippet or item.markup;
     const start = c.word_start;
     // A function (by its kind, or text that ends in a call when the server
     // doesn't say): <Tab> after it can end the statement with `;`.
-    const is_call = item.call or std.mem.endsWith(u8, std.mem.trimEnd(u8, insert, "$0"), ")");
+    const is_call = !ours and (item.call or std.mem.endsWith(u8, std.mem.trimEnd(u8, insert, "$0"), ")"));
     ed.closeCompletion();
     try ed.deleteRange(start, ed.view.cursor);
     if (!is_snippet) {
@@ -1260,6 +1678,64 @@ pub fn acceptCompletion(ed: *Editor) !void {
     defer snip.deinit(ed.gpa);
     try ed.insertText(snip.text);
     try ed.startSnippet(start, snip, is_call);
+    if (ours) if (ed.snippet) |*sn| {
+        sn.keep_defaults = true;
+    };
+}
+
+/// Insert-mode <Tab> after an Emmet abbreviation in markup (`div`,
+/// `ul>li*3`, `.card`): the markup, with tab stops in it. False when there
+/// is none here.
+pub fn expandEmmet(ed: *Editor) !bool {
+    if (ed.cursors.items.len > 0) return false;
+    const kind = tags.kindOf(ed);
+    if (kind == .none) return false;
+    const t = ed.text();
+    const pos = ed.view.cursor;
+    const ls = t.lineStart(t.lineOf(pos));
+    const line = t.slice(ls, pos);
+    const off = emmetStart(line);
+    const abbr = line[off..];
+    if (!emmet.looksLikeAbbreviation(abbr, kind == .jsx)) return false;
+    const start = ls + off;
+    if (!tags.markupAt(ed, kind, t.slice(0, t.len()), start)) return false;
+    var unit_buf: [16]u8 = undefined;
+    const indent = line[0 .. std.mem.indexOfNone(u8, line, " \t") orelse line.len];
+    const indent_copy = try ed.gpa.dupe(u8, indent);
+    defer ed.gpa.free(indent_copy);
+    const abbr_copy = try ed.gpa.dupe(u8, abbr);
+    defer ed.gpa.free(abbr_copy);
+    const src = (try emmet.expand(ed.gpa, abbr_copy, .{ .jsx = kind == .jsx, .unit = ed.indentUnit(&unit_buf), .indent = indent_copy })) orelse return false;
+    defer ed.gpa.free(src);
+    const snip = try Snippet.parse(ed.gpa, src);
+    defer snip.deinit(ed.gpa);
+    ed.closeCompletion();
+    try ed.deleteRange(start, pos);
+    try ed.insertText(snip.text);
+    try ed.startSnippet(start, snip, false);
+    return true;
+}
+
+/// Where the abbreviation before the end of `line` starts: back to a
+/// space, or to the `>` of a tag written before it (`<View>div` -> `div`).
+fn emmetStart(line: []const u8) usize {
+    var i = line.len;
+    var depth: usize = 0;
+    while (i > 0) : (i -= 1) {
+        const b = line[i - 1];
+        if (b == ']' or b == '}' or b == ')') {
+            depth += 1;
+        } else if (b == '[' or b == '{' or b == '(') {
+            if (depth == 0) break;
+            depth -= 1;
+        } else if (depth == 0 and (b == ' ' or b == '\t' or b == ';' or b == ',' or b == '=' or b == '&' or b == '|' or b == '?' or b == ':')) break;
+    }
+    const cand = line[i..];
+    if (std.mem.lastIndexOfScalar(u8, cand, '<')) |lt| {
+        const gt = std.mem.indexOfScalarPos(u8, cand, lt, '>') orelse return line.len;
+        return i + gt + 1;
+    }
+    return i;
 }
 
 /// A call was inserted with nothing to fill in (`foo()`): the cursor is
@@ -1425,6 +1901,45 @@ fn goSnippetStop(ed: *Editor, i: usize) void {
     if (ed.lspFor(ed.buffer)) |l| l.requestSignature(ed) catch {};
 }
 
+/// Leaving insert mode with a snippet half filled in: the placeholders still
+/// holding their default text (the current one if untouched, and the ones
+/// not reached yet) are removed together with the comma beside them, so
+/// `f(a: A, b: B)` left alone becomes `f()` rather than code that doesn't
+/// parse. Placeholders already visited stay as they are.
+pub fn dropUnfilledPlaceholders(ed: *Editor) !void {
+    if (ed.replaying) return;
+    const s = &(ed.snippet orelse return);
+    if (s.buffer != ed.buffer or s.at_end or s.keep_defaults) return;
+    var first: ?usize = null;
+    var i = s.stops.len;
+    while (i > s.current) {
+        i -= 1;
+        if (s.has_final and i == s.stops.len - 1) continue; // the cursor's final place
+        if (i == s.current and !s.fresh) continue; // typed into
+        var start = s.stops[i][0];
+        var end = s.stops[i][1];
+        if (end <= start) continue;
+        const t = ed.text();
+        const line = t.lineOf(start);
+        const ls = t.lineStart(line);
+        const le = t.lineEnd(line);
+        // The comma before it, else the one after it.
+        if (start >= ls + 2 and t.byteAt(start - 2) == ',' and t.byteAt(start - 1) == ' ') {
+            start -= 2;
+        } else if (start >= ls + 1 and t.byteAt(start - 1) == ',') {
+            start -= 1;
+        } else if (end + 2 <= le and t.byteAt(end) == ',' and t.byteAt(end + 1) == ' ') {
+            end += 2;
+        } else if (end + 1 <= le and t.byteAt(end) == ',') end += 1;
+        try ed.deleteRangeKeepCursor(start, end);
+        first = start;
+    }
+    if (first) |f| {
+        ed.view.cursor = @min(f, ed.text().len());
+        ed.view.want_col = null;
+    }
+}
+
 /// <Tab> / <S-Tab> in insert mode. False when there is no session.
 pub fn snippetStep(ed: *Editor, forward: bool) bool {
     const s = &(ed.snippet orelse return false);
@@ -1454,7 +1969,8 @@ pub fn snippetStep(ed: *Editor, forward: bool) bool {
 fn usesSemicolons(b: *const Buffer) bool {
     const s = b.syntax orelse return false;
     const name = s.lang.name;
-    return std.mem.eql(u8, name, "zig") or std.mem.eql(u8, name, "c") or std.mem.eql(u8, name, "rust");
+    for ([_][]const u8{ "zig", "c", "rust", "javascript", "typescript", "tsx", "css" }) |l| if (std.mem.eql(u8, name, l)) return true;
+    return false;
 }
 
 /// What follows the cursor on its line, trimmed.
@@ -1620,6 +2136,10 @@ fn pollGitJob(ed: *Editor) void {
         .pull => ed.notify(.info, "pulled: {s}", .{job.message}),
         .switch_branch, .create_branch => ed.notify(.info, "{s}", .{job.message}),
         .set_remote => ed.notify(.info, "remote origin set", .{}),
+        .init => {
+            ed.notify(.info, "{s}", .{job.message});
+            ed.adoptNewRepository(job.root);
+        },
     }
     // Files may have changed on disk; HEAD has moved.
     if (job.kind == .pull or job.kind == .switch_branch or job.kind == .create_branch) ed.reloadFromDisk();
@@ -1677,6 +2197,29 @@ fn finishGitCommit(ed: *Editor) !void {
         &.{ "git", "add", "-A" },
         &.{ "git", "commit", "-m", message },
     });
+}
+
+/// `SPC g i`: makes the current project (else the working folder) a git
+/// repository.
+pub fn gitInit(ed: *Editor) !void {
+    if (ed.gitRoot()) |root| return ed.setMessage(.info, "already in a git repository ({s})", .{root});
+    if (ed.git_job != null) return ed.setMessage(.info, "git is still busy...", .{});
+    ed.git_job = try GitJob.start(ed.gpa, ed.io, .init, ed.projectRoot(), &.{&.{ "git", "init" }}, ed.wake_fn);
+    ed.setMessage(.info, "git: initializing...", .{});
+}
+
+/// A repository was just made at `root`: the projects there (and the files
+/// in them) are git projects from now on, so the gutter, ghost lines,
+/// commits and the rest work without reopening anything.
+fn adoptNewRepository(ed: *Editor, root: []const u8) void {
+    for (ed.projects.items) |p| if (std.mem.eql(u8, p.root, root)) {
+        p.git = true;
+    };
+    for (ed.buffers.items) |b| {
+        const path = b.path orelse continue;
+        b.project = ed.projectOf(path);
+    }
+    if (Project.detect(ed.io, root)) |f| ed.last_project = ed.internProject(f.root, f.git);
 }
 
 pub fn gitPush(ed: *Editor) !void {
@@ -1844,7 +2387,11 @@ pub fn activeInput(ed: *Editor) ?*LineInput {
 /// Call after editing `activeInput()`.
 pub fn inputChanged(ed: *Editor) !void {
     switch (ed.mode) {
-        .picker => if (ed.picker) |p| try p.queryChanged(),
+        .picker => if (ed.picker) |p| {
+            try p.queryChanged();
+            // The server does this search: ask it again for the new text.
+            if (p.kind == .workspace_symbols) if (ed.lspFor(ed.buffer)) |l| try l.requestWorkspaceSymbols(p.activeQuery());
+        },
         .search => try ed.searchIncremental(),
         else => {},
     }
@@ -1928,7 +2475,7 @@ pub fn applyEdits(ed: *Editor, edits: []const Lsp.TextEdit) !void {
     }
     ed.switchTo(home);
     ed.setCursor(home_cursor);
-    ed.setMessage(.info, "renamed: {d} edit(s) in {d} file(s) (SPC f s to save)", .{ edits.len, files });
+    ed.setMessage(.info, "renamed: {d} edit(s) in {d} file(s) (SPC s to save)", .{ edits.len, files });
 }
 
 /// Byte offset of a (line, column) position, clamped to the text.
@@ -1945,6 +2492,14 @@ fn searchIncremental(ed: *Editor) !void {
     const t = ed.text();
     const hay = t.slice(0, t.len());
     if (sp.kind.boxed()) return;
+    if (sp.kind == .select_in) {
+        // Only shows the matches (the cursors come on <CR> / <Tab>).
+        try ed.last_search.resize(ed.gpa, 0);
+        try ed.last_search.appendSlice(ed.gpa, sp.input.items());
+        ed.last_search_whole_word = false;
+        ed.search_highlight = sp.input.items().len > 0;
+        return;
+    }
     ed.view.cursor = sp.origin;
     ed.view.top = sp.origin_top;
     ed.ghost = sp.origin_ghost;
@@ -1993,6 +2548,8 @@ fn finishSearch(ed: *Editor, pos: usize) !void {
     }
     ed.last_search_forward = sp.forward;
     ed.search_highlight = true;
+    ed.snipe_dot = sp.kind == .snipe and sp.return_mode != .operator;
+    ed.find_dot = false;
     ed.mode = sp.return_mode;
     ed.view.cursor = sp.origin;
     ed.view.top = sp.origin_top;
@@ -2013,8 +2570,10 @@ pub fn acceptSearch(ed: *Editor) !void {
         .git_commit => return ed.finishGitCommit(),
         .git_remote => return ed.finishGitRemote(),
         .new_file, .save_as, .rename_file, .copy_file => |k| return ed.finishFilePrompt(k),
-        .run_command, .run_runner => |k| return ed.finishRunPrompt(k),
+        .run_command => |k| return ed.finishRunPrompt(k),
         .ask_claude => return ed.finishAskClaude(),
+        .browse_new_folder, .browse_new_file, .browse_rename, .browse_move => |k| return ed.finishBrowsePrompt(k),
+        .select_in => return ed.cursorsFromPrompt(),
         .search, .snipe => {},
     }
     if (sp.input.items().len > 0) {
@@ -2045,6 +2604,11 @@ pub fn cancelSearch(ed: *Editor) void {
     ed.ghost = sp.origin_ghost;
     ed.search_highlight = sp.had_highlight;
     if (sp.return_mode == .operator) ed.resetCommand();
+    // Cancelling one of the browser's prompts goes back to the browser.
+    switch (sp.kind) {
+        .browse_new_folder, .browse_new_file, .browse_rename, .browse_move => ed.reopenBrowser(null),
+        else => {},
+    }
 }
 
 // Search over rows (text and ghost lines), used when ghost lines are shown.
@@ -2213,6 +2777,8 @@ fn finishSearchRow(ed: *Editor, rp: RowPos) !void {
     }
     ed.last_search_forward = sp.forward;
     ed.search_highlight = true;
+    ed.snipe_dot = sp.kind == .snipe and sp.return_mode != .operator;
+    ed.find_dot = false;
     ed.mode = sp.return_mode;
     ed.view.top = sp.origin_top;
     if (sp.return_mode != .operator) ed.pushJumpAt(sp.origin);
@@ -2678,7 +3244,13 @@ pub fn clickCell(ed: *Editor, row: usize, col: usize) void {
         return ed.setCursorRow(r);
     }
     ed.ghost = null;
-    const off = motions.byteAtCol(t.lineSlice(r.line), ed.view.left + col, ed.options.tab_width);
+    // A cell on a line with inlay hints is further along the text than it
+    // looks; one on a hint itself is the text right after it.
+    var hint_buf: [max_line_hints]LineHint = undefined;
+    const hints = ed.lineHints(ed.buffer, r.line, &hint_buf);
+    const bytes = t.lineSlice(r.line);
+    const text_col = hintVisualToText(hints, bytes, ed.view.left + col, ed.options.tab_width);
+    const off = motions.byteAtCol(bytes, text_col, ed.options.tab_width);
     ed.setCursor(t.lineStart(r.line) + off);
 }
 
@@ -2749,6 +3321,7 @@ pub fn scrollLines(ed: *Editor, delta: isize) void {
 /// Inserts at `pos`, recording it for undo. Leaves the cursor alone.
 pub fn insertAt(ed: *Editor, pos: usize, bytes: []const u8) !void {
     if (bytes.len == 0) return;
+    tags.beforeEdit(ed, pos, pos, bytes.len);
     try ed.buffer.history.recordInsert(ed.gpa, pos, bytes, ed.view.cursor);
     try ed.buffer.insert(ed.gpa, pos, bytes);
     ed.buffer.modified = true;
@@ -2779,6 +3352,7 @@ pub fn deleteRange(ed: *Editor, start: usize, end: usize) !void {
 /// position relative to the text around it.
 pub fn deleteRangeKeepCursor(ed: *Editor, start: usize, end: usize) !void {
     if (start >= end) return;
+    tags.beforeEdit(ed, start, end, 0);
     const t = ed.text();
     try ed.buffer.history.recordDelete(ed.gpa, start, t.slice(start, end), ed.view.cursor);
     ed.buffer.delete(start, end);
@@ -2913,7 +3487,7 @@ fn activate(ed: *Editor, b: *Buffer) void {
 /// last buffer leaves an empty scratch buffer.
 pub fn killBuffer(ed: *Editor, b: *Buffer) !void {
     if (b.modified) {
-        ed.setMessage(.err, "\"{s}\" has unsaved changes: SPC f s to save it first", .{b.displayName()});
+        ed.setMessage(.err, "\"{s}\" has unsaved changes: SPC s to save it first", .{b.displayName()});
         return;
     }
     ed.lspCloseBuffer(b);
@@ -2931,6 +3505,7 @@ pub fn killBuffer(ed: *Editor, b: *Buffer) !void {
     }
     _ = ed.buffers.orderedRemove(ed.bufferIndex(b));
     ed.forgetJumps(b);
+    ed.forgetMarks(b);
     var next = ed.buffers.items[0];
     for (ed.buffers.items) |o| {
         if (o.last_used > next.last_used) next = o;
@@ -3035,6 +3610,7 @@ fn shiftCursors(ed: *Editor, start: usize, end: usize, inserted: usize) void {
         S.shift(&c.anchor, start, end, inserted);
     }
     for (ed.jumps.items) |*j| if (j.buffer == ed.buffer) S.shift(&j.pos, start, end, inserted);
+    for (ed.marks.items) |*m| if (m.buffer == ed.buffer) S.shift(&m.pos, start, end, inserted);
     // Placeholders grow with typing at their end, not their start.
     if (ed.snippet) |sn| if (sn.buffer == ed.buffer) for (sn.stops) |*r| {
         if (start == end and inserted > 0) {
@@ -3168,18 +3744,38 @@ pub fn cursorsOnLines(ed: *Editor, at_end: bool, insert: bool) !void {
     ed.reportCursors();
 }
 
+/// `s` (visual: in the selection; normal: in the whole file): asks for text, then puts a cursor on every match of it
+/// inside the selection, each match selected (`c` changes them all).
+pub fn startSelectIn(ed: *Editor) void {
+    if (ed.ghost != null or (ed.mode != .visual and ed.mode != .normal)) return;
+    const t = ed.text();
+    // From normal mode there is no selection: the whole file.
+    var r: operators.Range = if (ed.mode == .visual) ed.visualRange() else .{ .start = 0, .end = t.len() };
+    if (ed.visual_line) {
+        r.start = t.lineStart(t.lineOf(r.start));
+        r.end = t.lineEnd(t.lineOf(@max(r.start, r.end -| 1)));
+    }
+    ed.startSearch(true, .select_in);
+    ed.search_prompt.?.within_start = r.start;
+    ed.search_prompt.?.within_end = r.end;
+}
+
 /// <Tab> in the snipe (`s`) or search (`/`) prompt: a cursor on every match
 /// (on screen for snipe, in the file for search), each match selected, so
 /// `c` changes them all and <Esc> leaves plain cursors.
 pub fn cursorsFromPrompt(ed: *Editor) !void {
     const sp = ed.search_prompt orelse return;
-    if (sp.kind != .search and sp.kind != .snipe) return;
+    if (sp.kind != .search and sp.kind != .snipe and sp.kind != .select_in) return;
     const needle = try ed.gpa.dupe(u8, sp.input.items());
     defer ed.gpa.free(needle);
     if (needle.len == 0) return;
     const t = ed.text();
     var from: usize = 0;
     var to = t.len();
+    if (sp.kind == .select_in) {
+        from = sp.within_start;
+        to = @min(sp.within_end, t.len());
+    }
     if (sp.kind == .snipe) {
         from = t.lineStart(@min(sp.origin_top, t.lineCount() - 1));
         to = t.lineEnd(@min(sp.origin_top + ed.view.rows, t.lineCount()) - 1);
@@ -3213,7 +3809,7 @@ pub fn cursorsFromPrompt(ed: *Editor) !void {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal popup (`SPC o t`) and running commands (`SPC r`).
+// Terminal popup (`SPC r t`) and running commands (`SPC r`).
 //
 // Both are terminals (a program on a PTY, emulated by libghostty-vt) shown
 // in a popup over the editor. While the popup is open every key goes to the
@@ -3221,11 +3817,48 @@ pub fn cursorsFromPrompt(ed: *Editor) !void {
 // (close) and r (run again).
 
 /// Starts `argv` in a terminal, in the current project's root.
+/// Build files that mark the folder a command should run in.
+const run_markers = Project.markers ++ [_][]const u8{ "makefile", "GNUmakefile" };
+
+/// Where commands (the runner, shells) start: the folder of the code you
+/// are in. From the current file's folder up to its project's root, the
+/// nearest folder with a build file (build.zig, Makefile, Cargo.toml, ...),
+/// else the project root. A file in no project: its own folder (not some
+/// other project you were in earlier). No file: the project root. The
+/// caller frees it.
+pub fn commandFolder(ed: *Editor) ![]u8 {
+    const b = ed.buffer;
+    const path = b.path orelse return ed.gpa.dupe(u8, ed.projectRoot());
+    const abs = try ed.absolutePath(path);
+    defer ed.gpa.free(abs);
+    const dir = std.fs.path.dirname(abs) orelse return ed.gpa.dupe(u8, ed.projectRoot());
+    const root = (b.project orelse return ed.gpa.dupe(u8, dir)).root;
+    const inside = dir.len >= root.len and std.mem.startsWith(u8, dir, root) and (dir.len == root.len or dir[root.len] == '/');
+    if (!inside) return ed.gpa.dupe(u8, dir);
+    var d: []const u8 = dir;
+    while (true) {
+        for (run_markers) |m| {
+            const candidate = try std.fs.path.join(ed.gpa, &.{ d, m });
+            defer ed.gpa.free(candidate);
+            if (ed.fileExists(candidate)) return ed.gpa.dupe(u8, d);
+        }
+        if (d.len <= root.len) break;
+        d = std.fs.path.dirname(d) orelse break;
+    }
+    return ed.gpa.dupe(u8, root);
+}
+
 fn spawnTerminal(ed: *Editor, argv: []const []const u8) !*Terminal {
+    const folder = try ed.commandFolder();
+    defer ed.gpa.free(folder);
+    return ed.spawnTerminalIn(argv, folder);
+}
+
+fn spawnTerminalIn(ed: *Editor, argv: []const []const u8, cwd: []const u8) !*Terminal {
     const sz = ed.term_size;
     return Terminal.create(ed.gpa, ed.io, .{
         .argv = argv,
-        .cwd = ed.projectRoot(),
+        .cwd = cwd,
         .cols = sz.cols,
         .rows = sz.rows,
         .cell_w = sz.cell_w,
@@ -3244,7 +3877,7 @@ pub fn popupTerminal(ed: *Editor) ?*Terminal {
     };
 }
 
-/// `SPC o t` / <C-\>: shows or hides the shell (started on first use).
+/// `SPC r t` / <C-\>: shows or hides the shell (started on first use).
 pub fn toggleShell(ed: *Editor) !void {
     if (ed.popup == .shell) {
         ed.popup = null;
@@ -3372,6 +4005,8 @@ fn popupKey(ed: *Editor, ev: KeyEvent) bool {
                 ed.popup = null;
                 ed.showRunErrors() catch |err| ed.setMessage(.err, "{s}", .{@errorName(err)});
             },
+            'y' => ed.yankRunOutput(t, false),
+            'Y' => ed.yankRunOutput(t, true),
             'k' => t.scroll(-1),
             'j' => t.scroll(1),
             else => {},
@@ -3455,13 +4090,66 @@ fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
 }
 
 /// `SPC r r`: the code runner's prompt, prefilled with the last command.
+/// `SPC r r`: the runner, a picker of this project's commands, newest
+/// first (Enter runs the last one again); typing a new one runs that.
+/// `SPC r c`: the multi-line command editor.
 pub fn runPrompt(ed: *Editor, runner: bool) !void {
     if (!runner) return ed.openCommandEditor();
-    ed.startSearch(true, if (runner) .run_runner else .run_command);
-    if (!runner) return;
-    const last = ed.loadRunnerCommand() orelse return;
-    defer ed.gpa.free(last);
-    try ed.search_prompt.?.input.set(ed.gpa, last);
+    try ed.openPicker(.runner, "");
+}
+
+/// This project's runner commands, newest first. The caller frees each
+/// and the slice.
+pub fn runnerHistory(ed: *Editor) ![][]u8 {
+    const path = ed.runMemoryPath() orelse return ed.gpa.alloc([]u8, 0);
+    const key = try ed.runKey();
+    defer ed.gpa.free(key);
+    return RunMemory.history(ed.gpa, ed.io, path, key);
+}
+
+/// Runs `cmd` as the runner's command: it goes to the front of the history.
+pub fn runFromRunner(ed: *Editor, command: []const u8) !void {
+    const cmd = std.mem.trim(u8, command, " \t");
+    if (cmd.len == 0) return;
+    if (ed.runMemoryPath()) |path| {
+        const key = try ed.runKey();
+        defer ed.gpa.free(key);
+        RunMemory.save(ed.gpa, ed.io, path, key, cmd);
+    }
+    try ed.startRun(cmd);
+}
+
+/// <Tab> in the runner: the selected command goes into the query line, to
+/// add to or cut down (typing, <BS>, <C-w>) before Enter runs the result.
+pub fn runnerEdit(ed: *Editor) !void {
+    const p = ed.picker orelse return;
+    if (p.kind != .runner) return;
+    p.sync();
+    // The "Run <typed>" row has nothing of its own to copy.
+    const item = p.itemAt(p.selected) orelse return;
+    try p.query.set(ed.gpa, item.text);
+    ed.mode = .picker;
+    try p.queryChanged();
+}
+
+/// `x` / `dd` in the runner: forgets the selected command.
+pub fn pickerForgetCommand(ed: *Editor) !void {
+    const p = ed.picker orelse return;
+    if (p.kind != .runner) return;
+    p.sync();
+    const item = p.itemAt(p.selected) orelse return;
+    const path = ed.runMemoryPath() orelse return;
+    const key = try ed.runKey();
+    defer ed.gpa.free(key);
+    RunMemory.forget(ed.gpa, ed.io, path, key, item.text);
+    try p.restart(null);
+    ed.mode = .picker_normal;
+}
+
+/// `SPC ;`: a one-off shell command. The prompt starts empty and what runs
+/// isn't remembered as the project's runner command (`SPC r r`).
+pub fn shellPrompt(ed: *Editor) void {
+    ed.startSearch(true, .run_command);
 }
 
 fn runMemoryPath(ed: *Editor) ?[]const u8 {
@@ -3469,14 +4157,27 @@ fn runMemoryPath(ed: *Editor) ?[]const u8 {
     return ed.run_memory_path;
 }
 
-fn projectDir(ed: *Editor) []const u8 {
-    return ed.projectRoot();
+/// What the runner's history is kept under: the current file's project,
+/// else (a file in no project) its folder, so a file elsewhere doesn't
+/// borrow the commands of whatever project you were in before. No file: the
+/// current project. The caller frees it.
+fn runKey(ed: *Editor) ![]u8 {
+    const b = ed.buffer;
+    if (b.project) |p| return ed.gpa.dupe(u8, p.root);
+    if (b.path) |path| {
+        const abs = try ed.absolutePath(path);
+        defer ed.gpa.free(abs);
+        return ed.gpa.dupe(u8, std.fs.path.dirname(abs) orelse abs);
+    }
+    return ed.gpa.dupe(u8, ed.projectRoot());
 }
 
-/// This project's remembered runner command. Caller frees.
+/// The remembered runner command for here. Caller frees.
 fn loadRunnerCommand(ed: *Editor) ?[]u8 {
     const path = ed.runMemoryPath() orelse return null;
-    return RunMemory.load(ed.gpa, ed.io, path, ed.projectDir());
+    const key = ed.runKey() catch return null;
+    defer ed.gpa.free(key);
+    return RunMemory.load(ed.gpa, ed.io, path, key);
 }
 
 fn finishRunPrompt(ed: *Editor, kind: PromptKind) !void {
@@ -3484,11 +4185,11 @@ fn finishRunPrompt(ed: *Editor, kind: PromptKind) !void {
     defer ed.gpa.free(raw);
     const cmd = std.mem.trim(u8, raw, " \t");
     if (cmd.len == 0) return;
-    if (kind == .run_runner) if (ed.runMemoryPath()) |path| RunMemory.save(ed.gpa, ed.io, path, ed.projectDir(), cmd);
+    _ = kind;
     try ed.startRun(cmd);
 }
 
-/// `SPC r R`: the runner's command again, without asking.
+/// `SPC r .`: the runner's command again, without asking.
 pub fn runAgain(ed: *Editor) !void {
     const cmd = ed.loadRunnerCommand() orelse return ed.runPrompt(true);
     defer ed.gpa.free(cmd);
@@ -3510,15 +4211,45 @@ pub fn startRun(ed: *Editor, cmd: []const u8) !void {
     };
     const owned = try ed.gpa.dupe(u8, cmd);
     errdefer ed.gpa.free(owned);
-    const t = try ed.spawnTerminal(&.{ Pty.userShell(), "-c", cmd });
+    const folder = try ed.commandFolder();
+    errdefer ed.gpa.free(folder);
+    const t = try ed.spawnTerminalIn(&.{ Pty.userShell(), "-c", cmd }, folder);
     if (ed.run) |old| old.destroy();
     if (ed.run_command) |old| ed.gpa.free(old);
+    if (ed.run_root_owned) |old| ed.gpa.free(old);
     ed.run = t;
     ed.run_command = owned;
-    ed.run_root = ed.projectRoot();
+    // Paths in its output (errors) are relative to here.
+    ed.run_root_owned = folder;
+    ed.run_root = folder;
     ed.run_started = Io.Timestamp.now(ed.io, .awake);
     ed.run_reported = false;
     ed.popup = .run;
+}
+
+/// `y` / `Y` in a finished run: its errors (from the first `error:` line
+/// on) or, with `all` or when there are none, the whole output, to the
+/// clipboard.
+fn yankRunOutput(ed: *Editor, t: *Terminal, all: bool) void {
+    const out = t.copyOutput(ed.gpa) catch return;
+    defer ed.gpa.free(out);
+    var body: []const u8 = std.mem.trimEnd(u8, out, " \t\r\n");
+    // Our own "exited" line at the end is not part of the output.
+    if (std.mem.lastIndexOfScalar(u8, body, '\n')) |nl| {
+        if (std.mem.indexOf(u8, body[nl..], "exited ") != null) body = std.mem.trimEnd(u8, body[0..nl], " \t\r\n");
+    }
+    var errors_only = false;
+    if (!all) if (std.mem.indexOf(u8, body, "error:")) |at| {
+        const line = if (std.mem.lastIndexOfScalar(u8, body[0..at], '\n')) |nl| nl + 1 else 0;
+        body = body[line..];
+        errors_only = true;
+    };
+    if (body.len == 0) return ed.setMessage(.info, "no output to yank", .{});
+    ed.registers.store(null, .yank, body, false) catch return;
+    ed.setMessage(.info, "yanked the run's {s} ({d} lines)", .{
+        if (errors_only) "errors" else "output",
+        std.mem.count(u8, body, "\n") + 1,
+    });
 }
 
 /// Finds `path:line:col` errors in the finished run's output.
@@ -3545,18 +4276,74 @@ fn collectRunErrors(ed: *Editor, t: *Terminal) void {
 }
 
 // Quickfix: one list of places, filled by runs and pickers, stepped
-// through with ]q / [q, listed with SPC x x.
+// through with ]q / [q, listed with SPC f q.
 
 pub fn clearQuickfix(ed: *Editor) void {
     for (ed.quickfix.items) |q| q.deinit(ed.gpa);
     ed.quickfix.clearRetainingCapacity();
     ed.quickfix_title.clearRetainingCapacity();
     ed.quickfix_index = null;
+    ed.quickfix_origin = .none;
+}
+
+/// Without a list of your own, the list is the project's errors and
+/// warnings as the language servers report them now: the current file's
+/// first (in line order), then the other files'.
+fn refreshLiveQuickfix(ed: *Editor) void {
+    if (ed.quickfix_origin == .run or ed.quickfix_origin == .picked) return;
+    ed.newQuickfix("Errors") catch return;
+    ed.quickfix_origin = .live;
+    const current: []const u8 = ed.buffer.path orelse "";
+    for ([_]bool{ true, false }) |own_file| {
+        if (ed.live_errors_override) |items| {
+            for (items) |q| if (std.mem.eql(u8, q.path, current) == own_file) {
+                ed.addQuickfix(q.path, q.line, q.col, q.text) catch return;
+            };
+            continue;
+        }
+        for (ed.lsps.items) |l| for (l.diagnostics.keys(), l.diagnostics.values()) |path, list| {
+            if (std.mem.eql(u8, path, current) != own_file) continue;
+            for (list) |d| {
+                if (d.severity != .err and d.severity != .warning) continue;
+                ed.addQuickfix(path, d.line, d.col, std.mem.sliceTo(d.message, '\n')) catch return;
+            }
+        };
+    }
+}
+
+/// `]q` / `[q` through live errors go by where the cursor is, not by a
+/// remembered place in a list that changes as you fix things: the next
+/// error below the cursor in this file, then on into the other files (and
+/// around); the previous one above the cursor, else the last of all.
+fn liveQuickfixTarget(ed: *Editor, forward: bool) usize {
+    const items = ed.quickfix.items;
+    const current: []const u8 = ed.buffer.path orelse "";
+    const line = ed.cursorLine();
+    if (forward) {
+        for (items, 0..) |q, i| {
+            if (!std.mem.eql(u8, q.path, current) or q.line > line) return i;
+        }
+        return 0;
+    }
+    var target: usize = items.len - 1;
+    for (items, 0..) |q, i| {
+        if (!std.mem.eql(u8, q.path, current) or q.line >= line) break;
+        target = i;
+    }
+    return target;
+}
+
+/// `x in the quickfix picker`: drops a run's or picker's list, so the list is the
+/// project's errors again.
+pub fn resetQuickfix(ed: *Editor) void {
+    ed.clearQuickfix();
+    ed.setMessage(.info, "quickfix cleared: it lists the project's errors again", .{});
 }
 
 /// Starts a new list named `title` (add entries with `addQuickfix`).
 pub fn newQuickfix(ed: *Editor, title: []const u8) !void {
     ed.clearQuickfix();
+    ed.quickfix_origin = .picked;
     try ed.quickfix_title.appendSlice(ed.gpa, title);
 }
 
@@ -3571,6 +4358,7 @@ pub fn addQuickfix(ed: *Editor, path: []const u8, line: usize, col: usize, messa
 
 fn quickfixFromRunErrors(ed: *Editor) void {
     ed.newQuickfix(ed.run_command orelse "run") catch return;
+    ed.quickfix_origin = .run;
     for (ed.run_errors.items) |e| ed.addQuickfix(e.path, e.line - 1, e.col - 1, e.message) catch return;
 }
 
@@ -3585,8 +4373,14 @@ pub fn goQuickfix(ed: *Editor, i: usize) !void {
 
 /// `]q` / `[q`: the next / previous entry (`count` of them).
 pub fn stepQuickfix(ed: *Editor, forward: bool, count: usize) !void {
+    ed.refreshLiveQuickfix();
     const n = ed.quickfix.items.len;
-    if (n == 0) return ed.setMessage(.info, "the quickfix list is empty (Ctrl-q in a picker fills it)", .{});
+    if (n == 0) return ed.setMessage(.info, "no errors in the project (a run's errors, or Ctrl-q in a picker, also fill the quickfix list)", .{});
+    if (ed.quickfix_origin == .live) {
+        const first = ed.liveQuickfixTarget(forward);
+        const extra = count - 1;
+        return ed.goQuickfix(if (forward) @min(first + extra, n - 1) else first -| extra);
+    }
     const i: usize = if (ed.quickfix_index) |cur| blk: {
         if (forward) {
             if (cur + 1 >= n) return ed.setMessage(.info, "last quickfix entry ({d}/{d})", .{ n, n });
@@ -3598,24 +4392,24 @@ pub fn stepQuickfix(ed: *Editor, forward: bool, count: usize) !void {
     try ed.goQuickfix(i);
 }
 
-/// `SPC x x`: the quickfix picker, docked at the bottom in normal mode at
-/// the current entry; moving through it moves the editor (where you were
-/// goes on the jumplist, so <C-o> comes back after closing).
+/// `SPC f q`: the quickfix list as a picker (every entry with its file and
+/// line number, previewed), in normal mode at the current entry. Nothing
+/// moves until one is picked.
 pub fn showQuickfix(ed: *Editor) !void {
-    if (ed.quickfix.items.len == 0) return ed.setMessage(.info, "the quickfix list is empty (Ctrl-q in a picker fills it)", .{});
+    ed.refreshLiveQuickfix();
+    if (ed.quickfix.items.len == 0) return ed.setMessage(.info, "no errors in the project (a run's errors, or Ctrl-q in a picker, also fill the quickfix list)", .{});
+    // Live errors: start on the one at or after the cursor.
+    const start = if (ed.quickfix_origin == .live) blk: {
+        const next = ed.liveQuickfixTarget(true);
+        const here = if (next > 0) next - 1 else 0;
+        const q = ed.quickfix.items[here];
+        const on_it = std.mem.eql(u8, q.path, ed.buffer.path orelse "") and q.line == ed.cursorLine();
+        break :blk if (on_it) here else next;
+    } else ed.quickfix_index orelse 0;
     ed.closePicker();
     ed.popup = null;
-    ed.pushJump();
     try ed.openPicker(.quickfix, "");
-    ed.picker.?.want_id = @intCast(ed.quickfix_index orelse 0);
-}
-
-/// Moving through the quickfix picker: the editor shows each entry.
-pub fn followQuickfix(ed: *Editor, i: usize) !void {
-    if (i >= ed.quickfix.items.len) return;
-    const q = ed.quickfix.items[i];
-    ed.quickfix_index = i;
-    try ed.moveTo(q.path, q.line, q.col);
+    ed.picker.?.want_id = @intCast(start);
 }
 
 /// `<C-q>` in a picker of places: every current match becomes the list.
@@ -3664,12 +4458,14 @@ fn pollTerminals(ed: *Editor) void {
         const secs = ed.runSeconds();
         ed.collectRunErrors(t);
         const n = ed.run_errors.items.len;
-        if (n > 0) ed.quickfixFromRunErrors();
+        // A run without errors retires the last run's list: the quickfix
+        // list is the project's live errors again.
+        if (n > 0) ed.quickfixFromRunErrors() else if (ed.quickfix_origin == .run) ed.clearQuickfix();
         var buf: [160]u8 = undefined;
         const ok = t.exit_code == 0;
         var errs_buf: [48]u8 = undefined;
         const errs: []const u8 = if (n > 0) std.fmt.bufPrint(&errs_buf, "   e: {d} error{s}", .{ n, if (n == 1) "" else "s" }) catch "" else "";
-        const line = std.fmt.bufPrint(&buf, "\r\n\x1b[1;{s}m{s} exited {d}\x1b[0;2m in {d:.2}s{s}   r: run again   q: close\x1b[0m", .{
+        const line = std.fmt.bufPrint(&buf, "\r\n\x1b[1;{s}m{s} exited {d}\x1b[0;2m in {d:.2}s{s}   r: run again   y: yank errors   q: close\x1b[0m", .{
             if (ok) "32" else "31", if (ok) "✓" else "✗", t.exit_code, secs, errs,
         }) catch "";
         t.print(line);
@@ -3987,7 +4783,7 @@ pub fn claudeResolve(ed: *Editor, accept: bool) void {
 
 // ---------------------------------------------------------------------------
 // Jumplist: where you were before each jump. `<C-o>` goes back, `<C-i>`
-// forward, `SPC s j` lists them. One entry per line (the newest wins).
+// forward, `SPC f j` lists them. One entry per line (the newest wins).
 
 const max_jumps = 100;
 
@@ -4056,6 +4852,388 @@ pub fn goJump(ed: *Editor, i: usize) !void {
     const pos = @min(j.pos, t.len());
     ed.revealLine(t.lineOf(pos));
     ed.setCursor(pos);
+}
+
+// Marks: `m{letter}` sets one, `'{letter}` goes to its line, `` `{letter} ``
+// to the exact place; `SPC f m` lists them.
+
+/// The mark `name` as seen from the current buffer.
+pub fn findMark(ed: *Editor, name: u21) ?*Mark {
+    const n = std.math.cast(u8, name) orelse return null;
+    const global = std.ascii.isUpper(n);
+    for (ed.marks.items) |*m| {
+        if (m.name == n and (global or m.buffer == ed.buffer)) return m;
+    }
+    return null;
+}
+
+pub fn setMark(ed: *Editor, name: u21) void {
+    const n = std.math.cast(u8, name) orelse 0;
+    if (!std.ascii.isAlphabetic(n)) return ed.setMessage(.info, "marks are letters: a-z in this file, A-Z across files", .{});
+    const b = ed.buffer;
+    const path = if (b.path) |p| ed.gpa.dupe(u8, p) catch null else null;
+    if (ed.findMark(n)) |m| {
+        if (m.path) |old| ed.gpa.free(old);
+        m.* = .{ .name = n, .buffer = b, .path = path, .pos = ed.view.cursor };
+    } else ed.marks.append(ed.gpa, .{ .name = n, .buffer = b, .path = path, .pos = ed.view.cursor }) catch {
+        if (path) |p| ed.gpa.free(p);
+        return;
+    };
+    ed.setMessage(.info, "mark {c} set", .{n});
+}
+
+/// Goes to a mark, reopening its file if its buffer was closed.
+pub fn goMark(ed: *Editor, m: Mark, exact: bool) !void {
+    if (m.buffer) |b| {
+        ed.switchTo(b);
+    } else if (m.path) |p| {
+        const path = try ed.gpa.dupe(u8, p);
+        defer ed.gpa.free(path);
+        try ed.openFile(path);
+        for (ed.marks.items) |*o| if (o.buffer == null and o.path != null and std.mem.eql(u8, o.path.?, path)) {
+            o.buffer = ed.buffer;
+        };
+    } else return;
+    const t = ed.text();
+    const pos = @min(m.pos, t.len());
+    ed.revealLine(t.lineOf(pos));
+    ed.setCursor(if (exact) pos else motions.firstNonBlank(t, t.lineOf(pos)));
+}
+
+/// A closed buffer's own marks go; global ones keep their file.
+fn forgetMarks(ed: *Editor, b: *Buffer) void {
+    var i: usize = 0;
+    while (i < ed.marks.items.len) {
+        const m = &ed.marks.items[i];
+        if (m.buffer == b) {
+            if (std.ascii.isLower(m.name) or m.path == null) {
+                if (m.path) |p| ed.gpa.free(p);
+                _ = ed.marks.orderedRemove(i);
+                continue;
+            }
+            m.buffer = null;
+        }
+        i += 1;
+    }
+}
+
+// Indentation: the file's own style where it has one (`Buffer.indent_style`,
+// detected when it is read), else the options.
+
+pub fn usesTabs(ed: *const Editor) bool {
+    return if (ed.buffer.indent_style) |s| s.tabs else !ed.options.expand_tab;
+}
+
+/// The columns one level of indentation takes.
+pub fn indentWidth(ed: *const Editor) usize {
+    if (ed.buffer.indent_style) |s| if (!s.tabs) return s.width;
+    // The config's for the language.
+    if (ed.buffer.syntax) |syn| if (config.settingsFor(syn.lang.name)) |cfg| if (cfg.indent) |n| return n;
+    // A file with no indentation yet: the web and config languages indent
+    // by two (as prettier writes them, and YAML is usually written).
+    if (ed.buffer.syntax) |syn| for ([_][]const u8{ "javascript", "typescript", "tsx", "html", "css", "json", "yaml", "toml" }) |l| {
+        if (std.mem.eql(u8, syn.lang.name, l)) return 2;
+    };
+    return ed.options.tab_width;
+}
+
+/// One level of indentation, as text.
+pub fn indentUnit(ed: *const Editor, buf: *[16]u8) []const u8 {
+    if (ed.usesTabs()) return "\t";
+    const n = @min(ed.indentWidth(), buf.len);
+    @memset(buf[0..n], ' ');
+    return buf[0..n];
+}
+
+/// The indentation for a new line made by breaking `line` at `at`: the
+/// line's own, one level deeper after something that opens a block (`{`,
+/// `(`, `[`; `:` in Python).
+pub fn newlineIndent(ed: *Editor, line: usize, at: usize, buf: []u8) []const u8 {
+    const t = ed.text();
+    // A blank line has no indentation of its own to go by: the code around it does.
+    if (ed.isBlankLine(t, line)) return ed.contextIndent(line, buf);
+    const ls = t.lineStart(line);
+    const base = t.slice(ls, @min(motions.firstNonBlank(t, line), @max(at, ls)));
+    const before = std.mem.trimEnd(u8, t.slice(ls, @max(at, ls)), " \t");
+    const python = if (ed.buffer.path) |p| std.mem.endsWith(u8, p, ".py") else false;
+    const opens = before.len > 0 and switch (before[before.len - 1]) {
+        '{', '(', '[' => true,
+        ':' => python,
+        else => false,
+    };
+    var unit_buf: [16]u8 = undefined;
+    const unit: []const u8 = if (opens) ed.indentUnit(&unit_buf) else "";
+    if (base.len + unit.len > buf.len) return "";
+    @memcpy(buf[0..base.len], base);
+    @memcpy(buf[base.len..][0..unit.len], unit);
+    return buf[0 .. base.len + unit.len];
+}
+
+pub fn isBlankLine(_: *const Editor, t: *const Text, line: usize) bool {
+    return std.mem.indexOfNone(u8, t.lineSlice(line), " \t") == null;
+}
+
+/// The indentation a new line made on blank line `line` should have: where
+/// the code around it is. That of the nearest line above that has text (a
+/// level deeper when it opens a block); with none above, the nearest below.
+pub fn contextIndent(ed: *Editor, line: usize, buf: []u8) []const u8 {
+    const t = ed.text();
+    var l = line;
+    while (l > 0) {
+        l -= 1;
+        if (!ed.isBlankLine(t, l)) return ed.newlineIndent(l, t.lineEnd(l), buf);
+    }
+    l = line + 1;
+    while (l < t.lineCount()) : (l += 1) {
+        if (ed.isBlankLine(t, l)) continue;
+        const own = t.slice(t.lineStart(l), motions.firstNonBlank(t, l));
+        const n = @min(own.len, buf.len);
+        @memcpy(buf[0..n], own[0..n]);
+        return buf[0..n];
+    }
+    return buf[0..0];
+}
+
+/// A closing bracket typed as the first thing on its line lines up with the
+/// line that opened it.
+pub fn dedentCloser(ed: *Editor) !void {
+    const t = ed.text();
+    const pos = ed.view.cursor;
+    if (pos == 0) return;
+    const line = t.lineOf(pos - 1);
+    const ls = t.lineStart(line);
+    if (std.mem.indexOfNone(u8, t.slice(ls, pos - 1), " \t") != null) return; // not first on the line
+    const open = motions.matchBracket(t, pos - 1) orelse return;
+    const open_line = t.lineOf(open);
+    if (open_line >= line) return;
+    var buf: [256]u8 = undefined;
+    const want = t.slice(t.lineStart(open_line), motions.firstNonBlank(t, open_line));
+    if (want.len > buf.len or std.mem.eql(u8, want, t.slice(ls, pos - 1))) return;
+    @memcpy(buf[0..want.len], want);
+    try ed.deleteRangeKeepCursor(ls, pos - 1);
+    try ed.insertAt(ls, buf[0..want.len]);
+    ed.view.cursor = ls + want.len + 1;
+    ed.view.want_col = null;
+}
+
+// ---------------------------------------------------------------------------
+// Inlay hints: the language server's type and parameter labels (`: u32`
+// after a name, `fmt:` before an argument), drawn inside the code. They are
+// asked for the lines in view (a screenful either side), again when the text
+// has been still for a moment or the view moves out of what was asked, and
+// kept in place through edits in between (`Buffer.insert` / `delete`).
+
+/// One hint on a line: its label goes before the text at byte `off`.
+pub const LineHint = struct {
+    off: usize,
+    text: []const u8,
+
+    pub fn cells(h: LineHint) usize {
+        return std.unicode.utf8CountCodepoints(h.text) catch h.text.len;
+    }
+};
+
+pub const max_line_hints = 32;
+
+/// How long the text must stay unchanged before hints are asked for again.
+const hint_debounce_ms = 250;
+
+/// The hints to draw on `line` of `b`, in order. None while the option is
+/// off, and none on the line being typed on in insert mode (they would
+/// jump about under the cursor; they come back with Esc).
+pub fn lineHints(ed: *const Editor, b: *const Buffer, line: usize, out: []LineHint) []LineHint {
+    if (!ed.options.inlay_hints or b.hints.items.len == 0) return out[0..0];
+    if (ed.mode == .insert and b == ed.buffer and line == ed.cursorLineConst()) return out[0..0];
+    const t = &b.text;
+    if (line >= t.lineCount()) return out[0..0];
+    const ls = t.lineStart(line);
+    const le = t.lineEnd(line);
+    // First hint at or after the line's start.
+    var lo: usize = 0;
+    var hi: usize = b.hints.items.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (b.hints.items[mid].pos < ls) lo = mid + 1 else hi = mid;
+    }
+    var n: usize = 0;
+    while (lo < b.hints.items.len and b.hints.items[lo].pos <= le and n < out.len) : (lo += 1) {
+        const h = b.hints.items[lo];
+        out[n] = .{ .off = h.pos - ls, .text = h.text };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn cursorLineConst(ed: *const Editor) usize {
+    return ed.buffer.text.lineOf(ed.view.cursor);
+}
+
+/// Columns the hints push the text at byte `off` to the right (hints
+/// before it, and one at `off` itself, which is drawn in front of it).
+pub fn hintShift(hints: []const LineHint, off: usize) usize {
+    var n: usize = 0;
+    for (hints) |h| if (h.off <= off) {
+        n += h.cells();
+    };
+    return n;
+}
+
+/// Like `hintShift`, without a hint at `off` itself: where a range ends,
+/// the hint in front of the next character isn't part of it.
+pub fn hintShiftBefore(hints: []const LineHint, off: usize) usize {
+    var n: usize = 0;
+    for (hints) |h| if (h.off < off) {
+        n += h.cells();
+    };
+    return n;
+}
+
+/// The text column for a column of the screen: the other way round from
+/// `hintShift`. A column on a hint is the text right after it.
+pub fn hintVisualToText(hints: []const LineHint, bytes: []const u8, visual: usize, tab_width: usize) usize {
+    var shift: usize = 0;
+    for (hints) |h| {
+        const start = motions.displayCol(bytes, @min(h.off, bytes.len), tab_width) + shift;
+        const width = h.cells();
+        if (visual < start) break;
+        if (visual < start + width) return start - shift;
+        shift += width;
+    }
+    return visual - shift;
+}
+
+/// An inlay-hint answer for lines `first..last` of `b` (as at `version`):
+/// takes the hints in `new` (the texts go to the buffer) in place of the
+/// ones it had for those lines.
+pub fn takeInlayHints(ed: *Editor, b: *Buffer, new: *std.ArrayList(Buffer.Hint), first: usize, last: usize, version: u64) !void {
+    b.hint_pending = false;
+    // The text moved on while the server worked: its answer is for text that
+    // is gone. The next tick asks again.
+    if (b.edit_version != version) return;
+    const t = &b.text;
+    const lo = t.lineStart(@min(first, t.lineCount() - 1));
+    const hi = t.lineEnd(@min(last, t.lineCount() - 1));
+    var kept: std.ArrayList(Buffer.Hint) = .empty;
+    errdefer kept.deinit(ed.gpa);
+    for (b.hints.items) |h| {
+        if (h.pos >= lo and h.pos <= hi) ed.gpa.free(h.text) else try kept.append(ed.gpa, h);
+    }
+    for (new.items) |h| try kept.append(ed.gpa, h);
+    new.clearRetainingCapacity(); // now the buffer's
+    std.mem.sort(Buffer.Hint, kept.items, {}, struct {
+        fn before(_: void, a: Buffer.Hint, c: Buffer.Hint) bool {
+            return a.pos < c.pos;
+        }
+    }.before);
+    b.hints.deinit(ed.gpa);
+    b.hints = kept;
+    b.hint_version = version;
+    b.hint_range = .{ first, last };
+    ed.wake_fn();
+}
+
+/// The lines of `b` to have hints for while a window shows it from `top`:
+/// the screen and a screenful either side.
+fn hintWindow(b: *const Buffer, top: usize, rows: usize) [2]usize {
+    return .{ top -| rows, @min(top + 2 * rows, b.text.lineCount() - 1) };
+}
+
+/// Whether `b`'s hints are for what is on screen (from `top`, `rows` tall).
+fn hintsCover(b: *const Buffer, top: usize, rows: usize) bool {
+    const r = b.hint_range;
+    return r[0] <= top and top + rows <= r[1] + 1 or (r[1] + 1 >= b.text.lineCount() and r[0] <= top);
+}
+
+/// Each frame: asks the language server for the hints of whatever a window
+/// shows that has none, or stale ones.
+fn tickInlayHints(ed: *Editor) void {
+    if (!ed.options.inlay_hints) return;
+    for (ed.window_list.items) |w| {
+        if (w.term != null) continue;
+        const b = ed.windowBuffer(w);
+        const l = ed.lspFor(b) orelse continue;
+        if (!l.can_inlay or b.hint_pending or b.path == null) continue;
+        // The text changing resets the wait.
+        if (b.hint_seen != b.edit_version) {
+            b.hint_seen = b.edit_version;
+            b.hint_changed = ed.now;
+        }
+        const v = ed.windowView(w);
+        const stale = b.hint_version != b.edit_version;
+        const covered = hintsCover(b, v.top, v.rows);
+        if (!stale and covered) continue;
+        // After edits: once the text has been still for a moment. Scrolling
+        // to lines never asked for: at once.
+        if (stale and b.hint_changed.durationTo(ed.now).nanoseconds < hint_debounce_ms * std.time.ns_per_ms) continue;
+        const range = hintWindow(b, v.top, v.rows);
+        l.requestInlayHints(ed, b, range[0], range[1]) catch {};
+    }
+}
+
+/// Some window's hints are waiting out the debounce (a frame must come).
+fn inlayHintsDue(ed: *const Editor) bool {
+    if (!ed.options.inlay_hints) return false;
+    for (ed.window_list.items) |w| {
+        if (w.term != null) continue;
+        const b = if (w == ed.window) ed.buffer else w.buffer;
+        const l = ed.lspFor(b) orelse continue;
+        if (!l.can_inlay or b.hint_pending or b.path == null) continue;
+        if (b.hint_version != b.edit_version) return true;
+    }
+    return false;
+}
+
+/// Writes a todo tag as a comment (`SPC l t`, insert-mode `<C-t>`): a blank
+/// line becomes the comment, a line of code gets it at its end. Then insert
+/// mode, after the tag.
+pub fn writeTodoTag(ed: *Editor, tag: []const u8) !void {
+    const t = ed.text();
+    const line = ed.cursorLine();
+    const st = textops.commentStyle(ed, line);
+    var buf: [64]u8 = undefined;
+    const blank = motions.firstNonBlank(t, line) == t.lineEnd(line);
+    const written = try std.fmt.bufPrint(&buf, "{s}{s} {s}: ", .{ if (blank) "" else " ", st.open, tag });
+    ed.setMode(.insert);
+    const at = t.lineEnd(line);
+    try ed.insertAt(at, written);
+    // A block comment closes after where you type.
+    if (st.close.len > 0) {
+        var cbuf: [16]u8 = undefined;
+        try ed.insertAt(at + written.len, std.fmt.bufPrint(&cbuf, " {s}", .{st.close}) catch st.close);
+    }
+    ed.setCursor(at + written.len);
+}
+
+/// Opens `text` as a new buffer named `label` (a manual page, say): not a
+/// file, and not counted as modified.
+pub fn openTextBuffer(ed: *Editor, label: []const u8, contents: []const u8) !void {
+    const b = try ed.gpa.create(Buffer);
+    errdefer ed.gpa.destroy(b);
+    b.* = try Buffer.initEmpty(ed.gpa);
+    errdefer b.deinit(ed.gpa);
+    try b.text.insert(ed.gpa, 0, std.mem.trimEnd(u8, contents, "\n"));
+    b.label = try ed.gpa.dupe(u8, label);
+    try ed.buffers.append(ed.gpa, b);
+    ed.focusEditorWindow();
+    ed.switchTo(b);
+}
+
+/// `SPC f y`: pastes register `name` after the cursor.
+pub fn pasteRegister(ed: *Editor, name: u8) !void {
+    const v = ed.registers.get(name) orelse return ed.setMessage(.info, "register {c} is empty", .{name});
+    const copy = try ed.gpa.dupe(u8, v.text);
+    defer ed.gpa.free(copy);
+    try operators.paste(ed, .{ .text = copy, .linewise = v.linewise }, 1, false);
+}
+
+/// `SPC f u`: takes the buffer to any state in its undo tree.
+pub fn undoTo(ed: *Editor, node: u32) !void {
+    ed.cursors.clearRetainingCapacity();
+    const b = ed.buffer;
+    try b.history.commit(ed.gpa);
+    const cursor = try b.history.goTo(ed.gpa, node, b) orelse return;
+    b.modified = b.history.isModified();
+    ed.setCursor(cursor);
 }
 
 /// A closed buffer's jumps keep their file path (or go, for scratch buffers).
@@ -4291,7 +5469,7 @@ pub fn isClaudeTerm(ed: *const Editor, t: *const Terminal) bool {
     return c.term == t;
 }
 
-/// `SPC o T`: the current window becomes your shell (the file stays
+/// `SPC r w`: the current window becomes your shell (the file stays
 /// underneath). A shell hidden earlier comes back; else a new one starts in
 /// the project root.
 pub fn openTermWindow(ed: *Editor) !void {
@@ -4361,7 +5539,7 @@ pub fn focusNext(ed: *Editor) void {
 pub fn filePrompt(ed: *Editor, kind: PromptKind) !void {
     const path = ed.buffer.path;
     if (path == null and (kind == .rename_file or kind == .copy_file))
-        return ed.setMessage(.info, "this buffer has no file yet: SPC f S saves it as one", .{});
+        return ed.setMessage(.info, "this buffer has no file yet: SPC b w saves it as one", .{});
     ed.startSearch(true, kind);
     const prefill: []const u8 = if (path) |p| switch (kind) {
         .new_file => p[0 .. if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| i + 1 else 0],
@@ -4446,7 +5624,7 @@ fn setBufferPath(ed: *Editor, b: *Buffer, path: []const u8) !void {
     if (b == ed.buffer) ed.updateGit();
 }
 
-/// `SPC f D`: asks (in a Yes/No picker) before deleting the current file.
+/// `SPC b x`: asks (in a Yes/No picker) before deleting the current file.
 pub fn deleteFilePrompt(ed: *Editor) !void {
     const path = ed.buffer.path orelse return ed.setMessage(.info, "this buffer has no file", .{});
     if (!ed.fileExists(path)) return ed.setMessage(.info, "\"{s}\" is not on disk", .{path});
@@ -4464,7 +5642,7 @@ pub fn deleteFile(ed: *Editor, b: *Buffer) !void {
     try ed.killBuffer(b);
 }
 
-/// `SPC f y` / `SPC f Y`: the file's path, relative or absolute, to the clipboard.
+/// `SPC b y` / `SPC b f`: the file's path, relative or absolute, to the clipboard.
 pub fn yankPath(ed: *Editor, absolute: bool) !void {
     const path = ed.buffer.path orelse return ed.setMessage(.info, "this buffer has no file", .{});
     const out = if (absolute) try ed.absolutePath(path) else try ed.gpa.dupe(u8, path);
@@ -4473,7 +5651,7 @@ pub fn yankPath(ed: *Editor, absolute: bool) !void {
     ed.setMessage(.info, "yanked \"{s}\"", .{out});
 }
 
-/// `SPC f s`: writes the current buffer (formatted first, with format on
+/// `SPC s`: writes the current buffer (formatted first, with format on
 /// save); one without a file asks for a name.
 pub fn saveCurrent(ed: *Editor) !void {
     const b = ed.buffer;
@@ -4494,14 +5672,15 @@ pub fn saveBufferNow(ed: *Editor, b: *Buffer) void {
 }
 
 // ---------------------------------------------------------------------------
-// Formatting (`SPC c f`, and on save): the language server's, else the
+// Formatting (`SPC l f`, and on save): the language server's, else the
 // language's formatter run directly.
 
 /// Formats the current buffer (lines `range`, inclusive, if the server can
 /// format ranges), then saves it if `then_save`.
 pub fn formatBuffer(ed: *Editor, range: ?[2]usize, then_save: bool) !void {
     const b = ed.buffer;
-    if (ed.lspFor(b)) |l| if (l.can_format) {
+    const lang = if (b.syntax) |sx| sx.lang.name else "";
+    if (!format.preferred(lang)) if (ed.lspFor(b)) |l| if (l.can_format) {
         l.requestFormat(ed, range, then_save) catch |err| {
             ed.setMessage(.err, "could not format: {s}", .{@errorName(err)});
             if (then_save) ed.saveBufferNow(b);
@@ -4521,7 +5700,9 @@ fn formatExternal(ed: *Editor, then_save: bool) !void {
     // The buffer as the file would be written (final newline included).
     const src = try std.mem.concat(ed.gpa, u8, &.{ t.slice(0, t.len()), if (b.final_newline and t.len() > 0) "\n" else "" });
     defer ed.gpa.free(src);
-    switch (try format.run(ed.gpa, ed.io, lang, src, ed.projectRoot())) {
+    const abs = if (b.path) |p| try ed.absolutePath(p) else null;
+    defer if (abs) |a| ed.gpa.free(a);
+    switch (try format.run(ed.gpa, ed.io, lang, src, ed.projectRoot(), abs)) {
         .none => if (!then_save) {
             if (format.name(lang)) |n| ed.setMessage(.err, "{s} isn't installed", .{n}) else ed.setMessage(.info, "no formatter for this file", .{});
         },
@@ -4641,7 +5822,7 @@ fn findBuffer(ed: *Editor, path: []const u8) ?*Buffer {
     return null;
 }
 
-/// `SPC b N`: a new empty scratch buffer.
+/// `SPC b e`: a new empty scratch buffer.
 pub fn newBuffer(ed: *Editor) !void {
     const b = try ed.gpa.create(Buffer);
     errdefer ed.gpa.destroy(b);
@@ -4651,7 +5832,7 @@ pub fn newBuffer(ed: *Editor) !void {
     ed.switchTo(b);
 }
 
-/// `SPC b l`: back to the previous buffer (the most recently used other one).
+/// `SPC b b`: back to the previous buffer (the most recently used other one).
 pub fn lastBuffer(ed: *Editor) !void {
     const order = try ed.buffersByRecency(ed.gpa);
     defer ed.gpa.free(order);
@@ -4659,7 +5840,7 @@ pub fn lastBuffer(ed: *Editor) !void {
     ed.switchTo(order[0]);
 }
 
-/// `SPC b O`: kills every other buffer without unsaved changes.
+/// `SPC b o`: kills every other buffer without unsaved changes.
 pub fn killOtherBuffers(ed: *Editor) !void {
     var kept: usize = 0;
     var i: usize = 0;
@@ -4675,7 +5856,7 @@ pub fn killOtherBuffers(ed: *Editor) !void {
     if (kept > 0) ed.setMessage(.info, "kept {d} buffer(s) with unsaved changes", .{kept}) else ed.setMessage(.info, "killed other buffers", .{});
 }
 
-/// `SPC b S`: saves every modified buffer that has a file.
+/// `SPC b a`: saves every modified buffer that has a file.
 pub fn saveAll(ed: *Editor) void {
     var n: usize = 0;
     for (ed.buffers.items) |b| if (b.modified and b.path != null) {
@@ -4696,6 +5877,8 @@ pub fn bufferIndex(ed: *const Editor, b: *const Buffer) usize {
 
 /// Cycles through buffers in list order.
 pub fn cycleBuffer(ed: *Editor, delta: isize) void {
+    // The command editor's buffer isn't one of the list.
+    if (ed.cmd_float != null) return ed.setMessage(.info, "close the command editor first (<Esc> in normal mode)", .{});
     const n: isize = @intCast(ed.buffers.items.len);
     const i: isize = @intCast(ed.bufferIndex(ed.buffer));
     ed.switchTo(ed.buffers.items[@intCast(@mod(i + delta, n))]);
@@ -4806,6 +5989,209 @@ fn setBrowseDir(ed: *Editor, dir: []const u8) !void {
     if (ed.browse_label.items[ed.browse_label.items.len - 1] != '/') try ed.browse_label.append(ed.gpa, '/');
 }
 
+// File operations in the browser's list (normal mode): `o` new folder,
+// `n` new file, `r` rename, `m` move, `x` / `dd` delete, `yy` copy and `p`
+// paste into the folder shown.
+
+pub const BrowseOp = enum { new_folder, new_file, rename, move, delete, copy, paste };
+
+fn setBrowseSlot(ed: *Editor, slot: *?[]u8, path: []const u8) !void {
+    const owned = try ed.gpa.dupe(u8, path);
+    if (slot.*) |old| ed.gpa.free(old);
+    slot.* = owned;
+}
+
+/// Reopens the browser on its folder, on the entry `select` if given.
+fn reopenBrowser(ed: *Editor, select: ?[]const u8) void {
+    ed.openPicker(.browse, "") catch return;
+    ed.mode = .picker_normal;
+    if (select) |s| ed.picker.?.want_select = ed.gpa.dupe(u8, s) catch null;
+}
+
+pub fn browseOp(ed: *Editor, op: BrowseOp) !void {
+    const p = ed.picker orelse return;
+    if (p.kind != .browse) return;
+    p.sync();
+    switch (op) {
+        .new_folder, .new_file => {
+            ed.closePicker();
+            ed.startSearch(true, if (op == .new_folder) .browse_new_folder else .browse_new_file);
+            return;
+        },
+        .paste => return ed.browsePaste(),
+        else => {},
+    }
+    // The rest act on the selected entry.
+    const item = p.itemAt(p.selected) orelse return ed.setMessage(.info, "nothing selected", .{});
+    const is_dir = std.mem.endsWith(u8, item.text, "/");
+    const name = try ed.gpa.dupe(u8, std.mem.trimEnd(u8, item.text, "/"));
+    defer ed.gpa.free(name);
+    const abs = try ed.browsePath(name);
+    defer ed.gpa.free(abs);
+    switch (op) {
+        .copy => {
+            if (is_dir) return ed.setMessage(.info, "copying a whole folder isn't supported (m moves one)", .{});
+            try ed.setBrowseSlot(&ed.browse_clip, abs);
+            ed.setMessage(.info, "copied \"{s}\": p pastes it into the folder shown", .{name});
+        },
+        .rename, .move => {
+            try ed.setBrowseSlot(&ed.browse_target, abs);
+            ed.closePicker();
+            ed.startSearch(true, if (op == .rename) .browse_rename else .browse_move);
+            try ed.search_prompt.?.input.set(ed.gpa, if (op == .rename) name else abs);
+        },
+        .delete => {
+            try ed.setBrowseSlot(&ed.browse_target, abs);
+            ed.closePicker();
+            try ed.openPicker(.confirm_remove, "");
+        },
+        else => unreachable,
+    }
+}
+
+fn browsePaste(ed: *Editor) !void {
+    const src = ed.browse_clip orelse return ed.setMessage(.info, "nothing copied (yy on a file copies it)", .{});
+    const base = std.fs.path.basename(src);
+    var dest = try ed.browsePath(base);
+    defer ed.gpa.free(dest);
+    if (ed.fileExists(dest)) {
+        // Next to the original: "name copy.ext".
+        const ext = std.fs.path.extension(base);
+        const named = try std.fmt.allocPrint(ed.gpa, "{s} copy{s}", .{ base[0 .. base.len - ext.len], ext });
+        defer ed.gpa.free(named);
+        ed.gpa.free(dest);
+        dest = try ed.browsePath(named);
+        if (ed.fileExists(dest)) return ed.setMessage(.err, "\"{s}\" already exists here", .{named});
+    }
+    Io.Dir.copyFile(Io.Dir.cwd(), src, Io.Dir.cwd(), dest, ed.io, .{}) catch |err|
+        return ed.setMessage(.err, "could not copy: {s}", .{@errorName(err)});
+    const shown = try ed.gpa.dupe(u8, std.fs.path.basename(dest));
+    defer ed.gpa.free(shown);
+    if (ed.picker) |p| {
+        try p.restart(shown);
+        ed.mode = .picker_normal;
+    }
+    ed.setMessage(.info, "pasted \"{s}\"", .{shown});
+}
+
+fn finishBrowsePrompt(ed: *Editor, kind: PromptKind) !void {
+    const raw = try ed.takePromptText() orelse return;
+    defer ed.gpa.free(raw);
+    const typed = std.mem.trim(u8, raw, " ");
+    if (typed.len == 0) {
+        ed.setMessage(.info, "cancelled: no name", .{});
+        return ed.reopenBrowser(null);
+    }
+    const cwd = Io.Dir.cwd();
+    // Relative names are inside the folder shown.
+    const dest = try std.fs.path.resolve(ed.gpa, &.{ ed.browse_dir.items, typed });
+    defer ed.gpa.free(dest);
+    switch (kind) {
+        .browse_new_folder => {
+            cwd.createDirPath(ed.io, dest) catch |err| {
+                ed.setMessage(.err, "could not make the folder: {s}", .{@errorName(err)});
+                return ed.reopenBrowser(null);
+            };
+            ed.setMessage(.info, "made folder \"{s}\"", .{typed});
+        },
+        .browse_new_file => {
+            if (ed.fileExists(dest)) {
+                ed.setMessage(.err, "\"{s}\" already exists", .{typed});
+                return ed.reopenBrowser(null);
+            }
+            if (std.fs.path.dirname(dest)) |dir| cwd.createDirPath(ed.io, dir) catch {};
+            cwd.writeFile(ed.io, .{ .sub_path = dest, .data = "" }) catch |err| {
+                ed.setMessage(.err, "could not make the file: {s}", .{@errorName(err)});
+                return ed.reopenBrowser(null);
+            };
+            // A new file is for writing in: open it.
+            return ed.openFile(dest);
+        },
+        .browse_rename, .browse_move => {
+            const old = ed.browse_target orelse return;
+            if (std.mem.eql(u8, old, dest)) return ed.reopenBrowser(null);
+            if (ed.fileExists(dest)) {
+                ed.setMessage(.err, "\"{s}\" already exists", .{typed});
+                return ed.reopenBrowser(null);
+            }
+            if (std.fs.path.dirname(dest)) |dir| cwd.createDirPath(ed.io, dir) catch {};
+            Io.Dir.rename(cwd, old, cwd, dest, ed.io) catch |err| {
+                ed.setMessage(.err, "could not move it: {s}", .{@errorName(err)});
+                return ed.reopenBrowser(null);
+            };
+            try ed.retargetBuffers(old, dest);
+            ed.setMessage(.info, "\"{s}\" is now \"{s}\"", .{ std.fs.path.basename(old), typed });
+        },
+        else => unreachable,
+    }
+    // Show the result where it now is.
+    if (std.fs.path.dirname(dest)) |dir| ed.setBrowseDir(dir) catch {};
+    var sel_buf: [Io.Dir.max_name_bytes + 1]u8 = undefined;
+    const base = std.fs.path.basename(dest);
+    const st = cwd.statFile(ed.io, dest, .{}) catch null;
+    const is_dir = st != null and st.?.kind == .directory;
+    const sel = if (is_dir) std.fmt.bufPrint(&sel_buf, "{s}/", .{base}) catch base else base;
+    ed.reopenBrowser(sel);
+}
+
+/// Open buffers of a file (or of files in a folder) that moved from `old`
+/// to `new` follow it.
+fn retargetBuffers(ed: *Editor, old: []const u8, new: []const u8) !void {
+    for (ed.buffers.items) |b| {
+        const path = b.path orelse continue;
+        const abs = try ed.absolutePath(path);
+        defer ed.gpa.free(abs);
+        const inside = abs.len > old.len and std.mem.startsWith(u8, abs, old) and abs[old.len] == '/';
+        if (!std.mem.eql(u8, abs, old) and !inside) continue;
+        const moved = try std.mem.concat(ed.gpa, u8, &.{ new, abs[old.len..] });
+        defer ed.gpa.free(moved);
+        const norm = try ed.normalizePath(moved);
+        defer ed.gpa.free(norm);
+        try ed.setBufferPath(b, norm);
+    }
+}
+
+/// The delete confirmation answered: removes `browse_target` (a folder with
+/// everything in it) and closes unmodified buffers of what is gone.
+pub fn browseRemove(ed: *Editor, confirmed: bool) !void {
+    const target = ed.browse_target orelse return;
+    defer ed.reopenBrowser(null);
+    if (!confirmed) return ed.setMessage(.info, "kept \"{s}\"", .{std.fs.path.basename(target)});
+    const cwd = Io.Dir.cwd();
+    const st = cwd.statFile(ed.io, target, .{}) catch null;
+    const is_dir = st != null and st.?.kind == .directory;
+    (if (is_dir) cwd.deleteTree(ed.io, target) else cwd.deleteFile(ed.io, target)) catch |err|
+        return ed.setMessage(.err, "could not delete: {s}", .{@errorName(err)});
+    var i = ed.buffers.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (i >= ed.buffers.items.len) continue;
+        const b = ed.buffers.items[i];
+        const path = b.path orelse continue;
+        if (b.modified) continue;
+        const abs = try ed.absolutePath(path);
+        defer ed.gpa.free(abs);
+        const inside = abs.len > target.len and std.mem.startsWith(u8, abs, target) and abs[target.len] == '/';
+        if (std.mem.eql(u8, abs, target) or inside) try ed.killBuffer(b);
+    }
+    ed.setMessage(.info, "deleted \"{s}\"", .{std.fs.path.basename(target)});
+}
+
+/// `x` / `dd` in the buffer picker: closes the selected buffer, staying in
+/// the list.
+pub fn pickerKillBuffer(ed: *Editor) !void {
+    const p = ed.picker orelse return;
+    if (p.kind != .buffers) return;
+    p.sync();
+    const item = p.itemAt(p.selected) orelse return;
+    if (item.id >= ed.buffers.items.len) return;
+    const b = ed.buffers.items[item.id];
+    if (b.modified) return ed.setMessage(.err, "\"{s}\" has unsaved changes: save it first", .{b.displayName()});
+    try ed.killBuffer(b);
+    try p.restart(null);
+    ed.mode = .picker_normal;
+}
+
 /// Accepts the selected row: closes the picker, then acts on the choice
 /// (which may open another picker).
 pub fn acceptPicker(ed: *Editor) !void {
@@ -4827,7 +6213,7 @@ pub fn acceptPickerAs(ed: *Editor, target: OpenTarget) !void {
 /// Sources whose choices open something somewhere (files, places).
 pub fn opensPlaces(kind: Picker.Kind) bool {
     return switch (kind) {
-        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes, .browse, .jumps, .run_errors, .projects, .recent, .todos => true,
+        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes, .browse, .jumps, .run_errors, .projects, .recent, .frecent, .todos, .quickfix, .files_anywhere, .workspace_symbols, .marks => true,
         else => false,
     };
 }
@@ -4835,6 +6221,7 @@ pub fn opensPlaces(kind: Picker.Kind) bool {
 /// <Tab> in a picker: asks where to open the selection.
 pub fn pickerOpenMenu(ed: *Editor) !void {
     const p = ed.picker orelse return;
+    if (p.kind == .runner) return ed.runnerEdit();
     if (!opensPlaces(p.kind)) return;
     const choice = try p.choice();
     if (choice == .none) return;
@@ -4874,7 +6261,7 @@ fn runChoice(ed: *Editor, choice: Picker.Choice, target_in: OpenTarget) anyerror
     }
     // Pickers that take you somewhere are jumps.
     if (kind) |k| switch (k) {
-        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes, .recent, .todos => ed.pushJump(),
+        .files, .buffers, .lines, .grep, .locations, .diagnostics, .symbols, .git_changes, .recent, .frecent, .todos => ed.pushJump(),
         else => {},
     };
     if (target.dir()) |d| try ed.splitWindow(d);
@@ -4883,6 +6270,17 @@ fn runChoice(ed: *Editor, choice: Picker.Choice, target_in: OpenTarget) anyerror
         .item => |c| try @import("picker/sources.zig").accept(c.kind, ed, c.item),
         .create => |c| try @import("picker/sources.zig").create(c.kind, ed, c.query),
     }
+    // A picker that took you to a line shows it in the middle of the window,
+    // with its surroundings (pickers that open a file leave its view as it was).
+    if (choice == .item) switch (choice.item.kind) {
+        .lines, .grep, .todos, .locations, .diagnostics, .symbols, .workspace_symbols, .jumps, .marks, .quickfix, .run_errors => ed.centerCursor(),
+        else => {},
+    };
+}
+
+/// Scrolls so the cursor's row is in the middle of the window (`zz`).
+pub fn centerCursor(ed: *Editor) void {
+    ed.setTop(ed.stepRows(ed.cursorRow(), -@as(isize, @intCast(ed.view.rows / 2))));
 }
 
 // ---------------------------------------------------------------------------
@@ -4903,7 +6301,7 @@ pub fn clearMessage(ed: *Editor) void {
     ed.message.len = 0;
 }
 
-/// Keeps a message for the history (`SPC s m`); repeats aren't kept twice.
+/// Keeps a message for the history (`SPC f n`); repeats aren't kept twice.
 fn remember(ed: *Editor, kind: Message.Kind, s: []const u8) void {
     if (s.len == 0) return;
     if (ed.history.items.len > 0) {
@@ -4968,7 +6366,41 @@ pub fn wantsFrames(ed: *const Editor) bool {
     if (ed.view.scroll_offset != 0 or ed.view.scroll_frac != 0) return true;
     for (ed.window_list.items) |w| if (w != ed.window and (w.view.scroll_offset != 0 or w.view.scroll_frac != 0)) return true;
     for (ed.toasts.items) |t| if (!t.busy) return true;
+    if (ed.yank_flash != null) return true;
+    // Hints waiting out their debounce: a frame has to come to ask for them.
+    if (ed.inlayHintsDue()) return true;
+    // A guide is waiting out its delay, or growing: frames have to come.
+    if (ed.indent_candidate != null) return true;
+    if (ed.indent_guide) |g| if (g.growing(ed.now, ed.view.top, ed.view.top + ed.view.rows)) return true;
     return false;
+}
+
+/// Decides which indent scope guide is drawn this frame: the cursor's scope
+/// once it has been the same for a moment. Moving on to another block hides
+/// the guide at once; the new one appears when the cursor settles.
+fn tickIndentGuide(ed: *Editor) void {
+    const want: ?IndentGuide = blk: {
+        if (!ed.options.indent_scope or ed.ghost != null or ed.window.term != null) break :blk null;
+        const s = indents.scope(ed.text(), ed.cursorLine(), ed.options.tab_width, true) orelse break :blk null;
+        break :blk .{ .buffer = ed.buffer, .scope = s };
+    };
+    if (IndentGuide.same(want, ed.indent_guide)) {
+        if (ed.indent_guide) |*g| g.scope = want.?.scope; // its end may have moved
+        ed.indent_candidate = null;
+        return;
+    }
+    ed.indent_guide = null;
+    if (want == null) {
+        ed.indent_candidate = null;
+    } else if (!IndentGuide.same(want, ed.indent_candidate)) {
+        ed.indent_candidate = want;
+        ed.indent_since = ed.now;
+    } else if (ed.indent_since.durationTo(ed.now).nanoseconds >= indent_guide_delay_ms * std.time.ns_per_ms) {
+        ed.indent_guide = want;
+        ed.indent_guide.?.origin = std.math.clamp(ed.cursorLine(), want.?.scope.first, want.?.scope.last);
+        ed.indent_guide.?.born = ed.now;
+        ed.indent_candidate = null;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5163,6 +6595,74 @@ pub fn openStarter(ed: *Editor) !void {
 }
 
 // ---------------------------------------------------------------------------
+// The colour wheel (`SPC l c`): see ColorPicker.zig.
+
+/// Opens the wheel on the colour literal at the cursor, else the next one on
+/// the line, else the last one before it.
+pub fn openColorPicker(ed: *Editor) void {
+    const t = ed.text();
+    const line = ed.cursorLine();
+    const ls = t.lineStart(line);
+    const col = ed.view.cursor - ls;
+    const bytes = t.lineSlice(line);
+    var buf: [64]hipatterns.Match = undefined;
+    var found: ?hipatterns.Match = null;
+    for (hipatterns.scan(bytes, &buf)) |m| {
+        if (m.kind == .todo) continue;
+        found = m;
+        if (m.end > col) break; // at or after the cursor
+    }
+    const m = found orelse return ed.setMessage(.info, "no colour on this line (#rrggbb, #rgb, #rrggbbaa or 0xRRGGBB)", .{});
+    const parsed = ColorPicker.parse(bytes[m.start..m.end]) orelse return;
+    ed.color_picker = .init(ed.buffer, ls + m.start, ls + m.end, parsed);
+    ed.setCursor(ls + m.start);
+    ed.clearMessage();
+}
+
+/// Keys while the wheel is open. False when it isn't (or just went away
+/// because the text under it changed).
+fn colorKey(ed: *Editor, ev: KeyEvent) bool {
+    const p = &(ed.color_picker orelse return false);
+    if (p.buffer != ed.buffer or p.version != ed.buffer.edit_version) {
+        ed.color_picker = null;
+        return false;
+    }
+    const action: ColorPicker.Action = switch (ev.key) {
+        .special => |s| switch (s) {
+            .escape => .cancel,
+            .enter => .apply,
+            else => .none,
+        },
+        .codepoint => |cp| if (ev.mods.ctrl or ev.mods.alt) .none else p.key(cp),
+    };
+    var buf: [16]u8 = undefined;
+    switch (action) {
+        .none => {},
+        .cancel => ed.color_picker = null,
+        .yank => {
+            const literal = p.write(&buf);
+            ed.registers.store(null, .yank, literal, false) catch {};
+            ed.setMessage(.info, "copied {s}", .{literal});
+        },
+        .apply => {
+            const literal = p.write(&buf);
+            const start = p.start;
+            const end = p.end;
+            ed.color_picker = null;
+            if (!std.mem.eql(u8, literal, ed.text().slice(start, end))) {
+                ed.deleteRange(start, end) catch return true;
+                ed.insertAt(start, literal) catch return true;
+            }
+            ed.setCursor(start);
+            ed.afterKey(); // one undo step
+            ed.setMessage(.info, "colour: {s}", .{literal});
+        },
+    }
+    ed.wake_fn();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Bracketed jumps (mini.bracketed): `]d` `[d` diagnostics, `]x` `[x`
 // conflict markers, `]c` `[c` comment blocks.
 
@@ -5218,7 +6718,7 @@ pub fn jumpConflict(ed: *Editor, forward: bool) void {
 
 pub fn jumpComment(ed: *Editor, forward: bool) void {
     const t = ed.text();
-    const line = comment.nextBlock(t, ed.cursorLine(), textops.commentPrefix(ed), forward) orelse
+    const line = comment.nextBlock(t, ed.cursorLine(), textops.commentStyle(ed, ed.cursorLine()), forward) orelse
         return ed.setMessage(.info, "no more comments", .{});
     ed.goLine(line, motions.firstNonBlank(t, line) - t.lineStart(line));
 }
@@ -5329,6 +6829,16 @@ fn testEditor(content: []const u8) !Editor {
     var ed = try Editor.init(testing.allocator, testing.io);
     errdefer ed.deinit();
     try ed.text().insert(ed.gpa, 0, content);
+    return ed;
+}
+
+/// A test editor whose buffer is a (never written) file named `path`, so it
+/// gets that language's syntax tree and settings.
+fn testEditorAs(path: []const u8, content: []const u8) !Editor {
+    var ed = try testEditor(content);
+    errdefer ed.deinit();
+    ed.buffer.path = try ed.gpa.dupe(u8, path);
+    ed.buffer.syntax = Syntax.forPath(path);
     return ed;
 }
 
@@ -5470,7 +6980,7 @@ test "command picker: fuzzy search and accept" {
     var ed = try testEditor("x");
     defer ed.deinit();
     try ed.feed("ia<Esc>"); // modified, so quit_without_saving is observable
-    try ed.feed("<Space>:");
+    try ed.feed("<Space>fc");
     try testing.expectEqual(.picker, ed.mode);
     try ed.feed("quitwo<CR>");
     try testing.expectEqual(null, ed.picker);
@@ -5586,7 +7096,7 @@ test "f, t, ; and ," {
     defer ed.deinit();
     try ed.feed("f.");
     try testing.expectEqual(1, ed.view.cursor);
-    try ed.feed(";;");
+    try ed.feed("..");
     try testing.expectEqual(5, ed.view.cursor);
     try ed.feed(",");
     try testing.expectEqual(3, ed.view.cursor);
@@ -5636,6 +7146,248 @@ test "visual mode operators" {
     try expectText(&ed, "third\nsecond line");
     try ed.feed("viwU");
     try expectText(&ed, "THIRD\nsecond line");
+}
+
+test "v again switches to line mode over all the selected lines" {
+    var ed = try testEditor("hello world\nsecond line\nthird");
+    defer ed.deinit();
+    try ed.feed("wvvd");
+    try expectText(&ed, "second line\nthird");
+    try ed.feed("vjvd"); // moved: still line mode, both lines
+    try expectText(&ed, "");
+}
+
+test "autopairs: an opener right before its own closer adds no pair" {
+    var ed = try testEditor("}");
+    defer ed.deinit();
+    try ed.feed("i{<Esc>");
+    try expectText(&ed, "{}");
+    try ed.feed("A[<Esc>");
+    try expectText(&ed, "{}[]"); // another kind still pairs
+    try ed.feed("0a{<Esc>");
+    try expectText(&ed, "{{}}[]"); // an opener before: it nests
+}
+
+test "multicursor: qf in a selection puts cursors on the matches inside it" {
+    var ed = try testEditor("a1 a2\nxx a3 a4\na5");
+    defer ed.deinit();
+    try ed.feed("Vjsa<CR>");
+    try testing.expectEqual(3, ed.cursors.items.len); // four matches, not the fifth
+    try ed.feed("cZ<Esc>");
+    try expectText(&ed, "Z1 Z2\nxx Z3 Z4\na5");
+}
+
+test "f searches the line from its start; ; walks on; after an operator it starts at the cursor" {
+    var ed = try testEditor("a.b.c.d\nxx");
+    defer ed.deinit();
+    try ed.feed("$f.");
+    try testing.expectEqual(1, ed.view.cursor); // from the left, though the cursor was at the end
+    try ed.feed(".");
+    try testing.expectEqual(3, ed.view.cursor);
+    try ed.feed("0lldf.");
+    try expectText(&ed, "a.c.d\nxx"); // from the cursor
+}
+
+test ". repeats the last find, or the last change if that came after" {
+    var ed = try testEditor("a.b.c.d");
+    defer ed.deinit();
+    try ed.feed("f..");
+    try testing.expectEqual(3, ed.view.cursor); // f. then . : the second dot
+    try ed.feed("x"); // a change: . repeats it now
+    try expectText(&ed, "a.bc.d");
+    try ed.feed(".");
+    try expectText(&ed, "a.b.d");
+}
+
+test ". and , continue a snipe too" {
+    var ed = try testEditor("foo bar baz\nqux bar");
+    defer ed.deinit();
+    try ed.feed("tbar<CR>");
+    try testing.expectEqual(4, ed.view.cursor);
+    try ed.feed(".");
+    try testing.expectEqual(16, ed.view.cursor); // the next "bar"
+    try ed.feed(",");
+    try testing.expectEqual(4, ed.view.cursor);
+    try ed.feed("x.");
+    try expectText(&ed, "foo r baz\nqux bar"); // a change: . repeats it
+}
+
+test "yanking flashes the range; a delete does not" {
+    var ed = try testEditor("one two\nthree");
+    defer ed.deinit();
+    try ed.feed("yiw");
+    try testing.expectEqual(0, ed.yank_flash.?.start);
+    try testing.expectEqual(3, ed.yank_flash.?.end);
+    ed.yank_flash = null;
+    try ed.feed("dw");
+    try testing.expect(ed.yank_flash == null);
+    try ed.feed("yy");
+    try testing.expect(ed.yank_flash.?.linewise);
+}
+
+test "comments: <!-- --> in HTML, /* */ in CSS, {/* */} among JSX children" {
+    {
+        var ed = try testEditorAs("x.html", "<div>\n  <p>hi</p>\n</div>");
+        defer ed.deinit();
+        try ed.feed("jgcc");
+        try expectText(&ed, "<div>\n  <!-- <p>hi</p> -->\n</div>");
+        try ed.feed("gcc");
+        try expectText(&ed, "<div>\n  <p>hi</p>\n</div>");
+    }
+    {
+        var ed = try testEditorAs("x.css", "a {\n  color: red;\n}");
+        defer ed.deinit();
+        try ed.feed("jgcc");
+        try expectText(&ed, "a {\n  /* color: red; */\n}");
+    }
+    {
+        const src = "const A = () => (\n  <div>\n    <p>hi</p>\n  </div>\n);\nconst b = 1;";
+        var ed = try testEditorAs("x.tsx", src);
+        defer ed.deinit();
+        try ed.feed("jjgcc"); // a child of the <div>
+        try expectText(&ed, "const A = () => (\n  <div>\n    {/* <p>hi</p> */}\n  </div>\n);\nconst b = 1;");
+        try ed.feed("gcc");
+        try expectText(&ed, src);
+        try ed.feed("Ggcc"); // plain code
+        try expectText(&ed, "const A = () => (\n  <div>\n    <p>hi</p>\n  </div>\n);\n// const b = 1;");
+    }
+}
+
+test "tags: > closes, </ closes the open one, Enter splits, void and self-closing stay" {
+    {
+        var ed = try testEditorAs("x.html", "");
+        defer ed.deinit();
+        try ed.feed("i<lt>div class=\"a>b\">");
+        try expectText(&ed, "<div class=\"a>b\"></div>");
+        try ed.feed("<CR>");
+        try expectText(&ed, "<div class=\"a>b\">\n  \n</div>");
+        try ed.feed("<lt>br><Esc>");
+        try expectText(&ed, "<div class=\"a>b\">\n  <br>\n</div>"); // void: no </br>
+        try ed.feed("o<lt>p><Esc>");
+        try expectText(&ed, "<div class=\"a>b\">\n  <br>\n  <p></p>\n</div>");
+    }
+    {
+        var ed = try testEditorAs("x.html", "<ul>\n  <li>one");
+        defer ed.deinit();
+        try ed.feed("Go<lt>/"); // the <li> is the innermost open one
+        try expectText(&ed, "<ul>\n  <li>one\n  </li>");
+        try ed.feed("<CR><lt>/");
+        try expectText(&ed, "<ul>\n  <li>one\n  </li>\n</ul>"); // at the <ul>'s indentation
+    }
+    {
+        var ed = try testEditorAs("x.tsx", "const a: Array<string = [];\nconst A = () => ");
+        defer ed.deinit();
+        try ed.feed("GA<lt>View onPress={() => go()}><Esc>");
+        try expectText(&ed, "const a: Array<string = [];\nconst A = () => <View onPress={() => go()}></View>");
+        try ed.feed("ggf<lt>ea><Esc>"); // a generic: left alone
+        try expectText(&ed, "const a: Array<string> = [];\nconst A = () => <View onPress={() => go()}></View>");
+    }
+    {
+        var ed = try testEditorAs("x.tsx", "const f = ");
+        defer ed.deinit();
+        try ed.feed("A<lt>><Esc>"); // a fragment
+        try expectText(&ed, "const f = <></>");
+    }
+    {
+        var ed = try testEditorAs("x.tsx", "const x = <Foo />;");
+        defer ed.deinit();
+        try ed.feed("$i<lt>b><Esc>"); // after another element: a tag
+        try expectText(&ed, "const x = <Foo /><b></b>;");
+        try ed.feed("o<lt>Bar /><Esc>"); // self-closing: nothing added
+        try expectText(&ed, "const x = <Foo /><b></b>;\n<Bar />");
+    }
+}
+
+test "tags: editing a tag's name edits its partner, as one undo step" {
+    {
+        var ed = try testEditorAs("x.html", "<div>\n  <p>hi</p>\n</div>");
+        defer ed.deinit();
+        try ed.feed("lciwsection<Esc>");
+        try expectText(&ed, "<section>\n  <p>hi</p>\n</section>");
+        try ed.feed("u");
+        try expectText(&ed, "<div>\n  <p>hi</p>\n</div>");
+        try ed.feed("G$iaa<Esc>"); // the closing tag works too: </divaa>
+        try expectText(&ed, "<divaa>\n  <p>hi</p>\n</divaa>");
+        try ed.feed("jkkfpx"); // and in normal mode: x on the <p>
+        try expectText(&ed, "<divaa>\n  <>hi</>\n</divaa>");
+    }
+    {
+        var ed = try testEditorAs("x.tsx", "const A = () => (\n  <View style={s}>\n    <Text>hi</Text>\n  </View>\n);");
+        defer ed.deinit();
+        try ed.feed("jfVcwScrollView<Esc>");
+        try expectText(&ed, "const A = () => (\n  <ScrollView style={s}>\n    <Text>hi</Text>\n  </ScrollView>\n);");
+    }
+}
+
+test "emmet: Tab expands an abbreviation in markup, with tab stops" {
+    {
+        var ed = try testEditorAs("x.html", "<body>\n  \n</body>");
+        defer ed.deinit();
+        try ed.feed("jAul>li.item$*2<Tab>");
+        try expectText(&ed, "<body>\n  <ul>\n    <li class=\"item1\"></li>\n    <li class=\"item2\"></li>\n  </ul>\n</body>");
+        try ed.feed("one<Tab>two<Esc>"); // tab stops: the first <li>, then the second
+        try expectText(&ed, "<body>\n  <ul>\n    <li class=\"item1\">one</li>\n    <li class=\"item2\">two</li>\n  </ul>\n</body>");
+        try ed.feed("ohello<Tab><Esc>"); // prose: a tab, not <hello>
+        try testing.expect(std.mem.indexOf(u8, ed.text().slice(0, ed.text().len()), "<hello>") == null);
+    }
+    {
+        var ed = try testEditorAs("x.tsx", "const A = () => (\n  <View>\n    \n  </View>\n);");
+        defer ed.deinit();
+        try ed.feed("jjAText.title<Tab>Hi<Esc>");
+        try expectText(&ed, "const A = () => (\n  <View>\n    <Text className=\"title\">Hi</Text>\n  </View>\n);");
+    }
+    {
+        var ed = try testEditorAs("x.ts", "const x = ");
+        defer ed.deinit();
+        try ed.feed("Adiv<Tab><Esc>"); // TypeScript without JSX: no markup
+        try testing.expect(std.mem.indexOf(u8, ed.text().slice(0, ed.text().len()), "<div>") == null);
+    }
+}
+
+test "completion between JSX tags offers elements and the file's components" {
+    const gpa = testing.allocator;
+    var ed = try testEditorAs("x.tsx", "import { View } from \"rn\";\nconst A = () => (\n  <View>\n    \n  </View>\n);");
+    defer ed.deinit();
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa, "{\"items\":[]}", .{});
+    defer reply.deinit();
+    try ed.feed("3jAvie");
+    try ed.showCompletion(ed.buffer, ed.view.cursor - 3, reply.value);
+    const c = ed.completionShown().?;
+    try testing.expectEqualStrings("View", c.current().?.label);
+    try ed.feed("<CR>");
+    try testing.expect(std.mem.indexOf(u8, ed.text().slice(0, ed.text().len()), "    <View></View>\n") != null);
+}
+
+test "snippets: the exact trigger first, indented like its line" {
+    const gpa = testing.allocator;
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa, "{\"items\":[{\"label\":\"useState\"},{\"label\":\"user\"}]}", .{});
+    defer reply.deinit();
+    {
+        var ed = try testEditorAs("x.tsx", "function A() {\n  \n}");
+        defer ed.deinit();
+        try ed.feed("jAus");
+        try ed.showCompletion(ed.buffer, ed.view.cursor - 2, reply.value);
+        try testing.expectEqualStrings("us", ed.completionShown().?.current().?.label);
+        try ed.feed("<CR>count<Tab>Count<Tab>0<Esc>");
+        try expectText(&ed, "function A() {\n  const [count, setCount] = useState(0);\n}");
+    }
+    {
+        var ed = try testEditorAs("x.ts", "function A() {\n  \n}");
+        defer ed.deinit();
+        try ed.feed("jAtc");
+        try ed.showCompletion(ed.buffer, ed.view.cursor - 2, reply.value);
+        try testing.expectEqualStrings("tc", ed.completionShown().?.current().?.label);
+        try ed.feed("<CR><Esc>");
+        try expectText(&ed, "function A() {\n  try {\n    \n  } catch (err) {\n    \n  }\n}");
+    }
+    {
+        var ed = try testEditorAs("x.ts", "");
+        defer ed.deinit();
+        try ed.feed("ius"); // React Native snippets are for .jsx / .tsx only
+        try ed.showCompletion(ed.buffer, 0, reply.value);
+        const c = ed.completionShown().?;
+        for (c.shown.items) |i| try testing.expect(!std.mem.eql(u8, c.items[i].label, "us"));
+    }
 }
 
 test "registers: named, append, black hole" {
@@ -5729,7 +7481,7 @@ test "search: incremental /, n, N, *, Esc restores, d/ as motion" {
 test "search buffer picker jumps to the line" {
     var ed = try testEditor("one\ntwo\nthree");
     defer ed.deinit();
-    try ed.feed("<Space>ssthr<CR>");
+    try ed.feed("<Space>flthr<CR>");
     try expectCursor(&ed, 2, 0);
 }
 
@@ -5751,21 +7503,21 @@ test "il / al line objects (nvim's vil / val)" {
 test "snipe: jumps when one match is left, RET takes the first, n continues" {
     var ed = try testEditor("foo bar baz\nqux bar");
     defer ed.deinit();
-    try ed.feed("sba");
+    try ed.feed("tba");
     try testing.expectEqual(.search, ed.mode); // three matches: keep typing
     try ed.feed("z");
     try testing.expectEqual(.normal, ed.mode); // only "baz" left: jumped
     try testing.expectEqual(8, ed.view.cursor);
 
-    try ed.feed("ggsbar<CR>");
+    try ed.feed("ggtbar<CR>");
     try testing.expectEqual(4, ed.view.cursor);
     try ed.feed("n");
     try testing.expectEqual(16, ed.view.cursor);
 
-    try ed.feed("ggsq<Esc>"); // only one 'q': jumps on the first key
+    try ed.feed("ggtq<Esc>"); // only one 'q': jumps on the first key
     try testing.expectEqual(12, ed.view.cursor);
     try ed.feed("gg");
-    try ed.feed("sw<Esc>"); // no 'w' anywhere: Esc puts the cursor back
+    try ed.feed("tw<Esc>"); // no 'w' anywhere: Esc puts the cursor back
     try testing.expectEqual(0, ed.view.cursor);
     try testing.expectEqual(.normal, ed.mode);
 }
@@ -5820,7 +7572,7 @@ test "SPC Q s saves every modified buffer, then quits; SPC q checks all buffers"
     try ed.openFile(a);
     try ed.feed("ialpha<Esc>");
     try ed.openFile(b);
-    try ed.feed("ibeta<Esc><Space>bp"); // back to a.txt, which is saved? no: both modified
+    try ed.feed("ibeta<Esc>[b"); // back to a.txt, which is saved? no: both modified
     try ed.feed("<Space>q");
     try testing.expect(!ed.should_quit); // a.txt is unsaved: not closed
     try ed.feed("<Space>Qs");
@@ -5865,13 +7617,13 @@ test "dit / dat / cit on tags" {
     try expectText(&ed, "<ul></ul>");
 }
 
-test "SPC c l without a language server: tree-sitter outline picker" {
+test "SPC f s without a language server: tree-sitter outline picker" {
     var ed = try testEditor("");
     defer ed.deinit();
     try ed.openFile("edit-test-symbols.zig");
     try ed.insertAt(0, "const A = struct {\n    fn one() void {}\n};\nfn two() void {}");
     try ed.buffer.history.commit(ed.gpa);
-    try ed.feed("<Space>cl");
+    try ed.feed("<Space>fs");
     try testing.expectEqual(.symbols, ed.picker.?.kind);
     try ed.feed("one<CR>");
     try expectCursor(&ed, 1, 4);
@@ -6042,7 +7794,7 @@ test "ghost lines: /, n, N, f and snipe reach into them" {
     try ed.feed("N");
     try testing.expect(ed.ghost != null);
     try ed.feed("<Esc>gg");
-    try ed.feed("sh"); // the only 'h' on screen is in the ghost line: jumps
+    try ed.feed("th"); // the only 'h' on screen is in the ghost line: jumps
     try testing.expectEqual(.normal, ed.mode);
     try testing.expectEqual(11, ed.ghost.?.col);
     try ed.feed("<Esc>gg/zzz<Esc>"); // Esc returns to where we were
@@ -6116,8 +7868,8 @@ test "files: save as, rename, copy, delete, new" {
     var ed = try testEditor("");
     defer ed.deinit();
 
-    // A scratch buffer: SPC f s asks for a name, then saves there.
-    try ed.feed("ihello<Esc><Space>fs");
+    // A scratch buffer: SPC s asks for a name, then saves there.
+    try ed.feed("ihello<Esc><Space>s");
     try testing.expectEqual(PromptKind.save_as, ed.search_prompt.?.kind);
     try ed.search_prompt.?.input.set(gpa, a);
     try ed.feed("<CR>");
@@ -6128,7 +7880,7 @@ test "files: save as, rename, copy, delete, new" {
     try testing.expectEqualStrings("hello\n", saved);
 
     // Rename into a new folder: the file moves and the language follows.
-    try ed.feed("<Space>fR");
+    try ed.feed("<Space>br");
     try testing.expect(std.mem.endsWith(u8, a, ed.search_prompt.?.input.items())); // prefilled
     try ed.search_prompt.?.input.set(gpa, b);
     try ed.feed("<CR>");
@@ -6139,7 +7891,7 @@ test "files: save as, rename, copy, delete, new" {
 
     // Copy: writes a copy (unsaved edits included) and opens it; the
     // original keeps its unsaved state.
-    try ed.feed("A!<Esc><Space>fC");
+    try ed.feed("A!<Esc><Space>bc");
     try ed.search_prompt.?.input.set(gpa, c);
     try ed.feed("<CR>");
     try testing.expect(std.mem.endsWith(u8, c, ed.buffer.path.?));
@@ -6147,22 +7899,22 @@ test "files: save as, rename, copy, delete, new" {
     try testing.expect(ed.buffers.items[0].modified);
 
     // Refuses to overwrite an existing file.
-    try ed.feed("<Space>fS");
+    try ed.feed("<Space>bw");
     try ed.search_prompt.?.input.set(gpa, b);
     try ed.feed("<CR>");
     try testing.expectEqual(.err, ed.message.kind);
     try testing.expect(std.mem.endsWith(u8, c, ed.buffer.path.?));
 
     // Delete: "No" keeps it, "Yes" removes it and closes the buffer.
-    try ed.feed("<Space>fD<CR>");
+    try ed.feed("<Space>bx<CR>");
     try tmp.dir.access(io, "c.zig", .{});
-    try ed.feed("<Space>fDj<CR>"); // the confirmation starts in normal mode: j to "Yes"
+    try ed.feed("<Space>bxj<CR>"); // the confirmation starts in normal mode: j to "Yes"
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "c.zig", .{}));
     try testing.expectEqual(1, ed.buffers.items.len);
     try testing.expect(std.mem.endsWith(u8, b, ed.buffer.path.?));
 
     // New file: prefilled with the current folder; created on first save.
-    try ed.feed("<Space>fn");
+    try ed.feed("<Space>bn");
     try testing.expect(std.mem.endsWith(u8, ed.search_prompt.?.input.items(), "sub/"));
     try ed.feed("new.txt<CR>");
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "sub/new.txt"));
@@ -6376,11 +8128,11 @@ test "buffers: new, last, kill others" {
     defer ed.deinit();
     try ed.openFile("zile-test-a.txt");
     const a = ed.buffer;
-    try ed.feed("<Space>bN");
+    try ed.feed("<Space>be");
     try testing.expect(ed.buffer != a);
-    try ed.feed("<Space>bl");
+    try ed.feed("<Space>bb");
     try testing.expectEqual(a, ed.buffer);
-    try ed.feed("<Space>bN<Space>bN<Space>bO");
+    try ed.feed("<Space>be<Space>be<Space>bo");
     try testing.expectEqual(1, ed.buffers.items.len);
 }
 
@@ -6406,7 +8158,7 @@ test "jumplist: C-o / C-i, one entry per line, the picker" {
     try ed.feed("<C-o>");
     try testing.expectEqual(4, ed.cursorLine()); // "d" moved down a line
     // The picker lists newest first and goes where you pick.
-    try ed.feed("<Space>sj");
+    try ed.feed("<Space>fj");
     ed.picker.?.sync();
     try testing.expectEqual(.jumps, ed.picker.?.kind);
     try ed.feed("<CR>");
@@ -6438,18 +8190,42 @@ test "run: SPC r c shows output and how it ended; SPC r r remembers its command"
     defer gpa.free(out);
     try testing.expect(std.mem.startsWith(u8, out, "hi\n"));
     try testing.expect(std.mem.indexOf(u8, out, "exited 4") != null);
+    try ed.feed("y"); // no errors in it: the whole output, without our status line
+    try testing.expectEqualStrings("hi", std.mem.trimEnd(u8, ed.registers.get(null).?.text, "\n"));
     try ed.feed("q");
     try testing.expectEqual(null, ed.popup);
 
-    // The runner: first time empty, then prefilled with the last command.
+    // The runner: a picker of the commands run here. Empty the first time;
+    // typing one runs it; then it is first in the list.
     try ed.feed("<Space>rr");
-    try testing.expectEqualStrings("", ed.search_prompt.?.input.items());
+    settlePicker(&ed);
+    try testing.expectEqual(.runner, ed.picker.?.kind);
+    try testing.expectEqual(0, ed.picker.?.rowCount());
     try ed.feed("echo runner<CR>");
     waitForRun(&ed);
     try testing.expectEqual(0, ed.run.?.exit_code);
+    try ed.feed("q<Space>rrecho second<CR>");
+    waitForRun(&ed);
     try ed.feed("q<Space>rr");
-    try testing.expectEqualStrings("echo runner", ed.search_prompt.?.input.items());
-    try ed.feed("<CR>"); // Enter runs it again
+    settlePicker(&ed);
+    try testing.expectEqualStrings("echo second", ed.picker.?.itemAt(0).?.text); // newest first
+    try testing.expectEqualStrings("echo runner", ed.picker.?.itemAt(1).?.text);
+    // Typing filters the history; the typed text itself stays the first row.
+    try ed.feed("run");
+    settlePicker(&ed);
+    try testing.expectEqual(0, ed.picker.?.createRow().?);
+    try testing.expectEqualStrings("echo runner", ed.picker.?.itemAt(1).?.text);
+    try ed.feed("<C-n><CR>"); // down to the old command: run that
+    try testing.expectEqualStrings("echo runner", ed.run_command.?);
+    waitForRun(&ed);
+    // It is the newest now; x forgets one.
+    try ed.feed("q<Space>rr<Esc>");
+    settlePicker(&ed);
+    try testing.expectEqualStrings("echo runner", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("jx");
+    settlePicker(&ed);
+    try testing.expectEqual(1, ed.picker.?.rowCount());
+    try ed.feed("<CR>"); // Enter on the list: the last command again
     try testing.expectEqualStrings("echo runner", ed.run_command.?);
     waitForRun(&ed);
     try ed.feed("r"); // `r` in a finished run: once more
@@ -6462,7 +8238,7 @@ test "run: SPC r c shows output and how it ended; SPC r r remembers its command"
 test "terminal popup: keys go to the shell, Ctrl-\\ hides it and keeps it running" {
     var ed = try testEditor("text");
     defer ed.deinit();
-    try ed.feed("<Space>ot");
+    try ed.feed("<Space>rt");
     try testing.expectEqual(.shell, ed.popup.?);
     const shell = ed.shell.?;
     try ed.feed("<C-\\>");
@@ -6479,14 +8255,13 @@ test "terminal popup: keys go to the shell, Ctrl-\\ hides it and keeps it runnin
     try testing.expectEqual(null, ed.shell);
 }
 
-/// Lets the picker catch up (results, then a frame: the docked quickfix
-/// picker moves the editor on the frame after a key).
+/// Lets the picker catch up (results, then a frame for the preview).
 fn settlePicker(ed: *Editor) void {
     if (ed.picker) |p| p.sync();
     ed.tick();
 }
 
-test "run errors: a failing run fills the quickfix picker; j/k follow, Enter closes" {
+test "run errors: a failing run fills the quickfix picker; j/k preview, Enter goes" {
     var ed = try testEditor("");
     defer ed.deinit();
     ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
@@ -6500,18 +8275,23 @@ test "run errors: a failing run fills the quickfix picker; j/k follow, Enter clo
     try testing.expectEqual(.picker_normal, ed.mode); // quickfix starts in normal mode
     try testing.expectEqual(null, ed.popup);
     settlePicker(&ed);
-    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
-    try testing.expectEqual(3, ed.cursorLine());
-    try testing.expectEqual(6, ed.view.cursor - ed.text().lineStart(3));
-    try ed.feed("j"); // the editor follows the list
+    // A picker like any other: each row has its file and line number, the
+    // preview shows the place, and the editor stays put until Enter.
+    try testing.expectEqualStrings("src/main.zig:4", ed.picker.?.itemAt(0).?.detail);
+    try testing.expectEqualStrings("src/Editor.zig:2", ed.picker.?.itemAt(1).?.detail);
+    try testing.expectEqual(3, ed.picker.?.preview.focus_line);
+    try testing.expectEqual(null, ed.buffer.path);
+    try ed.feed("j");
     settlePicker(&ed);
-    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/Editor.zig"));
-    try testing.expectEqual(1, ed.cursorLine());
+    try testing.expectEqual(1, ed.picker.?.preview.focus_line);
+    try testing.expectEqual(null, ed.buffer.path);
     try ed.feed("k");
     settlePicker(&ed);
     try ed.feed("<CR>");
     try testing.expectEqual(null, ed.picker);
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
+    try testing.expectEqual(3, ed.cursorLine());
+    try testing.expectEqual(6, ed.view.cursor - ed.text().lineStart(3));
     try ed.feed("j"); // a normal j again
     try testing.expectEqual(4, ed.cursorLine());
     // ]q / [q without the picker.
@@ -6519,8 +8299,8 @@ test "run errors: a failing run fills the quickfix picker; j/k follow, Enter clo
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/Editor.zig"));
     try ed.feed("[q");
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
-    // SPC x x reopens at the current entry; i types to filter; q closes.
-    try ed.feed("<Space>xx");
+    // SPC f q reopens at the current entry; i types to filter; q closes.
+    try ed.feed("<Space>fq");
     settlePicker(&ed);
     try testing.expectEqual(0, ed.picker.?.selected);
     try ed.feed("itwo");
@@ -6533,7 +8313,7 @@ test "run errors: a failing run fills the quickfix picker; j/k follow, Enter clo
 test "pickers: Esc moves from typing to normal mode, j/k move, q closes" {
     var ed = try testEditor("alpha\nbeta\ngamma");
     defer ed.deinit();
-    try ed.feed("<Space>ss");
+    try ed.feed("<Space>fl");
     try testing.expectEqual(.picker, ed.mode); // buffer lines start typing
     try ed.feed("a<Esc>");
     try testing.expectEqual(.picker_normal, ed.mode);
@@ -6552,7 +8332,7 @@ test "quickfix: Ctrl-q sends a picker's results" {
     var ed = try testEditor("");
     defer ed.deinit();
     try ed.openFile("src/pairs.zig");
-    try ed.feed("<Space>sssurround");
+    try ed.feed("<Space>flsurround");
     ed.picker.?.sync();
     const n = ed.picker.?.snap.len;
     try testing.expect(n > 1);
@@ -6575,7 +8355,7 @@ test "command editor: multi-line with vim editing; Enter runs, Esc cancels" {
     try ed.feed("echo one<CR>echo two<Esc>");
     try ed.feed("ggA; echo three<Esc>"); // plain vim editing
     try expectText(&ed, "echo one; echo three\necho two");
-    try ed.feed("<Space>bn"); // leader menus wait until it closes
+    try ed.feed("<Space>be"); // leader menus wait until it closes
     try testing.expect(ed.cmd_float != null);
     try ed.feed("<CR>"); // normal mode: run it
     try testing.expectEqual(null, ed.cmd_float);
@@ -6634,10 +8414,12 @@ test "projects: each window's pickers, git and runner use its file's project" {
     try ed.feed("<Space><Space>");
     try testing.expect(std.mem.endsWith(u8, ed.picker_root, "/beta"));
     try ed.feed("<Esc><Esc><Space>rr");
-    try testing.expectEqualStrings("", ed.search_prompt.?.input.items());
-    try ed.feed("<Esc><Space>wh<Space>rr"); // back in alpha's window
-    try testing.expectEqualStrings("echo alpha", ed.search_prompt.?.input.items());
-    try ed.feed("<Esc>");
+    settlePicker(&ed);
+    try testing.expectEqual(0, ed.picker.?.rowCount());
+    try ed.feed("<Esc><Esc><Space>wh<Space>rr"); // back in alpha's window
+    settlePicker(&ed);
+    try testing.expectEqualStrings("echo alpha", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("<Esc><Esc>");
 }
 
 test "open in: Ctrl-v / Ctrl-s / Tab menu split; SPC p p into a split" {
@@ -6773,7 +8555,7 @@ test "signature help: the active parameter, closed by )" {
 test "zoom keys request a size change" {
     var ed = try testEditor("abc");
     defer ed.deinit();
-    try ed.feed("<Space>t+");
+    try ed.feed("<Space>t=");
     try testing.expectEqual(1, ed.zoom_request);
     try ed.feed("<Space>t-<Space>t-");
     try testing.expectEqual(-1, ed.zoom_request);
@@ -6820,7 +8602,7 @@ test "snippet: one more Tab after the call goes to the end, adding the ;" {
     try testing.expectEqual(null, ed.snippet);
 }
 
-test "formatting: SPC c f, one undo step, format on save, SPC t f" {
+test "formatting: SPC l f, one undo step, format on save, SPC t f" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -6834,7 +8616,7 @@ test "formatting: SPC c f, one undo step, format on save, SPC t f" {
     defer ed.deinit();
     try ed.openFile(path);
     try ed.feed("jj"); // on "return;"
-    try ed.feed("<Space>cf");
+    try ed.feed("<Space>lf");
     if (ed.message.kind == .err) return error.SkipZigTest; // no zig fmt here
     try expectText(&ed, "const x = 1;\nfn f() void {\n    return;\n}");
     try testing.expectEqual(2, ed.cursorLine()); // still on "return;"
@@ -6842,13 +8624,13 @@ test "formatting: SPC c f, one undo step, format on save, SPC t f" {
     try expectText(&ed, "const  x=1;\nfn f() void {\nreturn;\n}");
 
     // Saving formats first.
-    try ed.feed("<Space>fs");
+    try ed.feed("<Space>s");
     const saved = try tmp.dir.readFileAlloc(io, "m.zig", gpa, .limited(1024));
     defer gpa.free(saved);
     try testing.expectEqualStrings("const x = 1;\nfn f() void {\n    return;\n}\n", saved);
 
     // Off: saved as typed.
-    try ed.feed("<Space>tfggiconst  y=2;<CR><Esc><Space>fs");
+    try ed.feed("<Space>tfggiconst  y=2;<CR><Esc><Space>s");
     const raw = try tmp.dir.readFileAlloc(io, "m.zig", gpa, .limited(1024));
     defer gpa.free(raw);
     try testing.expect(std.mem.startsWith(u8, raw, "const  y=2;\n"));
@@ -7310,7 +9092,7 @@ test "mini.jump: f and t reach across lines; ; repeats" {
     try ed.feed("fx");
     try expectCursor(&ed, 1, 4);
     try testing.expect(ed.find_shown);
-    try ed.feed(";");
+    try ed.feed(".");
     try expectCursor(&ed, 2, 3);
     try ed.feed("Fa");
     try expectCursor(&ed, 0, 0);
@@ -7331,7 +9113,7 @@ test "mini.bracketed: conflict markers and comment blocks; trailing whitespace" 
     try testing.expectEqual(3, ed.cursorLine());
     try ed.feed("]c");
     try testing.expectEqual(6, ed.cursorLine());
-    try ed.feed("<Space>cw");
+    try ed.feed("<Space>lw");
     try expectText(&ed, "x\n<<<<<<< HEAD\na\n=======\nb\n>>>>>>> other\n# note\ny");
     try ed.feed("u");
     try testing.expect(std.mem.startsWith(u8, ed.text().slice(0, 3), "x  "));
@@ -7355,7 +9137,7 @@ test "notifications: toasts expire, progress updates in place, history keeps bot
     ed.pruneToasts();
     try testing.expectEqual(0, ed.toasts.items.len);
     ed.setMessage(.err, "oops", .{});
-    try ed.feed("<Space>sm");
+    try ed.feed("<Space>fn");
     settlePicker(&ed);
     try testing.expectEqualStrings("oops", ed.picker.?.itemAt(0).?.text);
     try testing.expectEqualStrings("pushed", ed.picker.?.itemAt(1).?.text);
@@ -7401,7 +9183,7 @@ test "smooth scrolling: the offset follows a scroll and glides to zero" {
     for (0..80) |_| ed.animate(0.016);
     try testing.expectEqual(0, ed.view.scroll_offset);
     // Another buffer in the window is not a scroll.
-    try ed.feed("<Space>bN");
+    try ed.feed("<Space>be");
     ed.animate(0.016);
     try testing.expectEqual(0, ed.view.scroll_offset);
 }
@@ -7507,4 +9289,958 @@ test "wheel: fractions of a line show at once, settle on a whole line, stop at t
     try testing.expectEqual(3, ed.view.top);
     try testing.expectEqual(0, ed.view.drawOffset());
     try testing.expect(!ed.wantsFrames());
+}
+
+test "QQ quits without asking, even with unsaved changes; Qq still records" {
+    var ed = try testEditor("one");
+    defer ed.deinit();
+    try ed.feed("Qqxx");
+    try testing.expectEqual('q', ed.macro_register.?);
+    try ed.feed("Q");
+    try testing.expect(!ed.should_quit);
+    try ed.feed("QQ");
+    try testing.expect(ed.should_quit);
+}
+
+test "ghost lines: o and O open a line in the text next to them" {
+    // Rows: a, [gone 1], [gone 2], "  b", c
+    var ed = try ghostEditor("a\ngone 1\ngone 2\n  b\nc", "a\n  b\nc");
+    defer ed.deinit();
+    try ed.feed("jj");
+    try testing.expectEqualStrings("gone 2", ed.ghostText(ed.ghost.?.line, ed.ghost.?.k));
+    try ed.feed("ox<Esc>"); // before the line below them, with its indent
+    try expectText(&ed, "a\n  x\n  b\nc");
+    try testing.expectEqual(null, ed.ghost);
+    try ed.feed("u");
+    try expectText(&ed, "a\n  b\nc");
+    try ed.feed("ggj");
+    try testing.expect(ed.ghost != null);
+    try ed.feed("Oy<Esc>"); // after the line above them, with its indent
+    try expectText(&ed, "a\ny\n  b\nc");
+    // Other edits are still refused there.
+    try ed.feed("u");
+    try ed.feed("ggjdd");
+    try expectText(&ed, "a\n  b\nc");
+}
+
+test "quickfix: without a run it is the project's live errors; a run's list takes over until cleared" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("src/pairs.zig");
+    var live = [_]QuickfixItem{
+        .{ .path = @constCast("src/main.zig"), .line = 4, .col = 0, .text = @constCast("elsewhere") },
+        .{ .path = @constCast("src/pairs.zig"), .line = 10, .col = 2, .text = @constCast("first here") },
+        .{ .path = @constCast("src/pairs.zig"), .line = 30, .col = 0, .text = @constCast("second here") },
+    };
+    ed.live_errors_override = &live;
+    // ]q: by the cursor, this file first, then the others.
+    try ed.feed("]q");
+    try testing.expectEqual(10, ed.cursorLine());
+    try ed.feed("]q");
+    try testing.expectEqual(30, ed.cursorLine());
+    try ed.feed("[q");
+    try testing.expectEqual(10, ed.cursorLine());
+    try ed.feed("]q]q");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/main.zig"));
+    try testing.expectEqual(4, ed.cursorLine());
+    // The list is live: a fixed error is gone the next time.
+    ed.live_errors_override = live[1..];
+    try ed.feed("<Space>fq");
+    settlePicker(&ed);
+    try testing.expectEqual(2, ed.picker.?.rowCount());
+    try testing.expectEqualStrings("src/pairs.zig:11", ed.picker.?.itemAt(0).?.detail);
+    try ed.feed("q");
+    // A list of your own stays, whatever the errors are, until x in the quickfix picker.
+    try ed.newQuickfix("mine");
+    try ed.addQuickfix("src/main.zig", 1, 0, "picked");
+    try ed.feed("]q");
+    try testing.expectEqual(1, ed.cursorLine());
+    try testing.expectEqual(1, ed.quickfix.items.len);
+    try ed.feed("<Space>fqx]q");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/pairs.zig"));
+    try testing.expectEqual(10, ed.cursorLine());
+}
+
+test "colour wheel: SPC l c edits the colour at the cursor; Enter writes, Esc leaves it, one undo" {
+    var ed = try testEditor("a = #ff0000; b = 0x0000FF;");
+    defer ed.deinit();
+    try ed.feed("<Space>lc");
+    try testing.expect(ed.color_picker != null);
+    try testing.expectEqual(4, ed.view.cursor); // on the literal
+    try ed.feed("60l<CR>"); // red, 120 degrees round: green
+    try expectText(&ed, "a = #00ff00; b = 0x0000FF;");
+    try testing.expectEqual(null, ed.color_picker);
+    try ed.feed("u");
+    try expectText(&ed, "a = #ff0000; b = 0x0000FF;");
+    // From past the first literal: the next one, written back in its form.
+    try ed.feed("$<Space>lc");
+    try ed.feed("50j<Esc>"); // changed, then cancelled
+    try expectText(&ed, "a = #ff0000; b = 0x0000FF;");
+    try ed.feed("fb<Space>lc25Jy<CR>");
+    try expectText(&ed, "a = #ff0000; b = 0x000080;");
+    try testing.expectEqualStrings("0x000080", ed.registers.get(null).?.text);
+    // Keys don't leak to the editor while it is open.
+    try ed.feed("<Space>lcdd");
+    try expectText(&ed, "a = #ff0000; b = 0x000080;");
+    try ed.feed("q");
+    try ed.feed("ggOno colours here<Esc><Space>lc");
+    try testing.expectEqual(null, ed.color_picker);
+}
+
+test "SPC ; runs a one-off shell command: empty prompt, survives being cleared, leaves the runner alone" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
+    try ed.feed("<Space>;");
+    try testing.expectEqual(PromptKind.run_command, ed.search_prompt.?.kind);
+    try testing.expectEqualStrings("", ed.search_prompt.?.input.items());
+    // Typing, deleting it all, and one more <BS>: still open.
+    try ed.feed("ab<BS><BS><BS><BS>");
+    try testing.expect(ed.search_prompt != null);
+    try ed.feed("echo once<CR>");
+    waitForRun(&ed);
+    try testing.expectEqualStrings("echo once", ed.run_command.?);
+    try ed.feed("q");
+    // Not one of the runner's commands: its list is still empty.
+    try ed.feed("<Space>rr");
+    settlePicker(&ed);
+    try testing.expectEqual(0, ed.picker.?.rowCount());
+    try ed.feed("<Esc><Esc>");
+    // The search prompt still closes on <BS> when empty.
+    try ed.feed("/<BS>");
+    try testing.expectEqual(null, ed.search_prompt);
+}
+
+test "file browser: new folder and file, rename, move, copy and paste, delete" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "alpha\n" });
+    try tmp.dir.createDirPath(io, "sub");
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const exists = struct {
+        fn at(d: Io.Dir, name: []const u8) bool {
+            d.access(testing.io, name, .{}) catch return false;
+            return true;
+        }
+    }.at;
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    const a = try std.fmt.allocPrint(gpa, "{s}/a.txt", .{base});
+    defer gpa.free(a);
+    try ed.openFile(a);
+    try ed.feed("<Space>.<Esc>"); // the browser, in normal mode
+    settlePicker(&ed);
+    try testing.expectEqual(.browse, ed.picker.?.kind);
+
+    try ed.feed("onewdir<CR>"); // o: a folder; back in the browser, on it
+    settlePicker(&ed);
+    try testing.expect(exists(tmp.dir, "newdir"));
+    try testing.expectEqualStrings("newdir/", ed.picker.?.itemAt(ed.picker.?.selected).?.text);
+
+    try ed.feed("ggjj"); // newdir/, sub/, a.txt
+    settlePicker(&ed);
+    try testing.expectEqualStrings("a.txt", ed.picker.?.itemAt(ed.picker.?.selected).?.text);
+    try ed.feed("yyp"); // copy, paste beside itself
+    settlePicker(&ed);
+    try testing.expect(exists(tmp.dir, "a copy.txt"));
+
+    try ed.feed("r<C-u>b.txt<CR>"); // rename the copy (selected after the paste)
+    settlePicker(&ed);
+    try testing.expect(exists(tmp.dir, "b.txt"));
+    try testing.expect(!exists(tmp.dir, "a copy.txt"));
+
+    // Move the open file into sub/: its buffer follows.
+    try ed.feed("gg");
+    settlePicker(&ed);
+    while (!std.mem.eql(u8, ed.picker.?.itemAt(ed.picker.?.selected).?.text, "a.txt")) {
+        try ed.feed("j");
+        settlePicker(&ed);
+    }
+    try ed.feed("m<C-u>sub/a.txt<CR>");
+    settlePicker(&ed);
+    try testing.expect(exists(tmp.dir, "sub/a.txt"));
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "sub/a.txt"));
+    try testing.expect(std.mem.endsWith(u8, ed.browse_dir.items, "/sub"));
+
+    // Delete asks; No keeps, Yes removes and closes its buffer.
+    try ed.feed("x");
+    try testing.expectEqual(.confirm_remove, ed.picker.?.kind);
+    settlePicker(&ed);
+    try ed.feed("<CR>"); // "No" is first
+    settlePicker(&ed);
+    try testing.expect(exists(tmp.dir, "sub/a.txt"));
+    try ed.feed("ddj<CR>");
+    settlePicker(&ed);
+    try testing.expect(!exists(tmp.dir, "sub/a.txt"));
+    try testing.expectEqual(null, ed.buffer.path);
+    // Esc in a prompt goes back to the browser.
+    try ed.feed("nxyz<Esc>");
+    try testing.expectEqual(.browse, ed.picker.?.kind);
+    try ed.feed("q");
+}
+
+test "buffer picker: x closes the selected buffer in place; pickers take a visual selection" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("src/pairs.zig");
+    try ed.openFile("src/format.zig");
+    try ed.feed("<Space>,<Esc>");
+    settlePicker(&ed);
+    try testing.expectEqualStrings("src/pairs.zig", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("x");
+    settlePicker(&ed);
+    try testing.expectEqual(1, ed.buffers.items.len);
+    try testing.expectEqual(1, ed.picker.?.rowCount());
+    try testing.expectEqual(.picker_normal, ed.mode);
+    try ed.feed("q");
+    // Visual SPC SPC / SPC /: the selection is the query.
+    try ed.feed("<Space>beihello @import<Esc>0viw<Space><Space>");
+    try testing.expectEqual(.files, ed.picker.?.kind);
+    try testing.expectEqualStrings("hello", ed.picker.?.query.items());
+    try ed.feed("<Esc><Esc>wviW<Space>/");
+    try testing.expectEqual(.grep, ed.picker.?.kind); // not the symbols picker
+    try testing.expectEqualStrings(" @import", ed.picker.?.query.items());
+    try ed.feed("<Esc><Esc>");
+}
+
+test "marks: m sets, ' and ` go (also as motions), SPC f m lists; global marks cross files" {
+    var ed = try testEditor("one\n  two\nthree\nfour");
+    defer ed.deinit();
+    try ed.feed("jwma"); // on "two"
+    try ed.feed("G'a");
+    try expectCursor(&ed, 1, 2);
+    try ed.feed("gg`a");
+    try expectCursor(&ed, 1, 2);
+    try ed.feed("ggOzero<Esc>"); // marks move with the text
+    try ed.feed("G'a");
+    try testing.expectEqual(2, ed.cursorLine());
+    try ed.feed("Gd'a"); // linewise, as a motion
+    try expectText(&ed, "zero\none");
+    try ed.feed("'z");
+    try testing.expectEqual(.info, ed.message.kind);
+
+    try ed.feed("mB"); // a global mark, here in the scratch buffer
+    try ed.openFile("src/pairs.zig");
+    try ed.feed("5jmc");
+    try ed.feed("<Space>fm");
+    settlePicker(&ed);
+    try testing.expectEqual(2, ed.picker.?.rowCount()); // B and this file's c
+    try ed.feed("q'B");
+    try testing.expectEqual(null, ed.buffer.path); // back in the scratch buffer
+}
+
+test "pickers: registers paste, undo history travels the tree, help finds keys" {
+    var ed = try testEditor("alpha beta");
+    defer ed.deinit();
+    try ed.feed("\"ayiww\"byiw");
+    try ed.feed("<Space>fy");
+    settlePicker(&ed);
+    const p = ed.picker.?;
+    var found: ?usize = null;
+    for (0..p.rowCount()) |row| if (std.mem.eql(u8, p.itemAt(row).?.detail, "\"a")) {
+        found = row;
+    };
+    for (0..found.?) |_| try ed.feed("j");
+    try ed.feed("<CR>");
+    try expectText(&ed, "alpha balphaeta");
+
+    // Undo history: two more states, then back to an earlier one and forward
+    // to a branch that plain redo could no longer reach.
+    try ed.feed("u");
+    try expectText(&ed, "alpha beta");
+    try ed.feed("x"); // "alpha eta": a second branch from the same state
+    try ed.feed("<Space>fu");
+    settlePicker(&ed);
+    try testing.expectEqual(3, ed.picker.?.rowCount()); // opened, the paste, the x
+    try ed.feed("j<CR>"); // the paste's state
+    try expectText(&ed, "alpha balphaeta");
+    try ed.feed("<Space>fuG<CR>"); // the file as opened
+    try expectText(&ed, "alpha beta");
+
+    try ed.feed("<Space>fkcomment / un");
+    settlePicker(&ed);
+    const h = ed.picker.?;
+    try testing.expect(h.rowCount() > 0);
+    try testing.expect(std.mem.indexOf(u8, h.itemAt(0).?.text, "Comment / uncomment") != null);
+    try ed.feed("<Esc><Esc>");
+}
+
+test "pickers: the list of pickers opens one; code actions and project symbols list the server's answers" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("<Space>f<Space>recent");
+    settlePicker(&ed);
+    try testing.expectEqualStrings("Recent files", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("<CR>");
+    try testing.expectEqual(.recent, ed.picker.?.kind);
+    try ed.feed("<Esc><Esc>");
+
+    try ed.showCodeActions(); // none: a message, no picker
+    try testing.expectEqual(null, ed.picker);
+    try ed.addCodeAction("Remove unused variable", "quickfix", try testing.allocator.dupe(u8, "{}"));
+    try ed.showCodeActions();
+    settlePicker(&ed);
+    try testing.expectEqualStrings("Remove unused variable", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("q");
+
+    try ed.openPicker(.workspace_symbols, "");
+    try ed.addWorkspaceSymbol("handleKey", "fn", "src/Editor.zig", 10, 4);
+    try ed.workspaceSymbolsArrived(); // the server answered: the list fills in
+    settlePicker(&ed);
+    try testing.expectEqualStrings("handleKey", ed.picker.?.itemAt(0).?.text);
+    try testing.expectEqualStrings("fn  src/Editor.zig:11", ed.picker.?.itemAt(0).?.detail);
+    try ed.feed("<Esc><CR>");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "src/Editor.zig"));
+    try testing.expectEqual(10, ed.cursorLine());
+}
+
+test "todo tags: SPC l t writes a comment tag and leaves you typing; Ctrl-t from insert mode" {
+    var ed = try testEditor("x = 1\n    ");
+    defer ed.deinit();
+    try ed.feed("<Space>lt");
+    settlePicker(&ed);
+    try ed.feed("j<CR>"); // FIXME
+    try testing.expectEqual(Mode.insert, ed.mode);
+    try ed.feed("later<Esc>");
+    try expectText(&ed, "x = 1 # FIXME: later\n    ");
+    try ed.feed("jA<C-t>");
+    settlePicker(&ed);
+    try ed.feed("<CR>now<Esc>"); // TODO, on the blank line, keeping its indent
+    try expectText(&ed, "x = 1 # FIXME: later\n    # TODO: now");
+    try ed.feed("u");
+    try expectText(&ed, "x = 1 # FIXME: later\n    ");
+}
+
+test "completion: arrow keys and Ctrl-n / Ctrl-p move through the suggestions" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ido");
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"doOne"},{"label":"doTwo"},{"label":"doThree"}]}
+    , .{});
+    defer reply.deinit();
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try testing.expectEqual(0, ed.completion.?.selected);
+    try ed.feed("<Down>");
+    try testing.expectEqual(1, ed.completion.?.selected);
+    try ed.feed("<Down>");
+    try testing.expectEqual(2, ed.completion.?.selected);
+    try ed.feed("<Up>");
+    try testing.expectEqual(1, ed.completion.?.selected);
+    try ed.feed("<C-n><C-p><C-p>");
+    try testing.expectEqual(0, ed.completion.?.selected);
+    try ed.feed("<Down><CR>");
+    try expectText(&ed, "doTwo");
+}
+
+test "completion: zls builtins after @ (the server's range starts after the @)" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ix = @");
+    // As zls answers: filterText without the @, the edit from after it.
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[
+        \\ {"label":"@as","filterText":"as","insertTextFormat":2,"textEdit":{"range":{"start":{"line":0,"character":5},"end":{"line":0,"character":5}},"newText":"as(${1:T}, ${2:x})"}},
+        \\ {"label":"@import","filterText":"import","insertTextFormat":2,"textEdit":{"range":{"start":{"line":0,"character":5},"end":{"line":0,"character":5}},"newText":"import(${1:path})"}}
+        \\]}
+    , .{});
+    defer reply.deinit();
+    try ed.showCompletion(ed.buffer, 4, reply.value); // our guess: the word starts at the @
+    try testing.expectEqual(2, ed.completion.?.shown.items.len);
+    try ed.feed("im");
+    try testing.expectEqual(1, ed.completion.?.shown.items.len);
+    try ed.feed("<Tab>");
+    try expectText(&ed, "x = @import(path)");
+}
+
+test "completion: a typo hides the list, fixing it brings the list back" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ido");
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"doOne"},{"label":"doTwo"}]}
+    , .{});
+    defer reply.deinit();
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try testing.expectEqual(2, ed.completionShown().?.shown.items.len);
+    try ed.feed("x"); // "dox": nothing matches
+    try testing.expectEqual(null, ed.completionShown());
+    try testing.expect(ed.completion != null); // kept, out of sight
+    try ed.feed("<CR>"); // keys act as if no popup were there...
+    try expectText(&ed, "dox\n");
+    try testing.expectEqual(null, ed.completion); // ...and leaving the word drops it
+    try ed.feed("<BS>");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try testing.expectEqual(null, ed.completionShown());
+    try ed.feed("<BS>T"); // fix the typo and go on: "doT"
+    try testing.expectEqual(1, ed.completionShown().?.shown.items.len);
+    try ed.feed("<BS><BS><BS>"); // back to nothing typed: every item
+    try testing.expectEqual(2, ed.completionShown().?.shown.items.len);
+    try ed.feed("d<Down><Tab>");
+    try expectText(&ed, "doTwo");
+}
+
+test "completion: letter case never rules a suggestion out" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("iAR");
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"arrayList"},{"label":"ArrayList"},{"label":"other"}]}
+    , .{});
+    defer reply.deinit();
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try testing.expectEqual(2, ed.completionShown().?.shown.items.len);
+    try ed.feed("<BS><BS><BS>arr");
+    try testing.expectEqual(2, ed.completionShown().?.shown.items.len);
+}
+
+test "r replaces the character under the cursor (with a count, and repeatable)" {
+    var ed = try testEditor("abcdef");
+    defer ed.deinit();
+    try ed.feed("rx");
+    try expectText(&ed, "xbcdef");
+    try ed.feed("l3ry");
+    try expectText(&ed, "xyyyef");
+    try ed.feed("0."); // the count goes with the repeat
+    try expectText(&ed, "yyyyef");
+    try ed.feed("$3rz"); // not enough characters left: nothing happens, as in vim
+    try expectText(&ed, "yyyyef");
+    try testing.expectEqual(Mode.normal, ed.mode);
+}
+
+test "new lines: a level deeper after an opening bracket; a closing bracket lines up with its opener" {
+    var ed = try testEditor("fn f() {\n    if (x) {\n    }\n}");
+    defer ed.deinit();
+    try ed.feed("oa;<Esc>"); // below a line that opens a block
+    try expectText(&ed, "fn f() {\n    a;\n    if (x) {\n    }\n}");
+    try ed.feed("jA<CR>b;<Esc>"); // Enter after `{`
+    try expectText(&ed, "fn f() {\n    a;\n    if (x) {\n        b;\n    }\n}");
+    try ed.feed("jOc;<Esc>"); // above the line that closes it
+    try expectText(&ed, "fn f() {\n    a;\n    if (x) {\n        b;\n        c;\n    }\n}");
+    try ed.feed("od;<Esc>"); // an ordinary line: the same indentation
+    try expectText(&ed, "fn f() {\n    a;\n    if (x) {\n        b;\n        c;\n        d;\n    }\n}");
+    // Typing the closer on a fresh line pulls it back to its opener's level.
+    try ed.feed("<Space>tp"); // (auto pairs off: type it by hand)
+    try ed.feed("Gowhile (y) {<CR>e;<CR>}<Esc>");
+    try expectText(&ed, "fn f() {\n    a;\n    if (x) {\n        b;\n        c;\n        d;\n    }\n}\nwhile (y) {\n    e;\n}");
+}
+
+test "indentation follows the file: two spaces, or tabs" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.c", .data = "int f() {\n  if (x) {\n    y();\n  }\n}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tabs.c", .data = "int f() {\n\tif (x) {\n\t\ty();\n\t}\n}\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const two = try std.fmt.allocPrint(gpa, "{s}/two.c", .{base});
+    defer gpa.free(two);
+    const tabs = try std.fmt.allocPrint(gpa, "{s}/tabs.c", .{base});
+    defer gpa.free(tabs);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.options.format_on_save = false;
+    try ed.openFile(two);
+    try testing.expectEqual(2, ed.indentWidth());
+    try ed.feed("joz();<Esc>"); // after `if (x) {`: four spaces, not eight
+    try testing.expectEqualStrings("    z();", ed.text().lineSlice(2));
+    try ed.feed(">>");
+    try testing.expectEqualStrings("      z();", ed.text().lineSlice(2));
+    try ed.feed("I<Tab><Esc>"); // a tab key is one level too
+    try testing.expectEqualStrings("        z();", ed.text().lineSlice(2));
+
+    try ed.openFile(tabs);
+    try testing.expect(ed.usesTabs());
+    try ed.feed("joz();<Esc>");
+    try testing.expectEqualStrings("\t\tz();", ed.text().lineSlice(2));
+    try ed.feed("<lt><lt>");
+    try testing.expectEqualStrings("\tz();", ed.text().lineSlice(2));
+}
+
+test "pickers that jump to a line centre it" {
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(testing.allocator);
+    for (0..200) |i| try lines.print(testing.allocator, "line {d}\n", .{i});
+    var ed = try testEditor(lines.items);
+    defer ed.deinit();
+    ed.setViewSize(20, 40);
+    try ed.feed("<Space>flline 150<CR>");
+    try testing.expectEqual(150, ed.cursorLine());
+    try testing.expectEqual(140, ed.view.top); // ten rows above it
+    try ed.feed("ggmaG<Space>fm<CR>"); // a mark near the top: as centred as the start allows
+    try testing.expectEqual(0, ed.cursorLine());
+    try testing.expectEqual(0, ed.view.top);
+}
+
+test "indent guide: appears once the cursor settles in a scope, hides at once on leaving it" {
+    var ed = try testEditor("fn a() {\n    x;\n    y;\n}\nfn b() {\n    z;\n}");
+    defer ed.deinit();
+    try ed.feed("j");
+    ed.tick();
+    try testing.expectEqual(null, ed.indent_guide); // not yet
+    try testing.expect(ed.wantsFrames()); // but a frame is due
+    ed.now = ed.timeAfter(indent_guide_delay_ms + 20);
+    ed.tickIndentGuide();
+    try testing.expectEqual(1, ed.indent_guide.?.scope.first);
+    // It grows out from the cursor's line, a row every step.
+    try testing.expectEqual(1, ed.indent_guide.?.origin);
+    try testing.expectEqual(0, ed.indent_guide.?.reach(ed.now));
+    try testing.expect(ed.wantsFrames()); // still growing
+    ed.now.nanoseconds += 10 * indent_guide_step_ms * std.time.ns_per_ms;
+    try testing.expectEqual(10, ed.indent_guide.?.reach(ed.now));
+    try testing.expect(!ed.wantsFrames()); // done: the block is two rows
+    // Within the block it stays; typing a line in it keeps it.
+    try ed.feed("j");
+    ed.tickIndentGuide();
+    try testing.expectEqual(1, ed.indent_guide.?.scope.first);
+    try ed.feed("ow;<Esc>");
+    ed.tickIndentGuide();
+    try testing.expectEqual(3, ed.indent_guide.?.scope.last);
+    // On into the next block: gone straight away, back after the delay.
+    try ed.feed("3j");
+    ed.tickIndentGuide();
+    try testing.expectEqual(null, ed.indent_guide);
+    ed.now = ed.timeAfter(10 * indent_guide_delay_ms); // well past the wait
+    ed.tickIndentGuide();
+    try testing.expectEqual(6, ed.indent_guide.?.scope.first);
+}
+
+test "file browser: typing a name ending in / makes a folder and goes into it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "alpha\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const a = try std.fmt.allocPrint(gpa, "{s}/a.txt", .{base});
+    defer gpa.free(a);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile(a);
+    try ed.feed("<Space>.");
+    settlePicker(&ed);
+    try ed.feed("newdir/"); // nothing matches, so the / is part of the name
+    try testing.expectEqualStrings("newdir/", ed.picker.?.query.items());
+    settlePicker(&ed);
+    try ed.feed("<CR>");
+    tmp.dir.access(io, "newdir", .{}) catch return error.FolderNotMade;
+    try testing.expectEqual(.browse, ed.picker.?.kind);
+    try testing.expect(std.mem.endsWith(u8, ed.browse_dir.items, "/newdir"));
+    // Nested, and a plain name is still a file.
+    try ed.feed("x/y/");
+    settlePicker(&ed);
+    try ed.feed("<CR>");
+    tmp.dir.access(io, "newdir/x/y", .{}) catch return error.FolderNotMade;
+    try ed.feed("note.txt");
+    settlePicker(&ed);
+    try ed.feed("<CR>");
+    try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "x/y/note.txt"));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(io, "newdir/x/y/note.txt", .{})); // not on disk until saved
+}
+
+test "git init: SPC g i makes the project a repository, and the open file becomes a git file" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    // Not under the checkout the tests run in (that is a repository already,
+    // and a project's git root is the outermost one found).
+    const dir = try std.fmt.allocPrint(gpa, "/tmp/zile-test-gitinit-{d}", .{Io.Timestamp.now(io, .real).nanoseconds});
+    defer gpa.free(dir);
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const file = try std.fmt.allocPrint(gpa, "{s}/a.txt", .{dir});
+    defer gpa.free(file);
+    const build = try std.fmt.allocPrint(gpa, "{s}/build.zig", .{dir});
+    defer gpa.free(build);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = "one\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = build, .data = "" });
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile(file);
+    try testing.expectEqual(null, ed.gitRoot()); // a build.zig project, no repository yet
+    try ed.feed("<Space>gi");
+    while (ed.git_job) |job| {
+        if (job.done.load(.acquire)) break;
+        std.Thread.yield() catch {};
+    }
+    ed.tick();
+    const dot_git = try std.fmt.allocPrint(gpa, "{s}/.git", .{dir});
+    defer gpa.free(dot_git);
+    Io.Dir.cwd().access(io, dot_git, .{}) catch return error.NoRepository;
+    try testing.expectEqualStrings(dir, ed.gitRoot().?);
+    try testing.expect(ed.buffer.project.?.git);
+    // Again: it says so instead of starting over.
+    try ed.feed("<Space>gi");
+    try testing.expectEqual(null, ed.git_job);
+    try testing.expect(std.mem.startsWith(u8, ed.message.text(), "already in a git repository"));
+}
+
+test "commands run in the folder of the code you are in" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const base = try std.fmt.allocPrint(gpa, "/tmp/zile-test-runfolder-{d}", .{Io.Timestamp.now(io, .real).nanoseconds});
+    defer gpa.free(base);
+    const cwd = Io.Dir.cwd();
+    defer cwd.deleteTree(io, base) catch {};
+    for ([_][]const u8{ "repo/.git", "repo/app/src", "repo/docs", "loose" }) |sub| {
+        const p = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, sub });
+        defer gpa.free(p);
+        try cwd.createDirPath(io, p);
+    }
+    const files = [_][2][]const u8{
+        .{ "repo/app/Makefile", "" },     .{ "repo/app/src/main.c", "int x;\n" },
+        .{ "repo/docs/notes.txt", "n\n" }, .{ "loose/x.txt", "x\n" },
+    };
+    for (files) |f| {
+        const p = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, f[0] });
+        defer gpa.free(p);
+        try cwd.writeFile(io, .{ .sub_path = p, .data = f[1] });
+    }
+    const at = struct {
+        fn path(g: std.mem.Allocator, b: []const u8, rel: []const u8) ![]u8 {
+            return std.fmt.allocPrint(g, "{s}/{s}", .{ b, rel });
+        }
+    }.path;
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.run_memory_path = try gpa.dupe(u8, "/nonexistent/run-commands");
+    // Inside the app: its Makefile's folder, not the repository's root.
+    const main_c = try at(gpa, base, "repo/app/src/main.c");
+    defer gpa.free(main_c);
+    try ed.openFile(main_c);
+    const folder = try ed.commandFolder();
+    defer gpa.free(folder);
+    const want_app = try at(gpa, base, "repo/app");
+    defer gpa.free(want_app);
+    try testing.expectEqualStrings(want_app, folder);
+    // No build file on the way up: the project root.
+    const notes = try at(gpa, base, "repo/docs/notes.txt");
+    defer gpa.free(notes);
+    try ed.openFile(notes);
+    const root = try ed.commandFolder();
+    defer gpa.free(root);
+    const want_root = try at(gpa, base, "repo");
+    defer gpa.free(want_root);
+    try testing.expectEqualStrings(want_root, root);
+    // A file in no project: its own folder, whatever project came before it.
+    const loose = try at(gpa, base, "loose/x.txt");
+    defer gpa.free(loose);
+    try ed.openFile(loose);
+    const own = try ed.commandFolder();
+    defer gpa.free(own);
+    const want_loose = try at(gpa, base, "loose");
+    defer gpa.free(want_loose);
+    try testing.expectEqualStrings(want_loose, own);
+    // Its runner history is its own too, not the project's from before.
+    const memory = try at(gpa, base, "run-commands");
+    defer gpa.free(memory);
+    gpa.free(ed.run_memory_path.?);
+    ed.run_memory_path = try gpa.dupe(u8, memory);
+    try ed.openFile(main_c);
+    try ed.feed("<Space>rrmake app<CR>");
+    waitForRun(&ed);
+    try ed.feed("q");
+    try ed.openFile(loose);
+    try ed.feed("<Space>rr");
+    settlePicker(&ed);
+    try testing.expectEqual(0, ed.picker.?.rowCount());
+    try ed.feed("<Esc><Esc>");
+    try ed.openFile(main_c);
+    try ed.feed("<Space>rr");
+    settlePicker(&ed);
+    try testing.expectEqualStrings("make app", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("<Esc><Esc>");
+    try ed.openFile(loose);
+    // And that is where the command really runs.
+    try ed.feed("<Space>;pwd<CR>");
+    waitForRun(&ed);
+    const out = try ed.run.?.screenText(gpa);
+    defer gpa.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, want_loose));
+    try testing.expectEqualStrings(want_loose, ed.run_root);
+    try ed.feed("q");
+}
+
+test "runner: Tab pulls a previous command into the query to append to or cut down" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.run_memory_path = try std.fs.path.join(gpa, &.{ dir, "run-commands" });
+    try ed.feed("<Space>rrecho hello<CR>");
+    waitForRun(&ed);
+    try ed.feed("q<Space>rr");
+    settlePicker(&ed);
+    try testing.expectEqualStrings("echo hello", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("<Esc><Tab>"); // from the list: into the query, typing again
+    try testing.expectEqual(Mode.picker, ed.mode);
+    try testing.expectEqualStrings("echo hello", ed.picker.?.query.items());
+    try ed.feed(" world<CR>"); // appended
+    waitForRun(&ed);
+    try testing.expectEqualStrings("echo hello world", ed.run_command.?);
+    // Newest first now; Tab, cut the " world" off again, and Enter runs
+    // what is left, which is the older command.
+    try ed.feed("q<Space>rr");
+    settlePicker(&ed);
+    try testing.expectEqualStrings("echo hello world", ed.picker.?.itemAt(0).?.text);
+    try ed.feed("<Tab><BS><BS><BS><BS><BS><BS><CR>"); // six: " world"
+    waitForRun(&ed);
+    try testing.expectEqualStrings("echo hello", ed.run_command.?);
+    // Cut down to something new: it runs as typed, not as the entry it resembles.
+    try ed.feed("q<Space>rr<Tab><BS><BS>xy<CR>");
+    waitForRun(&ed);
+    try testing.expectEqualStrings("echo helxy", ed.run_command.?);
+}
+
+test "snippet: Esc removes the arguments that were never filled in, with their commas" {
+    const gpa = testing.allocator;
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"doThing","insertText":"doThing(${1:path: Path}, ${2:opts: Opts}, ${3:last})$0","insertTextFormat":2}]}
+    , .{});
+    defer reply.deinit();
+
+    // Nothing filled in: the whole argument list goes.
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ido");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try ed.feed("<Tab>");
+    try expectText(&ed, "doThing(path: Path, opts: Opts, last)");
+    try ed.feed("<Esc>");
+    try expectText(&ed, "doThing()");
+    try testing.expectEqual(Mode.normal, ed.mode);
+    try testing.expectEqual(null, ed.snippet);
+    try testing.expectEqual(7, ed.view.cursor); // on the (
+    try ed.feed("u"); // one undo step for the whole insert
+    try expectText(&ed, "");
+
+    // The first one typed over: the rest go, and the comma after it.
+    try ed.feed("ido");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try ed.feed("<Tab>src<Esc>");
+    try expectText(&ed, "doThing(src)");
+
+    // Tabbed on to the second without typing: it goes (the first was left
+    // as it came); the third was never reached.
+    try ed.feed("S"); // start over on the line
+    try ed.feed("do");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try ed.feed("<Tab><Tab><Esc>");
+    try expectText(&ed, "doThing(path: Path)");
+}
+
+test "inlay hints: parsed from zls's answer, kept in place through edits, mapped to columns" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("const x = add(1, 2);\nconst s = \"zile\";");
+    defer ed.deinit();
+    ed.options.inlay_hints = true;
+    // As zls answers (labels, padding, byte columns).
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\[{"position":{"line":0,"character":7},"label":": u32","kind":1,"paddingLeft":false,"paddingRight":false},
+        \\ {"position":{"line":0,"character":14},"label":"a:","kind":2,"paddingLeft":false,"paddingRight":true},
+        \\ {"position":{"line":0,"character":17},"label":[{"value":"b"},{"value":":"}],"kind":2,"paddingRight":true},
+        \\ {"position":{"line":1,"character":7},"label":": *const [4:0]u8","kind":1},
+        \\ {"position":{"line":9,"character":0},"label":"off the end"},
+        \\ {"position":{"line":0,"character":2},"label":""}]
+    , .{});
+    defer reply.deinit();
+    var parsed: std.ArrayList(Buffer.Hint) = .empty;
+    defer {
+        for (parsed.items) |h| gpa.free(h.text);
+        parsed.deinit(gpa);
+    }
+    try Lsp.parseInlayHints(gpa, ed.text(), reply.value, &parsed);
+    try testing.expectEqual(4, parsed.items.len); // the empty label and the missing line are skipped
+    try testing.expectEqualStrings("b: ", parsed.items[2].text); // parts joined, padding added
+
+    try ed.takeInlayHints(ed.buffer, &parsed, 0, 1, ed.buffer.edit_version);
+    try testing.expectEqual(0, parsed.items.len); // the buffer has them now
+    var buf: [max_line_hints]LineHint = undefined;
+    const first = ed.lineHints(ed.buffer, 0, &buf);
+    try testing.expectEqual(3, first.len);
+    try testing.expectEqual(7, first[0].off);
+    // `x` ends at 7: the hint is in front of the byte at 7 (the space).
+    try testing.expectEqual(0, hintShift(first, 6));
+    try testing.expectEqual(5, hintShift(first, 7)); // ": u32"
+    try testing.expectEqual(5 + 3, hintShift(first, 14)); // + "a: "
+    try testing.expectEqual(5, hintShiftBefore(first, 14)); // a range ending at 14 stops before it
+    // And back: the screen column of a character after the hints.
+    const bytes = ed.text().lineSlice(0);
+    try testing.expectEqual(14, hintVisualToText(first, bytes, 14 + 5 + 3, 4)); // the `1`
+    try testing.expectEqual(7, hintVisualToText(first, bytes, 8, 4)); // on the first hint: the text after it
+
+    // Typing before a hint moves it on; deleting around it keeps it in the line.
+    try ed.feed("ggi// <Esc>");
+    const moved = ed.lineHints(ed.buffer, 0, &buf);
+    try testing.expectEqual(10, moved[0].off);
+    try ed.feed("0dw");
+    try testing.expectEqual(7, ed.lineHints(ed.buffer, 0, &buf)[0].off);
+    // Not on the line being typed on in insert mode.
+    try ed.feed("A");
+    try testing.expectEqual(0, ed.lineHints(ed.buffer, 0, &buf).len);
+    try testing.expectEqual(1, ed.lineHints(ed.buffer, 1, &buf).len);
+    try ed.feed("<Esc>");
+    try testing.expectEqual(3, ed.lineHints(ed.buffer, 0, &buf).len);
+
+    // A new answer for the lines replaces the old; one for stale text is dropped.
+    var again: std.ArrayList(Buffer.Hint) = .empty;
+    defer again.deinit(gpa);
+    try again.append(gpa, .{ .pos = 0, .text = try gpa.dupe(u8, "new ") });
+    const stale_version = ed.buffer.edit_version -% 1;
+    try ed.takeInlayHints(ed.buffer, &again, 0, 1, stale_version);
+    try testing.expectEqual(3, ed.lineHints(ed.buffer, 0, &buf).len); // dropped
+    gpa.free(again.items[0].text);
+    again.clearRetainingCapacity();
+    try again.append(gpa, .{ .pos = 0, .text = try gpa.dupe(u8, "new ") });
+    try ed.takeInlayHints(ed.buffer, &again, 0, 1, ed.buffer.edit_version);
+    try testing.expectEqual(1, ed.lineHints(ed.buffer, 0, &buf).len);
+    try testing.expectEqual(0, ed.lineHints(ed.buffer, 1, &buf).len);
+    // Off: nothing.
+    ed.options.inlay_hints = false;
+    try testing.expectEqual(0, ed.lineHints(ed.buffer, 0, &buf).len);
+}
+
+test "inlay hints: a click lands on the character it looks like it is on" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("const x = 1;");
+    defer ed.deinit();
+    var new: std.ArrayList(Buffer.Hint) = .empty;
+    defer new.deinit(gpa);
+    try new.append(gpa, .{ .pos = 7, .text = try gpa.dupe(u8, ": u8") });
+    try ed.takeInlayHints(ed.buffer, &new, 0, 0, ed.buffer.edit_version);
+    ed.clickCell(0, 6); // the `x`
+    try testing.expectEqual(6, ed.view.cursor);
+    ed.clickCell(0, 12); // after the hint: " = " begins at screen column 11
+    try testing.expectEqual(8, ed.view.cursor); // the `=` is at 8, screen column 12
+    ed.clickCell(0, 8); // on the hint: the text right after it
+    try testing.expectEqual(7, ed.view.cursor);
+}
+
+test "autopairs: Tab steps over a closing quote and bracket instead of inserting a tab" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.feed("ifoo(\"hi");
+    try expectText(&ed, "foo(\"hi\")");
+    try ed.feed("<Tab>"); // out of the quote
+    try testing.expectEqual(8, ed.view.cursor);
+    try ed.feed("<Tab>"); // out of the call
+    try testing.expectEqual(9, ed.view.cursor);
+    try ed.feed("<Tab>x"); // nothing to step over: a tab as usual
+    try expectText(&ed, "foo(\"hi\")   x"); // to the next tab stop
+    // An empty pair, and nested ones.
+    try ed.feed("<Esc>Sg([\"\"]");
+    try expectText(&ed, "g([\"\"])");
+    try ed.feed("<Esc>0f\"a<Tab><Tab><Tab>"); // inside the quotes: out of "", ], )
+    try testing.expectEqual(7, ed.view.cursor);
+    // A quote that opens a string isn't stepped over; nor is a closer at the
+    // start of a line (that is indentation).
+    try ed.feed("<Esc>S0 = \"abc\"<Esc>0f\"i<Tab>");
+    try expectText(&ed, "0 =     \"abc\"");
+    try ed.feed("<Esc>S}<Esc>0i<Tab>");
+    try expectText(&ed, "    }");
+    // Off with autopairs.
+    try ed.feed("<Esc><Space>tpSf(1)<Esc>i<Tab>"); // (S keeps the line's indentation)
+    try expectText(&ed, "    f(1 )");
+}
+
+test "f, t, F, T ignore letter case; ; and , repeat" {
+    var ed = try testEditor("xAbca\nDa");
+    defer ed.deinit();
+    try ed.feed("fa");
+    try expectCursor(&ed, 0, 1); // the capital A
+    try ed.feed(".");
+    try expectCursor(&ed, 0, 4);
+    try ed.feed("FA"); // a capital finds lower case too
+    try expectCursor(&ed, 0, 1);
+    try ed.feed("0dtA"); // till still works after an operator
+    try expectText(&ed, "Abca\nDa");
+    try ed.feed("u");
+    try ed.feed("fd"); // on to the next line: "Da"
+    try expectCursor(&ed, 1, 0);
+    try ed.feed("$dFa"); // back across the line to the previous a; F is exclusive: "a\nD" goes
+    try expectText(&ed, "xAbca");
+}
+
+test "completion: ( takes the selected suggestion's name, then opens the call" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"drawText","insertText":"drawText(${1:text}, ${2:x})$0","insertTextFormat":2},{"label":"other"}]}
+    , .{});
+    defer reply.deinit();
+    try ed.feed("idrawtex");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try testing.expectEqual(1, ed.completionShown().?.shown.items.len);
+    try ed.feed("(");
+    try expectText(&ed, "drawText()");
+    try testing.expectEqual(9, ed.view.cursor); // inside the parentheses
+    try testing.expectEqual(null, ed.completion);
+    // A plain item works the same; nothing to take when nothing matches.
+    try ed.feed("<Esc>Soth");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try ed.feed("(");
+    try expectText(&ed, "other()");
+    try ed.feed("<Esc>Szzz");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    try ed.feed("(");
+    try expectText(&ed, "zzz()");
+}
+
+test "o, O and Enter on a blank line indent like the code around it" {
+    var ed = try testEditor("fn f() {\n    if (x) {\n\n        y;\n    }\n}");
+    defer ed.deinit();
+    try ed.feed("ggjjoz<Esc>"); // below the blank line: the block's level, not column 0
+    try expectText(&ed, "fn f() {\n    if (x) {\n\n        z\n        y;\n    }\n}");
+    try ed.feed("ggjjOw<Esc>"); // above it
+    try expectText(&ed, "fn f() {\n    if (x) {\n        w\n\n        z\n        y;\n    }\n}");
+    try ed.feed("ggjjjA<CR>v<Esc>"); // Enter on the blank line
+    try expectText(&ed, "fn f() {\n    if (x) {\n        w\n\n        v\n        z\n        y;\n    }\n}");
+    // After a finished block, the level of the line closing it.
+    try ed.feed("Go<Esc>o}<Esc>");
+    // Nothing above: the code below it.
+    var top = try testEditor("\n\n    a;");
+    defer top.deinit();
+    try top.feed("ggox<Esc>");
+    try expectText(&top, "\n    x\n\n    a;");
+}
+
+test "completion: the exact name first, then shorter names, whatever order the server sent" {
+    const gpa = testing.allocator;
+    var ed = try testEditor("");
+    defer ed.deinit();
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"DrawTexture"},{"label":"DrawTextureV"},{"label":"DrawTextEx"},{"label":"DrawText"},{"label":"DrawTextCodepoint"}]}
+    , .{});
+    defer reply.deinit();
+    try ed.feed("idrawtext");
+    try ed.showCompletion(ed.buffer, 0, reply.value);
+    const c = ed.completionShown().?;
+    try testing.expectEqualStrings("DrawText", c.items[c.shown.items[0]].label);
+    // Not yet the whole name: the shortest of the equal matches leads.
+    try ed.feed("<BS>");
+    const d = ed.completionShown().?;
+    try testing.expectEqualStrings("DrawText", d.items[d.shown.items[0]].label);
+    try testing.expectEqualStrings("DrawTextEx", d.items[d.shown.items[1]].label);
+    try testing.expectEqualStrings("DrawTexture", d.items[d.shown.items[2]].label);
+    try ed.feed("<CR>"); // Enter takes the first one
+    try expectText(&ed, "DrawText");
 }

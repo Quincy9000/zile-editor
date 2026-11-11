@@ -163,6 +163,15 @@ pub fn queryChanged(p: *Picker) !void {
     p.top = 0;
 }
 
+/// Lists the source again, keeping the query (its items changed: a language
+/// server answered).
+pub fn refill(p: *Picker) !void {
+    const e = try p.startEngine(p.kind, p.activeQuery());
+    if (p.engine != p.shown) p.engine.destroy();
+    p.engine = e;
+    p.preview_for = null;
+}
+
 // ---------------------------------------------------------------------------
 // Results
 
@@ -210,13 +219,24 @@ pub fn createRow(p: *const Picker) ?usize {
     for (p.snap.slice()[0..@min(p.snap.len, 64)]) |r| {
         if (std.mem.eql(u8, p.shown.items.get(r.index).text, q)) return null;
     }
-    return p.snap.len;
+    return if (sources.createFirst(p.kind)) 0 else p.snap.len;
+}
+
+/// Which result `row` shows, or null for the create row (it may be the
+/// first row, with the results after it).
+fn resultAt(p: *const Picker, row: usize) ?usize {
+    var i = row;
+    if (p.createRow()) |c| if (c == 0 and p.snap.len > 0) {
+        if (row == 0) return null;
+        i = row - 1;
+    };
+    return if (i < p.snap.len) i else null;
 }
 
 /// The item at `row`, or null for the create row.
 pub fn itemAt(p: *const Picker, row: usize) ?*const Items.Item {
-    if (row >= p.snap.len) return null;
-    return p.shown.items.get(p.snap.results[row].index);
+    const i = p.resultAt(row) orelse return null;
+    return p.shown.items.get(p.snap.results[i].index);
 }
 
 pub fn move(p: *Picker, delta: isize) void {
@@ -241,14 +261,9 @@ pub fn updatePreview(p: *Picker) void {
         p.preview_for = null;
         return;
     };
-    const index = p.snap.results[p.selected].index;
+    const index = p.snap.results[p.resultAt(p.selected).?].index;
     if (p.preview_for == index) return;
     p.preview_for = index;
-    // Docked pickers move the editor instead of previewing.
-    if (sources.docked(p.kind)) {
-        sources.follow(p.kind, p.ed, item.*) catch |err| p.ed.setMessage(.err, "{s}", .{@errorName(err)});
-        return;
-    }
     sources.preview(p.kind, p.ed, item, &p.preview) catch |err| {
         p.preview.clear();
         p.preview.text.print(p.ed.gpa, "(preview failed: {s})", .{@errorName(err)}) catch {};

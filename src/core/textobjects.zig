@@ -355,14 +355,21 @@ fn parseTag(src: []const u8, lt: usize) ?Tag {
     const name_start = i;
     while (i < src.len and (std.ascii.isAlphanumeric(src[i]) or std.mem.indexOfScalar(u8, "-_:.", src[i]) != null)) i += 1;
     const name = src[name_start..i];
-    // Up to '>', skipping quoted attribute values.
+    // Up to '>', skipping quoted attribute values and JSX `{...}`.
     var in_quote: u8 = 0;
+    var depth: usize = 0;
     while (i < src.len) : (i += 1) {
         const b = src[i];
         if (in_quote != 0) {
             if (b == in_quote) in_quote = 0;
         } else if (b == '"' or b == '\'') {
             in_quote = b;
+        } else if (b == '{') {
+            depth += 1;
+        } else if (b == '}') {
+            depth -|= 1;
+        } else if (depth > 0) {
+            continue;
         } else if (b == '>') {
             return .{ .name = name, .end = i + 1, .closing = closing, .self_closing = src[i - 1] == '/' };
         } else if (b == '<') return null;
@@ -477,4 +484,169 @@ test "paragraph objects" {
     try testing.expectEqualStrings("a\nb", sliceOf(&t, paragraph(&t, 0, .inner)));
     try testing.expectEqualStrings("a\nb\n\n", sliceOf(&t, paragraph(&t, 0, .around)));
     try testing.expectEqualStrings("\n\nc", sliceOf(&t, paragraph(&t, 6, .around)));
+}
+
+// ---------------------------------------------------------------------------
+// Arguments (ia / aa): by the text alone, in any brackets.
+
+/// Whether the byte at `i` opens (`side` 0) or closes (1) a list. Angle
+/// brackets count only where they read as brackets (`Vec<T>`, `Map<K, V>`),
+/// not as comparisons or arrows (`a < b`, `->`, `=>`).
+fn listBracket(t: *const Text, i: usize, side: u1) bool {
+    const b = t.byteAt(i);
+    if (side == 0) {
+        if (b == '(' or b == '[' or b == '{') return true;
+        if (b != '<' or i == 0 or i + 1 >= t.len()) return false;
+        const prev = t.byteAt(i - 1);
+        const next = t.byteAt(i + 1);
+        return (classOf(prev, false) == .word or prev == ':') and next != ' ' and next != '=' and next != '<';
+    }
+    if (b == ')' or b == ']' or b == '}') return true;
+    if (b != '>' or i == 0) return false;
+    const prev = t.byteAt(i - 1);
+    return prev != '-' and prev != '=' and prev != ' ' and prev != '>' or (prev == '>' and listBracket(t, i - 1, 1));
+}
+
+/// How far back (in bytes) an argument's opening bracket is looked for.
+const argument_reach = 20_000;
+
+/// The bracket that opens the list around `pos` (the cursor on a bracket is
+/// inside its list).
+fn listOpen(t: *const Text, pos: usize) ?usize {
+    if (pos < t.len() and listBracket(t, pos, 0)) return pos;
+    var depth: usize = 0;
+    var i = @min(pos, t.len());
+    const stop = pos -| argument_reach;
+    while (i > stop) {
+        i -= 1;
+        if (listBracket(t, i, 1)) {
+            depth += 1;
+        } else if (listBracket(t, i, 0)) {
+            if (depth == 0) return i;
+            depth -= 1;
+        }
+    }
+    return null;
+}
+
+/// `ia` / `aa`: the argument at the cursor, by the text alone, so it works
+/// in any file and any brackets: `(a, b)`, `[1, 2]`, `{ .x = 1, .y = 2 }`,
+/// `<K, V>`. An argument is whatever lies between the list's bracket and a
+/// comma, or between two commas, at that list's own level (commas inside
+/// nested brackets or strings don't count; `:` and `=` are just text).
+///
+/// `ia` is the argument without the space around it. `aa` adds what makes
+/// the list whole again without it: the comma after it and the space that
+/// follows (or, for the last argument, the comma before it); an argument on
+/// lines of its own goes with those lines. Outside any list, the first
+/// argument of the next one ahead.
+pub fn argument(t: *const Text, pos: usize, scope: Scope) ?Range {
+    if (t.len() == 0) return null;
+    const open = listOpen(t, pos) orelse blk: {
+        // Not in a list: the next one ahead.
+        const limit = t.lineEnd(@min(t.lineCount() - 1, t.lineOf(pos) + seek_lines));
+        var i = pos;
+        while (i < limit) : (i += 1) if (listBracket(t, i, 0)) break :blk i;
+        return null;
+    };
+    const at = @max(pos, open + 1);
+
+    // Walk the list: the commas at its own level, and its closing bracket.
+    var seg_start = open + 1; // start of the argument holding the cursor
+    var prev_comma: ?usize = null; // the comma before it
+    var seg_end: ?usize = null; // the comma or bracket ending it
+    var next_comma = false;
+    var depth: usize = 0;
+    var in_quote: u8 = 0;
+    var i = open + 1;
+    while (i < t.len()) : (i += 1) {
+        const b = t.byteAt(i);
+        if (in_quote != 0) {
+            if (b == '\\') i += 1 else if (b == in_quote) in_quote = 0;
+            continue;
+        }
+        if (b == '"' or b == '`') {
+            in_quote = b;
+        } else if (b == '\'') {
+            // A character literal (it closes within a few bytes), not a
+            // Rust lifetime or an apostrophe.
+            const end = @min(t.len(), i + 5);
+            if (std.mem.indexOfScalarPos(u8, t.slice(0, end), i + 1, '\'') != null) in_quote = b;
+        } else if (listBracket(t, i, 0)) {
+            depth += 1;
+        } else if (listBracket(t, i, 1)) {
+            if (depth == 0) {
+                seg_end = i;
+                break;
+            }
+            depth -= 1;
+        } else if (b == ',' and depth == 0) {
+            if (i >= at) {
+                seg_end = i;
+                next_comma = true;
+                break;
+            }
+            prev_comma = i;
+            seg_start = i + 1;
+        }
+    }
+    const end = seg_end orelse return null; // unclosed
+    if (at > end) return null;
+
+    // Without the blanks (and line breaks) around it.
+    var a = seg_start;
+    var z = end;
+    while (a < z and std.ascii.isWhitespace(t.byteAt(a))) a += 1;
+    while (z > a and std.ascii.isWhitespace(t.byteAt(z - 1))) z -= 1;
+    if (a == z) return null; // nothing there (after a trailing comma)
+    if (scope == .inner) return .{ .start = a, .end = z };
+
+    if (next_comma) {
+        // With its comma. On lines of its own: those lines.
+        const first = t.lineOf(a);
+        const last = t.lineOf(end);
+        if (isBlank(t, t.lineStart(first), a) and isBlank(t, end + 1, t.lineEnd(last))) {
+            return .{ .start = t.lineStart(first), .end = t.lineEnd(last), .linewise = true };
+        }
+        var e = end + 1;
+        while (e < t.len() and (t.byteAt(e) == ' ' or t.byteAt(e) == '\t')) e += 1;
+        return .{ .start = a, .end = e };
+    }
+    // The last one: with the comma before it, if there is one.
+    return .{ .start = prev_comma orelse a, .end = z };
+}
+
+fn expectArgument(src: []const u8, cursor: []const u8, scope: Scope, expected: ?[]const u8) !void {
+    const gpa = std.testing.allocator;
+    var t = try Text.init(gpa, src);
+    defer t.deinit(gpa);
+    const pos = std.mem.indexOf(u8, src, cursor).?;
+    const r = argument(&t, pos, scope);
+    if (expected) |e| {
+        try std.testing.expectEqualStrings(e, src[r.?.start..r.?.end]);
+    } else try std.testing.expectEqual(null, r);
+}
+
+test "arguments: any brackets, nested lists and strings, first / middle / last" {
+    const call = "f(alpha, g(b, c), \"x, y\", last: u8)";
+    try expectArgument(call, "alpha", .inner, "alpha");
+    try expectArgument(call, "alpha", .around, "alpha, ");
+    try expectArgument(call, "g(b", .inner, "g(b, c)"); // on the callee: the whole call
+    try expectArgument(call, "b, c", .around, "b, ");
+    try expectArgument(call, "c)", .around, ", c");
+    try expectArgument(call, "x, y", .inner, "\"x, y\"");
+    try expectArgument(call, "u8", .inner, "last: u8"); // `:` is just text
+    try expectArgument(call, "last", .around, ", last: u8");
+    try expectArgument(call, "f(", .inner, "alpha"); // before the list: its first
+    try expectArgument("[1, 2, 3]", "2", .around, "2, ");
+    try expectArgument(".{ .x = 1, .y = 2 }", ".y", .inner, ".y = 2");
+    try expectArgument("Map<K, Vec<T>> = a < b, c", "K", .around, "K, ");
+    try expectArgument("Map<K, Vec<T>> = a < b, c", "T", .inner, "T");
+    try expectArgument("if (a < b and c > d) x", "b and", .inner, "a < b and c > d");
+    try expectArgument("f(only)", "only", .around, "only");
+    try expectArgument("f()", "f", .inner, null);
+    // One per line: `aa` takes the line.
+    try expectArgument("f(\n    one,\n    two,\n)", "one", .around, "    one,");
+    try expectArgument("f(\n    one,\n    two\n)", "two", .around, ",\n    two");
+    try expectArgument("f(\n    one,\n    two,\n)", "one", .inner, "one");
 }

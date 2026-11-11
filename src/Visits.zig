@@ -16,6 +16,9 @@ pub const Entry = struct {
     count: u32,
     /// Unix seconds of the last visit.
     last: i64,
+    /// The order of visits within this run (0: not visited in it), to tell
+    /// apart two in the same second.
+    seq: u64 = 0,
 };
 
 /// More than this and the lowest-ranked entries are dropped.
@@ -25,6 +28,7 @@ entries: std.ArrayList(Entry) = .empty,
 loaded: bool = false,
 /// Visits recorded since the last save.
 unsaved: usize = 0,
+visit_count: u64 = 0,
 
 pub fn deinit(v: *Visits, gpa: Allocator) void {
     for (v.entries.items) |e| gpa.free(e.path);
@@ -42,14 +46,16 @@ pub fn score(e: Entry, now: i64) f64 {
 
 pub fn record(v: *Visits, gpa: Allocator, path: []const u8, now: i64) Allocator.Error!void {
     v.unsaved += 1;
+    v.visit_count += 1;
     for (v.entries.items) |*e| if (std.mem.eql(u8, e.path, path)) {
         e.count +|= 1;
         e.last = now;
+        e.seq = v.visit_count;
         return;
     };
     const owned = try gpa.dupe(u8, path);
     errdefer gpa.free(owned);
-    try v.entries.append(gpa, .{ .path = owned, .count = 1, .last = now });
+    try v.entries.append(gpa, .{ .path = owned, .count = 1, .last = now, .seq = v.visit_count });
 }
 
 /// Renames an entry (the file moved); a no-op if it isn't known.
@@ -71,6 +77,16 @@ pub fn rank(v: *Visits, now: i64) void {
             return if (sa != sb) sa > sb else a.last > b.last;
         }
     }.better);
+}
+
+/// Sorts the entries by when they were last opened, newest first (the
+/// recent-files list: the file just opened is at the top).
+pub fn rankRecent(v: *Visits) void {
+    std.mem.sort(Entry, v.entries.items, {}, struct {
+        fn newer(_: void, a: Entry, b: Entry) bool {
+            return if (a.last != b.last) a.last > b.last else a.seq > b.seq;
+        }
+    }.newer);
 }
 
 pub fn load(v: *Visits, gpa: Allocator, io: Io, path: []const u8) void {
@@ -115,4 +131,11 @@ test "recent beats frequent-but-old; counts add up" {
     try std.testing.expectEqualStrings("/mid", v.entries.items[1].path);
     try std.testing.expectEqual(2, v.entries.items[1].count);
     try std.testing.expectEqualStrings("/old", v.entries.items[2].path);
+    // By recency alone: the one just opened is first, whatever its count.
+    try v.record(gpa, "/old", now);
+    try v.record(gpa, "/mid", now); // the same second: the later visit wins
+    v.rankRecent();
+    try std.testing.expectEqualStrings("/mid", v.entries.items[0].path);
+    try std.testing.expectEqualStrings("/old", v.entries.items[1].path);
+    try std.testing.expectEqualStrings("/new", v.entries.items[2].path);
 }

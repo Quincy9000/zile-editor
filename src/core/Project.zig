@@ -21,7 +21,7 @@ pub fn name(p: *const Project) []const u8 {
 }
 
 /// Build files that mark a project root when there is no git.
-const markers = [_][]const u8{ "build.zig", "Cargo.toml", "go.mod", "package.json", "pyproject.toml", "CMakeLists.txt", "Makefile" };
+pub const markers = [_][]const u8{ "build.zig", "Cargo.toml", "go.mod", "package.json", "pyproject.toml", "CMakeLists.txt", "Makefile" };
 
 pub const Found = struct { root: []const u8, git: bool };
 

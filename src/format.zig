@@ -4,14 +4,35 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const config = @import("config/config.zig");
 
-const formatters = [_]struct { lang: []const u8, argv: []const []const u8 }{
+/// Several rows for a language: the first one installed runs. `{path}` in
+/// an argument is the file's path (prettier picks its parser from it).
+const Row = struct { lang: []const u8, argv: []const []const u8 };
+
+const formatters = [_]Row{
     .{ .lang = "zig", .argv = &.{ "zig", "fmt", "--stdin" } },
     .{ .lang = "rust", .argv = &.{ "rustfmt", "--emit", "stdout" } },
     .{ .lang = "c", .argv = &.{"clang-format"} },
     .{ .lang = "python", .argv = &.{ "ruff", "format", "-" } },
     .{ .lang = "json", .argv = &.{ "jq", "." } },
-};
+    .{ .lang = "toml", .argv = &.{ "taplo", "fmt", "-" } },
+} ++ prettier("yaml") ++ prettier("javascript") ++ prettier("typescript") ++ prettier("tsx") ++ prettier("html") ++ prettier("css");
+
+fn prettier(comptime lang: []const u8) [2]Row {
+    return .{
+        .{ .lang = lang, .argv = &.{ "prettierd", "{path}" } },
+        .{ .lang = lang, .argv = &.{ "prettier", "--stdin-filepath", "{path}" } },
+    };
+}
+
+/// Languages formatted by their formatter even when the language server
+/// could do it: the web languages go through prettier, as in most projects.
+pub fn preferred(lang: []const u8) bool {
+    if (config.settingsFor(lang)) |s| if (s.formatter != null) return true;
+    for ([_][]const u8{ "javascript", "typescript", "tsx", "html", "css" }) |l| if (std.mem.eql(u8, l, lang)) return true;
+    return false;
+}
 
 pub const Result = union(enum) {
     /// The formatted text (owned).
@@ -24,23 +45,44 @@ pub const Result = union(enum) {
 
 /// The formatter's name for messages ("zig fmt"), if the language has one.
 pub fn name(lang: []const u8) ?[]const u8 {
+    if (config.settingsFor(lang)) |s| if (s.formatter) |argv| if (argv.len > 0) return argv[0];
     for (formatters) |f| if (std.mem.eql(u8, f.lang, lang)) return f.argv[0];
     return null;
 }
 
 /// Formats `text` (in language `lang`), running in `cwd` so project config
 /// files (.clang-format, rustfmt.toml) apply.
-pub fn run(gpa: Allocator, io: Io, lang: []const u8, text: []const u8, cwd: []const u8) !Result {
-    const f = for (formatters) |f| {
-        if (std.mem.eql(u8, f.lang, lang)) break f;
-    } else return .none;
-    var child = std.process.spawn(io, .{
-        .argv = f.argv,
-        .cwd = .{ .path = cwd },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    }) catch return .none; // not installed
+pub fn run(gpa: Allocator, io: Io, lang: []const u8, text: []const u8, cwd: []const u8, path: ?[]const u8) !Result {
+    // The config's formatter first (`languages.toml`).
+    if (config.settingsFor(lang)) |s| if (s.formatter) |argv| if (argv.len > 0 and argv.len <= 16) {
+        var args: [16][]const u8 = undefined;
+        for (argv, 0..) |a, i| args[i] = if (std.mem.eql(u8, a, "{path}")) path orelse "file" else a;
+        var child = std.process.spawn(io, .{
+            .argv = args[0..argv.len],
+            .cwd = .{ .path = cwd },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        }) catch return .none;
+        return finish(gpa, io, &child, text);
+    };
+    for (formatters) |f| {
+        if (!std.mem.eql(u8, f.lang, lang)) continue;
+        var argv: [8][]const u8 = undefined;
+        for (f.argv, 0..) |a, i| argv[i] = if (std.mem.eql(u8, a, "{path}")) path orelse "file" else a;
+        var child = std.process.spawn(io, .{
+            .argv = argv[0..f.argv.len],
+            .cwd = .{ .path = cwd },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        }) catch continue; // not installed: the next one
+        return finish(gpa, io, &child, text);
+    }
+    return .none;
+}
+
+fn finish(gpa: Allocator, io: Io, child: *std.process.Child, text: []const u8) !Result {
     // Formatters read all their input before writing, so this can't deadlock.
     child.stdin.?.writeStreamingAll(io, text) catch {};
     child.stdin.?.close(io);
@@ -71,7 +113,7 @@ fn readAll(gpa: Allocator, io: Io, file: Io.File) ![]u8 {
 test "zig fmt formats, and reports syntax errors" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    switch (try run(gpa, io, "zig", "const  x=1;\n", "/")) {
+    switch (try run(gpa, io, "zig", "const  x=1;\n", "/", null)) {
         .ok => |out| {
             defer gpa.free(out);
             try std.testing.expectEqualStrings("const x = 1;\n", out);
@@ -82,7 +124,7 @@ test "zig fmt formats, and reports syntax errors" {
             return error.TestUnexpectedResult;
         },
     }
-    switch (try run(gpa, io, "zig", "const x = ;\n", "/")) {
+    switch (try run(gpa, io, "zig", "const x = ;\n", "/", null)) {
         .failed => |m| gpa.free(m),
         .ok => |out| {
             gpa.free(out);
@@ -90,5 +132,5 @@ test "zig fmt formats, and reports syntax errors" {
         },
         .none => {},
     }
-    try std.testing.expectEqual(Result.none, try run(gpa, io, "cobol", "x", "/"));
+    try std.testing.expectEqual(Result.none, try run(gpa, io, "cobol", "x", "/", null));
 }

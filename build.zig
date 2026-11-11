@@ -8,13 +8,48 @@ const grammars = [_]struct {
     dep: []const u8,
     extensions: []const []const u8,
     scanner: bool,
+    /// Where `parser.c` lives in the repo (TypeScript has two grammars).
+    src: []const u8 = "src",
+    /// Highlight queries, joined in order: TypeScript's only add to
+    /// JavaScript's.
+    highlights: []const Query = &.{.{}},
 }{
     .{ .name = "zig", .dep = "ts_zig", .extensions = &.{ "zig", "zon" }, .scanner = false },
     .{ .name = "c", .dep = "ts_c", .extensions = &.{ "c", "h" }, .scanner = false },
-    .{ .name = "json", .dep = "ts_json", .extensions = &.{"json"}, .scanner = false },
+    .{ .name = "json", .dep = "ts_json", .extensions = &.{ "json", "jsonc", "json5", "webmanifest" }, .scanner = false },
     .{ .name = "python", .dep = "ts_python", .extensions = &.{"py"}, .scanner = true },
     .{ .name = "rust", .dep = "ts_rust", .extensions = &.{"rs"}, .scanner = true },
+    .{ .name = "toml", .dep = "ts_toml", .extensions = &.{"toml"}, .scanner = true },
+    .{ .name = "yaml", .dep = "ts_yaml", .extensions = &.{ "yaml", "yml" }, .scanner = true },
+    .{ .name = "html", .dep = "ts_html", .extensions = &.{ "html", "htm" }, .scanner = true },
+    .{ .name = "css", .dep = "ts_css", .extensions = &.{"css"}, .scanner = true },
+    .{
+        .name = "javascript",
+        .dep = "ts_javascript",
+        .extensions = &.{ "js", "mjs", "cjs", "jsx" },
+        .scanner = true,
+        .highlights = &.{ .{}, .{ .path = "queries/highlights-jsx.scm" } },
+    },
+    .{
+        .name = "typescript",
+        .dep = "ts_typescript",
+        .extensions = &.{ "ts", "mts", "cts" },
+        .scanner = true,
+        .src = "typescript/src",
+        .highlights = &.{ .{ .dep = "ts_javascript" }, .{} },
+    },
+    .{
+        .name = "tsx",
+        .dep = "ts_typescript",
+        .extensions = &.{"tsx"},
+        .scanner = true,
+        .src = "tsx/src",
+        .highlights = &.{ .{ .dep = "ts_javascript" }, .{ .dep = "ts_javascript", .path = "queries/highlights-jsx.scm" }, .{} },
+    },
 };
+
+/// A query file: in the grammar's own repo unless `dep` says another.
+const Query = struct { dep: ?[]const u8 = null, path: []const u8 = "queries/highlights.scm" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -116,15 +151,21 @@ fn addSyntax(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTa
     for (grammars) |g| {
         const dep = b.dependency(g.dep, .{});
         const lib_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
-        lib_mod.addIncludePath(dep.path("src"));
-        lib_mod.addCSourceFile(.{ .file = dep.path("src/parser.c"), .flags = &.{"-std=c11"} });
-        if (g.scanner) lib_mod.addCSourceFile(.{ .file = dep.path("src/scanner.c"), .flags = &.{"-std=c11"} });
+        lib_mod.addIncludePath(dep.path(g.src));
+        lib_mod.addCSourceFile(.{ .file = dep.path(b.fmt("{s}/parser.c", .{g.src})), .flags = &.{"-std=c11"} });
+        if (g.scanner) lib_mod.addCSourceFile(.{ .file = dep.path(b.fmt("{s}/scanner.c", .{g.src})), .flags = &.{"-std=c11"} });
         mod.linkLibrary(b.addLibrary(.{ .name = b.fmt("tree-sitter-{s}", .{g.name}), .root_module = lib_mod }));
 
-        _ = files.addCopyFile(dep.path("queries/highlights.scm"), b.fmt("{s}.scm", .{g.name}));
         table.appendSlice(b.allocator, b.fmt("    .{{ .name = \"{s}\", .extensions = &.{{", .{g.name})) catch @panic("OOM");
         for (g.extensions) |ext| table.appendSlice(b.allocator, b.fmt(" \"{s}\",", .{ext})) catch @panic("OOM");
-        table.appendSlice(b.allocator, b.fmt(" }}, .highlights = @embedFile(\"{s}.scm\") }},\n", .{g.name})) catch @panic("OOM");
+        table.appendSlice(b.allocator, " }, .highlights = \"\"") catch @panic("OOM");
+        for (g.highlights, 0..) |q, k| {
+            const from = if (q.dep) |d| b.dependency(d, .{}) else dep;
+            const name = b.fmt("{s}-{d}.scm", .{ g.name, k });
+            _ = files.addCopyFile(from.path(q.path), name);
+            table.appendSlice(b.allocator, b.fmt(" ++ @embedFile(\"{s}\") ++ \"\\n\"", .{name})) catch @panic("OOM");
+        }
+        table.appendSlice(b.allocator, " },\n") catch @panic("OOM");
     }
     table.appendSlice(b.allocator, "};\n") catch @panic("OOM");
     const table_file = files.add("grammars.zig", table.items);

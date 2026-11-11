@@ -120,6 +120,7 @@ fn yank(ed: *Editor, r: Range, register: ?u8, kind: Registers.Kind) !void {
     // With several cursors the registers keep what the primary cursor yanked.
     if (ed.replaying) return;
     const body = ed.text().slice(r.start, r.end);
+    if (kind == .yank) ed.yank_flash = .{ .buffer = ed.buffer, .start = r.start, .end = r.end, .linewise = r.linewise, .born = ed.now };
     if (!r.linewise) return ed.registers.store(register, kind, body, false);
     const with_nl = try std.mem.concat(ed.gpa, u8, &.{ body, "\n" });
     defer ed.gpa.free(with_nl);
@@ -153,7 +154,9 @@ fn shiftLines(ed: *Editor, r: Range, right: bool) !void {
     const t = ed.text();
     const first = t.lineOf(r.start);
     const last = t.lineOf(r.end);
-    const width = ed.options.tab_width;
+    const width = ed.indentWidth();
+    var unit_buf: [16]u8 = undefined;
+    const unit = ed.indentUnit(&unit_buf);
     // Bottom-up, so earlier line positions stay valid.
     var line = last + 1;
     while (line > first) {
@@ -161,10 +164,7 @@ fn shiftLines(ed: *Editor, r: Range, right: bool) !void {
         const ls = t.lineStart(line);
         if (right) {
             if (t.lineLen(line) == 0) continue;
-            if (ed.options.expand_tab) {
-                const spaces: [16]u8 = @splat(' ');
-                try ed.insertAt(ls, spaces[0..@min(width, spaces.len)]);
-            } else try ed.insertAt(ls, "\t");
+            try ed.insertAt(ls, unit);
         } else {
             var n: usize = 0;
             const le = t.lineEnd(line);

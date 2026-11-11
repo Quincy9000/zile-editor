@@ -30,7 +30,49 @@ const Spec = struct {
     folds: []const []const u8 = &.{},
 };
 
+/// JavaScript, and TypeScript on top of it (TSX the same).
+const js_spec = Spec{
+    .functions = &.{ "function_declaration", "function_expression", "function", "arrow_function", "method_definition", "generator_function_declaration", "generator_function" },
+    .classes = &.{ "class_declaration", "class", "abstract_class_declaration", "interface_declaration", "enum_declaration" },
+    .lists = &.{ "formal_parameters", "arguments", "type_arguments", "type_parameters" },
+    .class_wrappers = &.{"export_statement"},
+    .folds = &.{
+        "function_declaration", "function_expression", "arrow_function", "method_definition", "class_declaration",
+        "class_body",           "statement_block",     "object",         "array",             "switch_body",
+        "interface_body",       "object_type",         "enum_body",      "jsx_element",       "comment",
+        "template_string",      "import_statement",
+    },
+};
+
 const specs = std.StaticStringMap(Spec).initComptime(.{
+    .{ "json", Spec{ .functions = &.{}, .classes = &.{"object"}, .lists = &.{"array"}, .folds = &.{ "object", "array" } } },
+    .{ "toml", Spec{
+        .functions = &.{},
+        .classes = &.{ "table", "table_array_element" },
+        .lists = &.{"array"},
+        .folds = &.{ "table", "table_array_element", "array", "inline_table" },
+    } },
+    .{ "yaml", Spec{
+        .functions = &.{},
+        .classes = &.{"block_mapping_pair"},
+        .lists = &.{"flow_sequence"},
+        .folds = &.{ "block_mapping_pair", "block_sequence_item", "flow_mapping", "flow_sequence" },
+    } },
+    .{ "javascript", js_spec },
+    .{ "typescript", js_spec },
+    .{ "tsx", js_spec },
+    .{ "css", Spec{
+        .functions = &.{},
+        .classes = &.{ "rule_set", "media_statement", "keyframes_statement" },
+        .lists = &.{"arguments"},
+        .folds = &.{ "rule_set", "media_statement", "keyframes_statement", "supports_statement", "comment" },
+    } },
+    .{ "html", Spec{
+        .functions = &.{},
+        .classes = &.{ "element", "script_element", "style_element" },
+        .lists = &.{},
+        .folds = &.{ "element", "script_element", "style_element", "comment" },
+    } },
     .{ "zig", Spec{
         .functions = &.{ "function_declaration", "test_declaration" },
         .classes = &.{ "struct_declaration", "enum_declaration", "union_declaration", "opaque_declaration" },

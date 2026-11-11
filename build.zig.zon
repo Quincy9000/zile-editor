@@ -36,6 +36,30 @@
             .url = "https://release.files.ghostty.org/libghostty-vt/1.0.0/libghostty-vt-1.0.0.tar.gz",
             .hash = "ghostty-1.4.1-dev-5UdBC42jUAH6gFTaUyXGtolbhTf27EW0SZkK_lx5_fhQ",
         },
+        .ts_html = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-html?ref=v0.23.2#73a3947324f6efddf9e17c0ea58d454843590cc0",
+            .hash = "N-V-__8AAEmOAwDdgRRlet5t1CEdpX1YMCbfhFiIbj_vsBH9",
+        },
+        .ts_css = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-css?ref=v0.23.2#dda5cfc5722c429eaba1c910ca32c2c0c5bb1a3f",
+            .hash = "N-V-__8AAKwvEACP3YMpMDoRyyZPOdDN1n-zdTZRWTc3uufz",
+        },
+        .ts_javascript = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-javascript?ref=v0.23.1#58404d8cf191d69f2674a8fd507bd5776f46cb11",
+            .hash = "N-V-__8AANlfOQDpOAP-6YMQeJ2nQetX1OpUshQr903bnIHU",
+        },
+        .ts_typescript = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-typescript?ref=v0.23.2#75b3874edb2dc714fb1fd77a32013d0f8699989f",
+            .hash = "N-V-__8AAJZtIQHTLStHg_0TegWiaX-N1przeeHzJp9x9b6z",
+        },
+        .ts_toml = .{
+            .url = "git+https://github.com/tree-sitter-grammars/tree-sitter-toml?ref=v0.7.0#64b56832c2cffe41758f28e05c756a3a98d16f41",
+            .hash = "N-V-__8AAKI7BABbJ5LWswYbVPhQVdmSYR9zKxmZ7ob_RSNI",
+        },
+        .ts_yaml = .{
+            .url = "git+https://github.com/tree-sitter-grammars/tree-sitter-yaml?ref=v0.7.1#a1c4812a73ec5e089de8e441fdea3a921e8d5079",
+            .hash = "N-V-__8AAEkcHQB61IN4Zp5o83gmDa69AUnJUBSFIVM9lGg-",
+        },
     },
     .paths = .{
         "build.zig",

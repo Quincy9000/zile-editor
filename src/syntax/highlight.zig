@@ -58,6 +58,14 @@ const capture_map = [_]struct { []const u8, Style }{
     .{ "label", .label },
     .{ "module", .module },
     .{ "namespace", .module },
+    // HTML / JSX: element names like keywords (components are `@constructor`,
+    // a type); CSS at-rules (`@media`, `@keyframes`...) are keywords too.
+    .{ "tag", .keyword },
+    .{ "tag.error", .none },
+    .{ "media", .keyword },
+    .{ "supports", .keyword },
+    .{ "keyframes", .keyword },
+    .{ "charset", .keyword },
 };
 
 pub fn styleForCapture(name: []const u8) Style {

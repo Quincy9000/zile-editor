@@ -150,7 +150,55 @@ pub fn redo(h: *History, gpa: Allocator, target: anytype) Allocator.Error!?usize
     return if (node.ops.len > 0) node.ops[0].pos else node.cursor;
 }
 
+/// Moves to any state in the tree: undoes up to where the two histories
+/// meet, then redoes down to `node`. Returns the cursor to restore, or null
+/// if already there.
+pub fn goTo(h: *History, gpa: Allocator, node: u32, target: anytype) Allocator.Error!?usize {
+    if (node >= h.nodes.items.len or node == h.current) return null;
+    // The way from `node` up to the root.
+    var path: std.ArrayList(u32) = .empty;
+    defer path.deinit(gpa);
+    var n = node;
+    while (true) {
+        try path.append(gpa, n);
+        if (n == 0) break;
+        n = h.nodes.items[n].parent;
+    }
+    var cursor: ?usize = null;
+    // Up, until we stand on that way...
+    while (std.mem.indexOfScalar(u32, path.items, h.current) == null) cursor = try h.undo(gpa, target);
+    // ...then down it.
+    var at = std.mem.indexOfScalar(u32, path.items, h.current).?;
+    while (at > 0) {
+        at -= 1;
+        h.nodes.items[h.current].redo_child = path.items[at];
+        cursor = try h.redo(gpa, target);
+    }
+    return cursor;
+}
+
 const testing = std.testing;
+
+test "goTo reaches a state on another branch" {
+    const gpa = testing.allocator;
+    var t = try Text.init(gpa, "");
+    defer t.deinit(gpa);
+    var h = try History.init(gpa);
+    defer h.deinit(gpa);
+    try apply(&h, &t, .ins, 0, "a");
+    try h.commit(gpa); // node 1: "a"
+    try apply(&h, &t, .ins, 1, "b");
+    try h.commit(gpa); // node 2: "ab"
+    _ = try h.undo(gpa, &t);
+    try apply(&h, &t, .ins, 1, "c");
+    try h.commit(gpa); // node 3: "ac", a second branch
+    _ = try h.goTo(gpa, 2, &t);
+    try testing.expectEqualStrings("ab", t.slice(0, t.len()));
+    _ = try h.goTo(gpa, 0, &t);
+    try testing.expectEqualStrings("", t.slice(0, t.len()));
+    _ = try h.goTo(gpa, 3, &t);
+    try testing.expectEqualStrings("ac", t.slice(0, t.len()));
+}
 
 fn apply(h: *History, t: *Text, kind: enum { ins, del }, pos: usize, s: []const u8) !void {
     const gpa = testing.allocator;

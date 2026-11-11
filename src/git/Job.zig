@@ -9,7 +9,7 @@ const Io = std.Io;
 const Job = @This();
 
 /// What the editor does when the job finishes.
-pub const Kind = enum { commit, push, pull, switch_branch, create_branch, set_remote };
+pub const Kind = enum { commit, push, pull, switch_branch, create_branch, set_remote, init };
 
 gpa: Allocator,
 io: Io,

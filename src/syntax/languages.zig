@@ -33,10 +33,13 @@ pub const Language = struct {
     }
 };
 
-/// One entry per grammar, with the `tree_sitter_<name>` entry point declared
-/// at compile time.
-var registry = blk: {
-    var langs: [grammars.all.len]Language = undefined;
+/// The built-in grammars (compiled in, with the `tree_sitter_<name>` entry
+/// point declared at compile time), then those loaded at startup from the
+/// grammar folder (`config.zig`). Fixed capacity, so pointers to entries
+/// stay valid.
+pub const max_languages = 96;
+var registry: [max_languages]Language = blk: {
+    var langs: [max_languages]Language = undefined;
     for (grammars.all, 0..) |g, i| {
         langs[i] = .{
             .name = g.name,
@@ -47,19 +50,66 @@ var registry = blk: {
     }
     break :blk langs;
 };
+var registry_len: usize = grammars.all.len;
+
+/// Every language, built-in first.
+pub fn all() []Language {
+    return registry[0..registry_len];
+}
+
+/// Adds a language (a grammar loaded at runtime); one already known by
+/// that name is replaced in place.
+pub fn register(lang: Language) error{TooManyLanguages}!*Language {
+    if (byName(lang.name)) |old| {
+        old.* = lang;
+        return old;
+    }
+    if (registry_len == registry.len) return error.TooManyLanguages;
+    registry[registry_len] = lang;
+    registry_len += 1;
+    return &registry[registry_len - 1];
+}
 
 pub fn forPath(path: []const u8) ?*Language {
     const base = std.fs.path.basename(path);
     const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
     const ext = base[dot + 1 ..];
-    for (&registry) |*lang| {
-        for (lang.extensions) |e| if (std.mem.eql(u8, e, ext)) return lang;
+    // Later entries first: an extension given in the config wins over a
+    // built-in language's.
+    var i = registry_len;
+    while (i > 0) {
+        i -= 1;
+        for (registry[i].extensions) |e| if (std.mem.eql(u8, e, ext)) return &registry[i];
     }
     return null;
 }
 
 pub fn byName(name: []const u8) ?*Language {
-    for (&registry) |*lang| if (std.mem.eql(u8, lang.name, name)) return lang;
+    for (registry[0..registry_len]) |*lang| if (std.mem.eql(u8, lang.name, name)) return lang;
+    return null;
+}
+
+/// Whether the parser is one this tree-sitter can use.
+pub fn abiOk(lang: *const c.TSLanguage) bool {
+    const v = c.ts_language_abi_version(lang);
+    return v >= c.TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION and v <= c.TREE_SITTER_LANGUAGE_VERSION;
+}
+
+/// Compiles `source` as a highlight query for `lang`, or says where it
+/// fails (for `zile --grammar list`). The error text is static.
+pub fn checkQuery(lang: *Language) ?[]const u8 {
+    var err_offset: u32 = 0;
+    var err_type: c.TSQueryError = c.TSQueryErrorNone;
+    const src = lang.highlights_source;
+    const q = c.ts_query_new(lang.ts(), src.ptr, @intCast(src.len), &err_offset, &err_type) orelse return switch (err_type) {
+        c.TSQueryErrorSyntax => "syntax error",
+        c.TSQueryErrorNodeType => "unknown node type",
+        c.TSQueryErrorField => "unknown field",
+        c.TSQueryErrorCapture => "unknown capture",
+        c.TSQueryErrorStructure => "impossible pattern",
+        else => "error",
+    };
+    c.ts_query_delete(q);
     return null;
 }
 
@@ -207,7 +257,7 @@ pub fn run(q: *const Query, cursor: *c.TSQueryCursor, root: c.TSNode, text: []co
 }
 
 test "every grammar's highlight query compiles" {
-    for (&registry) |*lang| {
+    for (all()) |*lang| {
         if (lang.highlights() == null) {
             std.debug.print("query failed for {s}\n", .{lang.name});
             return error.TestUnexpectedResult;

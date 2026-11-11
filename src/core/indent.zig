@@ -19,6 +19,42 @@ pub const Scope = struct {
     bottom: ?usize,
 };
 
+/// How a file is indented: with tabs, or with `width` spaces a level.
+pub const Style = struct { tabs: bool, width: usize };
+
+/// Works out a text's indentation from its lines: tabs if more lines start
+/// with one than with spaces; else the commonest step between one line's
+/// indentation and the next deeper one. Null when nothing is indented (the
+/// editor's defaults then apply).
+pub fn detect(t: *const Text) ?Style {
+    var tab_lines: usize = 0;
+    var space_lines: usize = 0;
+    var steps: [9]usize = @splat(0); // steps[n]: times the indent grew by n spaces
+    var prev: usize = 0;
+    for (0..@min(t.lineCount(), 2000)) |line| {
+        const bytes = t.lineSlice(line);
+        const first = std.mem.indexOfNone(u8, bytes, " \t") orelse continue; // blank
+        if (first == 0) {
+            prev = 0;
+            continue;
+        }
+        if (bytes[0] == '\t') {
+            tab_lines += 1;
+            prev = 0;
+            continue;
+        }
+        space_lines += 1;
+        if (first > prev and first - prev < steps.len) steps[first - prev] += 1;
+        prev = first;
+    }
+    if (tab_lines > space_lines) return .{ .tabs = true, .width = 0 };
+    var best: usize = 0;
+    for (steps, 0..) |count, n| {
+        if (n >= 2 and count > steps[best]) best = n;
+    }
+    return if (best == 0) null else .{ .tabs = false, .width = best };
+}
+
 /// A line's indentation in display columns, or null for a blank line.
 pub fn lineIndent(t: *const Text, line: usize, tab_width: usize) ?usize {
     const bytes = t.lineSlice(line);
@@ -88,6 +124,23 @@ pub fn scope(t: *const Text, line: usize, tab_width: usize, as_border: bool) ?Sc
 }
 
 const testing = std.testing;
+
+test "detecting how a file is indented" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { []const u8, ?Style }{
+        .{ "a\nb\nc", null },
+        .{ "fn f() {\n  a;\n  if (x) {\n    b;\n  }\n}", .{ .tabs = false, .width = 2 } },
+        .{ "fn f() {\n    a;\n    if (x) {\n        b;\n    }\n}", .{ .tabs = false, .width = 4 } },
+        .{ "f() {\n\ta;\n\t\tb;\n}\n  odd", .{ .tabs = true, .width = 0 } },
+        // A continuation line (aligned, not a level) doesn't outvote the rest.
+        .{ "x = f(a,\n      b)\nif y:\n    z\n    if w:\n        v", .{ .tabs = false, .width = 4 } },
+    };
+    for (cases) |case| {
+        var t = try Text.init(gpa, case[0]);
+        defer t.deinit(gpa);
+        try testing.expectEqual(case[1], detect(&t));
+    }
+}
 
 test "scope of an indented block, from inside and from its border" {
     const gpa = testing.allocator;

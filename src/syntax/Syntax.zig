@@ -162,3 +162,25 @@ test "incremental reparse after edits" {
     try s.highlight(gpa, &t, 0, t.len());
     try std.testing.expect(s.styleAt(0) != .keyword);
 }
+
+test "config files: toml, yaml and json are highlighted" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { path: []const u8, text: []const u8, at: usize, style: Style }{
+        .{ .path = "Cargo.toml", .text = "[package]\nname = \"zile\"\n", .at = 18, .style = .string },
+        .{ .path = "Cargo.toml", .text = "# note\nx = 1", .at = 0, .style = .comment },
+        .{ .path = "ci.yml", .text = "name: build\non: [push]\n", .at = 0, .style = .property },
+        .{ .path = "ci.yaml", .text = "# hi\nretries: 3\n", .at = 0, .style = .comment },
+        .{ .path = "tsconfig.jsonc", .text = "{\"strict\": true}", .at = 1, .style = .string },
+    };
+    for (cases) |cs| {
+        var out: std.ArrayList(Style) = .empty;
+        defer out.deinit(gpa);
+        var s = forPath(cs.path) orelse return error.TestUnexpectedResult;
+        defer s.deinit(gpa);
+        try highlightText(gpa, s.lang, cs.text, &out);
+        std.testing.expectEqual(cs.style, out.items[cs.at]) catch |err| {
+            std.debug.print("{s}: byte {d}\n", .{ cs.path, cs.at });
+            return err;
+        };
+    }
+}

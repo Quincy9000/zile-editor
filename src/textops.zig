@@ -11,6 +11,8 @@ const motions = @import("core/motions.zig");
 const textobjects = @import("core/textobjects.zig");
 const comment = @import("core/comment.zig");
 const operators = @import("operators.zig");
+const ts = @import("tree_sitter");
+const config = @import("config/config.zig");
 
 const Range = textobjects.Range;
 
@@ -21,23 +23,64 @@ pub fn commentPrefix(ed: *Editor) []const u8 {
     return comment.prefixFor(ed.buffer.path);
 }
 
+/// How `line` is commented: the file's style, except among JSX children,
+/// where only `{/* */}` is a comment.
+pub fn commentStyle(ed: *Editor, line: usize) comment.Style {
+    var st = comment.styleFor(ed.buffer.path);
+    if (ed.buffer.syntax) |syn| if (config.settingsFor(syn.lang.name)) |cfg| if (cfg.comment) |own| {
+        st = own;
+    };
+    if (inJsxChildren(ed, line)) return comment.Style.jsx;
+    return st;
+}
+
+/// Whether `line` starts inside a JSX element's children (not at the
+/// element that is the expression itself, where `//` still works).
+fn inJsxChildren(ed: *Editor, line: usize) bool {
+    const syn = &(ed.buffer.syntax orelse return false);
+    const name = syn.lang.name;
+    if (!std.mem.eql(u8, name, "tsx") and !std.mem.eql(u8, name, "javascript")) return false;
+    const t = ed.text();
+    syn.update(t);
+    const tree = syn.tree orelse return false;
+    const at: u32 = @intCast(motions.firstNonBlank(t, line));
+    var node = ts.ts_node_descendant_for_byte_range(ts.ts_tree_root_node(tree), at, at);
+    while (!ts.ts_node_is_null(node)) : (node = ts.ts_node_parent(node)) {
+        const ty = std.mem.span(ts.ts_node_type(node));
+        // A line in an attribute's `{...}` or any other JS inside JSX.
+        if (std.mem.eql(u8, ty, "jsx_expression")) return ts.ts_node_start_byte(node) == at and parentIs(node, "jsx_element");
+        if (std.mem.eql(u8, ty, "jsx_opening_element") or std.mem.eql(u8, ty, "jsx_closing_element")) return parentIs(ts.ts_node_parent(node), "jsx_element");
+        if (std.mem.eql(u8, ty, "jsx_element") or std.mem.eql(u8, ty, "jsx_self_closing_element") or std.mem.eql(u8, ty, "jsx_text")) {
+            return parentIs(node, "jsx_element");
+        }
+    }
+    return false;
+}
+
+fn parentIs(node: ts.TSNode, ty: []const u8) bool {
+    const p = ts.ts_node_parent(node);
+    return !ts.ts_node_is_null(p) and std.mem.eql(u8, std.mem.span(ts.ts_node_type(p)), ty);
+}
+
 /// Comments lines `first..last` (inclusive), or uncomments them when every
 /// non-blank one already is a comment. The prefix goes at the block's
 /// smallest indentation, so the code keeps its shape.
 pub fn toggleComment(ed: *Editor, first: usize, last: usize) !void {
     const t = ed.text();
-    const prefix = commentPrefix(ed);
+    const st = commentStyle(ed, first);
     var all = true;
     var min_indent: ?usize = null;
     for (first..last + 1) |line| {
         const bytes = t.lineSlice(line);
         const fnb = std.mem.indexOfNone(u8, bytes, " \t") orelse continue;
         min_indent = @min(min_indent orelse fnb, fnb);
-        if (!std.mem.startsWith(u8, bytes[fnb..], prefix)) all = false;
+        if (!comment.isComment(bytes, st)) all = false;
     }
     const indent = min_indent orelse return; // only blank lines
     var buf: [16]u8 = undefined;
-    const with_space = std.fmt.bufPrint(&buf, "{s} ", .{prefix}) catch prefix;
+    const open = std.fmt.bufPrint(&buf, "{s} ", .{st.open}) catch st.open;
+    var cbuf: [16]u8 = undefined;
+    const close = if (st.close.len > 0) std.fmt.bufPrint(&cbuf, " {s}", .{st.close}) catch st.close else "";
     // Bottom-up, so earlier line positions stay valid.
     var line = last + 1;
     while (line > first) {
@@ -46,10 +89,20 @@ pub fn toggleComment(ed: *Editor, first: usize, last: usize) !void {
         const fnb = std.mem.indexOfNone(u8, bytes, " \t") orelse continue;
         const ls = t.lineStart(line);
         if (all) {
-            var n = prefix.len;
+            // The closer first (it is after the opener).
+            if (st.close.len > 0) {
+                const end = std.mem.trimEnd(u8, bytes, " \t").len;
+                var n = st.close.len;
+                if (end >= n + 1 and bytes[end - n - 1] == ' ') n += 1;
+                try ed.deleteRangeKeepCursor(ls + end - n, ls + end);
+            }
+            var n = st.open.len;
             if (fnb + n < bytes.len and bytes[fnb + n] == ' ') n += 1;
             try ed.deleteRangeKeepCursor(ls + fnb, ls + fnb + n);
-        } else try ed.insertAt(ls + indent, with_space);
+        } else {
+            if (close.len > 0) try ed.insertAt(ls + std.mem.trimEnd(u8, bytes, " \t").len, close);
+            try ed.insertAt(ls + indent, open);
+        }
     }
     ed.setCursor(motions.firstNonBlank(t, first));
 }
@@ -311,8 +364,8 @@ pub fn splitJoin(ed: *Editor) !void {
     } else {
         const line = t.lineOf(open);
         const indent = t.slice(t.lineStart(line), motions.firstNonBlank(t, line));
-        const spaces: [16]u8 = @splat(' ');
-        const unit: []const u8 = if (ed.options.expand_tab) spaces[0..@min(ed.options.tab_width, spaces.len)] else "\t";
+        var unit_buf: [16]u8 = undefined;
+        const unit = ed.indentUnit(&unit_buf);
         const trailing = allowsTrailingComma(ed.buffer.path);
         for (parts.items, 0..) |p, i| {
             try out.append(gpa, '\n');

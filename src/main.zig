@@ -8,6 +8,8 @@ const Theme = @import("ui/Theme.zig");
 const render = @import("ui/render.zig");
 const keys = @import("input/keys.zig");
 const Tui = @import("tui/Tui.zig");
+const config = @import("config/config.zig");
+const grammars = @import("config/grammars.zig");
 
 const usage =
     \\usage: zile [options] [file]
@@ -18,6 +20,10 @@ const usage =
     \\  -t, --tui           draw in the terminal instead of a window (automatic
     \\                      when there is no display, e.g. over SSH)
     \\  -h, --help          show this help
+    \\  --grammar install [name...]
+    \\                      fetch and build the grammars named in
+    \\                      ~/.config/zile/languages.toml
+    \\  --grammar list      every language and where its grammar comes from
     \\
     \\debug environment variables:
     \\  ZILE_TEST_KEYS=<keys>         feed key notation at startup, e.g. "ihello<Esc>"
@@ -60,7 +66,20 @@ fn parseArgs(init: std.process.Init) !Args {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    // `zile --grammar ...` does that and nothing else.
+    {
+        var it = init.minimal.args.iterate();
+        _ = it.skip();
+        if (it.next()) |first| if (std.mem.eql(u8, first, "--grammar")) {
+            var rest: std.ArrayList([]const u8) = .empty;
+            defer rest.deinit(gpa);
+            while (it.next()) |a| try rest.append(gpa, a);
+            std.process.exit(grammars.main(gpa, io, rest.items));
+        };
+    }
     const args = try parseArgs(init);
+    // Languages from the config, before any file opens.
+    const config_report = config.load(io);
     const test_keys = init.environ_map.get("ZILE_TEST_KEYS");
     const test_screenshot = init.environ_map.get("ZILE_TEST_SCREENSHOT");
 
@@ -72,6 +91,7 @@ pub fn main(init: std.process.Init) !void {
         ed.saveSession(false);
         ed.saveVisits();
     }
+    for (config_report.problems) |p| ed.notify(.err, "{s}", .{p});
     ed.theme_names = &Theme.names;
     ed.loadTheme();
     if (args.file) |path| ed.openArg(path);

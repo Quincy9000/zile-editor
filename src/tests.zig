@@ -22,6 +22,11 @@ comptime {
     _ = @import("core/search.zig");
     _ = @import("lsp/Client.zig");
     _ = @import("lsp/Completion.zig");
+    _ = @import("lsp/balance.zig");
+    _ = @import("emmet.zig");
+    _ = @import("snippets.zig");
+    _ = @import("config/toml.zig");
+    _ = @import("config/config.zig");
     _ = @import("lsp/Snippet.zig");
     _ = @import("picker/sources.zig");
     _ = @import("picker/fuzzy.zig");
@@ -48,4 +53,5 @@ comptime {
     _ = @import("Session.zig");
     _ = @import("git/Blame.zig");
     _ = @import("ui/icons.zig");
+    _ = @import("ColorPicker.zig");
 }

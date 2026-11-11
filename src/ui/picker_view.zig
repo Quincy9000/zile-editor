@@ -20,32 +20,7 @@ const cells = render.cells;
 /// Below this many columns the preview pane is hidden.
 const preview_min_cols = 90;
 
-/// Rows a docked picker shows at most (plus its query line).
-const docked_rows = 10;
-
-/// The height a docked picker (quickfix) takes at the bottom, or 0.
-pub fn dockedHeight(ed: *Editor, font: *const Font) f32 {
-    const p = ed.picker orelse return 0;
-    if (!sources.docked(p.kind)) return 0;
-    const rows = @min(@max(p.rowCount(), 1), docked_rows) + 1;
-    return @as(f32, @floatFromInt(rows)) * font.cell_h;
-}
-
-/// A docked picker: a panel above the status line, full width, no preview
-/// (the editor above shows the selection instead), no backdrop.
-fn drawDocked(p: *Picker, font: *const Font, theme: *const Theme, l: render.Layout) void {
-    const ch = font.cell_h;
-    const h = dockedHeight(p.ed, font);
-    const y0 = l.status_y - h;
-    const cols: usize = @intFromFloat(l.width / font.cell_w);
-    rect(0, y0, l.width, h, theme.popup_bg);
-    rect(0, y0, l.width, 1, theme.popup_border);
-    drawQueryLine(p, font, theme, 0, y0, cols);
-    drawList(p, font, theme, 0, y0 + ch, cols, @as(usize, @intFromFloat(h / ch)) - 1);
-}
-
 pub fn draw(p: *Picker, font: *const Font, theme: *const Theme, l: render.Layout) void {
-    if (sources.docked(p.kind)) return drawDocked(p, font, theme, l);
     const cw = font.cell_w;
     const ch = font.cell_h;
     const total_cols: usize = @intFromFloat(l.width / cw);
@@ -86,10 +61,18 @@ fn drawQueryLine(p: *Picker, font: *const Font, theme: *const Theme, bx: f32, y:
     x = font.drawText(p.query.items(), x, y, theme.fg);
     // Typing shows a cursor; moving through results shows the keys instead.
     if (p.ed.mode == .picker) {
-        rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
+        // In a terminal its own cursor is the bar; drawing one too makes two.
+        if (gfx.grid == null) rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
         gfx.cursor(x, y, .bar);
     } else {
-        _ = font.drawText("  j/k move · Enter open · i type · q close", x, y, theme.status_dim);
+        const hint = switch (p.kind) {
+            .browse => "  o folder · n file · r rename · m move · x delete · yy p copy · i type",
+            .buffers => "  j/k move · Enter open · x close it · n new · i type",
+            .runner => "  j/k move · Enter run · Tab edit it · x forget · i type",
+            .quickfix => "  j/k move · Enter open · x clear the list · i type",
+            else => "  j/k move · Enter open · i type · q close",
+        };
+        _ = font.drawText(hint, x, y, theme.status_dim);
     }
 
     // "matched/total", with an ellipsis while the source is still producing.
@@ -121,7 +104,7 @@ fn drawList(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: f32
         }
         const tx = x0 + cw;
         if (create_row == row) {
-            const x = font.drawText("+ Create ", tx, y, theme.whichkey_group);
+            const x = font.drawText(sources.createLabel(p.kind), tx, y, theme.whichkey_group);
             _ = font.drawText(p.activeQuery(), x, y, theme.fg);
             continue;
         }
@@ -141,7 +124,7 @@ fn drawList(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: f32
         // A file-type icon in front of rows that are files (mini.icons).
         var text_x = tx;
         const is_file = switch (p.kind) {
-            .files, .browse, .recent, .buffers, .git_changes => true,
+            .files, .browse, .recent, .frecent, .buffers, .git_changes, .files_anywhere, .folders_anywhere => true,
             .start => sources.startItemIsFile(item.id),
             else => false,
         };
@@ -152,7 +135,10 @@ fn drawList(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: f32
             avail -= 2;
         }
         // Prose reads from its start; paths keep their end (the file name).
-        const prose = p.kind == .todos or p.kind == .messages;
+        const prose = switch (p.kind) {
+            .todos, .messages, .quickfix, .registers, .marks, .undo, .help, .runner => true,
+            else => false,
+        };
         drawHighlighted(font, theme, item.text, positions, text_x, y, avail, if (is_folder) theme.whichkey_group else theme.fg, prose);
     }
 
@@ -284,6 +270,6 @@ pub fn drawPromptBox(font: *const Font, theme: *const Theme, l: render.Layout, t
         visible = text[it.i..];
     }
     x = font.drawText(visible, x, y, theme.fg);
-    rect(x, y + 2, 2, ch - 4, theme.cursor);
+    if (gfx.grid == null) rect(x, y + 2, 2, ch - 4, theme.cursor);
     gfx.cursor(x, y, .bar);
 }

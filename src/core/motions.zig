@@ -207,6 +207,28 @@ pub const Find = struct {
     }
 };
 
+/// The first `needle` at or after `from`. A letter matches in either case
+/// (`f` and `t` ignore it), anything else exactly.
+pub fn indexOfFold(hay: []const u8, from: usize, needle: []const u8) ?usize {
+    if (needle.len != 1 or !std.ascii.isAlphabetic(needle[0])) return std.mem.indexOfPos(u8, hay, from, needle);
+    const want = std.ascii.toLower(needle[0]);
+    var i = from;
+    while (i < hay.len) : (i += 1) if (std.ascii.toLower(hay[i]) == want) return i;
+    return null;
+}
+
+/// The last `needle` in `hay`, case-insensitive for a letter.
+pub fn lastIndexOfFold(hay: []const u8, needle: []const u8) ?usize {
+    if (needle.len != 1 or !std.ascii.isAlphabetic(needle[0])) return std.mem.lastIndexOf(u8, hay, needle);
+    const want = std.ascii.toLower(needle[0]);
+    var i = hay.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.ascii.toLower(hay[i]) == want) return i;
+    }
+    return null;
+}
+
 /// The `count`th occurrence of the character on the cursor's line, or null.
 /// `repeat` (from `;`/`,`) makes t/T skip a match right next to the cursor,
 /// so repeating a till moves on instead of staying put.
@@ -221,11 +243,11 @@ pub fn findInLine(t: *const Text, pos: usize, f: Find, count: usize, repeat: boo
         if (f.forward) {
             const from = at + 1 + skip;
             if (from > bytes.len) return null;
-            at = std.mem.indexOfPos(u8, bytes, from, needle) orelse return null;
+            at = indexOfFold(bytes, from, needle) orelse return null;
         } else {
             const end = at -| skip;
             if (end == 0) return null;
-            at = std.mem.lastIndexOf(u8, bytes[0..end], needle) orelse return null;
+            at = lastIndexOfFold(bytes[0..end], needle) orelse return null;
         }
     }
     const target = ls + at;
@@ -244,11 +266,11 @@ pub fn findAcross(t: *const Text, pos: usize, f: Find, count: usize, repeat: boo
         if (f.forward) {
             const from = at + 1 + skip;
             if (from > bytes.len) return null;
-            at = std.mem.indexOfPos(u8, bytes, from, needle) orelse return null;
+            at = indexOfFold(bytes, from, needle) orelse return null;
         } else {
             const end = at -| skip;
             if (end == 0) return null;
-            at = std.mem.lastIndexOf(u8, bytes[0..end], needle) orelse return null;
+            at = lastIndexOfFold(bytes[0..end], needle) orelse return null;
         }
     }
     if (!f.till) return at;

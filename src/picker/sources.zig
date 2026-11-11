@@ -9,6 +9,7 @@
 //!   accept:  fn (*Editor, Item)    act on the chosen item (main thread)
 //!   create:  fn (*Editor, query)   optional "Create <query>" row
 //!   preview: fn (*Editor, *const Item, *Preview)
+//!   location: fn (*Editor, Item)   optional: the place an item stands for
 //!
 //! Adding a source = adding a `Kind` tag and a struct below.
 
@@ -25,8 +26,9 @@ const languages = @import("../syntax/languages.zig");
 const motions = @import("../core/motions.zig");
 const Git = @import("../git/Git.zig");
 const hipatterns = @import("../core/hipatterns.zig");
+const keymap = @import("../input/keymap.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -53,6 +55,20 @@ fn Impl(comptime kind: Kind) type {
         .themes => Themes,
         .messages => Messages,
         .start => Start,
+        .confirm_remove => ConfirmRemove,
+        .runner => Runner,
+        .registers => RegisterList,
+        .marks => Marks,
+        .undo => UndoHistory,
+        .help => Help,
+        .pickers => Pickers,
+        .files_anywhere => Anywhere(false),
+        .folders_anywhere => Anywhere(true),
+        .code_actions => CodeActions,
+        .workspace_symbols => WorkspaceSymbols,
+        .todo_tags => TodoTags,
+        .man => ManPages,
+        .frecent => Frecent,
     };
 }
 
@@ -99,12 +115,32 @@ pub fn prefix(kind: Kind) ?u8 {
 
 /// Sources whose items depend on the query get a fresh engine per query.
 pub fn queryDriven(kind: Kind, io: Io) bool {
-    return kind == .grep and haveRg(io);
+    return switch (kind) {
+        .grep => haveRg(io),
+        // The whole disk is searched per query, never listed.
+        .files_anywhere, .folders_anywhere => true,
+        else => false,
+    };
 }
 
 pub fn canCreate(kind: Kind) bool {
     return switch (kind) {
         inline else => |k| @hasDecl(Impl(k), "create"),
+    };
+}
+
+/// Sources where the typed text is what Enter takes unless you move to a
+/// row (the runner: a new command, not the old one it happens to match).
+pub fn createFirst(kind: Kind) bool {
+    return switch (kind) {
+        inline else => |k| @hasDecl(Impl(k), "create_first"),
+    };
+}
+
+/// What the "create" row says before the typed text.
+pub fn createLabel(kind: Kind) []const u8 {
+    return switch (kind) {
+        inline else => |k| if (@hasDecl(Impl(k), "create_label")) Impl(k).create_label else "+ Create ",
     };
 }
 
@@ -139,14 +175,6 @@ pub fn create(kind: Kind, ed: *Editor, query: []const u8) !void {
     }
 }
 
-/// Docked sources show as a panel at the bottom (no preview pane): moving
-/// through them moves the editor instead (`follow`).
-pub fn docked(kind: Kind) bool {
-    return switch (kind) {
-        inline else => |k| @hasDecl(Impl(k), "follow"),
-    };
-}
-
 /// The mode a picker opens in: `.insert` (typing the query) for ones you
 /// search, `.normal` (moving with j/k) for short lists you step through.
 /// Every source must choose.
@@ -159,12 +187,6 @@ pub fn startsNormal(kind: Kind) bool {
             break :blk Impl(k).start_mode == .normal;
         },
     };
-}
-
-pub fn follow(kind: Kind, ed: *Editor, item: Item) !void {
-    switch (kind) {
-        inline else => |k| if (@hasDecl(Impl(k), "follow")) try Impl(k).follow(ed, item),
-    }
 }
 
 /// A place an item stands for (path owned by the caller, 0-based
@@ -326,7 +348,7 @@ const Files = struct {
         const path = try ed.pickerPath(query);
         defer ed.gpa.free(path);
         try ed.openFile(path);
-        ed.setMessage(.info, "new file \"{s}\" (SPC f s to create it on disk)", .{ed.buffer.displayName()});
+        ed.setMessage(.info, "new file \"{s}\" (SPC s to create it on disk)", .{ed.buffer.displayName()});
     }
 
     pub const preview_limit = 1024 * 1024;
@@ -409,11 +431,19 @@ const Browse = struct {
     }
 
     /// A new file in this folder ("sub/name" makes the folder on save).
+    /// A name ending in `/` is a new folder (made now, and entered);
+    /// anything else is a new file.
     pub fn create(ed: *Editor, query: []const u8) !void {
         const path = try ed.browsePath(query);
         defer ed.gpa.free(path);
+        if (std.mem.endsWith(u8, query, "/")) {
+            Io.Dir.cwd().createDirPath(ed.io, path) catch |err|
+                return ed.setMessage(.err, "could not make the folder: {s}", .{@errorName(err)});
+            try ed.browseInto(query);
+            return ed.setMessage(.info, "made folder \"{s}\"", .{query});
+        }
         try ed.openFile(path);
-        ed.setMessage(.info, "new file \"{s}\" (SPC f s to create it on disk)", .{ed.buffer.displayName()});
+        ed.setMessage(.info, "new file \"{s}\" (SPC s to create it on disk)", .{ed.buffer.displayName()});
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -450,40 +480,53 @@ fn displayPath(ed: *Editor, abs: []const u8, buf: []u8) []const u8 {
     return abs;
 }
 
-/// `SPC f r`: files opened before, in any session (mini.visits), the ones
-/// used most and most recently first.
-const Recent = struct {
-    pub const title = "Recent files";
-    pub const prefix: ?u8 = null;
-    pub const start_mode: StartMode = .insert;
+/// Files opened before, in any session (mini.visits).
+///   `SPC f r` recent: the most recently opened first.
+///   `SPC f v` frecent: the ones you keep going back to first (how often,
+///   weighted by how lately), each with its number of visits.
+const Recent = Visited(false);
+const Frecent = Visited(true);
 
-    pub fn fill(ed: *Editor, items: *Items) !void {
-        const v = ed.loadedVisits();
-        v.rank(ed.unixNow());
-        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
-        for (v.entries.items, 0..) |e, i| {
-            if (i == 300) break;
-            try items.append(.{ .text = displayPath(ed, e.path, &buf), .id = @intCast(i) });
+fn Visited(comptime by_frecency: bool) type {
+    return struct {
+        pub const title = if (by_frecency) "Frecent files" else "Recent files";
+        pub const prefix: ?u8 = null;
+        pub const start_mode: StartMode = .insert;
+
+        pub fn fill(ed: *Editor, items: *Items) !void {
+            const v = ed.loadedVisits();
+            if (by_frecency) v.rank(ed.unixNow()) else v.rankRecent();
+            var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+            var count_buf: [24]u8 = undefined;
+            for (v.entries.items, 0..) |e, i| {
+                if (i == 300) break;
+                const visits = if (by_frecency) std.fmt.bufPrint(&count_buf, "{d}\u{d7}", .{e.count}) catch "" else "";
+                try items.append(.{ .text = displayPath(ed, e.path, &buf), .detail = visits, .id = @intCast(i) });
+            }
         }
-    }
 
-    fn pathOf(ed: *Editor, id: u32) ?[]const u8 {
-        const entries = ed.visits.entries.items;
-        return if (id < entries.len) entries[id].path else null;
-    }
+        pub const pathOf = visitedPath;
+        pub const accept = visitedAccept;
+        pub const preview = visitedPreview;
+    };
+}
 
-    pub fn accept(ed: *Editor, item: Item) !void {
-        const p = try ed.gpa.dupe(u8, pathOf(ed, item.id) orelse return);
-        defer ed.gpa.free(p);
-        try ed.openFile(p);
-    }
+fn visitedPath(ed: *Editor, id: u32) ?[]const u8 {
+    const entries = ed.visits.entries.items;
+    return if (id < entries.len) entries[id].path else null;
+}
 
-    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        try Files.previewPath(ed, pathOf(ed, item.id) orelse return, out);
-    }
-};
+fn visitedAccept(ed: *Editor, item: Item) !void {
+    const p = try ed.gpa.dupe(u8, visitedPath(ed, item.id) orelse return);
+    defer ed.gpa.free(p);
+    try ed.openFile(p);
+}
 
-/// `SPC s t`: todo comments (`TODO`, `FIXME`, `HACK`, `NOTE`, ...) in the
+fn visitedPreview(ed: *Editor, item: *const Item, out: *Preview) !void {
+    try Files.previewPath(ed, visitedPath(ed, item.id) orelse return, out);
+}
+
+/// `SPC f t`: todo comments (`TODO`, `FIXME`, `HACK`, `NOTE`, ...) in the
 /// project (mini.hipatterns' words).
 const Todos = struct {
     pub const title = "Todo comments";
@@ -579,7 +622,7 @@ const Themes = struct {
     }
 };
 
-/// `SPC s m`: every message and notification so far, newest first. Enter
+/// `SPC f n`: every message and notification so far, newest first. Enter
 /// copies one.
 const Messages = struct {
     pub const title = "Messages";
@@ -642,7 +685,7 @@ const Start = struct {
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         const v = ed.loadedVisits();
-        v.rank(ed.unixNow());
+        v.rankRecent();
         var buf: [Io.Dir.max_path_bytes]u8 = undefined;
         var n: usize = 0;
         for (v.entries.items, 0..) |e, i| {
@@ -674,7 +717,7 @@ pub fn startItemIsFile(id: u32) bool {
     return id >= Start.recent_base;
 }
 
-/// `SPC s j`: the jumplist, newest first, with the line each jump left.
+/// `SPC f j`: the jumplist, newest first, with the line each jump left.
 const Jumps = struct {
     pub const title = "Jumplist";
     pub const prefix: ?u8 = null;
@@ -713,8 +756,8 @@ const Jumps = struct {
     }
 };
 
-/// `SPC x x`: the quickfix list, docked at the bottom; moving through it
-/// shows each entry in the editor.
+/// `SPC f q`: the quickfix list, a picker like any other: each entry with
+/// its file and line number, previewed at that line.
 const Quickfix = struct {
     pub const title = "Quickfix";
     pub const prefix: ?u8 = null;
@@ -732,17 +775,17 @@ const Quickfix = struct {
         try ed.goQuickfix(item.id);
     }
 
-    pub fn follow(ed: *Editor, item: Item) !void {
-        try ed.followQuickfix(item.id);
-    }
-
     pub fn location(ed: *Editor, item: Item) !?Location {
         if (item.id >= ed.quickfix.items.len) return null;
         const q = ed.quickfix.items[item.id];
         return .{ .path = try ed.gpa.dupe(u8, q.path), .line = q.line, .col = q.col };
     }
 
-    pub fn preview(_: *Editor, _: *const Item, _: *Preview) !void {}
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= ed.quickfix.items.len) return;
+        const q = ed.quickfix.items[item.id];
+        try previewAt(ed, q.path, q.line, out);
+    }
 };
 
 /// <Tab> in a picker: where to open the selection.
@@ -780,36 +823,81 @@ const OpenIn = struct {
 
 /// `SPC p p`: projects opened before, most recent first; picking one finds
 /// a file in it.
+/// The folders `Projects` scans, set from the editor's options when the
+/// picker opens (the worker thread can't read editor state).
+var project_dirs: []const []const u8 = &.{};
+
+fn expandHome(buf: []u8, shown: []const u8) []const u8 {
+    if (shown.len == 0 or shown[0] != '~') return shown;
+    const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else return shown;
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ home, shown[1..] }) catch shown;
+}
+
+fn shortenHome(buf: []u8, path: []const u8) []const u8 {
+    const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "";
+    if (home.len > 1 and std.mem.startsWith(u8, path, home)) return std.fmt.bufPrint(buf, "~{s}", .{path[home.len..]}) catch path;
+    return path;
+}
+
 const Projects = struct {
     pub const title = "Switch project";
     pub const prefix: ?u8 = null;
     pub const start_mode: StartMode = .insert;
 
+    /// What makes a folder a project.
+    const markers = [_][]const u8{ ".git", "build.zig", "Cargo.toml", "package.json", "go.mod", "Makefile" };
+    const max_depth = 3;
+
+    /// The ones opened before, most recent first.
     pub fn fill(ed: *Editor, items: *Items) !void {
-        const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "";
-        for (ed.knownProjects(), 0..) |root, i| {
+        project_dirs = ed.options.project_dirs;
+        for (ed.knownProjects()) |root| {
             var buf: [Io.Dir.max_path_bytes]u8 = undefined;
-            const shown = if (home.len > 1 and std.mem.startsWith(u8, root, home))
-                std.fmt.bufPrint(&buf, "~{s}", .{root[home.len..]}) catch root
-            else
-                root;
-            try items.append(.{ .text = std.fs.path.basename(root), .detail = shown, .id = @intCast(i) });
+            try items.append(.{ .text = std.fs.path.basename(root), .detail = shortenHome(&buf, root) });
         }
     }
 
+    /// Then every project found under the project folders.
+    pub fn produce(e: *Engine) anyerror!void {
+        const known = e.items.count();
+        for (project_dirs) |dir| try scan(e, known, dir, 0);
+    }
+
+    fn scan(e: *Engine, known: usize, path: []const u8, depth: usize) anyerror!void {
+        var dir = Io.Dir.cwd().openDir(e.io, path, .{ .iterate = true }) catch return;
+        defer dir.close(e.io);
+        const is_project = for (markers) |m| {
+            if (dir.access(e.io, m, .{})) |_| break true else |_| {}
+        } else false;
+        if (is_project and depth > 0) {
+            var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+            const shown = shortenHome(&buf, path);
+            for (0..known) |i| if (std.mem.eql(u8, e.items.get(i).detail, shown)) return;
+            try e.items.append(.{ .text = std.fs.path.basename(path), .detail = shown });
+            return; // not into a project for more
+        }
+        if (depth == max_depth) return;
+        var it = dir.iterate();
+        while (it.next(e.io) catch null) |entry| {
+            if (entry.kind != .directory or entry.name[0] == '.' or Files.skip_dirs.has(entry.name)) continue;
+            const child = try std.fs.path.join(e.gpa, &.{ path, entry.name });
+            defer e.gpa.free(child);
+            try scan(e, known, child, depth + 1);
+        }
+        try e.checkpoint();
+    }
+
     pub fn accept(ed: *Editor, item: Item) !void {
-        const known = ed.knownProjects();
-        if (item.id >= known.len) return;
-        const root = try ed.gpa.dupe(u8, known[item.id]);
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const root = try ed.gpa.dupe(u8, expandHome(&buf, item.detail));
         defer ed.gpa.free(root);
         try ed.switchProject(root);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        const known = ed.knownProjects();
-        if (item.id >= known.len) return;
+        var buf: [Io.Dir.max_path_bytes]u8 = undefined;
         // Its top-level entries.
-        var dir = Io.Dir.cwd().openDir(ed.io, known[item.id], .{ .iterate = true }) catch |err|
+        var dir = Io.Dir.cwd().openDir(ed.io, expandHome(&buf, item.detail), .{ .iterate = true }) catch |err|
             return out.text.print(ed.gpa, "({s})", .{@errorName(err)});
         defer dir.close(ed.io);
         var it = dir.iterate();
@@ -818,6 +906,96 @@ const Projects = struct {
             if (n == 200) break;
             try out.text.print(ed.gpa, "{s}{s}\n", .{ e.name, if (e.kind == .directory) "/" else "" });
         }
+    }
+};
+
+/// `SPC l t` (insert mode: `<C-t>`): a todo tag to write as a comment here.
+const TodoTags = struct {
+    pub const title = "Todo tag";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    const tags = [_][2][]const u8{
+        .{ "TODO", "something to do" },       .{ "FIXME", "something broken" }, .{ "HACK", "a workaround to revisit" },
+        .{ "BUG", "a known bug" },            .{ "NOTE", "worth knowing" },     .{ "WARN", "careful here" },
+        .{ "PERF", "could be faster" },
+    };
+
+    pub fn fill(_: *Editor, items: *Items) !void {
+        for (tags, 0..) |t, i| try items.append(.{ .text = t[0], .detail = t[1], .id = @intCast(i) });
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id < tags.len) try ed.writeTodoTag(tags[item.id][0]);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= tags.len) return;
+        try out.text.print(ed.gpa, "Writes a comment on this line:\n\n{s}: \n\nand leaves you typing after it.\nSPC f t lists them all.", .{tags[item.id][0]});
+    }
+};
+
+/// `SPC l m`: manual pages for C functions and system calls (sections 2
+/// and 3). Enter opens the page in a buffer.
+const ManPages = struct {
+    pub const title = "Manual pages";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
+
+    pub fn produce(e: *Engine) anyerror!void {
+        _ = try streamCommand(e, &.{ "apropos", "-s", "2,3", "." }, '\n', {}, add);
+    }
+
+    /// "name (3) - what it does"
+    fn add(_: void, e: *Engine, record: []const u8) !bool {
+        const open = std.mem.indexOf(u8, record, " (") orelse return true;
+        const close = std.mem.indexOfScalarPos(u8, record, open, ')') orelse return true;
+        const section = record[open + 2 .. close];
+        // The C library and the kernel, not Perl's modules.
+        if (section.len == 0 or (section[0] != '2' and section[0] != '3')) return true;
+        if (std.mem.eql(u8, section, "3perl") or std.mem.eql(u8, section, "3pm")) return true;
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "{s}({s})", .{ record[0..open], section }) catch return true;
+        const dash = std.mem.indexOfPos(u8, record, close, "- ");
+        try e.items.append(.{ .text = text, .detail = if (dash) |d| std.mem.trim(u8, record[d + 2 ..], " ") else "" });
+        return true;
+    }
+
+    /// The page's text for "name(section)". Caller frees.
+    fn page(ed: *Editor, entry: []const u8) !?[]u8 {
+        const open = std.mem.lastIndexOfScalar(u8, entry, '(') orelse return null;
+        if (entry.len < open + 3) return null;
+        const r = std.process.run(ed.gpa, ed.io, .{ .argv = &.{ "man", entry[open + 1 .. entry.len - 1], entry[0..open] } }) catch return null;
+        defer ed.gpa.free(r.stderr);
+        errdefer ed.gpa.free(r.stdout);
+        if (!r.term.success()) {
+            ed.gpa.free(r.stdout);
+            return null;
+        }
+        // Bold and underline arrive as overstrikes ("x\bx"): keep the letters.
+        var n: usize = 0;
+        for (r.stdout) |b| {
+            if (b == 0x08) {
+                n -|= 1;
+            } else {
+                r.stdout[n] = b;
+                n += 1;
+            }
+        }
+        return try ed.gpa.realloc(r.stdout, n);
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        const text = try page(ed, item.text) orelse return ed.setMessage(.err, "no manual page for {s}", .{item.text});
+        defer ed.gpa.free(text);
+        var label: [300]u8 = undefined;
+        try ed.openTextBuffer(std.fmt.bufPrint(&label, "man {s}", .{item.text}) catch "man", text);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const text = try page(ed, item.text) orelse return;
+        defer ed.gpa.free(text);
+        try out.text.appendSlice(ed.gpa, text);
     }
 };
 
@@ -918,7 +1096,7 @@ const Commands = struct {
     }
 };
 
-/// `SPC s s`: the current buffer's lines (Doom's swiper / consult-line).
+/// `SPC f l`: the current buffer's lines (Doom's swiper / consult-line).
 const Lines = struct {
     pub const title = "Search buffer";
     pub const prefix: ?u8 = null;
@@ -1132,7 +1310,7 @@ const Locations = struct {
     pub const location = detailLocation;
 };
 
-/// `SPC c x`: language server diagnostics for all files.
+/// `SPC f x`: language server diagnostics for all files.
 const Diagnostics = struct {
     pub const title = "Diagnostics";
     pub const prefix: ?u8 = '!';
@@ -1230,7 +1408,7 @@ test "fuzzy regex for rg" {
     try std.testing.expectEqualStrings("a.*?\\..*?b.*?c", r);
 }
 
-/// `SPC c l`: the current file's symbols (`ed.symbols`), in document order.
+/// `SPC f s`: the current file's symbols (`ed.symbols`), in document order.
 const Symbols = struct {
     pub const title = "Symbols";
     pub const prefix: ?u8 = '@';
@@ -1270,7 +1448,7 @@ const Symbols = struct {
 // ---------------------------------------------------------------------------
 // Confirmations: a two-row Yes/No picker.
 
-/// `SPC f D`: delete `ed.confirm_target`'s file?
+/// `SPC b x`: delete `ed.confirm_target`'s file?
 const ConfirmDelete = struct {
     pub const title = "Delete file?";
     pub const prefix: ?u8 = null;
@@ -1298,6 +1476,441 @@ const ConfirmDelete = struct {
     }
 };
 
+/// Text for one row: the first `max` bytes, line breaks shown as "↵".
+fn oneLine(buf: []u8, text: []const u8) []const u8 {
+    var n: usize = 0;
+    for (text) |b| {
+        if (b == '\n') {
+            if (n + 3 > buf.len) break;
+            @memcpy(buf[n..][0..3], "↵");
+            n += 3;
+        } else {
+            if (n + 1 > buf.len) break;
+            buf[n] = if (b == '\t') ' ' else b;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+/// `SPC f y`: every register that holds something; Enter pastes it.
+const RegisterList = struct {
+    pub const title = "Registers";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    const names = "\"0123456789abcdefghijklmnopqrstuvwxyz-";
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var buf: [300]u8 = undefined;
+        for (names) |name| {
+            const v = ed.registers.get(name) orelse continue;
+            const label = [_]u8{ '"', name };
+            try items.append(.{ .text = oneLine(&buf, v.text), .detail = &label, .id = name });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try ed.pasteRegister(@intCast(item.id));
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const v = ed.registers.get(@as(u8, @intCast(item.id))) orelse return;
+        try out.text.appendSlice(ed.gpa, v.text);
+    }
+};
+
+/// `SPC f m`: the marks (`m{letter}`), this file's and the global ones.
+const Marks = struct {
+    pub const title = "Marks";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    fn visible(ed: *Editor, m: Editor.Mark) bool {
+        return std.ascii.isUpper(m.name) or m.buffer == ed.buffer;
+    }
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var buf: [512]u8 = undefined;
+        for (ed.marks.items, 0..) |m, i| {
+            if (!visible(ed, m)) continue;
+            const name = if (m.buffer) |b| b.displayName() else m.path orelse "?";
+            if (m.buffer) |b| {
+                const t = &b.text;
+                const line = t.lineOf(@min(m.pos, t.len()));
+                const detail = std.fmt.bufPrint(&buf, "{c}  {s}:{d}", .{ m.name, name, line + 1 }) catch name;
+                const text = std.mem.trim(u8, t.lineSlice(line), " \t");
+                try items.append(.{ .text = if (text.len > 0) text else "(blank line)", .detail = detail, .id = @intCast(i) });
+            } else {
+                const detail = std.fmt.bufPrint(&buf, "{c}  {s}", .{ m.name, name }) catch name;
+                try items.append(.{ .text = "(closed file)", .detail = detail, .id = @intCast(i) });
+            }
+        }
+        if (items.count() == 0) ed.setMessage(.info, "no marks yet (m and a letter sets one)", .{});
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id >= ed.marks.items.len) return;
+        ed.pushJump();
+        try ed.goMark(ed.marks.items[item.id], true);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= ed.marks.items.len) return;
+        const m = ed.marks.items[item.id];
+        if (m.buffer) |b| {
+            try out.setCode(ed.gpa, b.text.slice(0, b.text.len()), b.path);
+            out.focus_line = b.text.lineOf(@min(m.pos, b.text.len()));
+        } else if (m.path) |p| try Files.previewPath(ed, p, out);
+    }
+};
+
+/// `SPC f u`: every state of the buffer's undo tree, newest first, branches
+/// you undid away from included. Enter takes the buffer there.
+const UndoHistory = struct {
+    pub const title = "Undo history";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const h = &ed.buffer.history;
+        try h.commit(ed.gpa);
+        var buf: [200]u8 = undefined;
+        var detail_buf: [48]u8 = undefined;
+        var i = h.nodes.items.len;
+        while (i > 0) {
+            i -= 1;
+            const node = h.nodes.items[i];
+            var w: Io.Writer = .fixed(&buf);
+            if (i == 0) {
+                w.writeAll("the file as opened") catch {};
+            } else for (node.ops, 0..) |op, k| {
+                if (k > 0) w.writeAll("  ") catch break;
+                var text_buf: [80]u8 = undefined;
+                w.print("{s}{s}", .{ if (op.kind == .insert) "+ " else "- ", oneLine(&text_buf, op.text) }) catch break;
+            }
+            const here: []const u8 = if (i == h.current) "now" else if (i == h.saved) "saved" else "";
+            const detail = std.fmt.bufPrint(&detail_buf, "{s}  #{d}", .{ here, i }) catch "";
+            try items.append(.{ .text = w.buffered(), .detail = detail, .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try ed.undoTo(item.id);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const h = &ed.buffer.history;
+        if (item.id >= h.nodes.items.len) return;
+        if (item.id == 0) return out.text.appendSlice(ed.gpa, "The file as it was when opened.");
+        for (h.nodes.items[item.id].ops) |op| {
+            var lines = std.mem.splitScalar(u8, op.text, '\n');
+            while (lines.next()) |line| try out.text.print(ed.gpa, "{s} {s}\n", .{ if (op.kind == .insert) "+" else "-", line });
+        }
+    }
+};
+
+/// `SPC f k`: every key binding in every mode, searchable by what it does.
+/// Enter runs it (a normal-mode command; others only say their keys).
+const Help = struct {
+    pub const title = "Keys";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
+
+    const mode_letters = [_]struct { keymap.Mode, []const u8 }{
+        .{ .normal, "n" },   .{ .visual, "v" },        .{ .operator, "o" }, .{ .insert, "i" },
+        .{ .picker, "p" },   .{ .picker_normal, "P" }, .{ .search, "/" },
+    };
+
+    fn sameKeys(a: []const keys.KeyEvent, b: []const keys.KeyEvent) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| if (!x.eql(y)) return false;
+        return true;
+    }
+
+    fn commandIndex(cmd: *const commands.Command) u32 {
+        return @intCast((@intFromPtr(cmd) - @intFromPtr(&commands.all[0])) / @sizeOf(commands.Command));
+    }
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var text_buf: [200]u8 = undefined;
+        var detail_buf: [96]u8 = undefined;
+        for (mode_letters, 0..) |ml, mi| {
+            for (ed.keymap.modes.getPtrConst(ml[0]).items) |b| {
+                // One row per key and command: the modes it works in together.
+                var seen = false;
+                for (mode_letters[0..mi]) |earlier| {
+                    for (ed.keymap.modes.getPtrConst(earlier[0]).items) |o| {
+                        if (o.command == b.command and sameKeys(o.seq, b.seq)) seen = true;
+                    }
+                }
+                if (seen) continue;
+                var w: Io.Writer = .fixed(&detail_buf);
+                keys.formatSequenceDisplay(b.seq, &w) catch {};
+                w.writeAll("  ") catch {};
+                for (mode_letters[mi..]) |later| {
+                    for (ed.keymap.modes.getPtrConst(later[0]).items) |o| {
+                        if (o.command == b.command and sameKeys(o.seq, b.seq)) {
+                            w.writeAll(later[1]) catch {};
+                            break;
+                        }
+                    }
+                }
+                const text = std.fmt.bufPrint(&text_buf, "{s}  ({s})", .{ b.command.doc, b.command.name }) catch b.command.doc;
+                try items.append(.{ .text = text, .detail = w.buffered(), .id = commandIndex(b.command) });
+            }
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id >= commands.all.len) return;
+        const cmd = &commands.all[item.id];
+        // Only what makes sense from here: a command with a normal-mode key.
+        if (ed.keymap.firstBinding(.normal, cmd) == null) return ed.setMessage(.info, "{s}: {s}", .{ item.detail, cmd.doc });
+        try ed.runCommand(cmd);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= commands.all.len) return;
+        const cmd = &commands.all[item.id];
+        try out.text.print(ed.gpa, "{s}\n\n{s}\n\nkeys (n normal, v visual, o after an operator,\ni insert, p picker, P picker list, / search):\n", .{ cmd.name, cmd.doc });
+        for (mode_letters) |ml| {
+            for (ed.keymap.modes.getPtrConst(ml[0]).items) |b| {
+                if (b.command != cmd) continue;
+                var buf: [64]u8 = undefined;
+                var w: Io.Writer = .fixed(&buf);
+                keys.formatSequenceDisplay(b.seq, &w) catch {};
+                try out.text.print(ed.gpa, "  {s}  {s}\n", .{ ml[1], w.buffered() });
+            }
+        }
+    }
+};
+
+/// `SPC f SPC`: every picker there is, by what it lists.
+const Pickers = struct {
+    pub const title = "Pickers";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
+
+    /// The commands that open a picker.
+    const names = [_][]const u8{
+        "find_file",          "browse_files",      "recent_files",     "frecent_files",      "find_file_anywhere",
+        "find_folder",
+        "switch_buffer",      "switch_project",    "search_project",   "search_buffer",      "search_todos",
+        "goto_symbol",        "workspace_symbols", "list_diagnostics", "code_action",        "quickfix_list",
+        "jump_list",          "pick_mark",         "pick_register",    "undo_history",       "run_runner",
+        "git_menu",           "git_branches",      "git_changed_files", "help_keys",         "command_picker",
+        "todo_tag",           "man_pages",
+        "message_history",    "pick_theme",        "start_screen",
+    };
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        for (names, 0..) |name, i| {
+            const cmd = commands.find(name) orelse continue;
+            var buf: [64]u8 = undefined;
+            var w: Io.Writer = .fixed(&buf);
+            if (ed.keymap.firstBinding(.normal, cmd)) |seq| keys.formatSequenceDisplay(seq, &w) catch {};
+            try items.append(.{ .text = cmd.doc, .detail = w.buffered(), .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id >= names.len) return;
+        try ed.runCommand(commands.find(names[item.id]) orelse return);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= names.len) return;
+        try out.text.print(ed.gpa, "{s}\n\n{s}", .{ item.text, names[item.id] });
+        if (item.detail.len > 0) try out.text.print(ed.gpa, "\n\nkey: {s}", .{item.detail});
+    }
+};
+
+var fd_state: std.atomic.Value(u8) = .init(0); // 0 unknown, 1 yes, 2 no
+
+fn haveFd(io: Io) bool {
+    const state = fd_state.load(.acquire);
+    if (state != 0) return state == 1;
+    const found = onPath(io, "fd");
+    fd_state.store(if (found) 1 else 2, .release);
+    return found;
+}
+
+/// `SPC f a` / `SPC f d`: files or folders anywhere on disk, by name. The
+/// disk is searched for each query with `fd` (hidden and ignored files
+/// included; system and cache folders left out), from three characters on.
+/// A folder becomes the project to work in.
+fn Anywhere(comptime folders: bool) type {
+    return struct {
+        pub const title = if (folders) "Find folder (anywhere)" else "Find file (anywhere)";
+        pub const prefix: ?u8 = null;
+        pub const start_mode: StartMode = .insert;
+
+        const min_query = 3;
+        const max_results = 5000;
+        const skip = [_][]const u8{ "/proc", "/sys", "/dev", "/run", ".git", "node_modules", "target", "__pycache__", ".cache", ".cargo", ".rustup", ".zig-cache", "zig-pkg" };
+
+        pub fn produce(e: *Engine) anyerror!void {
+            const query = std.mem.trim(u8, e.producerQuery(), " ");
+            if (query.len < min_query or !haveFd(e.io)) return;
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(e.gpa);
+            try argv.appendSlice(e.gpa, &.{ "fd", "--absolute-path", "--fixed-strings", "--hidden", "--no-ignore", "--type", if (folders) "d" else "f", "--color", "never" });
+            for (skip) |s| try argv.appendSlice(e.gpa, &.{ "--exclude", s });
+            // fd matches names; a query with a slash is about the path.
+            if (std.mem.indexOfScalar(u8, query, '/') != null) try argv.append(e.gpa, "--full-path");
+            try argv.appendSlice(e.gpa, &.{ "--", query, "/" });
+            _ = try streamCommand(e, argv.items, '\n', {}, add);
+        }
+
+        fn add(_: void, e: *Engine, record: []const u8) !bool {
+            if (e.items.count() >= max_results) return false;
+            const path = std.mem.trimEnd(u8, record, "/");
+            if (path.len == 0) return true;
+            // Folders show with a trailing slash, like the browser's.
+            var buf: [Io.Dir.max_path_bytes + 1]u8 = undefined;
+            const text = if (folders) std.fmt.bufPrint(&buf, "{s}/", .{path}) catch path else path;
+            try e.items.append(.{ .text = text });
+            return true;
+        }
+
+        pub fn accept(ed: *Editor, item: Item) !void {
+            if (!folders) return ed.openFile(item.text);
+            try ed.switchProject(std.mem.trimEnd(u8, item.text, "/"));
+        }
+
+        pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+            if (!folders) return Files.previewPath(ed, item.text, out);
+            var dir = Io.Dir.cwd().openDir(ed.io, item.text, .{ .iterate = true }) catch |err|
+                return out.text.print(ed.gpa, "({s})", .{@errorName(err)});
+            defer dir.close(ed.io);
+            var it = dir.iterate();
+            var n: usize = 0;
+            while (it.next(ed.io) catch null) |entry| : (n += 1) {
+                if (n == 200) break;
+                try out.text.print(ed.gpa, "{s}{s}\n", .{ entry.name, if (entry.kind == .directory) "/" else "" });
+            }
+        }
+    };
+}
+
+/// `SPC l a`: what the language server offers to do here.
+const CodeActions = struct {
+    pub const title = "Code actions";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        for (ed.code_actions.items, 0..) |a, i| try items.append(.{ .text = a.title, .detail = a.kind, .id = @intCast(i) });
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try ed.applyCodeAction(item.id);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= ed.code_actions.items.len) return;
+        const a = ed.code_actions.items[item.id];
+        try out.text.print(ed.gpa, "{s}\n\n{s}", .{ a.title, if (a.kind.len > 0) a.kind else "action" });
+    }
+};
+
+/// `SPC f w`: symbols across the project. The language server searches as
+/// you type (`Editor.inputChanged` asks it; its answer refills the list).
+const WorkspaceSymbols = struct {
+    pub const title = "Project symbols";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var detail: [std.fs.max_path_bytes + 48]u8 = undefined;
+        for (ed.workspace_symbols.items, 0..) |s, i| {
+            const where = std.fmt.bufPrint(&detail, "{s}  {s}:{d}", .{ s.kind, s.path, s.line + 1 }) catch s.path;
+            try items.append(.{ .text = s.name, .detail = where, .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id >= ed.workspace_symbols.items.len) return;
+        const s = ed.workspace_symbols.items[item.id];
+        const path = try ed.gpa.dupe(u8, s.path);
+        defer ed.gpa.free(path);
+        try ed.jumpTo(path, s.line, s.col);
+    }
+
+    pub fn location(ed: *Editor, item: Item) !?Location {
+        if (item.id >= ed.workspace_symbols.items.len) return null;
+        const s = ed.workspace_symbols.items[item.id];
+        return .{ .path = try ed.gpa.dupe(u8, s.path), .line = s.line, .col = s.col };
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= ed.workspace_symbols.items.len) return;
+        const s = ed.workspace_symbols.items[item.id];
+        try previewAt(ed, s.path, s.line, out);
+    }
+};
+
+/// `SPC r r`: the code runner. This project's commands, newest first:
+/// Enter on the list runs the last one again, any other can be picked, and
+/// typed text is a new command (it stays the first row, so Enter runs what
+/// you typed, not an old command it resembles). `x` forgets one.
+const Runner = struct {
+    pub const title = "Run";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .insert;
+    pub const create_first = true;
+    pub const create_label = "Run ";
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const history = try ed.runnerHistory();
+        defer {
+            for (history) |c| ed.gpa.free(c);
+            ed.gpa.free(history);
+        }
+        for (history, 0..) |c, i| try items.append(.{ .text = c, .detail = if (i == 0) "last" else "", .id = @intCast(i) });
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try ed.runFromRunner(item.text);
+    }
+
+    pub fn create(ed: *Editor, query: []const u8) !void {
+        try ed.runFromRunner(query);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const folder = ed.commandFolder() catch return;
+        defer ed.gpa.free(folder);
+        try out.text.print(ed.gpa, "Runs in {s}\nthrough your shell:\n\n{s}", .{ folder, item.text });
+    }
+};
+
+/// `x` / `dd` in the file browser: delete `ed.browse_target`?
+const ConfirmRemove = struct {
+    pub const title = "Delete?";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const target = ed.browse_target orelse return;
+        try items.append(.{ .text = "No, keep it", .detail = "", .id = 0 });
+        try items.append(.{ .text = "Yes, delete it", .detail = std.fs.path.basename(target), .id = 1 });
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try ed.browseRemove(item.id == 1);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const target = ed.browse_target orelse return;
+        if (item.id != 1) return out.text.appendSlice(ed.gpa, "Leaves it alone.");
+        const st = Io.Dir.cwd().statFile(ed.io, target, .{}) catch null;
+        const what: []const u8 = if (st != null and st.?.kind == .directory) "the folder and everything in it" else "the file";
+        try out.text.print(ed.gpa, "Removes {s} from disk:\n{s}\n\nThis cannot be undone.", .{ what, target });
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Git: a small menu of plain actions, branches, changed files.
 
@@ -1315,7 +1928,8 @@ const GitActions = struct {
         .{ "Changed files", "SPC g s" },
         .{ "Set remote URL...", "" },
         .{ "Restore change at cursor", "SPC g r" },
-        .{ "Reload HEAD", "SPC g R" },
+        .{ "Reload HEAD", "SPC g u" },
+        .{ "Make this a git repository (git init)", "SPC g i" },
     };
 
     pub fn fill(_: *Editor, items: *Items) !void {
@@ -1332,6 +1946,7 @@ const GitActions = struct {
             5 => try ed.gitRemotePrompt(),
             6 => if (ed.hunkAtCursor()) |h| try ed.restoreHunk(h) else ed.setMessage(.info, "no change here", .{}),
             7 => ed.reloadGit(),
+            8 => try ed.gitInit(),
             else => {},
         }
     }
@@ -1346,6 +1961,7 @@ const GitActions = struct {
             "Sets where Push and Pull go (the 'origin' remote).",
             "Puts the HEAD version of the change under the cursor back.",
             "Re-reads HEAD (after committing outside the editor).",
+            "Runs git init in this project's folder (the working folder if there is no project), so commits, the gutter and ghost lines work here.",
         };
         if (item.id < help.len) try out.text.appendSlice(ed.gpa, help[item.id]);
     }
