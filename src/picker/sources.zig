@@ -255,7 +255,7 @@ const Scope = struct { kind: Kind, name: []const u8, command: []const u8 };
 const scope_groups = [_][]const Scope{
     &.{
         .{ .kind = .browse, .name = "folder", .command = "find_file" },
-        .{ .kind = .buffers, .name = "open", .command = "switch_buffer" },
+        .{ .kind = .buffers, .name = "buffers", .command = "switch_buffer" },
         .{ .kind = .recent, .name = "recent everywhere", .command = "recent_files" },
         .{ .kind = .files_anywhere, .name = "whole disk", .command = "find_file_anywhere" },
     },
@@ -736,7 +736,7 @@ const Files = struct {
     /// The project's files you open most (mini.visits) come first, so an
     /// empty query already lists where you are likely going.
     pub fn fill(ed: *Editor, items: *Items) !void {
-        // Open buffers first (marked "open"), then the files you visit most.
+        // Open buffers first, then the files you visit most.
         try OpenRows.fill(ed, items, true);
         const opened = items.count();
         const root = ed.picker_root;
@@ -1761,7 +1761,7 @@ const GlobalFiles = struct {
     pub const preview = Browse.preview;
 };
 
-/// `SPC b`: the open buffers only (`C-t` in Files: its "open" scope).
+/// `SPC b`: the buffers (`C-t` in Files: its "buffers" scope).
 const Buffers = struct {
     pub const title = "Buffers";
     pub const prefix: ?u8 = null;
@@ -1817,7 +1817,7 @@ const OpenRows = struct {
                 text = buf[0..rel.len];
             }
         };
-        const detail: []const u8 = if (b == ed.buffer) "here" else if (b.modified) "open [+]" else "open";
+        const detail: []const u8 = if (b == ed.buffer) "here" else if (b.modified) "[+]" else "";
         try items.append(.{ .text = text, .detail = detail, .id = flag | @as(u32, @intCast(ed.bufferIndex(b))) });
     }
 
@@ -2209,7 +2209,7 @@ pub fn haveRg(io: Io) bool {
     return found;
 }
 
-fn onPath(io: Io, name: []const u8) bool {
+pub fn onPath(io: Io, name: []const u8) bool {
     const path = std.c.getenv("PATH") orelse return false;
     var dirs = std.mem.splitScalar(u8, std.mem.span(path), ':');
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2552,8 +2552,8 @@ const Help = struct {
 /// (Files: project, open, recent, whole disk; Search: project, this file,
 /// todos...).
 const Pickers = Menu("Find", &.{
-    .{ .key = 'f', .label = "Files (C-t: open, recent, whole disk)", .command = "find_file" },
-    .{ .key = 'b', .label = "Open buffers", .command = "switch_buffer" },
+    .{ .key = 'f', .label = "Files (C-t: buffers, recent, whole disk)", .command = "find_file" },
+    .{ .key = 'b', .label = "Buffers", .command = "switch_buffer" },
     .{ .key = 'g', .label = "Search (C-t: this file, todos)", .command = "search_project" },
     .{ .key = 'x', .label = "Problems (C-t: last run, saved list)", .command = "list_diagnostics" },
     .{ .key = 'j', .label = "Places (C-t: marks)", .command = "jump_list" },

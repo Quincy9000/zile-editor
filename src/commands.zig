@@ -61,6 +61,9 @@ pub const Command = struct {
     /// Works while the cursor is on a ghost line (otherwise the cursor
     /// returns to the text first, or the command is refused if it edits).
     ghost: bool = false,
+    /// A program it runs: when that isn't installed, running the command
+    /// just says so ("git isn't installed").
+    needs: []const u8 = "",
 };
 
 pub const all = base ++ text_object_commands;
@@ -120,7 +123,7 @@ const base = [_]Command{
     .{ .name = "find_file_anywhere", .doc = "Find a file anywhere on disk", .run = openPicker(.files_anywhere), .once = true },
     .{ .name = "find_folder", .doc = "Find a folder anywhere (work there)", .run = openPicker(.folders_anywhere), .once = true },
     .{ .name = "todo_tag", .doc = "Write a todo tag (TODO, FIXME...)", .run = openPicker(.todo_tags), .once = true },
-    .{ .name = "man_pages", .doc = "Manual pages (C functions, system calls)", .run = openPicker(.man), .once = true },
+    .{ .name = "man_pages", .doc = "Manual pages (C functions, system calls)", .run = openPicker(.man), .once = true, .needs = "man" },
     .{ .name = "all_pickers", .doc = "Every picker", .run = openPicker(.pickers), .once = true },
     .{ .name = "rename_symbol", .doc = "Rename symbol", .run = renameSymbol },
     .{ .name = "goto_symbol", .doc = "Go to symbol", .run = gotoSymbol },
@@ -211,7 +214,7 @@ const base = [_]Command{
     .{ .name = "toggle_diagnostic_text", .doc = "Diagnostic messages", .run = toggle("diagnostic_text", "diagnostic messages"), .ghost = true },
 
     // Git (in a repository)
-    .{ .name = "git_menu", .doc = "Git menu", .run = openPicker(.git_actions) },
+    .{ .name = "git_menu", .doc = "Git menu", .run = openPicker(.git_actions), .needs = "git" },
     .{ .name = "pick_windows", .doc = "Windows (split, close, resize, focus)", .run = openPicker(.windows) },
     .{ .name = "pick_toggles", .doc = "Toggles (every setting, the colour scheme, text size)", .run = openPicker(.toggles) },
     .{ .name = "jump_toggle", .doc = "Back to the last jump, and again: back here", .run = jumpToggle, .once = true },
@@ -220,14 +223,14 @@ const base = [_]Command{
     .{ .name = "claude_menu", .doc = "Claude", .run = openPicker(.leader_claude) },
     .{ .name = "quit_menu", .doc = "Quit", .run = openPicker(.leader_quit) },
     .{ .name = "code_menu", .doc = "Code (rename, actions, format, definitions, symbols...)", .run = openPicker(.code_menu) },
-    .{ .name = "git_commit", .doc = "Commit all changes", .run = gitAction(.commit) },
-    .{ .name = "git_push", .doc = "Push", .run = gitAction(.push) },
-    .{ .name = "git_pull", .doc = "Pull", .run = gitAction(.pull) },
-    .{ .name = "git_branches", .doc = "Switch / new branch", .run = openPicker(.git_branches) },
-    .{ .name = "git_changed_files", .doc = "Changed files", .run = openPicker(.git_changes) },
-    .{ .name = "git_init", .doc = "Make this a git repository", .run = gitAction(.init) },
-    .{ .name = "git_set_remote", .doc = "Set remote URL", .run = gitAction(.remote) },
-    .{ .name = "git_restore_hunk", .doc = "Restore hunk from HEAD", .run = gitCmd(.restore), .ghost = true },
+    .{ .name = "git_commit", .doc = "Commit all changes", .run = gitAction(.commit), .needs = "git" },
+    .{ .name = "git_push", .doc = "Push", .run = gitAction(.push), .needs = "git" },
+    .{ .name = "git_pull", .doc = "Pull", .run = gitAction(.pull), .needs = "git" },
+    .{ .name = "git_branches", .doc = "Switch / new branch", .run = openPicker(.git_branches), .needs = "git" },
+    .{ .name = "git_changed_files", .doc = "Changed files", .run = openPicker(.git_changes), .needs = "git" },
+    .{ .name = "git_init", .doc = "Make this a git repository", .run = gitAction(.init), .needs = "git" },
+    .{ .name = "git_set_remote", .doc = "Set remote URL", .run = gitAction(.remote), .needs = "git" },
+    .{ .name = "git_restore_hunk", .doc = "Restore hunk from HEAD", .run = gitCmd(.restore), .ghost = true, .needs = "git" },
     .{ .name = "git_next_hunk", .doc = "Next change", .run = gitCmd(.next), .ghost = true , .jump = true },
     .{ .name = "git_previous_hunk", .doc = "Previous change", .run = gitCmd(.previous), .ghost = true , .jump = true },
     .{ .name = "git_reload", .doc = "Reload HEAD", .run = gitCmd(.reload), .ghost = true },
@@ -291,9 +294,9 @@ const base = [_]Command{
     .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) , .jump = true },
     .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) , .jump = true },
     .{ .name = "switch_project", .doc = "Switch project", .run = openPicker(.projects), .once = true },
-    .{ .name = "claude_panel", .doc = "Claude Code panel", .run = claudeCmd(.panel), .once = true },
-    .{ .name = "claude_send", .doc = "Send selection/file to Claude", .run = claudeCmd(.send), .once = true },
-    .{ .name = "claude_ask", .doc = "Ask Claude about the selection", .run = claudeCmd(.ask), .once = true },
+    .{ .name = "claude_panel", .doc = "Claude Code panel", .run = claudeCmd(.panel), .once = true, .needs = "claude" },
+    .{ .name = "claude_send", .doc = "Send selection/file to Claude", .run = claudeCmd(.send), .once = true, .needs = "claude" },
+    .{ .name = "claude_ask", .doc = "Ask Claude about the selection", .run = claudeCmd(.ask), .once = true, .needs = "claude" },
     .{ .name = "claude_accept", .doc = "Accept Claude's change", .run = claudeCmd(.accept), .once = true },
     .{ .name = "claude_reject", .doc = "Reject Claude's change", .run = claudeCmd(.reject), .once = true },
     .{ .name = "terminal_window", .doc = "Terminal here (in this window)", .run = termCmd(.window), .once = true },
@@ -407,7 +410,7 @@ const base = [_]Command{
     .{ .name = "undo_history", .doc = "Undo history", .run = openPicker(.undo), .once = true },
     .{ .name = "help_keys", .doc = "Keys and commands", .run = openPicker(.help), .once = true },
     .{ .name = "pick_color", .doc = "Colour wheel (edit the colour here)", .run = pickColor, .once = true },
-    .{ .name = "git_line_commit", .doc = "Commit that changed this line", .run = gitLineCommit, .once = true },
+    .{ .name = "git_line_commit", .doc = "Commit that changed this line", .run = gitLineCommit, .once = true, .needs = "git" },
 
     // Inside the picker
     .{ .name = "picker_next", .doc = "Next result", .run = pickerMove(1, .wrap), .hidden = true },

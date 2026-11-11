@@ -20,6 +20,7 @@ const formatters = [_]Row{
     .{ .lang = "toml", .argv = &.{ "taplo", "fmt", "-" } },
     .{ .lang = "bash", .argv = &.{ "shfmt", "--filename", "{path}" } },
     .{ .lang = "lua", .argv = &.{ "stylua", "--stdin-filepath", "{path}", "-" } },
+    .{ .lang = "go", .argv = &.{"gofmt"} },
     .{ .lang = "sql", .argv = &.{ "pg_format", "-" } },
 } ++ prettier("yaml") ++ prettier("javascript") ++ prettier("typescript") ++ prettier("tsx") ++ prettier("html") ++ prettier("css");
 

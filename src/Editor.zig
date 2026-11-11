@@ -760,6 +760,10 @@ linter_checked: std.StringHashMapUnmanaged(bool) = .empty,
 lsp_failed: [Lsp.max_servers]bool = @splat(false),
 /// Times each server was restarted after exiting (given up after a few).
 lsp_restarts: [Lsp.max_servers]u8 = @splat(0),
+/// The server's program isn't installed (said when an action needs it).
+lsp_missing: [Lsp.max_servers]bool = @splat(false),
+/// Formatters found missing on a save (said once per session).
+format_missing_told: std.StringHashMapUnmanaged(void) = .empty,
 /// The outline shown by the symbols picker (`SPC f s`).
 symbols: std.ArrayList(syntax_objects.Symbol) = .empty,
 /// The buffer a Yes/No confirmation (`SPC b x`) is about.
@@ -949,6 +953,7 @@ pub fn deinit(ed: *Editor) void {
     if (ed.search_prompt) |*sp| sp.input.deinit(ed.gpa);
     if (ed.replace) |r| r.destroy();
     ed.grow_stack.deinit(ed.gpa);
+    ed.format_missing_told.deinit(ed.gpa);
     ed.action_query.deinit(ed.gpa);
     for (ed.query_undo.items) |u| ed.gpa.free(u.text);
     ed.query_undo.deinit(ed.gpa);
@@ -1056,8 +1061,16 @@ pub fn tick(ed: *Editor) void {
     }
 }
 
+/// Whether `cmd` needs a program that isn't installed; if so, says so.
+fn toolMissing(ed: *Editor, cmd: *const commands.Command) bool {
+    if (cmd.needs.len == 0 or sources.onPath(ed.io, cmd.needs)) return false;
+    ed.setMessage(.err, "{s} isn't installed", .{cmd.needs});
+    return true;
+}
+
 /// Runs a command as if its key was pressed with no count (command picker).
 pub fn runCommand(ed: *Editor, cmd: *const commands.Command) !void {
+    if (ed.toolMissing(cmd)) return;
     if (cmd.takes_char) {
         ed.awaiting_char = .{ .cmd = cmd, .count = 1, .has_count = false, .register = null };
         return;
@@ -1324,6 +1337,7 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 ed.awaiting_char = .{ .cmd = cmd, .count = @max(count, 1), .has_count = has_count, .register = register };
                 return;
             }
+            if (ed.toolMissing(cmd)) return;
             try cmd.run(.{
                 .ed = ed,
                 .count = @max(count, 1),
@@ -1379,6 +1393,17 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
 // ---------------------------------------------------------------------------
 // Language server
 
+/// A server that wouldn't start. Not installed: said when something needs it
+/// (`gd`, `K`, rename...), not on opening a file. Anything else: said now.
+fn serverStartFailed(ed: *Editor, i: usize, err: anyerror) void {
+    ed.lsp_failed[i] = true;
+    if (err == error.FileNotFound) {
+        ed.lsp_missing[i] = true;
+        return;
+    }
+    ed.notify(.err, "could not start {s}: {s}", .{ Lsp.servers[i].name, @errorName(err) });
+}
+
 fn tickLsp(ed: *Editor) void {
     // Start each language's server for each project, the first time one of
     // its files is open there.
@@ -1386,8 +1411,7 @@ fn tickLsp(ed: *Editor) void {
         const i = Lsp.serverFor(b) orelse continue;
         if (ed.lsp_failed[i] or ed.lspFor(b) != null) continue;
         const l = Lsp.start(ed, i, Lsp.bufferRoot(b, ed.cwd)) catch |err| {
-            ed.lsp_failed[i] = true;
-            ed.notify(.err, "could not start {s}: {s}", .{ Lsp.servers[i].name, @errorName(err) });
+            ed.serverStartFailed(i, err);
             continue;
         };
         ed.lsps.append(ed.gpa, l) catch l.deinit();
@@ -1401,8 +1425,7 @@ fn tickLsp(ed: *Editor) void {
         } else false;
         if (running or ed.linterAbsent(i, root)) continue;
         const l = Lsp.start(ed, i, root) catch |err| {
-            ed.lsp_failed[i] = true;
-            ed.notify(.err, "could not start {s}: {s}", .{ srv.name, @errorName(err) });
+            ed.serverStartFailed(i, err);
             continue;
         };
         ed.lsps.append(ed.gpa, l) catch l.deinit();
@@ -1490,7 +1513,9 @@ pub fn languageServer(ed: *Editor) ?*Lsp {
     };
     if (ed.lspFor(ed.buffer)) |l| return l;
     const name = Lsp.servers[i].name;
-    if (ed.lsp_failed[i]) ed.setMessage(.err, "{s} is not running", .{name}) else ed.setMessage(.info, "{s} is starting...", .{name});
+    if (ed.lsp_missing[i]) {
+        ed.setMessage(.err, "{s} isn't installed", .{name});
+    } else if (ed.lsp_failed[i]) ed.setMessage(.err, "{s} is not running", .{name}) else ed.setMessage(.info, "{s} is starting...", .{name});
     return null;
 }
 
@@ -5898,7 +5923,10 @@ fn forgetMarks(ed: *Editor, b: *Buffer) void {
 // detected when it is read), else the options.
 
 pub fn usesTabs(ed: *const Editor) bool {
-    return if (ed.buffer.indent_style) |s| s.tabs else !ed.options.expand_tab;
+    if (ed.buffer.indent_style) |s| return s.tabs;
+    // A Go file with no indentation yet: tabs, as gofmt writes them.
+    if (ed.buffer.syntax) |syn| if (std.mem.eql(u8, syn.lang.name, "go")) return true;
+    return !ed.options.expand_tab;
 }
 
 /// The columns one level of indentation takes.
@@ -6807,6 +6835,12 @@ fn formatExternal(ed: *Editor, then_save: bool) !void {
     switch (try format.run(ed.gpa, ed.io, lang, src, ed.projectRoot(), abs)) {
         .none => if (!then_save) {
             if (format.name(lang)) |n| ed.setMessage(.err, "{s} isn't installed", .{n}) else ed.setMessage(.info, "no formatter for this file", .{});
+        } else if (format.name(lang)) |n| {
+            // On save: said once, then saving just goes on unformatted.
+            if (!ed.format_missing_told.contains(n)) {
+                ed.format_missing_told.put(ed.gpa, n, {}) catch {};
+                ed.notify(.err, "{s} isn't installed: saved without formatting", .{n});
+            }
         },
         .failed => |m| {
             defer ed.gpa.free(m);
@@ -9568,6 +9602,33 @@ test "pickers as menus: buffers' actions, the Tab menu, toggles, row keys" {
     try ed.feed("W");
     try testing.expectEqual(null, ed.picker);
     try testing.expect(std.mem.indexOf(u8, ed.text().slice(0, ed.text().len()), "x   ") == null);
+}
+
+test "go: a new file indents with tabs" {
+    var ed = try testEditorAs("main.go", "func main() {");
+    defer ed.deinit();
+    try testing.expect(ed.usesTabs());
+    try ed.feed("A<CR>x<Esc>");
+    try testing.expectEqualStrings("\tx", ed.text().lineSlice(1));
+}
+
+test "missing tools: quiet until an action needs them, then said plainly" {
+    var ed = try testEditorAs("main.go", "package main");
+    defer ed.deinit();
+    const i = Lsp.serverFor(ed.buffer).?;
+    const toasts = ed.toasts.items.len;
+    ed.serverStartFailed(i, error.FileNotFound);
+    try testing.expectEqual(toasts, ed.toasts.items.len); // nothing on opening
+    try testing.expect(ed.languageServer() == null); // gd, K, rename...
+    try testing.expect(std.mem.endsWith(u8, ed.message.text(), "isn't installed"));
+    // A command needing a program that isn't there.
+    const cmd: commands.Command = .{ .name = "x", .doc = "x", .run = struct {
+        fn run(_: commands.Context) anyerror!void {
+            return error.ShouldNotRun;
+        }
+    }.run, .needs = "zile-no-such-program" };
+    try ed.runCommand(&cmd);
+    try testing.expectEqualStrings("zile-no-such-program isn't installed", ed.message.text());
 }
 
 test "registers: named, append, black hole" {

@@ -70,7 +70,7 @@ the row, `/` types to filter.
 | key | picker | its actions / rows |
 |---|---|---|
 | `SPC` | Leader menu | every row below, on its key; `i` filters |
-| `SPC SPC` (and `SPC .`) | Files: the explorer | starts as the project's folder (`SPC .`: the current file's), its entries only; typing searches two ways at once: **here** (the folder's entries and every file below it, the ones you visit most first; instant, ranked by the file name then nearness) and, under a line, **elsewhere** (`files_global`, a second engine run per query: files you opened in other places, then `fd --fixed-strings` over `$HOME`, skipping `.git`, `node_modules`, caches and build output unless `SPC t` turns that off), so `main.zig` shows this project's first and `zshrc` finds `~/.zshrc` from any project; Create is the last row; `src/` goes into a folder, `BS` on nothing goes up; `o n r m x yy p` the explorer's file operations; `C-t` scopes: folder · open · recent everywhere · whole disk |
+| `SPC SPC` (and `SPC .`) | Files: the explorer | starts as the project's folder (`SPC .`: the current file's), its entries only; typing searches two ways at once: **here** (the folder's entries and every file below it, the ones you visit most first; instant, ranked by the file name then nearness) and, under a line, **elsewhere** (`files_global`, a second engine run per query: files you opened in other places, then `fd --fixed-strings` over `$HOME`, skipping `.git`, `node_modules`, caches and build output unless `SPC t` turns that off), so `main.zig` shows this project's first and `zshrc` finds `~/.zshrc` from any project; Create is the last row; `src/` goes into a folder, `BS` on nothing goes up; `o n r m x yy p` the explorer's file operations; `C-t` scopes: folder · buffers · recent everywhere · whole disk |
 | `SPC b` | Files, open scope | `x` / `C-x` close, `n` new, `s` save, `S` save all, `r` rename / move, `w` save as, `c` copy to, `R` revert, `D` delete the file, `o` close the others, `y` / `Y` copy path |
 | `SPC w` | Windows | rows: the other windows (last used first), the one you're in last (`SPC w Enter` flips back), then `+ New window right… / below…` (pick what it shows in Files; cancel: no window) and `+ New terminal window`; the preview draws the layout (selected window double-lined, yours `*`); `w` (`SPC w w`) back to the previous window and again to toggle, `h j k l` the window that way from yours, `v` / `s` split the selected one, `x` close, `X` swap with yours, `z` maximise / back, `b` choose its buffer, `o` only, `=` equal, `>` `<` `+` `-` grow / shrink (stays open), `t` terminal in it |
 | `SPC t` | toggles | every setting with its on / off state; Enter flips it and the list stays; colour scheme, text size |
@@ -214,7 +214,7 @@ code actions, buffers, jumplist, registers, terminals.
 - **Scopes, not more pickers.** Pickers that differ only in what they
   range over are one picker with scopes; `C-t` steps through them keeping
   the query, and the bottom bar shows them (`C-t project · open · ...`).
-  Groups (`sources.scope_groups`): Files (folder, open, recent everywhere,
+  Groups (`sources.scope_groups`): Files (folder, buffers, recent everywhere,
   whole disk), Search (project, this file, todos), Symbols (this file,
   project), Problems (errors, last run, saved list), Places (jumps, marks),
   Commands (commands, keys).
@@ -499,6 +499,11 @@ and text objects (`objects.zig` specs) for new languages.
 is a `#!` naming a shell (`languages.forShebang`, which also knows python,
 node, deno and bun). `#` comments, `shfmt` formatting. No server built in
 (`bash-language-server` isn't installed; add it in `languages.toml`).
+
+**Go** (tree-sitter-go v0.23.4): `.go`; `gopls`; `gofmt` on save; tabs
+in a new file; `af` functions and methods, `ac` structs / interfaces with
+their name, `ia` parameters and arguments; folds; `Alt-f` skips `func`
+literals.
 
 **Lua** (tree-sitter-lua v0.2.0, tree-sitter-grammars): `.lua`
 `.rockspec` `.luacheckrc` and `#!` lua / luajit; `--` comments;

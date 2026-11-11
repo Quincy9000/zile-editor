@@ -102,6 +102,19 @@ const specs = std.StaticStringMap(Spec).initComptime(.{
             "mod_item",      "block",     "match_block", "block_comment",
         },
     } },
+    .{ "go", Spec{
+        .functions = &.{ "function_declaration", "method_declaration", "func_literal" },
+        .classes = &.{ "struct_type", "interface_type" },
+        .lists = &.{ "parameter_list", "argument_list", "type_arguments", "type_parameter_list" },
+        // `ac` on a struct takes `Foo struct {...}`.
+        .class_wrappers = &.{"type_spec"},
+        .folds = &.{
+            "function_declaration", "method_declaration",          "func_literal",          "block",
+            "type_declaration",     "literal_value",               "import_declaration",    "const_declaration",
+            "var_declaration",      "expression_switch_statement", "type_switch_statement", "select_statement",
+            "comment",
+        },
+    } },
     .{ "lua", Spec{
         .functions = &.{ "function_declaration", "function_definition" },
         .classes = &.{"table_constructor"},
@@ -563,7 +576,7 @@ fn isNamedFunction(spec: Spec, n: c.TSNode) bool {
     if (!isOneOf(n, spec.functions)) return false;
     const ty = typeOf(n);
     const anonymous = std.mem.eql(u8, ty, "arrow_function") or std.mem.eql(u8, ty, "function_expression") or
-        std.mem.eql(u8, ty, "function") or std.mem.eql(u8, ty, "closure_expression");
+        std.mem.eql(u8, ty, "function") or std.mem.eql(u8, ty, "closure_expression") or std.mem.eql(u8, ty, "func_literal");
     if (!anonymous) return true;
     const p = c.ts_node_parent(n);
     return !c.ts_node_is_null(p) and isOneOf(p, &.{ "variable_declarator", "pair", "public_field_definition", "assignment_expression" });
@@ -688,4 +701,23 @@ test "lua: functions as text objects, folds and outline" {
     const arg = find(&s, &t, std.mem.indexOf(u8, src, "b)").?, .argument, .inner, 1).?;
     try std.testing.expectEqualStrings("b", src[arg.start..arg.end]);
     try std.testing.expectEqual(std.mem.indexOf(u8, src, "local f").?, functionStart(&s, &t, at, true).?);
+}
+
+test "go: functions, methods, structs, arguments" {
+    const gpa = std.testing.allocator;
+    const src = "package main\n\ntype Point struct {\n\tX, Y int\n}\n\nfunc (p Point) Add(q Point) Point {\n\treturn Point{p.X + q.X, p.Y + q.Y}\n}\n\nfunc main() {\n\tf := func(x int) int { return x }\n\t_ = f(1)\n}\n";
+    var t = try Text.init(gpa, src);
+    defer t.deinit(gpa);
+    var s = Syntax.forPath("main.go").?;
+    defer s.deinit(gpa);
+    const ret = std.mem.indexOf(u8, src, "return Point").?;
+    const m = find(&s, &t, ret, .function, .around, 1).?;
+    try std.testing.expect(std.mem.startsWith(u8, src[m.start..m.end], "func (p Point) Add"));
+    const st = find(&s, &t, std.mem.indexOf(u8, src, "X, Y").?, .class, .around, 1).?;
+    try std.testing.expect(std.mem.startsWith(u8, src[st.start..st.end], "Point struct {"));
+    const arg = find(&s, &t, std.mem.indexOf(u8, src, "q Point").?, .argument, .inner, 1).?;
+    try std.testing.expectEqualStrings("q Point", src[arg.start..arg.end]);
+    // Alt-f: from the method to main, past the func literal.
+    try std.testing.expectEqual(std.mem.indexOf(u8, src, "func main").?, functionStart(&s, &t, ret, true).?);
+    try std.testing.expectEqual(null, functionStart(&s, &t, std.mem.indexOf(u8, src, "f := ").?, true));
 }

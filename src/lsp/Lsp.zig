@@ -149,6 +149,7 @@ const builtin_servers = [_]Server{
     .{ .languages = &.{.{ "c", "c" }}, .name = "clangd", .command = &.{"clangd"} },
     .{ .languages = &.{.{ "rust", "rust" }}, .name = "rust-analyzer", .command = &.{"rust-analyzer"} },
     .{ .languages = &.{.{ "lua", "lua" }}, .name = "lua-language-server", .command = &.{"lua-language-server"} },
+    .{ .languages = &.{.{ "go", "go" }}, .name = "gopls", .command = &.{"gopls"} },
     .{
         .languages = &.{ .{ "javascript", "javascript" }, .{ "typescript", "typescript" }, .{ "tsx", "typescriptreact" } },
         .name = "vtsls",

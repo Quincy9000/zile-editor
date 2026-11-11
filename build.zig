@@ -29,6 +29,7 @@ const grammars = [_]struct {
         .extensions = &.{ "sh", "bash", "zsh", "bashrc", "bash_profile", "bash_logout", "profile", "zshrc", "zprofile", "zshenv", "zlogin", "xinitrc", "xprofile", "envrc", "PKGBUILD", "install", "env" },
         .scanner = true,
     },
+    .{ .name = "go", .dep = "ts_go", .extensions = &.{"go"}, .scanner = false },
     .{ .name = "lua", .dep = "ts_lua", .extensions = &.{ "lua", "rockspec", "luacheckrc" }, .scanner = true },
     .{ .name = "sql", .dep = "ts_sql", .extensions = &.{ "sql", "psql", "pgsql" }, .scanner = true },
     .{ .name = "html", .dep = "ts_html", .extensions = &.{ "html", "htm" }, .scanner = true, .highlights = &.{ .{}, .{ .path = "queries/html.scm", .own = true } } },
