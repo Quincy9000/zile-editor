@@ -442,8 +442,10 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     const cursor_line = ed.cursorLine();
     // Breakpoints and the debugger's stop are kept by absolute path.
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // (Resolved as `Editor.absolutePath` does, so `./a.c` is `a.c`.)
+    var abs_fba: std.heap.FixedBufferAllocator = .init(&abs_buf);
     const debug_path: ?[]const u8 = if (ed.breakpoints.items.len == 0 and ed.debugger == null) null else if (ed.buffer.path) |bp|
-        (if (std.fs.path.isAbsolute(bp)) bp else std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ ed.cwd, bp }) catch null)
+        (std.fs.path.resolve(abs_fba.allocator(), &.{ ed.cwd, bp }) catch null)
     else
         null;
     const tab_width = ed.options.tab_width;

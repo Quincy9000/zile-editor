@@ -119,7 +119,7 @@ pub fn start(gpa: Allocator, io: Io, opts: Options) !*Debugger {
     // In a session of its own: gdb on zile's terminal (terminal mode) takes
     // it over for job control, and the program never starts.
     const client = try Client.start(gpa, io, &.{ "setsid", "gdb", "-q", "-nx", "-i", "dap" }, opts.wake, opts.log);
-    errdefer client.deinit();
+    errdefer stopGdb(client);
     const d = try gpa.create(Debugger);
     errdefer gpa.destroy(d);
     d.* = .{ .gpa = gpa, .io = io, .client = client };
@@ -150,16 +150,20 @@ pub fn deinit(d: *Debugger) void {
     if (d.state != .exited) if (d.pid) |pid| if (std.math.cast(c_int, pid)) |p| {
         _ = killProcess(p, 9);
     };
-    // gdb ignores SIGTERM, which is what the client's cleanup sends before
-    // waiting for it: that wait would never end (the editor would hang).
-    if (d.client.child.id) |pid| _ = killProcess(pid, 9);
-    d.client.deinit();
+    stopGdb(d.client);
     d.clearFrames();
     d.frames.deinit(d.gpa);
     d.waiting.deinit(d.gpa);
     d.gpa.free(d.reason);
     if (d.note) |n| d.gpa.free(n);
     d.gpa.destroy(d);
+}
+
+/// gdb ignores SIGTERM, which is what the client's cleanup sends before
+/// waiting for it: that wait would never end (the editor would hang).
+fn stopGdb(client: *Client) void {
+    if (client.child.id) |pid| _ = killProcess(pid, 9);
+    client.deinit();
 }
 
 const killProcess = @extern(*const fn (c_int, c_int) callconv(.c) c_int, .{ .name = "kill" });
@@ -247,6 +251,8 @@ fn handle(d: *Debugger, msg: std.json.Value, up: *Update) !void {
         d.pid = int(field(body, "systemProcessId"));
     } else if (std.mem.eql(u8, event, "exited")) {
         d.exit_code = int(field(body, "exitCode"));
+        // Its process id may be another's from here on.
+        d.pid = null;
     } else if (std.mem.eql(u8, event, "terminated")) {
         d.state = .exited;
         up.ended = true;
@@ -324,8 +330,11 @@ fn onResponse(d: *Debugger, msg: std.json.Value, up: *Update) !void {
                 const value = str(field(x, "value")) orelse "";
                 try f.vars.print(d.gpa, "{s} = ", .{name});
                 // One line each, cut short when long.
-                for (value[0..@min(value.len, max_value)]) |b| try f.vars.append(d.gpa, if (b == '\n' or b == '\r') ' ' else b);
-                if (value.len > max_value) try f.vars.appendSlice(d.gpa, "…");
+                var end = @min(value.len, max_value);
+                // Not through the middle of a character.
+                while (end < value.len and end > 0 and value[end] & 0xC0 == 0x80) end -= 1;
+                for (value[0..end]) |b| try f.vars.append(d.gpa, if (b == '\n' or b == '\r') ' ' else b);
+                if (end < value.len) try f.vars.appendSlice(d.gpa, "…");
                 try f.vars.append(d.gpa, '\n');
             };
             up.vars = true;
@@ -370,9 +379,9 @@ fn int(v: ?std.json.Value) ?i64 {
 pub const Plan = struct {
     build: ?[]u8 = null,
     /// A path (relative to where the command runs, or absolute), or a name
-    /// to find on PATH; with `newest_in`, the folder the build puts it in:
-    /// which program it is, the build system doesn't say (it's picked once
-    /// in the Debug picker and remembered).
+    /// to find on PATH; with `newest_in`, the folder the build system puts
+    /// programs in: which one it is, it doesn't say (it's looked for there
+    /// once the build is done).
     program: []u8,
     newest_in: bool = false,
     /// The command asks for an optimized build (`--release`, `-O`): such a
@@ -385,6 +394,14 @@ pub const Plan = struct {
         gpa.free(p.program);
         for (p.args) |a| gpa.free(a);
         gpa.free(p.args);
+    }
+
+    pub fn clone(p: Plan, gpa: Allocator) !Plan {
+        const build: ?[]u8 = if (p.build) |b| try gpa.dupe(u8, b) else null;
+        errdefer if (build) |b| gpa.free(b);
+        const program = try gpa.dupe(u8, p.program);
+        errdefer gpa.free(program);
+        return .{ .build = build, .program = program, .newest_in = p.newest_in, .release = p.release, .args = try dupeAll(gpa, p.args) };
     }
 };
 
@@ -441,17 +458,17 @@ pub fn plan(gpa: Allocator, cmd: []const u8) !PlanResult {
         var build: std.ArrayList(u8) = .empty;
         errdefer build.deinit(gpa);
         try build.appendSlice(gpa, "zig build");
-        var left_out = false;
+        var release = false;
         for (head[2..], 2..) |x, i| {
             if (i == run) continue;
-            if (std.mem.eql(u8, x, "--release") or std.mem.startsWith(u8, x, "--release=") or (std.mem.startsWith(u8, x, "-Doptimize=") and !std.mem.endsWith(u8, x, "=Debug"))) left_out = true;
+            if (std.mem.eql(u8, x, "--release") or std.mem.startsWith(u8, x, "--release=") or (std.mem.startsWith(u8, x, "-Doptimize=") and !std.mem.endsWith(u8, x, "=Debug"))) release = true;
             try appendWord(gpa, &build, x);
         }
         return .{ .plan = .{
             .build = try build.toOwnedSlice(gpa),
             .program = try gpa.dupe(u8, "zig-out/bin"),
             .newest_in = true,
-            .release = left_out,
+            .release = release,
             .args = try dupeAll(gpa, tail),
         } };
     }
@@ -465,32 +482,32 @@ pub fn plan(gpa: Allocator, cmd: []const u8) !PlanResult {
         var build: std.ArrayList(u8) = .empty;
         errdefer build.deinit(gpa);
         try build.appendSlice(gpa, "mkdir -p .zig-cache/zile-debug && zig build-exe");
-        var left_out = false;
+        var release = false;
         for (head[2..]) |x| {
             // `-O ReleaseFast`, `-OReleaseFast`.
-            if (std.mem.startsWith(u8, x, "-O")) left_out = true;
+            if (std.mem.startsWith(u8, x, "-O")) release = true;
             try appendWord(gpa, &build, x);
         }
         try build.appendSlice(gpa, " -femit-bin=");
         try build.appendSlice(gpa, out);
-        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = out, .release = left_out, .args = try dupeAll(gpa, tail) } };
+        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = out, .release = release, .args = try dupeAll(gpa, tail) } };
     }
     if (std.mem.eql(u8, t[0], "cargo") and head.len >= 2 and std.mem.eql(u8, head[1], "run")) {
         var build: std.ArrayList(u8) = .empty;
         errdefer build.deinit(gpa);
         try build.appendSlice(gpa, "cargo build");
-        var left_out = false;
+        var release = false;
         var bin: ?[]const u8 = null;
         for (head[2..], 2..) |x, i| {
-            if (std.mem.eql(u8, x, "--release") or std.mem.eql(u8, x, "-r")) left_out = true;
+            if (std.mem.eql(u8, x, "--release") or std.mem.eql(u8, x, "-r")) release = true;
             try appendWord(gpa, &build, x);
             if (std.mem.eql(u8, x, "--bin") and i + 1 < head.len) bin = head[i + 1];
             if (std.mem.startsWith(u8, x, "--bin=")) bin = x["--bin=".len..];
         }
-        const dir = if (left_out) "target/release" else "target/debug";
+        const dir = if (release) "target/release" else "target/debug";
         const program = if (bin) |b| try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, b }) else try gpa.dupe(u8, dir);
         errdefer gpa.free(program);
-        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = program, .newest_in = bin == null, .release = left_out, .args = try dupeAll(gpa, tail) } };
+        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = program, .newest_in = bin == null, .release = release, .args = try dupeAll(gpa, tail) } };
     }
     const name = std.fs.path.basename(t[0]);
     for ([_][]const u8{ "go", "gopls" }) |x| if (std.mem.eql(u8, name, x))

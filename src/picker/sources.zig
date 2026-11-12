@@ -2832,9 +2832,7 @@ const Debug = struct {
     pub const start_mode: StartMode = .normal;
     pub const create_label = "Debug ";
     const bp_base: u32 = 1 << 20;
-    /// Programs debugged before (newest first), then the project's
-    /// executables found on disk.
-    const prog_base: u32 = 1 << 21;
+    /// A compiled program found on disk (asking which one a build made).
     const found_id: u32 = 1 << 22;
     /// The command the debugger runs.
     const cmd_id: u32 = 1 << 23;
@@ -2880,7 +2878,8 @@ const Debug = struct {
         return ed.debug_asking;
     }
 
-    /// The project's compiled programs, newest first (`findPrograms`).
+    /// The compiled programs where the build put them, newest first
+    /// (`findPrograms`; the picker's root is that folder).
     pub fn produce(e: *Engine) anyerror!void {
         const found = try @import("../Debugger.zig").findPrograms(e.gpa, e.io, e.root);
         defer {
@@ -2888,16 +2887,7 @@ const Debug = struct {
             e.gpa.free(found);
         }
         try e.checkpoint();
-        // Not the programs already listed (debugged this session).
-        const seeded = e.items.count();
-        outer: for (found) |f| {
-            for (0..seeded) |i| {
-                const t = e.items.get(i).text;
-                const prog = t[0 .. std.mem.indexOfScalar(u8, t, ' ') orelse t.len];
-                if (std.mem.eql(u8, prog, f)) continue :outer;
-            }
-            try e.items.append(.{ .text = f, .detail = "", .id = found_id });
-        }
+        for (found) |f| try e.items.append(.{ .text = f, .detail = "", .id = found_id });
     }
 
     pub fn create(ed: *Editor, query: []const u8) !void {
@@ -2906,7 +2896,7 @@ const Debug = struct {
 
     pub fn accept(ed: *Editor, item: Item) !void {
         if (item.id == cmd_id) return ed.debugRowAccept();
-        if (item.id >= prog_base) return ed.debugProgramText(item.text);
+        if (item.id >= found_id) return ed.debugProgramText(item.text);
         if (item.id < bp_base) return ed.showFrame(item.id);
         const i = item.id - bp_base;
         if (i >= ed.breakpoints.items.len) return;
@@ -2929,7 +2919,7 @@ const Debug = struct {
             try out.text.appendSlice(ed.gpa, "e: change it (a debug build, other arguments, or\n   `zig build && ./zig-out/bin/app` to name the program).\nIt holds for this session; the runner's command stays as it is.");
             return;
         }
-        if (item.id >= prog_base) {
+        if (item.id >= found_id) {
             try out.text.print(ed.gpa, "Enter: debugs\n\n  {s}\n\n(type after it to add arguments)", .{item.text});
             return;
         }
@@ -2977,7 +2967,7 @@ const Debug = struct {
     /// `d`: the row's breakpoint removed.
     fn removeRow(ed: *Editor, item: ?Item) anyerror!void {
         const it = item orelse return;
-        if (it.id < bp_base or it.id >= prog_base) return ed.setMessage(.info, "d removes a breakpoint row", .{});
+        if (it.id < bp_base or it.id >= found_id) return ed.setMessage(.info, "d removes a breakpoint row", .{});
         try ed.removeBreakpoint(it.id - bp_base);
     }
 

@@ -755,10 +755,12 @@ so its output and input work as in a plain run; Ctrl-C there pauses it.
 - **From a command to a program** (`Debugger.plan`): `./app args` and
   `make && ./app` name it; `zig run x.zig` is built to a path zile chooses;
   `cargo run --bin x` is `target/debug/x`. `zig build run` / `cargo run`
-  don't say: the build runs first, then the project's compiled programs (ELF
-  executables, hidden folders skipped) are looked at: one is used; several
-  are listed in `SPC d` ("Debug which program?", newest first). The pick
-  holds for the session only (nothing on disk).
+  don't say: the build runs first, then compiled programs (ELF executables)
+  are looked for where the build system puts them (`zig-out/bin`,
+  `target/debug`) and, with none there, anywhere in the folder (hidden
+  folders skipped): one is used; several are listed in `SPC d` ("Debug
+  which program?", newest first; Enter starts it without building again).
+  The pick holds for the session only (nothing on disk).
 - **The debugger's command.** The first time a runner command is debugged
   in a session it comes up in the command editor (a vim buffer, "Debug
   command"), to change for the debugger: take release flags out, other
