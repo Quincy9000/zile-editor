@@ -458,6 +458,9 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
 
     .{ I, "<Esc>", "normal_mode" },
     .{ I, "<CR>", "completion_accept_or_newline" },
+    // In a SQL file: the statement at the cursor, on the database.
+    .{ NV, "<C-CR>", "run_sql" },
+    .{ I, "<C-CR>", "run_sql_or_newline" },
     .{ I, "<Tab>", "completion_accept_or_tab" },
     .{ I, "<S-Tab>", "snippet_previous" },
     // The gray AI suggestion: all of it, a line, a character.

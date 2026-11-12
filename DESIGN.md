@@ -76,7 +76,7 @@ the row, `/` types to filter.
 | `SPC d` | Debug | gdb: see Debugger below |
 | `SPC t` | toggles | every setting with its on / off state; Enter flips it and the list stays; colour scheme, text size |
 | `SPC l` | code (menu) | `.` rename, `r` references, `a` actions, `f` format, `d` definition, `i` implementations, `k` docs, `l` symbols (`C-t`: project), `w` project symbols, `x` errors, `c` colour wheel, `m` man pages, `t` todo tag, `W` trim whitespace |
-| `SPC r` | runner | your commands, newest first: Enter runs, type a new one; `e` / `C-e` edit, `x` / `C-x` forget, `c` multi-line, `.` again, `o` output, `E` errors, `t` terminal, `T` terminal here, `s` / `S` SQL statement / file |
+| `SPC r` | runner | your commands, newest first: Enter runs, type a new one; `e` / `C-e` edit, `x` / `C-x` forget, `c` multi-line, `.` again, `o` output, `E` errors, `t` terminal, `T` terminal here |
 | `SPC g` | Git: changed files | Enter opens one; `c` commit all, `p` push, `P` pull, `b` branches, `r` restore the change at the cursor, `l` this line's commit, `R` remote URL, `u` reload HEAD, `i` git init |
 | `SPC /` | Search | `C-t` scopes: project · this file · todos; `C-r` replace across the project |
 | `SPC f` | Find (menu) | few pickers, each with its scopes on `C-t`: `f` Files, `b` buffers, `r` recent files, `g` Search (project · this file · todos), `x` Problems (errors · last run · saved list), `j` Places (jumps · marks), `c` Commands (commands · keys), `e` explore, `p` projects, `y` registers, `u` undo history, `n` notifications, `h` start screen, `T` colour scheme, `M` man pages |
@@ -84,7 +84,7 @@ the row, `/` types to filter.
 | others (Leader rows) | | `.` browse, `;` shell command, `'` resume picker, `,` last jump (again: back), `s` save, `q` close; `SPC a` Claude (`a` `s` `i` `y` `n`), `SPC Q` quit (`s` `Q`) |
 
 In visual mode `SPC l a` (code actions), `SPC l f` (format the lines) and
-`SPC r s` (run the selected SQL) act on the selection.
+Ctrl-Enter (run the selected SQL) act on the selection.
 
 The table below is the history of what was built, with its keys in this layout.
 
@@ -528,10 +528,11 @@ comments, `${VAR}`. They're not formatted on save (shfmt would rewrite
 
 **SQL** (tree-sitter-sql, pinned to its `gh-pages` commit: only that branch
 carries the generated parser): `.sql` `.psql` `.pgsql`, `--` comments,
-`pg_format` formatting. In a SQL file `SPC r` lists its SQL first: Enter
-runs the statement at the cursor (from the `;` before it to its own; quotes
-and `--` comments skipped), or the selected lines in visual mode; the next
-row the whole file (`sql.zig`). (`s` / `S` after Esc do the same.) The database, as
+`pg_format` formatting. Ctrl-Enter in a SQL file runs the statement at the
+cursor (from the `;` before it to its own; quotes and `--` comments
+skipped), in insert mode too (you stay typing); in visual mode the selected
+lines. The whole file: "Run the whole SQL file" in the command picker
+(`sql.zig`). The runner (`SPC r`) is shell commands only. The database, as
 the nvim config: `$DATABASE_URL`, else `DATABASE_URL` in the nearest `.env`
 above the file, then above the working folder. `postgres://` runs `psql -X -v
 ON_ERROR_STOP=1`, `sqlite:path` (or a `.db` / `.sqlite` path) `sqlite3 -header

@@ -307,6 +307,7 @@ const base = [_]Command{
     .{ .name = "run_command", .doc = "Run a command (multi-line editor)", .run = termCmd(.command), .once = true },
     .{ .name = "run_again", .doc = "Run the runner command again", .run = termCmd(.again), .once = true },
     .{ .name = "run_sql", .doc = "Run the SQL statement (or selection)", .run = runSql(false), .once = true },
+    .{ .name = "run_sql_or_newline", .doc = "Run the SQL statement; elsewhere a new line", .run = runSqlOrNewline, .once = true, .hidden = true },
     .{ .name = "run_sql_file", .doc = "Run the whole SQL file", .run = runSql(true), .once = true },
     .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
     .{ .name = "run_errors", .doc = "Errors from the last run", .run = termCmd(.errors), .once = true },
@@ -2520,6 +2521,15 @@ fn startSearch(comptime forward: bool, comptime kind: Editor.PromptKind) Handler
 
 fn selectIn(c: Context) !void {
     c.ed.startSelectIn();
+}
+
+/// Insert-mode Ctrl-Enter: in a SQL file the statement being written is
+/// run (you stay typing); in any other file it is Enter.
+fn runSqlOrNewline(c: Context) anyerror!void {
+    const lang = if (c.ed.buffer.syntax) |syn| syn.lang.name else "";
+    if (std.mem.eql(u8, lang, "sql")) return c.ed.runSql(false);
+    const enter = find("completion_accept_or_newline") orelse return;
+    try enter.run(c);
 }
 
 fn runSql(comptime whole: bool) Handler {

@@ -1,5 +1,5 @@
-//! Running SQL (`SPC r s`): the statement at the cursor (or the selected
-//! lines, or the whole file with `SPC r f`) against the project's database,
+//! Running SQL (Ctrl-Enter in a SQL file): the statement at the cursor (or
+//! the selected lines, or the whole file from the command picker) against the project's database,
 //! the results in the run popup. As the nvim config's `sql.lua`:
 //!
 //! The database is the first of `$DATABASE_URL`, `DATABASE_URL` in the

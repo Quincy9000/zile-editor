@@ -5229,7 +5229,8 @@ fn finishRunPrompt(ed: *Editor, kind: PromptKind) !void {
 const libcSetenv = @extern(*const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) c_int, .{ .name = "setenv" });
 
 
-/// `SPC r s` (`SPC r f` with `whole`): SQL against the project's database,
+/// Ctrl-Enter in a SQL file (the whole file with `whole`: the command
+/// picker's "Run the whole SQL file"): SQL against the project's database,
 /// the results in the run popup: the statement at the cursor, the selected
 /// lines in visual mode, or the whole file.
 pub fn runSql(ed: *Editor, whole: bool) !void {
@@ -5242,7 +5243,15 @@ pub fn runSql(ed: *Editor, whole: bool) !void {
         const last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
         ed.exitVisual();
         break :blk t.slice(t.lineStart(first), t.lineEnd(last));
-    } else if (whole) all else sql.statementAt(all, ed.view.cursor);
+    } else if (whole) all else blk: {
+        const here = sql.statementAt(all, ed.view.cursor);
+        if (std.mem.trim(u8, here, " \t\r\n;").len > 0) break :blk here;
+        // Just after a statement's `;` (it was typed a moment ago, or the
+        // cursor is at its line's end): that statement.
+        var p = ed.view.cursor;
+        while (p > 0 and std.ascii.isWhitespace(all[p - 1])) p -= 1;
+        break :blk if (p > 0 and all[p - 1] == ';') sql.statementAt(all, p - 1) else here;
+    };
     if (std.mem.trim(u8, statement, " \t\r\n;").len == 0) return ed.setMessage(.info, "no statement here", .{});
     const folder = try ed.fileFolder();
     defer ed.gpa.free(folder);
@@ -9534,18 +9543,29 @@ test "saving a TypeScript file with no servers running still saves" {
     try testing.expectEqualStrings("const x = 1;\n", saved);
 }
 
-test "SQL file: SPC r lists its statement first, so Enter runs it" {
+test "SQL file: Ctrl-Enter runs the statement at the cursor; the runner has no SQL in it" {
     var ed = try testEditorAs("q.sql", "select 1;\nselect 2;\n");
     defer ed.deinit();
-    try ed.feed("j r");
+    // No database under tests: it gets as far as looking for one.
+    try ed.feed("j<C-CR>");
+    try testing.expect(std.mem.startsWith(u8, ed.message.buf[0..ed.message.len], "no database"));
+    ed.setMessage(.info, "", .{});
+    // While typing too, and you stay typing.
+    try ed.feed("A<C-CR>");
+    try testing.expect(ed.mode == .insert);
+    try testing.expect(std.mem.startsWith(u8, ed.message.buf[0..ed.message.len], "no database"));
+    try testing.expectEqualStrings("select 2;", ed.text().lineSlice(1));
+    try ed.feed("<Esc> r");
     const p = ed.picker orelse return error.TestUnexpectedResult;
     p.sync();
-    try testing.expectEqualStrings("SQL: the statement at the cursor", p.itemAt(0).?.text);
-    try testing.expectEqualStrings("SQL: the whole file", p.itemAt(1).?.text);
-    // No database under tests: it gets as far as looking for one.
-    try ed.feed("<CR>");
-    try testing.expect(ed.picker == null);
-    try testing.expect(std.mem.startsWith(u8, ed.message.buf[0..ed.message.len], "no database"));
+    for (0..p.rowCount()) |row| if (p.itemAt(row)) |it| try testing.expect(!std.mem.startsWith(u8, it.text, "SQL"));
+}
+
+test "Ctrl-Enter while typing outside SQL is Enter" {
+    var ed = try testEditorAs("a.txt", "one");
+    defer ed.deinit();
+    try ed.feed("A<C-CR>two");
+    try testing.expectEqualStrings("two", ed.text().lineSlice(1));
 }
 
 test "SQL completion: tables and columns from the database, after an alias its columns" {
