@@ -350,7 +350,7 @@ fn drawPreview(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: 
         return;
     }
     // Show the focus line about a third of the way down.
-    const first = pv.focus_line -| visible / 3;
+    const first = (pv.focus_line -| visible / 3) + p.previewScroll();
     const gutter: usize = if (pv.numbered) 5 else 0;
     var lines = std.mem.splitScalar(u8, pv.text.items, '\n');
     var n: usize = 0;

@@ -403,6 +403,7 @@ const base = [_]Command{
     .{ .name = "toggle_icons", .doc = "File icons", .run = toggle("icons", "file icons") },
     .{ .name = "toggle_smooth_scroll", .doc = "Smooth scrolling", .run = toggle("smooth_scroll", "smooth scrolling") },
     .{ .name = "toggle_inlay_hints", .doc = "Type hints (from the server)", .run = toggle("inlay_hints", "inline type hints") },
+    .{ .name = "toggle_debug_values", .doc = "Debugger values at line ends", .run = toggle("debug_values", "debugger values in the code") },
     .{ .name = "toggle_git_blame", .doc = "Git blame on the cursor line", .run = toggle("git_blame", "inline git blame") },
     // Pickers and state
     .{ .name = "recent_files", .doc = "Recent files", .run = openPicker(.recent), .once = true },
@@ -435,6 +436,8 @@ const base = [_]Command{
     .{ .name = "replace_previous", .doc = "Replace: previous line", .run = replaceCmd(.previous), .once = true, .hidden = true },
     .{ .name = "replace_skip_file", .doc = "Replace: skip (or take back) the whole file", .run = replaceCmd(.skip_file), .once = true, .hidden = true },
     .{ .name = "picker_accept", .doc = "Open the selection", .run = pickerAccept, .hidden = true },
+    .{ .name = "picker_preview_down", .doc = "Picker: scroll the preview down", .run = previewScroll(3), .hidden = true },
+    .{ .name = "picker_preview_up", .doc = "Picker: scroll the preview up", .run = previewScroll(-3), .hidden = true },
     .{ .name = "picker_accept_alt", .doc = "Accept the other way (the runner: under the debugger)", .run = pickerAcceptAlt, .hidden = true },
     .{ .name = "picker_open_menu", .doc = "Open in... (split)", .run = pickerOpen(null), .hidden = true },
     .{ .name = "picker_open_right", .doc = "Open in a split to the right", .run = pickerOpen(.right), .hidden = true },
@@ -2523,6 +2526,15 @@ fn startSearch(comptime forward: bool, comptime kind: Editor.PromptKind) Handler
 
 fn selectIn(c: Context) !void {
     c.ed.startSelectIn();
+}
+
+fn previewScroll(comptime by: isize) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const p = c.ed.picker orelse return;
+            p.scrollPreview(by * @as(isize, @intCast(@max(c.count, 1))));
+        }
+    }.run;
 }
 
 fn storedData(c: Context) anyerror!void {

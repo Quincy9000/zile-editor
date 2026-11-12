@@ -7,6 +7,7 @@
 //! is shown and the Debug picker opens with the stack.
 
 const std = @import("std");
+const syntax_objects = @import("syntax/objects.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Editor = @import("Editor.zig");
@@ -897,6 +898,66 @@ fn sendBreakpoints(ed: *Editor, path: []const u8) !void {
 
 /// For drawing `b`'s gutter: whether `line` has a breakpoint, and whether
 /// it's where the program is stopped (the shown frame).
+/// While stopped: the values of the shown frame's variables that line
+/// `line` of the file at `abs` uses, as `name = value, ...` for the end of
+/// the line. Only the function's lines down to where it stopped (below it
+/// nothing has run yet). In `buf`; null for none.
+pub fn inlineValues(ed: *Editor, abs: []const u8, line: usize, buf: []u8) ?[]const u8 {
+    const d = ed.dbg.session orelse return null;
+    if (d.state != .stopped or ed.dbg.frame >= d.frames.items.len) return null;
+    const f = &d.frames.items[ed.dbg.frame];
+    const path = f.path orelse return null;
+    if (line > f.line or !std.mem.eql(u8, path, abs)) return null;
+    // Its function's first line (else a screenful above the stop).
+    const first = if (ed.buffer.syntax) |*sx| syntax_objects.enclosingFunctionLine(sx, ed.text(), f.line) orelse f.line -| 30 else f.line -| 30;
+    if (line < first) return null;
+    const text = ed.text().lineSlice(line);
+    var w: std.Io.Writer = .fixed(buf);
+    var any = false;
+    for (f.vars.items) |v| {
+        if (v.depth != 0 or v.value.len == 0) continue;
+        if (!usesName(text, v.name)) continue;
+        if (any) w.writeAll(", ") catch break;
+        any = true;
+        w.print("{s} = ", .{v.name}) catch break;
+        // One short line: a struct shows its start.
+        var n: usize = 0;
+        var it = std.unicode.Utf8View.initUnchecked(v.value).iterator();
+        while (it.nextCodepointSlice()) |cs| : (n += 1) {
+            if (n == max_inline_value) {
+                w.writeAll("…") catch {};
+                break;
+            }
+            w.writeAll(if (cs[0] == '\n' or cs[0] == '\t') " " else cs) catch break;
+        }
+    }
+    return if (any) w.buffered() else null;
+}
+
+/// Of one value at a line's end.
+const max_inline_value = 40;
+
+/// `name` as a whole word in `line` (not inside a longer name, a string's
+/// text aside).
+fn usesName(line: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, name)) |at| {
+        from = at + 1;
+        const before_ok = at == 0 or !isNameByte(line[at - 1]);
+        const name_end = at + name.len;
+        const after_ok = name_end >= line.len or !isNameByte(line[name_end]);
+        // `.name` is a field of something else, not this variable.
+        const field = at > 0 and line[at - 1] == '.';
+        if (before_ok and after_ok and !field) return true;
+    }
+    return false;
+}
+
+fn isNameByte(b: u8) bool {
+    return std.ascii.isAlphanumeric(b) or b == '_';
+}
+
 pub fn marks(ed: *const Editor, abs: []const u8, line: usize) Marks {
     var out: Marks = .{};
     for (ed.dbg.breakpoints.items) |bp| if (bp.line == line and std.mem.eql(u8, bp.path, abs)) {

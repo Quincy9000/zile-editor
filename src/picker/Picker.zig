@@ -39,6 +39,10 @@ top: usize = 0,
 preview: sources.Preview = .{},
 /// Item index the preview currently shows.
 preview_for: ?u32 = null,
+/// Lines the preview is scrolled past its usual start (`J` / `K`), and the
+/// row it was scrolled on (another row starts at the top again).
+preview_scroll: usize = 0,
+preview_scroll_row: usize = 0,
 /// For match highlighting in the view.
 pos_scratch: fuzzy.PositionScratch = .{},
 /// Item text to select once the results arrive (owned), e.g. the folder the
@@ -324,6 +328,19 @@ pub fn moveClamped(p: *Picker, delta: isize) void {
     if (rows == 0) return;
     const max: isize = @intCast(rows - 1);
     p.selected = @intCast(std.math.clamp(@as(isize, @intCast(p.selected)) + delta, 0, max));
+}
+
+pub fn scrollPreview(p: *Picker, by: isize) void {
+    if (p.preview_scroll_row != p.selected) p.preview_scroll = 0;
+    p.preview_scroll_row = p.selected;
+    const lines = std.mem.count(u8, p.preview.text.items, "\n") + 1;
+    const max: isize = @intCast(lines -| 1);
+    p.preview_scroll = @intCast(std.math.clamp(@as(isize, @intCast(p.preview_scroll)) + by, 0, max));
+}
+
+/// How far the preview is scrolled for the selected row.
+pub fn previewScroll(p: *const Picker) usize {
+    return if (p.preview_scroll_row == p.selected) p.preview_scroll else 0;
 }
 
 /// Recomputes the preview when the selection changed.

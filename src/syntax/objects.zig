@@ -607,6 +607,19 @@ fn findFunction(spec: Spec, t: *const Text, n: c.TSNode, line: usize, forward: b
     while (i < count) : (i += 1) findFunction(spec, t, c.ts_node_named_child(n, i), line, forward, best);
 }
 
+/// The first line of the named function `line` is in, if it is in one.
+pub fn enclosingFunctionLine(s: *Syntax, t: *const Text, line: usize) ?usize {
+    const spec = specs.get(s.lang.name) orelse return null;
+    const root = rootOf(s, t) orelse return null;
+    if (line >= t.lineCount()) return null;
+    const pos: u32 = @intCast(motions.firstNonBlank(t, line));
+    var n = c.ts_node_descendant_for_byte_range(root, pos, pos);
+    while (!c.ts_node_is_null(n)) : (n = c.ts_node_parent(n)) {
+        if (isNamedFunction(spec, n)) return t.lineOf(startOf(n));
+    }
+    return null;
+}
+
 /// Sticky context: the first lines of the scopes `line` is inside that
 /// start above it (function, class, `if`, JSX element...), outermost first,
 /// at most `out.len` (the innermost ones).

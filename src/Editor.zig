@@ -114,6 +114,8 @@ pub const Options = struct {
     smooth_scroll: bool = true,
     /// Who last changed the cursor's line, after its end.
     git_blame: bool = false,
+    /// Stopped in the debugger: the values a line uses, after its end.
+    debug_values: bool = true,
     /// Type and parameter labels from the language server, drawn inside the
     /// code (inlay hints).
     inlay_hints: bool = true,
@@ -13254,6 +13256,19 @@ test "debugging: a breakpoint stops the program there, stepping, locals, the exi
     defer vars.deinit(gpa);
     try d.frames.items[0].writeVars(gpa, &vars);
     try testing.expect(std.mem.startsWith(u8, vars.items, "a = 2\nb = 3\nc = "));
+    // The values a line uses, for its end: the function's lines down to the
+    // stop, not below it.
+    var vbuf: [256]u8 = undefined;
+    try testing.expectEqualStrings("a = 2, b = 3", debugging.inlineValues(&ed, src, 1, &vbuf).?);
+    try testing.expect(std.mem.startsWith(u8, debugging.inlineValues(&ed, src, 2, &vbuf).?, "a = 2, b = 3, c = "));
+    try testing.expect(debugging.inlineValues(&ed, src, 3, &vbuf) == null);
+    try testing.expect(debugging.inlineValues(&ed, src, 0, &vbuf) == null);
+    // J / K scroll the variables in the preview.
+    ed.picker.?.updatePreview();
+    try ed.feed("J");
+    try testing.expectEqual(3, ed.picker.?.previewScroll());
+    try ed.feed("K");
+    try testing.expectEqual(0, ed.picker.?.previewScroll());
     // The editor is on the stop, marked, with the Debug picker open.
     try testing.expectEqual(2, ed.cursorLine());
     try testing.expect(debugging.marks(&ed, src, 2).here and debugging.marks(&ed, src, 2).breakpoint);

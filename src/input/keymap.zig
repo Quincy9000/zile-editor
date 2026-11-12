@@ -514,6 +514,11 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ PN, "k", "picker_previous" },
     .{ PA, "<PageDown>", "picker_page_down" },
     .{ PA, "<PageUp>", "picker_page_up" },
+    // The preview: J / K, and Shift with the arrows while typing.
+    .{ PN, "J", "picker_preview_down" },
+    .{ PN, "K", "picker_preview_up" },
+    .{ PA, "<S-Down>", "picker_preview_down" },
+    .{ PA, "<S-Up>", "picker_preview_up" },
     .{ PN, "<C-d>", "picker_page_down" },
     .{ PN, "<C-u>", "picker_page_up" },
     .{ PN, "gg", "picker_first" },

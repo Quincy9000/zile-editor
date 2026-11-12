@@ -818,6 +818,13 @@ so its output and input work as in a plain run; Ctrl-C there pauses it.
   levels down, 32 of each; for the frame it stopped in at once, for
   another when you look at it. This is gdb's own reading of the program,
   so it is the same for C, C++, Rust and Zig.
+- **In the code**: while stopped, each line of the shown frame's function
+  down to the stop gets the values of the variables it uses after its end
+  (`debugging.inlineValues`: the frame's arguments and locals, by whole
+  name, not `.field`s; 40 characters each), in the inlay colour; `SPC t`
+  "Debugger values at line ends" turns it off. The preview's variables
+  scroll with `J` / `K` (Shift-Up / Shift-Down while typing), as any
+  picker's preview does.
 - **Printers** (`src/gdb_setup.py`, embedded and sent to gdb at the
   start): what gdb doesn't find on its own. C needs none; C++'s come with
   the compiler and gdb loads them. Rust's (`String`, `Vec`, `HashMap`)

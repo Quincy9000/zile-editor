@@ -464,6 +464,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     else
         null;
     const tab_width = ed.options.tab_width;
+    var values_buf: [256]u8 = undefined;
     var ghost_below: ?struct { text: []const u8, y: f32 } = null;
 
     // mini.nvim decorations, worked out once per window.
@@ -707,6 +708,11 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
                 const label = std.fmt.bufPrint(&buf, "… {d} lines", .{f.last - f.first}) catch "…";
                 _ = font.drawText(label, colX(font, l, end_col), y, theme.fold_fg);
             }
+        } else if (debug_path != null and last_piece and inlineValuesAt(ed, debug_path.?, line, &values_buf) != null) {
+            // Stopped in the debugger: the values this line uses, after it.
+            const vals = inlineValuesAt(ed, debug_path.?, line, &values_buf).?;
+            const end_col = dcol(bytes, bytes.len, tab_width) + 3;
+            if (end_col >= win_left and end_col < winEnd(l)) _ = font.drawText(clip(vals, winEnd(l) - end_col), colX(font, l, end_col), y, theme.inlay_fg);
         } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, diags, line, y, last_piece);
         // Inline blame: who last changed the cursor's line.
         if (last_piece and focused and is_current and ed.options.git_blame and fold == null and ghost == null and ed.ghost == null and
@@ -737,6 +743,11 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     var cursor_color = theme.cursor;
     if (!focused) cursor_color.a = 70;
     drawCursorAt(ed, font, theme, l, ed.view.cursor, cursor_color);
+}
+
+fn inlineValuesAt(ed: *Editor, abs: []const u8, line: usize, buf: []u8) ?[]const u8 {
+    if (!ed.options.debug_values) return null;
+    return debugging.inlineValues(ed, abs, line, buf);
 }
 
 /// How far (in pixels) a gliding scroll still has the text from its place.
