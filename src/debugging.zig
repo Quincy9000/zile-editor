@@ -524,9 +524,9 @@ pub fn launch(ed: *Editor, plan: Debugger.Plan) !void {
         return ed.setMessage(.err, "nothing to debug: no program at {s}", .{plan.program});
     };
     defer ed.gpa.free(program);
-    // The program's terminal, held open by a process that only waits (and
-    // ignores Ctrl-C, which pauses the program instead).
-    const t = try ed.spawnTerminalIn(&.{ "/bin/sh", "-c", "trap '' INT QUIT TSTP; exec sleep 2147483647" }, folder);
+    // The program's terminal: one with nothing in it until gdb starts the
+    // program there (Ctrl-C in the popup pauses it instead).
+    const t = try ed.spawnTerminalIn(&.{}, folder);
     errdefer t.destroy();
     var tty_buf: [128]u8 = undefined;
     const tty = t.pty.deviceName(&tty_buf);
@@ -623,7 +623,11 @@ pub fn stop(ed: *Editor) void {
 /// popup is a finished run (q closes it, r debugs again).
 fn finishTerminal(ed: *Editor) void {
     if (!ed.run_debug) return;
-    if (ed.run) |t| t.pty.hangup();
+    const code: u8 = if (ed.dbg.outcome) |o| switch (o) {
+        .exited => |c| @truncate(@as(u64, @bitCast(c))),
+        .ended, .stopped => 1,
+    } else 1;
+    if (ed.run) |t| t.finish(code);
 }
 
 pub fn tick(ed: *Editor) void {

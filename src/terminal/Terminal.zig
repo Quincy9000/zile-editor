@@ -90,7 +90,9 @@ pub fn create(gpa: Allocator, io: Io, opts: Options) !*Terminal {
     if (c.ghostty_key_event_new(null, &t.key_event) != c.GHOSTTY_SUCCESS) return error.TerminalInit;
     errdefer c.ghostty_key_event_free(t.key_event);
 
-    t.pty = try Pty.spawnEnv(gpa, opts.argv, opts.cwd, .{ .cols = opts.cols, .rows = opts.rows, .cell_w = opts.cell_w, .cell_h = opts.cell_h }, opts.env);
+    const size: Pty.Size = .{ .cols = opts.cols, .rows = opts.rows, .cell_w = opts.cell_w, .cell_h = opts.cell_h };
+    // No program: a terminal for one started elsewhere (`Pty.openOnly`).
+    t.pty = if (opts.argv.len == 0) try Pty.openOnly(size) else try Pty.spawnEnv(gpa, opts.argv, opts.cwd, size, opts.env);
     errdefer {
         t.pty.hangup();
         _ = t.pty.wait();
@@ -127,7 +129,8 @@ fn readLoop(t: *Terminal) void {
         if (!t.pty.waitReadable(100)) continue;
         const n = t.pty.read(&buf);
         if (n == 0) {
-            t.exit_code = t.pty.wait();
+            // A terminal of our own has the code `finish` gave it.
+            if (t.pty.pid > 0) t.exit_code = t.pty.wait();
             t.exited.store(true, .release);
             t.wake();
             return;
@@ -151,6 +154,13 @@ pub fn copyOutput(t: *Terminal, gpa: Allocator) ![]u8 {
     t.mutex.lockUncancelable(t.io);
     defer t.mutex.unlock(t.io);
     return gpa.dupe(u8, t.output.items);
+}
+
+/// A terminal without a program of its own (`argv` empty): the one using
+/// it has ended with `code`, so it ends too (once its output is read).
+pub fn finish(t: *Terminal, code: u8) void {
+    t.exit_code = code;
+    t.pty.release();
 }
 
 pub fn isRunning(t: *const Terminal) bool {

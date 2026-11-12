@@ -9,7 +9,11 @@ const Pty = @This();
 
 /// The PTY's controlling side. -1 once closed.
 fd: c_int,
+/// 0: no process of ours in it (`openOnly`).
 pid: c_int,
+/// `openOnly`: the terminal's own side, held open so the terminal lasts
+/// between programs (the debugger's program comes and goes). -1: none.
+held: c_int = -1,
 
 const Winsize = extern struct { row: u16, col: u16, xpixel: u16, ypixel: u16 };
 extern "c" fn forkpty(master: *c_int, name: ?[*]u8, termp: ?*const anyopaque, winp: ?*const Winsize) c_int;
@@ -68,6 +72,39 @@ pub fn spawnEnv(gpa: Allocator, argv: []const []const u8, cwd: []const u8, size:
     return .{ .fd = master, .pid = pid };
 }
 
+extern "c" fn posix_openpt(flags: c_int) c_int;
+extern "c" fn grantpt(fd: c_int) c_int;
+extern "c" fn unlockpt(fd: c_int) c_int;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+const O_RDWR = 0o2;
+const O_NOCTTY = 0o400;
+const O_CLOEXEC = 0o2000000;
+
+/// A terminal with no program in it yet, for one started elsewhere (gdb's
+/// program, given `deviceName`). Not zile's controlling terminal, nor
+/// anyone's: the program it gets can make it its own (Ctrl-C, job control).
+/// `release` lets it end once that program is gone.
+pub fn openOnly(size: Size) !Pty {
+    const fd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (fd < 0) return error.NoPty;
+    errdefer _ = std.c.close(fd);
+    if (grantpt(fd) != 0 or unlockpt(fd) != 0) return error.NoPty;
+    var name: [128]u8 = undefined;
+    if (ptsname_r(fd, &name, name.len) != 0) return error.NoPty;
+    const held = open(@ptrCast(&name), O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (held < 0) return error.NoPty;
+    const p: Pty = .{ .fd = fd, .pid = 0, .held = held };
+    p.resize(size);
+    return p;
+}
+
+/// `openOnly`'s terminal: let go of its side, so it ends (reads see the
+/// end) once no program has it open.
+pub fn release(p: *Pty) void {
+    if (p.held >= 0) _ = std.c.close(p.held);
+    p.held = -1;
+}
+
 /// The user's shell ($SHELL, else /bin/sh).
 pub fn userShell() []const u8 {
     if (std.c.getenv("SHELL")) |s| {
@@ -117,12 +154,13 @@ pub fn resize(p: *const Pty, size: Size) void {
 
 /// Hangs up on the child (as closing a terminal window does).
 pub fn hangup(p: *const Pty) void {
-    _ = killProcess(p.pid, SIGHUP);
+    // (`kill(0, ...)` would signal zile's own process group.)
+    if (p.pid > 0) _ = killProcess(p.pid, SIGHUP);
 }
 
 /// Ends the child for sure.
 pub fn kill(p: *const Pty) void {
-    _ = killProcess(p.pid, SIGKILL);
+    if (p.pid > 0) _ = killProcess(p.pid, SIGKILL);
 }
 
 /// Waits up to `ms` for output (or the child going away).
@@ -133,6 +171,7 @@ pub fn waitReadable(p: *const Pty, ms: i32) bool {
 
 /// Reaps the child; returns its exit code (128 + signal if killed).
 pub fn wait(p: *const Pty) u8 {
+    if (p.pid <= 0) return 0;
     var status: c_int = 0;
     while (std.c.waitpid(p.pid, &status, 0) < 0) {
         if (std.c.errno(@as(c_int, -1)) != .INTR) return 255;
@@ -143,8 +182,30 @@ pub fn wait(p: *const Pty) u8 {
 }
 
 pub fn close(p: *Pty) void {
+    p.release();
     if (p.fd >= 0) _ = std.c.close(p.fd);
     p.fd = -1;
+}
+
+test "openOnly: another program writes to it; it ends once released and that program is gone" {
+    var p = try openOnly(.{ .cols = 80, .rows = 24 });
+    defer p.close();
+    var name_buf: [128]u8 = undefined;
+    const name = p.deviceName(&name_buf).?;
+    const cmd = try std.fmt.allocPrint(std.testing.allocator, "printf hi > {s}", .{name});
+    defer std.testing.allocator.free(cmd);
+    var other = try spawn(std.testing.allocator, &.{ "/bin/sh", "-c", cmd }, "/", .{ .cols = 80, .rows = 24 });
+    defer other.close();
+    _ = other.wait();
+    var out: [64]u8 = undefined;
+    try std.testing.expect(p.waitReadable(2000));
+    const n = p.read(&out);
+    try std.testing.expectEqualStrings("hi", out[0..n]);
+    // Held: no end yet. Released: the end.
+    try std.testing.expect(!p.waitReadable(50));
+    p.release();
+    try std.testing.expect(p.waitReadable(2000));
+    try std.testing.expectEqual(0, p.read(&out));
 }
 
 test "run a command and read its output" {

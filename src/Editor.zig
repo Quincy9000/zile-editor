@@ -13191,6 +13191,14 @@ test "debugging: a breakpoint stops the program there, stepping, locals, the exi
     defer gpa.free(shown);
     try testing.expect(std.mem.indexOf(u8, shown, "x=5") != null);
     try testing.expect(std.mem.indexOf(u8, shown, "exited 7") != null);
+    // The terminal had no process of its own: it ends with the program, its
+    // code the program's.
+    for (0..400) |_| {
+        if (!ed.run.?.isRunning()) break;
+        testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    }
+    try testing.expect(!ed.run.?.isRunning());
+    try testing.expectEqual(7, ed.run.?.exit_code);
 }
 
 test "breakpoints: on/off keeps them, clearing and undo, runs choose gdb" {
