@@ -2791,11 +2791,17 @@ const Runner = struct {
         try ed.runnerEdit();
     }
 
+    /// `c`: the command in the command editor (a vim buffer, any number of
+    /// lines); with no row, an empty one.
+    fn change(ed: *Editor, item: ?Item) anyerror!void {
+        try ed.editCommand(if (item) |it| it.text else "", .runner, null);
+    }
+
     pub const item_actions = [_]Action{
         .{ .label = "edit it", .key = 'e', .ctrl = 'e', .stay = true, .run = edit },
         .{ .label = "forget it", .key = 'x', .ctrl = 'x', .stay = true, .run = command("picker_delete") },
         .{ .label = "debugger", .key = 'd', .any = true, .run = openDebug },
-        .{ .label = "new (several lines)", .key = 'c', .any = true, .run = command("run_command") },
+        .{ .label = "change it (vim)", .key = 'c', .any = true, .run = change },
         .{ .label = "again", .key = '.', .any = true, .run = command("run_again") },
         .{ .label = "output", .key = 'o', .any = true, .run = command("run_output") },
         .{ .label = "errors", .key = 'E', .any = true, .run = command("run_errors") },
@@ -2830,6 +2836,8 @@ const Debug = struct {
     /// executables found on disk.
     const prog_base: u32 = 1 << 21;
     const found_id: u32 = 1 << 22;
+    /// The command the debugger runs.
+    const cmd_id: u32 = 1 << 23;
 
     pub const title = "Debug";
 
@@ -2853,14 +2861,12 @@ const Debug = struct {
             const where = if (f.path) |p| std.fmt.bufPrint(&detail, "{s}:{d}", .{ std.fs.path.basename(p), f.line + 1 }) catch "" else "no source";
             try items.append(.{ .text = f.name, .detail = where, .id = @intCast(i) });
         };
-        // The programs debugged here: the first is what `r` and `zig build
-        // run` debug.
-        const programs = try ed.debugPrograms();
-        defer {
-            for (programs) |x| ed.gpa.free(x);
-            ed.gpa.free(programs);
-        }
-        for (programs, 0..) |x, i| try items.append(.{ .text = x, .detail = if (i == 0) "program" else "", .id = prog_base + @as(u32, @intCast(i)) });
+        // Not debugging: the command Enter (or `R`) debugs.
+        if (ed.debugger == null) if (try ed.debugRow()) |row| {
+            defer ed.gpa.free(row.cmd);
+            defer ed.gpa.free(row.from);
+            try items.append(.{ .text = row.cmd, .detail = if (row.edited) "debug command" else "debug command (from the runner)", .id = cmd_id });
+        };
         for (ed.breakpoints.items, 0..) |b, i| {
             const dot = if (ed.breakpoints_on) "●" else "○";
             const shown = std.fmt.bufPrint(&detail, "{s} {s}:{d}", .{ dot, std.fs.path.basename(b.path), b.line + 1 }) catch continue;
@@ -2869,8 +2875,9 @@ const Debug = struct {
     }
 
     /// Not while stepping: the rows refill on every stop.
+    /// Only when asking which program a build made.
     pub fn wantsProduce(ed: *Editor) bool {
-        return ed.debugger == null or ed.debug_asking;
+        return ed.debug_asking;
     }
 
     /// The project's compiled programs, newest first (`findPrograms`).
@@ -2898,6 +2905,7 @@ const Debug = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id == cmd_id) return ed.debugRowAccept();
         if (item.id >= prog_base) return ed.debugProgramText(item.text);
         if (item.id < bp_base) return ed.showFrame(item.id);
         const i = item.id - bp_base;
@@ -2910,12 +2918,19 @@ const Debug = struct {
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id == cmd_id) {
+            try out.text.print(ed.gpa, "Enter: runs under gdb\n\n  {s}\n\nin {s}\n\n", .{ item.text, ed.projectRoot() });
+            const programs = try ed.debugPrograms();
+            defer {
+                for (programs) |x| ed.gpa.free(x);
+                ed.gpa.free(programs);
+            }
+            if (programs.len > 0) try out.text.print(ed.gpa, "its program: {s}\n\n", .{programs[0]});
+            try out.text.appendSlice(ed.gpa, "e: change it (a debug build, other arguments, or\n   `zig build && ./zig-out/bin/app` to name the program).\nIt holds for this session; the runner's command stays as it is.");
+            return;
+        }
         if (item.id >= prog_base) {
-            const runner = ed.loadRunnerCommandPub();
-            defer if (runner) |r| ed.gpa.free(r);
-            try out.text.print(ed.gpa, "Enter: debugs\n\n  {s}\n\nin {s}", .{ item.text, ed.projectRoot() });
-            if (runner) |r| try out.text.print(ed.gpa, "\n\nbuilt first by the build part of\n\n  {s}", .{r});
-            try out.text.appendSlice(ed.gpa, "\n\nThis session, it's the program `zig build run` / `cargo run` debug here.\ne: add arguments   d: forget it");
+            try out.text.print(ed.gpa, "Enter: debugs\n\n  {s}\n\n(type after it to add arguments)", .{item.text});
             return;
         }
         if (item.id >= bp_base) {
@@ -2959,17 +2974,16 @@ const Debug = struct {
         try ed.toggleBreakpoint();
     }
 
-    /// `d`: a breakpoint removed, or a program forgotten.
+    /// `d`: the row's breakpoint removed.
     fn removeRow(ed: *Editor, item: ?Item) anyerror!void {
         const it = item orelse return;
-        if (it.id >= prog_base and it.id < found_id) return ed.forgetDebugProgram(it.text);
-        if (it.id < bp_base or it.id >= prog_base) return ed.setMessage(.info, "d removes breakpoints and forgets programs", .{});
+        if (it.id < bp_base or it.id >= prog_base) return ed.setMessage(.info, "d removes a breakpoint row", .{});
         try ed.removeBreakpoint(it.id - bp_base);
     }
 
-    /// `e`: the row into the query, to add arguments to.
+    /// `e`: the debugger's command, in the command editor.
     fn editRow(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.runnerEdit();
+        try ed.debugRowEdit();
     }
 
     fn clearAll(ed: *Editor, _: ?Item) anyerror!void {
@@ -3015,8 +3029,8 @@ const Debug = struct {
         .{ .label = "continue", .key = 'c', .any = true, .run = stepper(.cont) },
         .{ .label = "pause", .key = 'p', .stay = true, .any = true, .run = pause },
         .{ .label = "breakpoint here", .key = 'b', .stay = true, .any = true, .run = breakpoint },
-        .{ .label = "remove / forget", .key = 'd', .stay = true, .run = removeRow },
-        .{ .label = "arguments", .key = 'e', .ctrl = 'e', .stay = true, .run = editRow },
+        .{ .label = "remove breakpoint", .key = 'd', .stay = true, .run = removeRow },
+        .{ .label = "edit the command", .key = 'e', .any = true, .run = editRow },
         .{ .label = "breakpoints on/off", .key = 't', .stay = true, .any = true, .run = onOff },
         .{ .label = "remove all breakpoints", .key = 'B', .stay = true, .any = true, .run = clearAll },
         .{ .label = "undo (breakpoints)", .key = 'u', .stay = true, .any = true, .run = undo },

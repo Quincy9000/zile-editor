@@ -375,9 +375,9 @@ pub const Plan = struct {
     /// in the Debug picker and remembered).
     program: []u8,
     newest_in: bool = false,
-    /// Release flags were left out of `build`: an optimized program loses
-    /// variables and its lines jump about under a debugger.
-    debug_build: bool = false,
+    /// The command asks for an optimized build (`--release`, `-O`): such a
+    /// program loses variables and its lines jump about under a debugger.
+    release: bool = false,
     args: [][]u8,
 
     pub fn deinit(p: Plan, gpa: Allocator) void {
@@ -444,17 +444,14 @@ pub fn plan(gpa: Allocator, cmd: []const u8) !PlanResult {
         var left_out = false;
         for (head[2..], 2..) |x, i| {
             if (i == run) continue;
-            if (std.mem.eql(u8, x, "--release") or std.mem.startsWith(u8, x, "--release=") or std.mem.startsWith(u8, x, "-Doptimize=")) {
-                left_out = true;
-                continue;
-            }
+            if (std.mem.eql(u8, x, "--release") or std.mem.startsWith(u8, x, "--release=") or (std.mem.startsWith(u8, x, "-Doptimize=") and !std.mem.endsWith(u8, x, "=Debug"))) left_out = true;
             try appendWord(gpa, &build, x);
         }
         return .{ .plan = .{
             .build = try build.toOwnedSlice(gpa),
             .program = try gpa.dupe(u8, "zig-out/bin"),
             .newest_in = true,
-            .debug_build = left_out,
+            .release = left_out,
             .args = try dupeAll(gpa, tail),
         } };
     }
@@ -469,23 +466,14 @@ pub fn plan(gpa: Allocator, cmd: []const u8) !PlanResult {
         errdefer build.deinit(gpa);
         try build.appendSlice(gpa, "mkdir -p .zig-cache/zile-debug && zig build-exe");
         var left_out = false;
-        var skip_next = false;
         for (head[2..]) |x| {
-            if (skip_next) {
-                skip_next = false;
-                continue;
-            }
             // `-O ReleaseFast`, `-OReleaseFast`.
-            if (std.mem.startsWith(u8, x, "-O")) {
-                left_out = true;
-                skip_next = x.len == 2;
-                continue;
-            }
+            if (std.mem.startsWith(u8, x, "-O")) left_out = true;
             try appendWord(gpa, &build, x);
         }
         try build.appendSlice(gpa, " -femit-bin=");
         try build.appendSlice(gpa, out);
-        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = out, .debug_build = left_out, .args = try dupeAll(gpa, tail) } };
+        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = out, .release = left_out, .args = try dupeAll(gpa, tail) } };
     }
     if (std.mem.eql(u8, t[0], "cargo") and head.len >= 2 and std.mem.eql(u8, head[1], "run")) {
         var build: std.ArrayList(u8) = .empty;
@@ -494,18 +482,15 @@ pub fn plan(gpa: Allocator, cmd: []const u8) !PlanResult {
         var left_out = false;
         var bin: ?[]const u8 = null;
         for (head[2..], 2..) |x, i| {
-            if (std.mem.eql(u8, x, "--release") or std.mem.eql(u8, x, "-r")) {
-                left_out = true;
-                continue;
-            }
+            if (std.mem.eql(u8, x, "--release") or std.mem.eql(u8, x, "-r")) left_out = true;
             try appendWord(gpa, &build, x);
             if (std.mem.eql(u8, x, "--bin") and i + 1 < head.len) bin = head[i + 1];
             if (std.mem.startsWith(u8, x, "--bin=")) bin = x["--bin=".len..];
         }
-        const dir = "target/debug";
+        const dir = if (left_out) "target/release" else "target/debug";
         const program = if (bin) |b| try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, b }) else try gpa.dupe(u8, dir);
         errdefer gpa.free(program);
-        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = program, .newest_in = bin == null, .debug_build = left_out, .args = try dupeAll(gpa, tail) } };
+        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = program, .newest_in = bin == null, .release = left_out, .args = try dupeAll(gpa, tail) } };
     }
     const name = std.fs.path.basename(t[0]);
     for ([_][]const u8{ "go", "gopls" }) |x| if (std.mem.eql(u8, name, x))
@@ -654,17 +639,16 @@ fn tokenize(gpa: Allocator, line: []const u8) error{ Shell, OutOfMemory }!std.Ar
 
 test "plan: what to build and which program to debug" {
     const gpa = std.testing.allocator;
-    const Case = struct { cmd: []const u8, build: ?[]const u8, program: []const u8, newest: bool = false, args: []const []const u8 = &.{} };
+    const Case = struct { cmd: []const u8, build: ?[]const u8, program: []const u8, newest: bool = false, release: bool = false, args: []const []const u8 = &.{} };
     for ([_]Case{
         .{ .cmd = "zig build run", .build = "zig build", .program = "zig-out/bin", .newest = true },
         .{ .cmd = "zig build run -Dfoo=bar -- a 'b c'", .build = "zig build -Dfoo=bar", .program = "zig-out/bin", .newest = true, .args = &.{ "a", "b c" } },
         .{ .cmd = "zig run src/main.zig -- x", .build = "mkdir -p .zig-cache/zile-debug && zig build-exe src/main.zig -femit-bin=.zig-cache/zile-debug/main", .program = ".zig-cache/zile-debug/main", .args = &.{"x"} },
         .{ .cmd = "cargo run", .build = "cargo build", .program = "target/debug", .newest = true },
-        // Release flags are left out: the debugger gets a debug build.
-        .{ .cmd = "cargo run --release --bin srv -- -p 80", .build = "cargo build --bin srv", .program = "target/debug/srv", .args = &.{ "-p", "80" } },
-        .{ .cmd = "zig build run --release=fast", .build = "zig build", .program = "zig-out/bin", .newest = true },
-        .{ .cmd = "zig build run -Doptimize=ReleaseFast -Dx=1", .build = "zig build -Dx=1", .program = "zig-out/bin", .newest = true },
-        .{ .cmd = "zig run -O ReleaseFast a.zig", .build = "mkdir -p .zig-cache/zile-debug && zig build-exe a.zig -femit-bin=.zig-cache/zile-debug/a", .program = ".zig-cache/zile-debug/a" },
+        // The command is built as written; release flags are only noted.
+        .{ .cmd = "cargo run --release --bin srv -- -p 80", .build = "cargo build --release --bin srv", .program = "target/release/srv", .release = true, .args = &.{ "-p", "80" } },
+        .{ .cmd = "zig build run --release=fast", .build = "zig build --release=fast", .program = "zig-out/bin", .newest = true, .release = true },
+        .{ .cmd = "zig run -O ReleaseFast a.zig", .build = "mkdir -p .zig-cache/zile-debug && zig build-exe -O ReleaseFast a.zig -femit-bin=.zig-cache/zile-debug/a", .program = ".zig-cache/zile-debug/a", .release = true },
         .{ .cmd = "./build/app --verbose \"two words\"", .build = null, .program = "./build/app", .args = &.{ "--verbose", "two words" } },
         .{ .cmd = "make && ./app in.txt", .build = "make", .program = "./app", .args = &.{"in.txt"} },
     }) |c| {
@@ -674,6 +658,7 @@ test "plan: what to build and which program to debug" {
         if (c.build) |b| try std.testing.expectEqualStrings(b, p.build.?) else try std.testing.expect(p.build == null);
         try std.testing.expectEqualStrings(c.program, p.program);
         try std.testing.expectEqual(c.newest, p.newest_in);
+        try std.testing.expectEqual(c.release, p.release);
         try std.testing.expectEqual(c.args.len, p.args.len);
         for (c.args, p.args) |want, got| try std.testing.expectEqualStrings(want, got);
     }

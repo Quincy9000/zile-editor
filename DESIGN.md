@@ -758,8 +758,18 @@ so its output and input work as in a plain run; Ctrl-C there pauses it.
   don't say: the build runs first, then the project's compiled programs (ELF
   executables, hidden folders skipped) are looked at: one is used; several
   are listed in `SPC d` ("Debug which program?", newest first). The pick
-  holds for the session only (nothing on disk). Release flags
-  (`--release`, `-Doptimize=`, `-O`) are left out of a debugger's build.
+  holds for the session only (nothing on disk).
+- **The debugger's command.** The first time a runner command is debugged
+  in a session it comes up in the command editor (a vim buffer, "Debug
+  command"), to change for the debugger: take release flags out, other
+  arguments, or `zig build && ./zig-out/bin/app` to name the program. Enter
+  debugs it, and that runner command debugs as it for the session; the
+  runner's own command is untouched. It's the first row of `SPC d` when
+  idle (Enter debugs, `e` changes it). Commands are built as written:
+  release flags only get a note that variables may be missing.
+- **Runner:** `c` on a row opens that command in the same vim editor
+  (Enter runs it and it joins the history); `e` / `C-e` puts it in the
+  query line for a quick change.
 - **Stopped** (breakpoint, step, crash): the editor goes to the innermost
   frame in your code (`▶`, tinted line) and `SPC d` opens: rows are the
   stack, the preview a frame's arguments and locals. `n` next, `s` step in,

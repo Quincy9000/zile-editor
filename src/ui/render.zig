@@ -203,8 +203,11 @@ fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.
     rect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, theme.popup_border);
     rect(r.x, r.y, r.w, r.h, theme.bg);
     rect(r.x, r.y, r.w, font.cell_h, theme.status_bg);
-    _ = font.drawText("Run command", r.x + font.cell_w, r.y, theme.mode_picker);
-    const hint = if (ed.mode == .normal) "Enter runs   Esc cancels" else "Esc, then Enter runs";
+    const debug = ed.cmd_purpose == .debug;
+    _ = font.drawText(if (debug) "Debug command (this session)" else "Run command", r.x + font.cell_w, r.y, theme.mode_picker);
+    const hint = if (ed.mode == .normal)
+        (if (debug) "Enter debugs   Esc cancels" else "Enter runs   Esc cancels")
+    else if (debug) "Esc, then Enter debugs" else "Esc, then Enter runs";
     _ = font.drawText(hint, r.x + r.w - @as(f32, @floatFromInt(cells(hint) + 1)) * font.cell_w, r.y, theme.status_dim);
 
     const fl = floatLayout(ed, font, f);

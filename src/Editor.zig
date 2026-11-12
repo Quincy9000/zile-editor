@@ -242,6 +242,22 @@ pub const Breakpoint = struct { path: []u8, line: u32 };
 
 pub const DebugMarks = struct { breakpoint: bool = false, here: bool = false };
 
+/// `run`: it runs. `runner`: it runs as a runner command (remembered).
+/// `debug`: it runs under gdb, and is what its runner command debugs as.
+pub const CommandPurpose = enum { run, runner, debug };
+
+pub const DebugCommand = struct {
+    project: []u8,
+    from: []u8,
+    cmd: []u8,
+
+    fn deinit(d: DebugCommand, gpa: Allocator) void {
+        gpa.free(d.project);
+        gpa.free(d.from);
+        gpa.free(d.cmd);
+    }
+};
+
 /// A program debugged in a project (`project` a root, `text` the program
 /// relative to it and its arguments).
 pub const DebugProgram = struct {
@@ -648,6 +664,14 @@ run_errors: std.ArrayList(run_errors_mod.Error) = .empty,
 cmd_float: ?*Windows.Window = null,
 /// The window to return to when the command editor closes.
 cmd_return: ?*Windows.Window = null,
+/// What Enter in the command editor does with the command.
+cmd_purpose: CommandPurpose = .run,
+/// For `.debug`: the runner command this is the debugger's version of
+/// (owned).
+cmd_from: ?[]u8 = null,
+/// The commands the debugger runs, this session: a runner command (`from`,
+/// per project) as you edited it the first time it was debugged.
+debug_commands: std.ArrayList(DebugCommand) = .empty,
 /// Which terminal the popup shows, if open. Keys go to it.
 popup: ?enum { shell, run } = null,
 /// The popup's size, kept current by the UI (new terminals start at it).
@@ -945,6 +969,9 @@ pub fn deinit(ed: *Editor) void {
     if (ed.debug_command) |c| ed.gpa.free(c);
     for (ed.debug_programs.items) |dp| dp.deinit(ed.gpa);
     ed.debug_programs.deinit(ed.gpa);
+    for (ed.debug_commands.items) |dc| dc.deinit(ed.gpa);
+    ed.debug_commands.deinit(ed.gpa);
+    if (ed.cmd_from) |f| ed.gpa.free(f);
     freeBreakpoints(ed.gpa, ed.breakpoints.items);
     ed.breakpoints.deinit(ed.gpa);
     for (ed.breakpoint_undo.items) |list| {
@@ -5045,17 +5072,31 @@ fn termKey(ed: *Editor, t: *Terminal, ev: KeyEvent) void {
 /// command (any number of lines). Insert mode first; in normal mode <CR>
 /// runs it and <Esc> cancels.
 pub fn openCommandEditor(ed: *Editor) !void {
+    return ed.editCommand("", .run, null);
+}
+
+/// The command editor on `cmd` (normal mode, to change it with vim's keys;
+/// empty: insert mode). Enter does what `purpose` says.
+pub fn editCommand(ed: *Editor, cmd: []const u8, purpose: CommandPurpose, from: ?[]const u8) !void {
     if (ed.cmd_float != null) return;
+    const from_owned: ?[]u8 = if (from) |f| try ed.gpa.dupe(u8, f) else null;
+    errdefer if (from_owned) |f| ed.gpa.free(f);
     const b = try ed.gpa.create(Buffer);
     errdefer ed.gpa.destroy(b);
     b.* = try Buffer.initEmpty(ed.gpa);
     errdefer b.deinit(ed.gpa);
+    try b.text.insert(ed.gpa, 0, cmd);
     const w = try ed.gpa.create(Windows.Window);
     w.* = .{ .buffer = b, .view = .{ .rows = ed.view.rows, .cols = ed.view.cols }, .node = undefined };
     ed.cmd_float = w;
     ed.cmd_return = ed.window;
+    ed.cmd_purpose = purpose;
+    if (ed.cmd_from) |old| ed.gpa.free(old);
+    ed.cmd_from = from_owned;
+    // Keys are the editor's now, not a finished run's popup's.
+    ed.popup = null;
     ed.focusWindow(w);
-    ed.setMode(.insert);
+    if (cmd.len == 0) ed.setMode(.insert);
 }
 
 /// The command editor's text, as one shell script. Caller frees.
@@ -5077,6 +5118,7 @@ pub fn closeCommandEditor(ed: *Editor) void {
     ed.gpa.destroy(w);
     ed.cmd_float = null;
     ed.cmd_return = null;
+    ed.cmd_purpose = .run;
 }
 
 /// In the command editor's normal mode: <CR> runs, <Esc> cancels.
@@ -5089,8 +5131,19 @@ fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
         .enter => {
             const cmd = ed.commandEditorText() catch return true;
             defer ed.gpa.free(cmd);
+            const purpose = ed.cmd_purpose;
+            const from = ed.cmd_from;
+            ed.cmd_from = null;
+            defer if (from) |f| ed.gpa.free(f);
             ed.closeCommandEditor();
-            if (cmd.len > 0) ed.startRun(cmd) catch |err| ed.setMessage(.err, "could not run: {s}", .{@errorName(err)});
+            if (cmd.len == 0) return true;
+            const one_line = std.mem.indexOfScalar(u8, cmd, '\n') == null;
+            (switch (purpose) {
+                .run => ed.startRun(cmd),
+                // The history is a line per command.
+                .runner => if (one_line) ed.runFromRunner(cmd) else ed.startRun(cmd),
+                .debug => ed.debugEdited(from orelse cmd, cmd),
+            }) catch |err| ed.setMessage(.err, "could not run: {s}", .{@errorName(err)});
         },
         else => return false,
     }
@@ -5139,7 +5192,7 @@ fn runOrDebug(ed: *Editor, cmd: []const u8) !void {
             return;
         },
     }
-    try ed.startDebug(cmd);
+    try ed.debugVia(cmd);
 }
 
 /// Breakpoints (switched on) in the project the runner's commands are for.
@@ -5286,7 +5339,7 @@ pub fn runAgain(ed: *Editor) !void {
 pub fn debugAgain(ed: *Editor) !void {
     const cmd = ed.loadRunnerCommand() orelse return ed.runPrompt(true);
     defer ed.gpa.free(cmd);
-    try ed.startDebug(cmd);
+    try ed.debugVia(cmd);
 }
 
 fn rerun(ed: *Editor) !void {
@@ -5607,7 +5660,110 @@ pub fn debugFromRunner(ed: *Editor, command: []const u8) !void {
         defer ed.gpa.free(key);
         RunMemory.save(ed.gpa, ed.io, path, key, cmd);
     }
+    try ed.debugVia(cmd);
+}
+
+/// Debugs runner command `cmd`. The first time this session it comes up in
+/// the command editor, to change for the debugger (a debug build, other
+/// arguments, `zig build && ./zig-out/bin/app` to name the program); Enter
+/// there debugs it, and it's what `cmd` debugs as from then on.
+pub fn debugVia(ed: *Editor, cmd: []const u8) !void {
+    if (try ed.debugCommandFor(cmd)) |mine| {
+        defer ed.gpa.free(mine);
+        return ed.startDebug(mine);
+    }
+    if (!sources.onPath(ed.io, "gdb")) return ed.setMessage(.err, "gdb isn't installed", .{});
+    try ed.editCommand(cmd, .debug, cmd);
+    const release = switch (try Debugger.plan(ed.gpa, cmd)) {
+        .plan => |p| blk: {
+            defer p.deinit(ed.gpa);
+            break :blk p.release;
+        },
+        .unsupported => false,
+    };
+    if (release) {
+        ed.setMessage(.info, "the debugger's command: release flags lose variables under gdb (take them out here?)", .{});
+    } else ed.setMessage(.info, "the debugger's command for this session: change it or just Enter", .{});
+}
+
+/// What runner command `from` debugs as, if it was debugged this session.
+/// Caller frees.
+fn debugCommandFor(ed: *Editor, from: []const u8) !?[]u8 {
+    const key = try ed.runKey();
+    defer ed.gpa.free(key);
+    for (ed.debug_commands.items) |d| {
+        if (std.mem.eql(u8, d.project, key) and std.mem.eql(u8, d.from, from)) return try ed.gpa.dupe(u8, d.cmd);
+    }
+    return null;
+}
+
+/// Enter in the command editor: `cmd` is what `from` debugs as; debug it.
+/// Which program it starts is asked again if need be.
+fn debugEdited(ed: *Editor, from: []const u8, cmd: []const u8) !void {
+    const key = try ed.runKey();
+    var key_owned = true;
+    defer if (key_owned) ed.gpa.free(key);
+    var i: usize = 0;
+    while (i < ed.debug_commands.items.len) {
+        const d = ed.debug_commands.items[i];
+        if (std.mem.eql(u8, d.project, key) and std.mem.eql(u8, d.from, from)) {
+            d.deinit(ed.gpa);
+            _ = ed.debug_commands.orderedRemove(i);
+        } else i += 1;
+    }
+    i = 0;
+    while (i < ed.debug_programs.items.len) {
+        const d = ed.debug_programs.items[i];
+        if (std.mem.eql(u8, d.project, key)) {
+            d.deinit(ed.gpa);
+            _ = ed.debug_programs.orderedRemove(i);
+        } else i += 1;
+    }
+    const f = try ed.gpa.dupe(u8, from);
+    errdefer ed.gpa.free(f);
+    const c = try ed.gpa.dupe(u8, cmd);
+    errdefer ed.gpa.free(c);
+    try ed.debug_commands.append(ed.gpa, .{ .project = key, .from = f, .cmd = c });
+    key_owned = false;
     try ed.startDebug(cmd);
+}
+
+/// The Debug picker's command row: the command last debugged here this
+/// session (`edited`), else the runner's. Caller frees `cmd` and `from`.
+pub const DebugRow = struct { cmd: []u8, from: []u8, edited: bool };
+
+pub fn debugRow(ed: *Editor) !?DebugRow {
+    const key = try ed.runKey();
+    defer ed.gpa.free(key);
+    var i = ed.debug_commands.items.len;
+    while (i > 0) {
+        i -= 1;
+        const d = ed.debug_commands.items[i];
+        if (!std.mem.eql(u8, d.project, key)) continue;
+        const c = try ed.gpa.dupe(u8, d.cmd);
+        errdefer ed.gpa.free(c);
+        return .{ .cmd = c, .from = try ed.gpa.dupe(u8, d.from), .edited = true };
+    }
+    const cmd = ed.loadRunnerCommand() orelse return null;
+    errdefer ed.gpa.free(cmd);
+    return .{ .cmd = cmd, .from = try ed.gpa.dupe(u8, cmd), .edited = false };
+}
+
+/// Enter on the command row: debug it (the first time, after a look).
+pub fn debugRowAccept(ed: *Editor) !void {
+    const row = try ed.debugRow() orelse return ed.runPrompt(true);
+    defer ed.gpa.free(row.cmd);
+    defer ed.gpa.free(row.from);
+    if (row.edited) return ed.startDebug(row.cmd);
+    try ed.debugVia(row.cmd);
+}
+
+/// `e` in the Debug picker: the debugger's command, in the command editor.
+pub fn debugRowEdit(ed: *Editor) !void {
+    const row = try ed.debugRow() orelse return ed.runPrompt(true);
+    defer ed.gpa.free(row.cmd);
+    defer ed.gpa.free(row.from);
+    try ed.editCommand(row.cmd, .debug, row.from);
 }
 
 /// Debugs `cmd`: a build-and-run command (`zig build run`, `cargo run`) is
@@ -5642,7 +5798,7 @@ pub fn startDebug(ed: *Editor, cmd: []const u8) !void {
         errdefer chosen.deinit(ed.gpa);
         // The command's build, and its arguments if it has any.
         std.mem.swap(?[]u8, &chosen.build, &p.build);
-        chosen.debug_build = p.debug_build;
+        chosen.release = p.release;
         if (p.args.len > 0) std.mem.swap([][]u8, &chosen.args, &p.args);
         try ed.inProject(&chosen);
         try ed.setDebugCommand(cmd, false);
@@ -5717,7 +5873,7 @@ pub fn debugProgramText(ed: *Editor, row: []const u8) !void {
                 var r = rp;
                 defer r.deinit(ed.gpa);
                 std.mem.swap(?[]u8, &chosen.build, &r.build);
-                chosen.debug_build = r.debug_build;
+                chosen.release = r.release;
             },
             .unsupported => {},
         }
@@ -5787,7 +5943,7 @@ fn askProgram(ed: *Editor, plan: Debugger.Plan) anyerror!void {
     }
     // One: that's it; the command's arguments go to it.
     try ed.rememberProgram(found[0]);
-    var chosen: Debugger.Plan = .{ .program = try std.fs.path.resolve(ed.gpa, &.{ root, found[0] }), .debug_build = plan.debug_build, .args = try Debugger.dupeArgs(ed.gpa, plan.args) };
+    var chosen: Debugger.Plan = .{ .program = try std.fs.path.resolve(ed.gpa, &.{ root, found[0] }), .release = plan.release, .args = try Debugger.dupeArgs(ed.gpa, plan.args) };
     defer chosen.deinit(ed.gpa);
     try ed.launchDebug(chosen);
 }
@@ -5850,7 +6006,7 @@ fn launchDebug(ed: *Editor, plan: Debugger.Plan) !void {
     ed.debug_frame = 0;
     ed.popup = .run;
     var line_buf: [512]u8 = undefined;
-    t.print(std.fmt.bufPrint(&line_buf, "\x1b[2mgdb: {s}   C-c pauses it{s}\x1b[0m\r\n", .{ program, if (plan.debug_build) "\r\na debug build: the command's release flags were left out" else "" }) catch "");
+    t.print(std.fmt.bufPrint(&line_buf, "\x1b[2mgdb: {s}   C-c pauses it{s}\x1b[0m\r\n", .{ program, if (plan.release) "\r\na release build: variables may be missing (SPC d, e changes the command)" else "" }) catch "");
     ed.setMessage(.info, "debugging {s}: it stops at breakpoints and crashes", .{std.fs.path.basename(program)});
 }
 
@@ -13594,4 +13750,77 @@ test "SPC d: C-j / C-k move the editor's cursor, the picker staying open; b ther
     try testing.expect(ed.picker != null);
     try ed.feed("b");
     try testing.expectEqual(1, ed.breakpoints.items[0].line);
+}
+
+test "debugging a runner command: the first time it comes up to change; remembered this session" {
+    const gpa = testing.allocator;
+    if (!sources.onPath(testing.io, "gdb") or !sources.onPath(testing.io, "cc")) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "t.c", .data = "int main(int n, char **v) {\n  return n;\n}\n" });
+    const src = try std.fs.path.join(gpa, &.{ dir, "t.c" });
+    defer gpa.free(src);
+    const prog = try std.fs.path.join(gpa, &.{ dir, "t" });
+    defer gpa.free(prog);
+    const cc = try std.process.run(gpa, testing.io, .{ .argv = &.{ "cc", "-g", "-o", prog, src } });
+    gpa.free(cc.stdout);
+    gpa.free(cc.stderr);
+    const S = struct {
+        fn untilEnd(e: *Editor) !void {
+            for (0..2000) |_| {
+                e.tick();
+                if (e.debugger == null) return;
+                testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+            }
+            return error.Timeout;
+        }
+    };
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.run_memory_path = try gpa.dupe(u8, "/nonexistent/run-commands");
+    const cmd = try std.fmt.allocPrint(gpa, "{s} a", .{prog});
+    defer gpa.free(cmd);
+    // First time: the command editor, on the command, in normal mode.
+    try ed.debugVia(cmd);
+    try testing.expect(ed.cmd_float != null and ed.debugger == null);
+    try testing.expectEqual(Mode.normal, ed.mode);
+    try expectText(&ed, cmd);
+    try ed.feed("A b<Esc><CR>"); // vim: another argument, then Enter debugs
+    try testing.expectEqual(null, ed.cmd_float);
+    try testing.expect(ed.debugger != null);
+    try S.untilEnd(&ed);
+    {
+        const shown = try ed.run.?.screenText(gpa);
+        defer gpa.free(shown);
+        try testing.expect(std.mem.indexOf(u8, shown, "exited 3") != null); // t a b
+    }
+    // Again: no question, the changed command.
+    try ed.debugVia(cmd);
+    try testing.expectEqual(null, ed.cmd_float);
+    try testing.expect(ed.debugger != null);
+    try testing.expect(std.mem.endsWith(u8, ed.debug_command.?, " a b"));
+    try S.untilEnd(&ed);
+    // The Debug picker's row is that command; e changes it again.
+    const row = (try ed.debugRow()).?;
+    defer gpa.free(row.cmd);
+    defer gpa.free(row.from);
+    try testing.expect(row.edited);
+    try testing.expectEqualStrings(cmd, row.from);
+    try ed.debugRowEdit();
+    try testing.expect(ed.cmd_float != null);
+    try ed.feed("<Esc>");
+    try testing.expectEqual(null, ed.cmd_float);
+}
+
+test "the runner: c changes a command in the vim command editor; Enter runs it" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
+    try ed.editCommand("echo one two", .runner, null);
+    try ed.feed("$ciwthree<Esc><CR>");
+    waitForRun(&ed);
+    try testing.expectEqualStrings("echo one three", ed.run_command.?);
 }
