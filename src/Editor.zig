@@ -75,8 +75,10 @@ pub const Options = struct {
     ghost_lines: bool = true,
     /// Line numbers relative to the cursor line.
     relative_numbers: bool = false,
-    /// Diagnostic messages after the end of lines.
-    diagnostic_text: bool = true,
+    /// Diagnostic messages after the end of lines (wrapped onto rows under
+    /// them). Off: diagnostics are underlined, and the message pops up with
+    /// the cursor or the mouse resting on one (as in Neovim and Helix).
+    diagnostic_text: bool = false,
     /// Close brackets and quotes as they are typed.
     auto_pairs: bool = true,
     /// Format a file (language server, else its formatter) when saving it.
@@ -811,9 +813,6 @@ mouse_hover: ?MouseHover = null,
 cursor_rest: ?CursorRest = null,
 /// The window border being dragged with the mouse.
 border_drag: ?*Windows.Split = null,
-/// Running in a terminal: diagnostics are underlined only, their messages
-/// pop up with the cursor on them (no text after the line).
-terminal_ui: bool = false,
 completion: ?Completion = null,
 /// The call the cursor is in (signature help), shown above it while typing.
 signature: ?SignatureHelp = null,
@@ -3843,14 +3842,9 @@ pub fn ghostText(ed: *const Editor, line: usize, k: u32) []const u8 {
 /// Whether some line can take more than one row (then rows can't be
 /// counted as lines).
 pub fn layered(ed: *const Editor) bool {
-    return ed.wraps() or ed.hasLenses() or (ed.showsDiagnosticText() and ed.hasDiagnostics(ed.buffer));
+    return ed.wraps() or ed.hasLenses() or (ed.options.diagnostic_text and ed.hasDiagnostics(ed.buffer));
 }
 
-/// Diagnostic messages after their lines (option `diagnostic_text`): in the
-/// window; a terminal underlines only, the message pops up on the cursor.
-pub fn showsDiagnosticText(ed: *const Editor) bool {
-    return ed.options.diagnostic_text and !ed.terminal_ui;
-}
 
 /// The rows (wrapped pieces) of `line`, written into `buf`: at least one.
 /// A closed fold's line is one row.
@@ -4038,7 +4032,7 @@ pub const DiagText = struct {
 
 /// `line`'s diagnostic message laid out for the window (`segs`: its rows).
 pub fn diagText(ed: *const Editor, line: usize, segs: []const Seg) ?DiagText {
-    if (!ed.showsDiagnosticText() or ed.foldAt(line) != null) return null;
+    if (!ed.options.diagnostic_text or ed.foldAt(line) != null) return null;
     const diag = ed.lineDiagnostic(line) orelse return null;
     const t = &ed.buffer.text;
     if (line >= t.lineCount()) return null;
@@ -4565,7 +4559,7 @@ pub fn hoveredDiagnostics(ed: *const Editor, out: []*const Lsp.Diagnostic) []*co
 
 fn diagnosticsUnder(ed: *const Editor, h: MouseHover, out: []*const Lsp.Diagnostic) []*const Lsp.Diagnostic {
     const pos = h.pos orelse {
-        if (out.len == 0 or !ed.showsDiagnosticText()) return out[0..0];
+        if (out.len == 0 or !ed.options.diagnostic_text) return out[0..0];
         out[0] = ed.lineDiagnostic(h.line) orelse return out[0..0];
         return out[0..1];
     };
@@ -14103,6 +14097,7 @@ test "breakpoints follow their lines through edits and undo" {
 test "diagnostics: a long message wraps onto rows under its line, which j skips" {
     var ed = try testEditor("    const a = 1;\nnext\n");
     defer ed.deinit();
+    ed.options.diagnostic_text = true;
     ed.setViewSize(10, 40);
     const diags = try ed.gpa.alloc(Lsp.Diagnostic, 1);
     diags[0] = .{ .line = 0, .col = 10, .end_line = 0, .end_col = 11, .severity = .err, .message = try ed.gpa.dupe(u8, "expected type 'u8', found 'comptime_int' because of reasons") };
@@ -14130,6 +14125,7 @@ test "diagnostics: a long message wraps onto rows under its line, which j skips"
 test "diagnostics: the mouse resting on one (or its message) finds it after a moment" {
     var ed = try testEditor("    const a = 1;\nnext\n");
     defer ed.deinit();
+    ed.options.diagnostic_text = true; // the message's rows too
     ed.setViewSize(10, 40);
     const diags = try ed.gpa.alloc(Lsp.Diagnostic, 1);
     diags[0] = .{ .line = 0, .col = 10, .end_line = 0, .end_col = 11, .severity = .err, .message = try ed.gpa.dupe(u8, "expected type 'u8', found 'comptime_int' because of reasons") };
@@ -14156,16 +14152,16 @@ test "diagnostics: the mouse resting on one (or its message) finds it after a mo
     try testing.expectEqual(0, ed.hoveredDiagnostics(&out).len);
 }
 
-test "diagnostics: in a terminal, no message after the line (it pops up on the cursor)" {
+test "diagnostics: by default no message after the line (it pops up), in both front ends" {
     var ed = try testEditor("    const a = 1;\nnext\n");
     defer ed.deinit();
     ed.setViewSize(10, 40);
     const diags = try ed.gpa.alloc(Lsp.Diagnostic, 1);
     diags[0] = .{ .line = 0, .col = 10, .end_line = 0, .end_col = 11, .severity = .err, .message = try ed.gpa.dupe(u8, "expected type 'u8', found 'comptime_int' because of reasons") };
     try ed.check_results.append(ed.gpa, .{ .buffer = ed.buffer, .diags = diags, .libc = false });
-    try testing.expectEqual(3, ed.subRows(0));
-    ed.terminal_ui = true;
-    try testing.expectEqual(1, ed.subRows(0));
     var buf: [max_segments]Seg = undefined;
+    try testing.expectEqual(1, ed.subRows(0));
     try testing.expectEqual(null, ed.diagText(0, ed.segments(0, &buf)));
+    ed.options.diagnostic_text = true;
+    try testing.expectEqual(3, ed.subRows(0));
 }

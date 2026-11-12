@@ -736,7 +736,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, line, y, last_piece);
         // Inline blame: who last changed the cursor's line.
         if (last_piece and focused and is_current and ed.options.git_blame and fold == null and ghost == null and ed.ghost == null and
-            !(line_diag != null and ed.showsDiagnosticText())) drawBlame(ed, font, theme, l, bytes, line, y);
+            !(line_diag != null and ed.options.diagnostic_text)) drawBlame(ed, font, theme, l, bytes, line, y);
 
         // The suggestion's further lines: rows of their own under this one
         // (no line numbers: they aren't in the file yet).
@@ -1637,6 +1637,7 @@ test "terminal mode: a long diagnostic wraps under its line; resting the mouse o
     const gpa = std.testing.allocator;
     var ed = try Editor.init(gpa, std.testing.io);
     defer ed.deinit();
+    ed.options.diagnostic_text = true;
     try ed.text().insert(gpa, 0, "    const a = 1;\nnext\n");
     const diags = try gpa.alloc(Lsp.Diagnostic, 1);
     diags[0] = .{ .line = 0, .col = 10, .end_line = 0, .end_col = 11, .severity = .err, .message = try gpa.dupe(u8, "expected type 'u8', found 'comptime_int' because of reasons") };
@@ -1681,7 +1682,6 @@ test "terminal mode: the cursor resting on a diagnostic pops it up" {
     const diags = try gpa.alloc(Lsp.Diagnostic, 1);
     diags[0] = .{ .line = 0, .col = 6, .end_line = 0, .end_col = 7, .severity = .err, .message = try gpa.dupe(u8, "unused local constant") };
     try ed.check_results.append(gpa, .{ .buffer = ed.buffer, .diags = diags, .libc = false });
-    ed.options.diagnostic_text = false;
     var grid: Grid = .{};
     defer grid.deinit(gpa);
     try grid.resize(gpa, 50, 12);
@@ -1723,7 +1723,6 @@ test "terminal mode: the mouse resting on a diagnostic pops it up" {
     const gpa = std.testing.allocator;
     var ed = try Editor.init(gpa, std.testing.io);
     defer ed.deinit();
-    ed.terminal_ui = true;
     try ed.text().insert(gpa, 0, "const a = 1;\nnext\nmore\n");
     const diags = try gpa.alloc(Lsp.Diagnostic, 1);
     diags[0] = .{ .line = 0, .col = 6, .end_line = 0, .end_col = 7, .severity = .err, .message = try gpa.dupe(u8, "unused local constant") };

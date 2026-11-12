@@ -54,7 +54,6 @@ fn termSize(tty: bool) [2]usize {
 pub fn run(gpa: Allocator, io: Io, ed: *Editor, opts: Options) !void {
     const tty = std.c.isatty(stdin) == 1 and std.c.isatty(stdout) == 1;
     if (!tty and opts.test_keys == null) return error.NotATerminal;
-    ed.terminal_ui = true;
 
     // Raw mode, restored on the way out.
     var saved: std.c.termios = undefined;
