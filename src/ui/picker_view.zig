@@ -680,7 +680,7 @@ pub fn drawGrid(g: *ResultGrid, font: *const Font, theme: *const Theme, l: rende
     const room = cols -| (cells(name) + 3);
     drawCell(font, g.cell(g.row, g.col), x, value_y, room, theme.fg);
 
-    const hint = "hjkl move · w/b next/prev cell · v cells · V rows · y yank · Y row · / search · o as text · q close";
+    const hint = "hjkl move · w/b next/prev cell · v cells · V rows · y yank · Y row · / search · o open as buffer · q close";
     _ = font.drawText(clipCells(hint, cols), x0, value_y + ch, theme.status_dim);
 }
 

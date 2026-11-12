@@ -53,7 +53,7 @@ pub const Outcome = union(enum) {
     /// Text for the yank register (owned by the caller from here), and what
     /// to say about it.
     yank: struct { text: []u8, what: []const u8, n: usize },
-    /// `o`: the results as a table in a buffer.
+    /// `o`: open as a buffer (the results as a table).
     table,
     /// The search found nothing.
     not_found,
