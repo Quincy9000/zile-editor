@@ -200,7 +200,7 @@ fn drawQueryLine(p: *Picker, font: *const Font, theme: *const Theme, bx: f32, y:
             .buffers => "  j/k move · Enter open · i type",
             .runner => "  j/k move · Enter run · i type",
             .quickfix => "  j/k move · Enter open · x clear the list · i type",
-            .sql_results => "  j/k move · Enter yank the row · i type to filter · q close",
+            .sql_results => if (p.ed.sql_row != null) "  j/k move · Enter yank the value · i type to filter · q close" else "  j/k move · Enter open the row · i type to filter · q close",
             else => if (sources.rowKeys(p.kind).len > 0) blk: {
                 // `q` may be a row (the start screen's Quit): then Esc closes.
                 const q_row = std.mem.indexOfScalar(u8, sources.rowKeys(p.kind), 'q') != null;

@@ -123,6 +123,11 @@ pub fn debugTitle(ed: *Editor) []const u8 {
     return Debug.liveTitle(ed);
 }
 
+/// "SQL results", or the row that is open.
+pub fn sqlResultsTitle(ed: *Editor) []const u8 {
+    return if (ed.sql_row != null) "SQL row (b: back to the rows)" else SqlResults.title;
+}
+
 pub fn prefix(kind: Kind) ?u8 {
     return switch (kind) {
         inline else => |k| Impl(k).prefix,
@@ -3020,6 +3025,9 @@ const Debug = struct {
 /// The rows a SQL statement returned (Ctrl-Enter in a SQL file): one row
 /// each, however wide the table is; the preview is the selected row with a
 /// line per column. Typing filters on any value.
+///
+/// Enter opens a row (`ed.sql_row`): the list is then its columns, one
+/// each, to pick a single value from (Enter / `y` yanks it; `b` goes back).
 const SqlResults = struct {
     pub const title = "SQL results";
     pub const prefix: ?u8 = null;
@@ -3028,52 +3036,105 @@ const SqlResults = struct {
     /// Of a value in a row of the list (the preview has all of it).
     const max_cell = 48;
 
+    fn results(ed: *Editor) ?*@import("../sql.zig").Results {
+        const r = ed.sql_results orelse return null;
+        return if (r.done.load(.acquire)) r else null;
+    }
+
+    /// The open row, when one is.
+    fn openRow(ed: *Editor) ?[]const []const u8 {
+        const r = results(ed) orelse return null;
+        const i = ed.sql_row orelse return null;
+        return if (i < r.rows.len) r.rows[i] else null;
+    }
+
+    /// `value` on one line, at most `max` bytes of it.
+    fn appendFlat(ed: *Editor, line: *std.ArrayList(u8), value: []const u8, max: usize) !void {
+        var end = @min(value.len, max);
+        while (end < value.len and end > 0 and value[end] & 0xC0 == 0x80) end -= 1;
+        for (value[0..end]) |b| try line.append(ed.gpa, if (b == '\n' or b == '\r' or b == '\t') ' ' else b);
+        if (end < value.len) try line.appendSlice(ed.gpa, "…");
+    }
+
     pub fn fill(ed: *Editor, items: *Items) !void {
-        const r = ed.sql_results orelse return;
-        if (!r.done.load(.acquire)) return;
+        const r = results(ed) orelse return;
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(ed.gpa);
+        // A row is open: its columns.
+        if (openRow(ed)) |row| {
+            var width: usize = 0;
+            for (r.columns) |name| width = @max(width, name.len);
+            for (row, 0..) |value, c| {
+                line.clearRetainingCapacity();
+                const name = if (c < r.columns.len) r.columns[c] else "";
+                try line.appendSlice(ed.gpa, name);
+                try line.appendNTimes(ed.gpa, ' ', width - @min(width, name.len));
+                try line.appendSlice(ed.gpa, " │ ");
+                try appendFlat(ed, &line, value, 200);
+                try items.append(.{ .text = line.items, .detail = "", .id = @intCast(c) });
+            }
+            return;
+        }
         for (r.rows, 0..) |row, i| {
             line.clearRetainingCapacity();
             for (row, 0..) |value, c| {
                 if (c > 0) try line.appendSlice(ed.gpa, " │ ");
-                var end = @min(value.len, max_cell);
-                while (end < value.len and end > 0 and value[end] & 0xC0 == 0x80) end -= 1;
-                for (value[0..end]) |b| try line.append(ed.gpa, if (b == '\n' or b == '\r' or b == '\t') ' ' else b);
-                if (end < value.len) try line.appendSlice(ed.gpa, "…");
+                try appendFlat(ed, &line, value, max_cell);
             }
             try items.append(.{ .text = line.items, .detail = "", .id = @intCast(i) });
         }
     }
 
-    fn rowOf(ed: *Editor, item: Item) ?[]const []const u8 {
-        const r = ed.sql_results orelse return null;
-        return if (r.done.load(.acquire) and item.id < r.rows.len) r.rows[item.id] else null;
-    }
-
-    /// The row as you'd paste it into a sheet: its values, tabs between.
-    fn yankRow(ed: *Editor, item: ?Item) anyerror!void {
-        const row = rowOf(ed, item orelse return) orelse return;
-        const text = try std.mem.join(ed.gpa, "\t", row);
+    /// `y`: the selected value of an open row; else the row as you'd paste
+    /// it into a sheet (its values, tabs between).
+    fn yank(ed: *Editor, item: ?Item) anyerror!void {
+        const r = results(ed) orelse return;
+        const it = item orelse return;
+        if (openRow(ed)) |row| {
+            if (it.id >= row.len) return;
+            try ed.registers.store(null, .yank, row[it.id], false);
+            const name = if (it.id < r.columns.len) r.columns[it.id] else "the value";
+            return ed.setMessage(.info, "yanked {s}", .{name});
+        }
+        if (it.id >= r.rows.len) return;
+        const text = try std.mem.join(ed.gpa, "\t", r.rows[it.id]);
         defer ed.gpa.free(text);
         try ed.registers.store(null, .yank, text, false);
-        ed.setMessage(.info, "yanked the row ({d} values, tabs between)", .{row.len});
+        ed.setMessage(.info, "yanked the row ({d} values, tabs between)", .{r.rows[it.id].len});
     }
 
     fn yankAll(ed: *Editor, _: ?Item) anyerror!void {
-        const r = ed.sql_results orelse return;
-        if (!r.done.load(.acquire)) return;
+        const r = results(ed) orelse return;
         try ed.registers.store(null, .yank, r.csv, false);
         ed.setMessage(.info, "yanked {d} rows as CSV", .{r.rows.len});
     }
 
+    /// `b`: from a row's columns back to the rows.
+    fn back(ed: *Editor, _: ?Item) anyerror!void {
+        // On the row that was open.
+        if (ed.picker) |p| p.want_id = ed.sql_row;
+        ed.sql_row = null;
+    }
+
+    /// Enter: a row opens (its columns to pick from); a column's value is
+    /// yanked.
     pub fn accept(ed: *Editor, item: Item) !void {
-        try yankRow(ed, item);
+        if (ed.sql_row != null) return yank(ed, item);
+        ed.sql_row = item.id;
+        try ed.openPicker(.sql_results, "");
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        const r = ed.sql_results orelse return;
-        const row = rowOf(ed, item.*) orelse return;
+        const r = results(ed) orelse return;
+        // A column of the open row: all of its value, as it is.
+        if (openRow(ed)) |row| {
+            if (item.id >= row.len) return;
+            const name = if (item.id < r.columns.len) r.columns[item.id] else "";
+            try out.text.print(ed.gpa, "{s}  (row {d} of {d})\n\n{s}", .{ name, ed.sql_row.? + 1, r.rows.len, row[item.id] });
+            return;
+        }
+        if (item.id >= r.rows.len) return;
+        const row = r.rows[item.id];
         var width: usize = 0;
         for (r.columns) |name| width = @max(width, name.len);
         try out.text.print(ed.gpa, "row {d} of {d}\n\n", .{ item.id + 1, r.rows.len });
@@ -3098,8 +3159,9 @@ const SqlResults = struct {
     }
 
     pub const item_actions = [_]Action{
-        .{ .label = "yank the row", .key = 'y', .stay = true, .keep_rows = true, .run = yankRow },
-        .{ .label = "yank all (CSV)", .key = 'Y', .stay = true, .any = true, .keep_rows = true, .run = yankAll },
+        .{ .label = "yank it", .key = 'y', .stay = true, .keep_rows = true, .run = yank },
+        .{ .label = "yank all rows (CSV)", .key = 'Y', .stay = true, .any = true, .keep_rows = true, .run = yankAll },
+        .{ .label = "back to the rows", .key = 'b', .stay = true, .any = true, .run = back },
     };
 };
 

@@ -762,6 +762,9 @@ sql_schema: ?*sql.Schema = null,
 /// The last statement run with Ctrl-Enter: running, or its rows (kept for
 /// the results picker to come back to).
 sql_results: ?*sql.Results = null,
+/// The row of `sql_results` open in the results picker (its columns are
+/// listed), if one is.
+sql_row: ?u32 = null,
 /// `sql_results` has finished and was shown (or said).
 sql_results_seen: bool = true,
 sql_checked: ?*const Buffer = null,
@@ -1822,6 +1825,7 @@ fn tickSqlResults(ed: *Editor) void {
     // Not over what you're in the middle of (typing, another picker).
     if (ed.mode != .normal or ed.picker != null or ed.popup != null)
         return ed.setMessage(.info, "{d} row{s}: \"SQL results\" in the command picker shows them", .{ r.rows.len, if (r.rows.len == 1) "" else "s" });
+    ed.sql_row = null;
     ed.openPicker(.sql_results, "") catch {};
 }
 
@@ -1831,6 +1835,7 @@ pub fn showSqlResults(ed: *Editor) !void {
     if (!r.done.load(.acquire)) return ed.setMessage(.info, "the statement is still running", .{});
     if (r.failed) return ed.setMessage(.err, "{s}", .{std.mem.sliceTo(r.err, '\n')});
     if (r.rows.len == 0) return ed.setMessage(.info, "it returned no rows", .{});
+    ed.sql_row = null;
     try ed.openPicker(.sql_results, "");
 }
 
@@ -9654,10 +9659,25 @@ test "SQL results: a statement's rows in a picker, a row's columns in the previe
     try testing.expectEqualStrings("2 │ b@x.io │ has, a comma", p.itemAt(1).?.text);
     p.updatePreview();
     try testing.expectEqualStrings("row 1 of 2\n\nid    │ 1\nemail │ a@x.io\nnote  │ two\n      │ lines\n", p.preview.text.items);
-    // Enter: the row, for pasting.
-    try ed.feed("j<CR>");
-    try testing.expect(ed.picker == null);
+    // `y`: the row, for pasting.
+    try ed.feed("jy");
     try testing.expectEqualStrings("2\tb@x.io\thas, a comma", ed.registers.get(null).?.text);
+    // Enter opens the row: its columns, to take one value from.
+    try ed.feed("<CR>");
+    const cols = ed.picker orelse return error.TestUnexpectedResult;
+    cols.sync();
+    try testing.expectEqual(3, cols.rowCount());
+    try testing.expectEqualStrings("email │ b@x.io", cols.itemAt(1).?.text);
+    try ed.feed("jy");
+    try testing.expectEqualStrings("b@x.io", ed.registers.get(null).?.text);
+    // `b`: the rows again; Enter on a column yanks it and closes.
+    try ed.feed("b");
+    ed.picker.?.sync();
+    try testing.expectEqual(2, ed.picker.?.rowCount());
+    try testing.expectEqual(1, ed.picker.?.selected); // on the row that was open
+    try ed.feed("k<CR>jj<CR>");
+    try testing.expect(ed.picker == null);
+    try testing.expectEqualStrings("two\nlines", ed.registers.get(null).?.text);
 
     // No rows back, and an error (the database's words, at the cursor).
     try ed.startSqlStatement(db, "update users set note = '' where id = 9", db);
