@@ -48,6 +48,8 @@ fn loadFrom(gpa: Allocator, io: Io, path: []const u8, project: []const u8) ?[]u8
 
 /// Commands kept per project; older ones are dropped.
 const max_history = 100;
+/// Lines in all (every project's): the oldest go beyond it.
+const max_lines = 2000;
 
 fn saveTo(gpa: Allocator, io: Io, path: []const u8, project: []const u8, command: []const u8) !void {
     try rewrite(gpa, io, path, project, command, true);
@@ -90,6 +92,14 @@ fn rewrite(gpa: Allocator, io: Io, path: []const u8, project: []const u8, comman
         }
     }
     if (add) try out.print(gpa, "{s}\t{s}\n", .{ project, command });
+    // Oldest first in the file: what's over the limit is at the top.
+    var lines_n = std.mem.count(u8, out.items, "\n");
+    var start: usize = 0;
+    while (lines_n > max_lines) : (lines_n -= 1) start = (std.mem.indexOfScalarPos(u8, out.items, start, '\n') orelse break) + 1;
+    if (start > 0) {
+        std.mem.copyForwards(u8, out.items, out.items[start..]);
+        out.shrinkRetainingCapacity(out.items.len - start);
+    }
     if (std.fs.path.dirname(path)) |dir| try Io.Dir.cwd().createDirPath(io, dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
 }

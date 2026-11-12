@@ -495,6 +495,19 @@ and text objects (`objects.zig` specs) for new languages.
 | JSON | `vscode-json-language-server` with schemas for `package.json`, `tsconfig*.json`, `app.json` (Expo) and `eas.json`; prettier formats JSON (and YAML) |
 | SQL completion | keywords, tables and columns of the database (loaded in the background with psql / sqlite3 when a SQL file is shown, again after a statement that creates, alters or drops); after `name.` only that table's columns, aliases (`from users u`) included; the file's words too |
 
+## Stored data
+
+What zile keeps between runs, all plain text: in `$XDG_STATE_HOME/zile`
+`visits` (500 files at most), `sessions/` (a file per project, the newest
+100 kept), `undo/` (a file per edited file, the newest 300 and 256 MB
+kept), `run-commands` (100 a project, 2000 in all), `projects` (50),
+`theme`; in `$XDG_CACHE_HOME/zile` the language servers' and gdb's logs
+(replaced at each start). The folders are pruned at startup
+(`StoredData.prune`, oldest first). "Stored data" in the command picker
+lists each with its size: Enter opens it (a folder in the file browser),
+`x` clears the row's (`x` again to be sure), `X` all of it. Breakpoints,
+the debugger's choices and SQL results are never written.
+
 ## Shell and SQL
 
 **Bash** (tree-sitter-bash): `.sh` `.bash` `.zsh`, dotfiles (`.bashrc`,

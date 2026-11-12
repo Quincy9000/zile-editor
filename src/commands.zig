@@ -308,6 +308,7 @@ const base = [_]Command{
     .{ .name = "run_again", .doc = "Run the runner command again", .run = termCmd(.again), .once = true },
     .{ .name = "run_sql", .doc = "Run the SQL statement (or selection)", .run = runSql(false), .once = true },
     .{ .name = "run_sql_or_newline", .doc = "Run the SQL statement; elsewhere a new line", .run = runSqlOrNewline, .once = true, .hidden = true },
+    .{ .name = "stored_data", .doc = "Stored data: see and clear what zile remembers", .run = storedData, .once = true },
     .{ .name = "sql_results", .doc = "SQL results: the last statement's rows", .run = sqlResults, .once = true },
     .{ .name = "run_sql_file", .doc = "Run the whole SQL file", .run = runSql(true), .once = true },
     .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
@@ -2522,6 +2523,10 @@ fn startSearch(comptime forward: bool, comptime kind: Editor.PromptKind) Handler
 
 fn selectIn(c: Context) !void {
     c.ed.startSelectIn();
+}
+
+fn storedData(c: Context) anyerror!void {
+    try c.ed.openPicker(.stored_data, "");
 }
 
 fn sqlResults(c: Context) anyerror!void {

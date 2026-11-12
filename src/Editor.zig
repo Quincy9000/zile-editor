@@ -26,6 +26,7 @@ const sources = @import("picker/sources.zig");
 const Completion = @import("lsp/Completion.zig");
 const lsp_docs = @import("lsp/docs.zig");
 const ResultGrid = @import("ResultGrid.zig");
+const StoredData = @import("StoredData.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
@@ -763,6 +764,8 @@ sql_schema: ?*sql.Schema = null,
 /// The last statement run with Ctrl-Enter: running, or its rows (kept for
 /// the results picker to come back to).
 sql_results: ?*sql.Results = null,
+/// The "Stored data" row `x` was pressed on once (a second `x` clears it).
+stored_confirm: ?u32 = null,
 /// The results grid over the code (Ctrl-Enter's rows), while it is open.
 grid: ?ResultGrid = null,
 /// `sql_results` has finished and was shown (or said).
@@ -8400,11 +8403,96 @@ pub fn rememberPositions(ed: *Editor) void {
     for (ed.buffers.items) |b| ed.rememberPosition(b);
 }
 
+/// Where a store is kept (`StoredData`). Caller frees.
+pub fn storePath(ed: *Editor, store: StoredData.Store) ?[]u8 {
+    if (store == .logs) {
+        if (ed.state_dir) |d| return std.fs.path.join(ed.gpa, &.{ d, "logs" }) catch null;
+        if (@import("builtin").is_test) return null;
+        return config.dir(ed.gpa, .cache, "");
+    }
+    return ed.statePath(store.name());
+}
+
+/// The folders that grow a file per project or per file, kept to their
+/// newest (at the start; `StoredData.prune`).
+pub fn pruneStoredData(ed: *Editor) void {
+    if (ed.storePath(.sessions)) |p| {
+        defer ed.gpa.free(p);
+        StoredData.prune(ed.gpa, ed.io, p, StoredData.max_sessions, std.math.maxInt(u64));
+    }
+    if (ed.storePath(.undo)) |p| {
+        defer ed.gpa.free(p);
+        StoredData.prune(ed.gpa, ed.io, p, StoredData.max_undo_files, StoredData.max_undo_bytes);
+    }
+}
+
+/// The "Stored data" picker's `x`: removes what `store` keeps, on disk and
+/// here (so leaving doesn't write it back).
+pub fn clearStore(ed: *Editor, store: StoredData.Store) void {
+    switch (store) {
+        .visits => {
+            for (ed.visits.entries.items) |e| ed.gpa.free(e.path);
+            ed.visits.entries.clearRetainingCapacity();
+            ed.visits.loaded = true;
+            ed.visits.unsaved = 0;
+        },
+        .projects => if (ed.known_projects) |*k| {
+            for (k.items) |r| ed.gpa.free(r);
+            k.clearRetainingCapacity();
+        },
+        else => {},
+    }
+    const p = ed.storePath(store) orelse return;
+    defer ed.gpa.free(p);
+    if (store == .logs) {
+        // The language servers' folder and gdb's log.
+        const lsp = std.fs.path.join(ed.gpa, &.{ p, "lsp" }) catch return;
+        defer ed.gpa.free(lsp);
+        StoredData.clear(ed.io, lsp);
+    }
+    StoredData.clear(ed.io, p);
+}
+
 pub fn saveVisits(ed: *Editor) void {
     if (ed.visits.unsaved == 0) return;
     const p = ed.statePath("visits") orelse return;
     defer ed.gpa.free(p);
     ed.visits.save(ed.gpa, ed.io, p, ed.unixNow());
+}
+
+test "stored data: clearing a store empties it on disk and here; the folders are pruned" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.state_dir = dir;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "visits", .data = "3\t100\t0\t0\t/x/a.zig\n" });
+    try tmp.dir.createDirPath(testing.io, "undo");
+    for (0..5) |i| {
+        var name: [16]u8 = undefined;
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.bufPrint(&name, "undo/{d}", .{i}), .data = "x" });
+    }
+    _ = ed.loadedVisits();
+    try testing.expectEqual(1, ed.visits.entries.items.len);
+    ed.clearStore(.visits);
+    try testing.expectEqual(0, ed.visits.entries.items.len);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "visits", .{}));
+    try ed.openPicker(.stored_data, "");
+    const p = ed.picker.?;
+    p.sync();
+    try testing.expectEqual(std.enums.values(StoredData.Store).len, p.rowCount());
+    // `x` twice on the undo row: asked, then cleared.
+    for (0..p.rowCount()) |row| if (std.mem.startsWith(u8, p.itemAt(row).?.text, "Undo")) {
+        p.selected = row;
+    };
+    var undo_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const undo_dir = try std.fmt.bufPrint(&undo_buf, "{s}/undo", .{dir});
+    try ed.feed("x");
+    try testing.expectEqual(5, StoredData.usage(testing.io, undo_dir).files);
+    try ed.feed("x");
+    try testing.expectEqual(0, StoredData.usage(testing.io, undo_dir).files);
 }
 
 /// Saves the current project's session (`SPC p s`, and on the way out).

@@ -29,7 +29,7 @@ const Git = @import("../git/Git.zig");
 const hipatterns = @import("../core/hipatterns.zig");
 const keymap = @import("../input/keymap.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug, stored_data };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -79,6 +79,7 @@ fn Impl(comptime kind: Kind) type {
         .leader_quit => QuitMenu,
         .files_global => GlobalFiles,
         .debug => Debug,
+        .stored_data => StoredDataList,
     };
 }
 
@@ -3013,6 +3014,89 @@ const Debug = struct {
         .{ .label = "run", .key = 'r', .any = true, .run = run },
         .{ .label = "run under gdb", .key = 'R', .any = true, .run = runDebug },
         .{ .label = "stop", .key = 'x', .stay = true, .any = true, .run = stop },
+    };
+};
+
+/// What zile keeps on disk, a row each with how much: `x` clears the row's
+/// (`x` again to be sure), `X` all of it; Enter opens the file (or the
+/// folder in the file browser).
+const StoredDataList = struct {
+    pub const title = "Stored data";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+    const StoredData = @import("../StoredData.zig");
+    const Store = StoredData.Store;
+    /// `X`'s row id: all of them.
+    const all_id = std.math.maxInt(u32);
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var buf: [64]u8 = undefined;
+        for (std.enums.values(Store)) |store| {
+            const path = ed.storePath(store);
+            defer if (path) |p| ed.gpa.free(p);
+            const u = if (path) |p| (if (store == .logs) logUsage(ed, p) else StoredData.usage(ed.io, p)) else StoredData.Usage{};
+            try items.append(.{ .text = store.label(), .detail = StoredData.describe(&buf, store, u), .id = @intFromEnum(store) });
+        }
+    }
+
+    fn logUsage(ed: *Editor, cache: []const u8) StoredData.Usage {
+        var u = StoredData.usage(ed.io, cache);
+        const lsp = std.fs.path.join(ed.gpa, &.{ cache, "lsp" }) catch return u;
+        defer ed.gpa.free(lsp);
+        const more = StoredData.usage(ed.io, lsp);
+        u.files += more.files;
+        u.bytes += more.bytes;
+        return u;
+    }
+
+    fn storeOf(item: ?Item) ?Store {
+        const it = item orelse return null;
+        return std.enums.fromInt(Store, it.id);
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        const store = storeOf(item) orelse return;
+        const path = ed.storePath(store) orelse return;
+        defer ed.gpa.free(path);
+        if (store.isFolder()) {
+            try ed.setBrowseDir(path);
+            return ed.openPicker(.browse, "");
+        }
+        ed.openFile(path) catch ed.setMessage(.info, "nothing stored there yet", .{});
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const store = storeOf(item.*) orelse return;
+        const path = ed.storePath(store);
+        defer if (path) |p| ed.gpa.free(p);
+        try out.text.print(ed.gpa, "{s}\n\n{s}\n\nx clears it (x again to be sure):\n{s}\n\nKept in {s}", .{ store.about(), if (store == .sessions) "At most 100 kept, the oldest go." else if (store == .undo) "At most 300 files and 256 MB kept, the oldest go." else "", store.effect(), path orelse "(nowhere: tests)" });
+    }
+
+    /// `x`: the row's store, the second time it's pressed on that row.
+    fn clearRow(ed: *Editor, item: ?Item) anyerror!void {
+        const store = storeOf(item) orelse return;
+        if (ed.stored_confirm != item.?.id) {
+            ed.stored_confirm = item.?.id;
+            return ed.setMessage(.info, "x again clears: {s}", .{store.label()});
+        }
+        ed.stored_confirm = null;
+        ed.clearStore(store);
+        ed.setMessage(.info, "cleared: {s}", .{store.label()});
+    }
+
+    fn clearAll(ed: *Editor, _: ?Item) anyerror!void {
+        if (ed.stored_confirm != all_id) {
+            ed.stored_confirm = all_id;
+            return ed.setMessage(.info, "X again clears everything zile stores", .{});
+        }
+        ed.stored_confirm = null;
+        for (std.enums.values(Store)) |store| ed.clearStore(store);
+        ed.setMessage(.info, "cleared everything zile stores", .{});
+    }
+
+    pub const item_actions = [_]Action{
+        .{ .label = "clear it", .key = 'x', .stay = true, .run = clearRow },
+        .{ .label = "clear everything", .key = 'X', .stay = true, .any = true, .run = clearAll },
     };
 };
 

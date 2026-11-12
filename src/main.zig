@@ -90,6 +90,8 @@ pub fn main(init: std.process.Init) !void {
 
     var ed = try Editor.init(gpa, io);
     defer ed.deinit();
+    // Old sessions and undo histories past the limits go.
+    ed.pruneStoredData();
     // What is remembered between runs: the session and the visits, saved on
     // the way out (however we leave).
     defer {
