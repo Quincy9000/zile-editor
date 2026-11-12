@@ -7,6 +7,7 @@ const fuzzy = @import("../picker/fuzzy.zig");
 const Lsp = @import("Lsp.zig");
 const emmet = @import("../emmet.zig");
 const snippets = @import("../snippets.zig");
+const docs = @import("docs.zig");
 
 const Completion = @This();
 
@@ -32,6 +33,12 @@ pub const Item = struct {
     /// One of our snippets (`snippets.zig`): first when its trigger is typed
     /// in full, otherwise after the server's items.
     user_snippet: bool = false,
+    /// The server's documentation for it, as sent (markdown); `docText`
+    /// is the one to show.
+    doc: []const u8 = "",
+    /// Taking it should open the suggestions again (the server says so: a
+    /// CSS property, completed to `name: `, is followed by its values).
+    again: bool = false,
 };
 
 arena: std.heap.ArenaAllocator,
@@ -51,7 +58,23 @@ incomplete: bool = false,
 /// What `shown` was last ranked against (a hash of the typed text).
 ranked_for: ?u64 = null,
 
+/// The documentation last shown: item `index`'s, as plain text.
+doc_shown: ?struct { index: u32, text: []const u8 } = null,
+
 pub const max_shown = 100;
+/// Columns the documentation beside the list is wrapped to.
+pub const doc_cols = 64;
+
+/// The selected item's documentation as plain wrapped lines; "" for none.
+pub fn docText(c: *Completion) []const u8 {
+    if (c.shown.items.len == 0) return "";
+    const index = c.shown.items[c.selected];
+    if (c.doc_shown) |d| if (d.index == index) return d.text;
+    const raw = c.items[index].doc;
+    const text = if (raw.len == 0) "" else docs.plain(c.arena.allocator(), raw, doc_cols) catch "";
+    c.doc_shown = .{ .index = index, .text = text };
+    return text;
+}
 
 /// Builds the popup from a `textDocument/completion` result.
 pub fn fromJson(gpa: Allocator, result: std.json.Value, word_start: usize) !Completion {
@@ -93,6 +116,9 @@ pub fn fromJson(gpa: Allocator, result: std.json.Value, word_start: usize) !Comp
                 else => false,
             } else false,
             .call = if (Lsp.field(it, "kind")) |k| k == .integer and k.integer >= 2 and k.integer <= 4 else false,
+            // A string, or `{kind, value}`.
+            .doc = try a.dupe(u8, if (Lsp.field(it, "documentation")) |d| (if (d == .string) d.string else Lsp.str(Lsp.field(d, "value")) orelse "") else ""),
+            .again = if (Lsp.str(Lsp.field(Lsp.field(it, "command"), "command"))) |cmd| std.mem.eql(u8, cmd, "editor.action.triggerSuggest") else false,
         });
     }
     c.items = try items.toOwnedSlice(a);
@@ -248,12 +274,20 @@ pub fn filter(c: *Completion, gpa: Allocator, typed: []const u8, types_first: bo
     const Scored = struct { index: u32, score: i32, len: usize, exact: bool, same_case: bool, prefix: bool, buffer: bool, type_wanted: bool, snippet_exact: bool };
     var scored: std.ArrayList(Scored) = .empty;
     defer scored.deinit(gpa);
+    // Nothing typed yet (after `.`, or `justify-content: `): what the server
+    // offers here, in its order, without the file's words and our snippets
+    // (those are every word there is until a letter narrows them).
+    const from_server = for (c.items) |item| {
+        if (!item.from_buffer and !item.user_snippet and !item.markup) break true;
+    } else false;
+    const only_server = typed.len == 0 and from_server;
     for (c.items, 0..) |item, i| {
+        if (only_server and (item.from_buffer or item.user_snippet or item.markup)) continue;
         const s = fuzzy.score(q, item.filter, &scratch) orelse continue;
         try scored.append(gpa, .{
             .index = @intCast(i),
             .score = s,
-            .len = item.filter.len,
+            .len = if (typed.len == 0) 0 else item.filter.len,
             .exact = typed.len > 0 and std.ascii.eqlIgnoreCase(typed, item.filter),
             .same_case = std.mem.eql(u8, typed, item.filter),
             .prefix = typed.len > 0 and item.filter.len >= typed.len and std.ascii.eqlIgnoreCase(typed, item.filter[0..typed.len]),

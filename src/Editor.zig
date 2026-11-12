@@ -24,6 +24,7 @@ const Lsp = @import("lsp/Lsp.zig");
 const Replace = @import("Replace.zig");
 const sources = @import("picker/sources.zig");
 const Completion = @import("lsp/Completion.zig");
+const lsp_docs = @import("lsp/docs.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
@@ -1682,8 +1683,10 @@ pub fn workspaceSymbolsArrived(ed: *Editor) !void {
 }
 
 pub fn showHover(ed: *Editor, content: []const u8) !void {
+    // As plain lines: the box doesn't render markdown.
+    const plain = try lsp_docs.plain(ed.gpa, content, 78);
     if (ed.hover) |h| ed.gpa.free(h);
-    ed.hover = try ed.gpa.dupe(u8, content);
+    ed.hover = plain;
 }
 
 pub fn closeCompletion(ed: *Editor) void {
@@ -1740,9 +1743,27 @@ fn afterTyped(ed: *Editor, cp: u21) void {
     // when a typo is fixed); only a cut-short one needs asking for again.
     if (ed.completion) |c| if (!c.incomplete) return;
     const start = ed.wordStart();
-    const ask = trigger or (cp < 0x80 and ed.isNameChar(@intCast(cp)) and ed.view.cursor > start);
+    const ask = trigger or (cp < 0x80 and ed.isNameChar(@intCast(cp)) and ed.view.cursor > start) or
+        (cp == ' ' and ed.cssValueStarts());
     if (!ask) return;
     ed.askCompletion(l, start);
+}
+
+/// The cursor is after `property: ` in CSS (a stylesheet, or a page's
+/// `<style>` or `style=""`): its values are suggested without a letter
+/// typed, as an enum's would be after a `.`.
+fn cssValueStarts(ed: *Editor) bool {
+    const lang = if (ed.buffer.syntax) |sx| sx.lang.name else return false;
+    const styled = for ([_][]const u8{ "css", "scss", "less", "html" }) |l| {
+        if (std.mem.eql(u8, lang, l)) break true;
+    } else false;
+    if (!styled) return false;
+    const t = ed.text();
+    const ls = t.lineStart(ed.cursorLine());
+    const cur = ed.view.cursor;
+    // `name: |`: one space, a colon, and a property's name before it.
+    if (cur < ls + 3 or t.byteAt(cur - 1) != ' ' or t.byteAt(cur - 2) != ':') return false;
+    return ed.isNameChar(t.byteAt(cur - 3));
 }
 
 /// The current file's folder (absolute), else the working folder. Caller
@@ -1960,6 +1981,9 @@ pub fn acceptCompletion(ed: *Editor) !void {
     defer ed.gpa.free(insert);
     const is_snippet = item.snippet;
     const ours = item.user_snippet or item.markup;
+    // What comes next is suggested too (a CSS property's values).
+    const again = item.again;
+    defer if (again) if (ed.lspFor(ed.buffer)) |l| ed.askCompletion(l, ed.wordStart());
     const start = c.word_start;
     // A function (by its kind, or text that ends in a call when the server
     // doesn't say): <Tab> after it can end the statement with `;`.
@@ -9315,6 +9339,32 @@ test "completion in CSS: a - keeps the list (background-color, --gap)" {
     try testing.expectEqualStrings("background-color", c.current().?.label);
     try ed.feed("<CR>");
     try testing.expectEqualStrings("  background-color", ed.text().lineSlice(1));
+}
+
+test "completion in CSS: a property's values as the server lists them, each with its documentation" {
+    const gpa = testing.allocator;
+    var ed = try testEditorAs("x.css", "a {\n  justify-content:\n}");
+    defer ed.deinit();
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"isIncomplete":true,"items":[
+        \\{"label":"space-between","documentation":{"kind":"markdown","value":"Flex items are evenly distributed in the line\\."}},
+        \\{"label":"center","documentation":{"kind":"markdown","value":"Packed toward the center\\.\n\n![Baseline icon](data:image/svg+xml;base64,AAAA)\n\n[MDN Reference](https://developer.mozilla.org/docs/Web/CSS/justify-content)"}},
+        \\{"label":"end","documentation":"plain"}]}
+    , .{});
+    defer reply.deinit();
+    try ed.feed("jA ");
+    // Nothing typed after `: `: the values only (not the file's words), in
+    // the server's order (not the shortest first).
+    try ed.showCompletion(ed.buffer, ed.view.cursor, reply.value);
+    const c = ed.completionShown() orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(3, c.shown.items.len);
+    try testing.expectEqualStrings("space-between", c.current().?.label);
+    try testing.expectEqualStrings("Flex items are evenly distributed in the line.", c.docText());
+    try ed.feed("<C-n>");
+    try testing.expectEqualStrings("center", ed.completionShown().?.current().?.label);
+    try testing.expectEqualStrings("Packed toward the center.\n\nMDN Reference\n(https://developer.mozilla.org/docs/Web/CSS/justify-content)", ed.completionShown().?.docText());
+    try ed.feed("<CR>");
+    try testing.expectEqualStrings("  justify-content: center", ed.text().lineSlice(1));
 }
 
 test "snippets: the exact trigger first, indented like its line" {

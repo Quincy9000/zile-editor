@@ -4,6 +4,7 @@ const std = @import("std");
 const debugging = @import("../debugging.zig");
 const rl = @import("raylib");
 const Editor = @import("../Editor.zig");
+const Completion = @import("../lsp/Completion.zig");
 const motions = @import("../core/motions.zig");
 const Font = @import("Font.zig");
 const Theme = @import("Theme.zig");
@@ -1355,6 +1356,41 @@ fn drawCompletion(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout
             const dx = box.x + @as(f32, @floatFromInt(label_w + 3)) * font.cell_w;
             _ = font.drawText(clip(item.detail, detail_w), dx, y, theme.status_dim);
         }
+    }
+    drawCompletionDoc(c, font, theme, l, box.x, box.y, cols);
+}
+
+/// The selected suggestion's documentation, beside the list (on the side
+/// with room for it; none when neither has).
+fn drawCompletionDoc(c: *Completion, font: *const Font, theme: *const Theme, l: Layout, list_x: f32, list_y: f32, list_cols: usize) void {
+    const text = c.docText();
+    if (text.len == 0) return;
+    const max_rows = 16;
+    var lines: [max_rows][]const u8 = undefined;
+    var n: usize = 0;
+    var width: usize = 1;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (n == lines.len) {
+            lines[n - 1] = "…";
+            break;
+        }
+        lines[n] = line;
+        n += 1;
+        width = @max(width, cells(line));
+    }
+    const cols = @min(width, Completion.doc_cols) + 2;
+    const w = @as(f32, @floatFromInt(cols)) * font.cell_w;
+    const h = @as(f32, @floatFromInt(n)) * font.cell_h;
+    const list_w = @as(f32, @floatFromInt(list_cols)) * font.cell_w;
+    const right = list_x + list_w + 2;
+    const x = if (right + w + 1 <= l.width) right else if (list_x - w - 2 >= 0) list_x - w - 2 else return;
+    // Kept on the screen when the list is near the bottom.
+    const y = @max(@min(list_y, l.status_y - h - 1), 0);
+    rect(x - 1, y - 1, w + 2, h + 2, theme.popup_border);
+    rect(x, y, w, h, theme.popup_bg);
+    for (lines[0..n], 0..) |line, i| {
+        _ = font.drawText(clip(line, cols - 2), x + font.cell_w, y + @as(f32, @floatFromInt(i)) * font.cell_h, theme.fg);
     }
 }
 
