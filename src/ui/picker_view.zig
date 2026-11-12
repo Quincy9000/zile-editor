@@ -65,8 +65,9 @@ pub fn draw(p: *Picker, font: *const Font, theme: *const Theme, l: render.Layout
     const show_preview = box_cols >= preview_min_cols;
     const list_cols = if (show_preview) box_cols * 2 / 5 else box_cols;
     // The picker's actions along the bottom, when it has any.
-    const bar = actionBar(p);
-    const visible = box_rows - 1 - @intFromBool(bar);
+    // As many lines as its keys need: a key that isn't shown isn't found.
+    const bar: usize = if (actionBar(p)) @min(actionBarLines(p, font, theme, bx, 0, box_cols, 0), box_rows -| 4) else 0;
+    const visible = box_rows - 1 - bar;
     drawList(p, font, theme, bx, by + ch, list_cols, visible);
 
     if (show_preview) {
@@ -74,17 +75,45 @@ pub fn draw(p: *Picker, font: *const Font, theme: *const Theme, l: render.Layout
         rect(px, by + ch, 1, @as(f32, @floatFromInt(visible)) * ch, theme.popup_border);
         drawPreview(p, font, theme, px + cw, by + ch, box_cols - list_cols - 2, visible);
     }
-    if (bar) drawActionBar(p, font, theme, bx, by + bh - ch, box_cols);
+    if (bar > 0) _ = actionBarLines(p, font, theme, bx, by + bh - @as(f32, @floatFromInt(bar)) * ch, box_cols, bar);
 }
 
-/// One `key label` of the bar at `x.*`, if it fits before `end`.
-fn putPart(font: *const Font, theme: *const Theme, x: *f32, end: f32, y: f32, key: []const u8, label: []const u8) bool {
-    const need = @as(f32, @floatFromInt(cells(key) + 1 + cells(label) + 3)) * font.cell_w;
-    if (x.* + need > end) return false;
-    x.* = font.drawText(key, x.*, y, theme.whichkey_group);
-    x.* = font.drawText(label, x.* + font.cell_w, y, theme.status_dim) + 3 * font.cell_w;
-    return true;
-}
+/// Where the action bar's next part goes: parts flow left to right and
+/// onto a new line when one is full.
+const Flow = struct {
+    font: *const Font,
+    theme: *const Theme,
+    x0: f32,
+    end: f32,
+    y0: f32,
+    /// Lines there's room for when painting (0 while measuring).
+    paint: usize,
+    x: f32,
+    line: usize = 0,
+
+    fn y(f: *const Flow) f32 {
+        return f.y0 + @as(f32, @floatFromInt(f.line)) * f.font.cell_h;
+    }
+
+    /// Room for `n` cells on this line, else the start of the next.
+    fn fit(f: *Flow, n: usize) void {
+        if (f.x > f.x0 and f.x + @as(f32, @floatFromInt(n)) * f.font.cell_w > f.end) {
+            f.x = f.x0;
+            f.line += 1;
+        }
+    }
+
+    /// One `key label`.
+    fn put(f: *Flow, key: []const u8, label: []const u8) void {
+        f.fit(cells(key) + 1 + cells(label));
+        const cw = f.font.cell_w;
+        if (f.line < f.paint) {
+            _ = f.font.drawText(key, f.x, f.y(), f.theme.whichkey_group);
+            _ = f.font.drawText(label, f.x + @as(f32, @floatFromInt(cells(key) + 1)) * cw, f.y(), f.theme.status_dim);
+        }
+        f.x += @as(f32, @floatFromInt(cells(key) + 1 + cells(label) + 3)) * cw;
+    }
+};
 
 /// The key that starts typing in a menu: `/`, unless that's a row (the
 /// leader's grep), then `i`.
@@ -97,45 +126,48 @@ fn actionBar(p: *const Picker) bool {
 }
 
 /// `C-t project · open · recent · disk`, the current scope bright.
-fn drawScopes(p: *const Picker, font: *const Font, theme: *const Theme, x: *f32, end: f32, y: f32) void {
+fn drawScopes(p: *const Picker, f: *Flow) void {
     const group = sources.scopeGroup(p.kind) orelse return;
     var need: usize = 4;
     for (group) |sc| need += cells(sc.name) + 3;
-    if (x.* + @as(f32, @floatFromInt(need)) * font.cell_w > end) return;
-    x.* = font.drawText("C-t", x.*, y, theme.whichkey_group) + font.cell_w;
-    for (group, 0..) |sc, i| {
-        if (i > 0) x.* = font.drawText(" · ", x.*, y, theme.status_dim);
-        x.* = font.drawText(sc.name, x.*, y, if (sc.kind == p.kind) theme.fg else theme.status_dim);
+    f.fit(need);
+    if (f.line < f.paint) {
+        var x = f.font.drawText("C-t", f.x, f.y(), f.theme.whichkey_group) + f.font.cell_w;
+        for (group, 0..) |sc, i| {
+            if (i > 0) x = f.font.drawText(" · ", x, f.y(), f.theme.status_dim);
+            x = f.font.drawText(sc.name, x, f.y(), if (sc.kind == p.kind) f.theme.fg else f.theme.status_dim);
+        }
     }
-    x.* += 3 * font.cell_w;
+    f.x += @as(f32, @floatFromInt(need + 3)) * f.font.cell_w;
 }
 
-/// The bottom line: what the picker does besides Enter. After <Esc>, the
-/// letters; while typing, the Ctrl keys; <Tab> for all of them.
-fn drawActionBar(p: *const Picker, font: *const Font, theme: *const Theme, x0: f32, y: f32, cols: usize) void {
+/// The bottom lines: what the picker does besides Enter. After <Esc>, the
+/// letters; while typing, the Ctrl keys; <Tab> for all of them. Every key
+/// is there, over as many lines as they take. Returns that many; draws
+/// `paint` lines of them (0: none, to know the height first).
+fn actionBarLines(p: *const Picker, font: *const Font, theme: *const Theme, x0: f32, y: f32, cols: usize, paint: usize) usize {
     const cw = font.cell_w;
-    rect(x0, y, @as(f32, @floatFromInt(cols)) * cw, 1, theme.popup_border);
-    const x_end = x0 + @as(f32, @floatFromInt(cols -| 1)) * cw;
-    var x = x0 + cw;
+    if (paint > 0) rect(x0, y, @as(f32, @floatFromInt(cols)) * cw, 1, theme.popup_border);
+    var f: Flow = .{ .font = font, .theme = theme, .x0 = x0 + cw, .x = x0 + cw, .end = x0 + @as(f32, @floatFromInt(cols -| 1)) * cw, .y0 = y, .paint = paint };
     const typing = p.ed.mode == .picker;
     if (sources.rowKeys(p.kind).len > 0) {
-        _ = putPart(font, theme, &x, x_end, y, "key", "runs its row");
-        _ = putPart(font, theme, &x, x_end, y, filterKey(p), "type to filter");
-        return;
+        f.put("key", "runs its row");
+        f.put(filterKey(p), "type to filter");
+        return f.line + 1;
     }
-    drawScopes(p, font, theme, &x, x_end, y);
-    if (sources.itemActions(p.kind).len == 0) return;
+    drawScopes(p, &f);
+    if (sources.itemActions(p.kind).len == 0) return f.line + 1;
     var buf: [16]u8 = undefined;
-    const tab_label = if (typing) "actions" else "all actions";
-    if (!putPart(font, theme, &x, x_end, y, "Tab", tab_label)) return;
-    if (sources.altAccept(p.kind)) |alt| if (!putPart(font, theme, &x, x_end, y, "C-⏎", alt.label)) return;
+    f.put("Tab", if (typing) "actions" else "all actions");
+    if (sources.altAccept(p.kind)) |alt| f.put("C-⏎", alt.label);
     for (sources.itemActions(p.kind)) |a| {
         const key = if (typing)
             (if (a.ctrl != 0) std.fmt.bufPrint(&buf, "C-{c}", .{a.ctrl}) catch continue else continue)
         else if (a.key != 0) std.fmt.bufPrint(&buf, "{c}", .{a.key}) catch continue else continue;
-        if (!putPart(font, theme, &x, x_end, y, key, a.label)) break;
+        f.put(key, a.label);
     }
-    if (typing) _ = putPart(font, theme, &x, x_end, y, "Esc", "for the letters");
+    if (typing) f.put("Esc", "for the letters");
+    return f.line + 1;
 }
 
 fn drawQueryLine(p: *Picker, font: *const Font, theme: *const Theme, bx: f32, y: f32, box_cols: usize) void {
