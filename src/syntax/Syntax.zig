@@ -24,6 +24,11 @@ dirty: bool = true,
 /// Bumped on every parse.
 version: u64 = 0,
 
+/// The languages inside this one (markdown's text and code fences), parsed
+/// for `injected_version`: only highlighting needs them.
+injected: std.ArrayList(Injected) = .empty,
+injected_version: u64 = std.math.maxInt(u64),
+
 /// Styles for bytes `[hl_start, hl_start + styles.len)`, valid for `hl_version`.
 styles: std.ArrayList(Style) = .empty,
 hl_start: usize = 0,
@@ -55,6 +60,7 @@ pub fn init(lang: *languages.Language) ?Syntax {
 }
 
 pub fn deinit(s: *Syntax, gpa: Allocator) void {
+    freeInjected(gpa, &s.injected);
     if (s.tree) |t| c.ts_tree_delete(t);
     c.ts_query_cursor_delete(s.cursor);
     c.ts_parser_delete(s.parser);
@@ -120,10 +126,106 @@ pub fn highlight(s: *Syntax, gpa: Allocator, t: *const Text, start: usize, end: 
     if (s.hl_version == s.version and s.hl_start == start and s.styles.items.len == end - start) return;
     const tree = s.tree orelse return;
     const q = s.lang.highlights() orelse return;
+    const text = t.slice(0, t.len());
     try s.styles.resize(gpa, end - start);
-    languages.run(q, s.cursor, c.ts_tree_root_node(tree), t.slice(0, t.len()), start, end, s.styles.items);
+    languages.run(q, s.cursor, c.ts_tree_root_node(tree), text, start, end, s.styles.items);
+    if (s.lang.injections() != null) {
+        if (s.injected_version != s.version) {
+            freeInjected(gpa, &s.injected);
+            try parseInjected(gpa, s.lang, c.ts_tree_root_node(tree), text, &s.injected);
+            s.injected_version = s.version;
+        }
+        overlayInjected(s.injected.items, s.cursor, text, start, end, s.styles.items);
+    }
     s.hl_start = start;
     s.hl_version = s.version;
+}
+
+// ---------------------------------------------------------------------------
+// Injections: languages inside the text (markdown's inline text in its
+// blocks, code fences in their language). Each language found is parsed
+// once over all its ranges (`ts_parser_set_included_ranges`), and its
+// highlights go over the host's. One level deep.
+
+pub const Injected = struct { lang: *languages.Language, tree: *c.TSTree };
+
+fn freeInjected(gpa: Allocator, list: *std.ArrayList(Injected)) void {
+    for (list.items) |inj| c.ts_tree_delete(inj.tree);
+    list.clearAndFree(gpa);
+}
+
+/// Parses the languages `lang`'s injection query finds under `root`.
+fn parseInjected(gpa: Allocator, lang: *languages.Language, root: c.TSNode, text: []const u8, out: *std.ArrayList(Injected)) Allocator.Error!void {
+    const q = lang.injections() orelse return;
+    const cursor = c.ts_query_cursor_new() orelse return;
+    defer c.ts_query_cursor_delete(cursor);
+    c.ts_query_cursor_exec(cursor, q.ts, root);
+
+    const Group = struct { lang: *languages.Language, ranges: std.ArrayList(c.TSRange) = .empty };
+    var groups: std.ArrayList(Group) = .empty;
+    defer {
+        for (groups.items) |*g| g.ranges.deinit(gpa);
+        groups.deinit(gpa);
+    }
+    var m: c.TSQueryMatch = undefined;
+    while (c.ts_query_cursor_next_match(cursor, &m)) {
+        if (!q.matches(m, text)) continue;
+        var content: ?c.TSNode = null;
+        var name = q.set_language[m.pattern_index];
+        for (m.captures[0..m.capture_count]) |cap| {
+            if (q.content == cap.index) content = cap.node;
+            if (q.language == cap.index) {
+                const a = c.ts_node_start_byte(cap.node);
+                const b = c.ts_node_end_byte(cap.node);
+                if (b <= text.len and a < b) name = text[a..b];
+            }
+        }
+        const node = content orelse continue;
+        const inner = languages.forInjection(name orelse continue) orelse continue;
+        if (inner == lang or inner.highlights() == null) continue;
+        const group = for (groups.items) |*g| {
+            if (g.lang == inner) break g;
+        } else blk: {
+            try groups.append(gpa, .{ .lang = inner });
+            break :blk &groups.items[groups.items.len - 1];
+        };
+        try group.ranges.append(gpa, .{
+            .start_point = c.ts_node_start_point(node),
+            .end_point = c.ts_node_end_point(node),
+            .start_byte = c.ts_node_start_byte(node),
+            .end_byte = c.ts_node_end_byte(node),
+        });
+    }
+    for (groups.items) |*g| {
+        // In order and not overlapping, as tree-sitter wants them.
+        std.mem.sort(c.TSRange, g.ranges.items, {}, struct {
+            fn lessThan(_: void, a: c.TSRange, b: c.TSRange) bool {
+                return a.start_byte < b.start_byte;
+            }
+        }.lessThan);
+        var kept: usize = 0;
+        for (g.ranges.items) |r| {
+            if (kept > 0 and r.start_byte < g.ranges.items[kept - 1].end_byte) continue;
+            g.ranges.items[kept] = r;
+            kept += 1;
+        }
+        const parser = c.ts_parser_new() orelse continue;
+        defer c.ts_parser_delete(parser);
+        if (!c.ts_parser_set_language(parser, g.lang.ts())) continue;
+        if (!c.ts_parser_set_included_ranges(parser, g.ranges.items.ptr, @intCast(kept))) continue;
+        const tree = c.ts_parser_parse_string(parser, null, text.ptr, @intCast(text.len)) orelse continue;
+        out.append(gpa, .{ .lang = g.lang, .tree = tree }) catch |err| {
+            c.ts_tree_delete(tree);
+            return err;
+        };
+    }
+}
+
+fn overlayInjected(list: []const Injected, cursor: *c.TSQueryCursor, text: []const u8, start: usize, end: usize, out: []Style) void {
+    for (list) |inj| {
+        const q = inj.lang.highlights() orelse continue;
+        languages.overlay(q, cursor, c.ts_tree_root_node(inj.tree), text, start, end, out);
+    }
 }
 
 pub fn styleAt(s: *const Syntax, pos: usize) Style {
@@ -141,7 +243,12 @@ pub fn highlightText(gpa: Allocator, lang: *languages.Language, text: []const u8
     const tree = c.ts_parser_parse_string(s.parser, null, text.ptr, @intCast(text.len)) orelse return;
     defer c.ts_tree_delete(tree);
     try out.resize(gpa, text.len);
-    languages.run(q, s.cursor, c.ts_tree_root_node(tree), text, 0, text.len, out.items);
+    const root = c.ts_tree_root_node(tree);
+    languages.run(q, s.cursor, root, text, 0, text.len, out.items);
+    var injected: std.ArrayList(Injected) = .empty;
+    defer freeInjected(gpa, &injected);
+    try parseInjected(gpa, lang, root, text, &injected);
+    overlayInjected(injected.items, s.cursor, text, 0, text.len, out.items);
 }
 
 test "incremental reparse after edits" {
@@ -262,4 +369,29 @@ test "lua: highlighted, by name and by #!" {
     try std.testing.expectEqual(.comment, out.items[std.mem.indexOf(u8, text, "-- say").?]);
     try std.testing.expectEqual(.string, out.items[std.mem.indexOf(u8, text, "\"hi").?]);
     try std.testing.expectEqualStrings("lua", forFile("script", "#!/usr/bin/env lua5.4\nprint(1)").?.lang.name);
+}
+
+test "markdown: headings, code spans, links, and code fences in their language" {
+    const gpa = std.testing.allocator;
+    const src = "# Title\n\nSome `code` and a [link](http://x.y) and *it*.\n\n```zig\nconst x = 1;\n```\n";
+    var t = try Text.init(gpa, src);
+    defer t.deinit(gpa);
+    var s = forPath("README.md").?;
+    defer s.deinit(gpa);
+    s.update(&t);
+    try s.highlight(gpa, &t, 0, t.len());
+    const at = struct {
+        fn f(needle: []const u8) usize {
+            return std.mem.indexOf(u8, src, needle).?;
+        }
+    }.f;
+    try std.testing.expectEqual(.keyword, s.styleAt(at("Title"))); // the heading
+    try std.testing.expectEqual(.punctuation, s.styleAt(0)); // its `#`
+    try std.testing.expectEqual(.string, s.styleAt(at("code`"))); // a code span (inline)
+    try std.testing.expectEqual(.function, s.styleAt(at("link]"))); // a link's text
+    try std.testing.expectEqual(.module, s.styleAt(at("http"))); // its url
+    try std.testing.expectEqual(.parameter, s.styleAt(at("it*"))); // emphasis
+    try std.testing.expectEqual(.keyword, s.styleAt(at("const"))); // zig, in the fence
+    try std.testing.expectEqual(.number, s.styleAt(at("1;")));
+    try std.testing.expectEqual(.none, s.styleAt(at("Some")));
 }

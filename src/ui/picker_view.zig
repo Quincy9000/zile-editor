@@ -656,11 +656,13 @@ pub fn drawGrid(g: *ResultGrid, font: *const Font, theme: *const Theme, l: rende
             const here = r == g.row and c == g.col;
             if (g.selected(r, c)) rect(cx, y, cell_w, ch, theme.selection_bg);
             if (g.matches(r, c) and !here) rect(cx, y, cell_w, ch, theme.search_match);
+            // The cell under the cursor, all of it, is the cursor: in a
+            // terminal its own cursor isn't put there too (drawn over a
+            // cursor-coloured cell, it hides the letter it sits on).
             var color = theme.fg;
             if (here) {
                 rect(cx, y, cell_w, ch, theme.cursor);
                 color = theme.cursor_text;
-                gfx.cursor(cx, y, .block);
             }
             drawCell(font, g.cell(r, c), cx, y, w, color);
             cx += cell_w;
@@ -689,4 +691,29 @@ fn clipCells(s: []const u8, max: usize) []const u8 {
     var n: usize = 0;
     while (n < max) : (n += 1) _ = it.next() orelse return s;
     return s[0..it.i];
+}
+
+test "terminal mode: the results grid's cell is the cursor (no terminal cursor over its first letter)" {
+    const Grid = @import("../tui/Grid.zig");
+    const gpa = std.testing.allocator;
+    const rows = [_][]const []const u8{ &.{ "52721", "Testeban" }, &.{ "52698", "Testeban" } };
+    var g = try ResultGrid.init(gpa, &.{ "id", "Name" }, &rows);
+    defer g.deinit();
+    g.col = 1;
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 60, 16);
+    grid.clear(.{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    const theme = Theme.get(0);
+    const l: render.Layout = .{ .gutter_cols = 0, .text_x = 0, .rows = 16, .cols = 60, .status_y = 15 * Grid.cell_h, .width = 60 * Grid.cell_w, .x0 = 0, .y0 = 0 };
+    drawGrid(&g, &font, theme, l);
+    try std.testing.expectEqual(null, grid.cursor);
+    // The selected cell's `T` is there, in the cursor's text colour.
+    const at = for (grid.cells, 0..) |cell, i| {
+        if (cell.cp == 'T' and std.meta.eql(cell.bg, theme.cursor)) break i;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(std.meta.eql(grid.cells[at].fg, theme.cursor_text));
 }

@@ -186,7 +186,7 @@ pub const Step = enum {
 pub fn start(gpa: Allocator, io: Io, opts: Options) !*Debugger {
     // In a session of its own: gdb on zile's terminal (terminal mode) takes
     // it over for job control, and the program never starts.
-    const client = try Client.start(gpa, io, &.{ "setsid", "gdb", "-q", "-nx", "-i", "dap" }, opts.wake, opts.log);
+    const client = try Client.start(gpa, io, &.{ "setsid", "gdb", "-q", "-nx", "-i", "dap" }, opts.wake, opts.log, null);
     errdefer stopGdb(client);
     const d = try gpa.create(Debugger);
     errdefer gpa.destroy(d);

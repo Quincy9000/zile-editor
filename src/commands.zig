@@ -213,6 +213,7 @@ const base = [_]Command{
     .{ .name = "toggle_ghost_lines", .doc = "Ghost lines", .run = toggle("ghost_lines", "ghost lines"), .ghost = true },
     .{ .name = "toggle_relative_numbers", .doc = "Relative numbers", .run = toggle("relative_numbers", "relative line numbers"), .ghost = true },
     .{ .name = "toggle_diagnostic_text", .doc = "Diagnostic messages", .run = toggle("diagnostic_text", "diagnostic messages"), .ghost = true },
+    .{ .name = "toggle_ligatures", .doc = "Ligatures", .run = toggle("ligatures", "ligatures"), .ghost = true },
 
     // Git (in a repository)
     .{ .name = "git_menu", .doc = "Git menu", .run = openPicker(.git_actions), .needs = "git" },

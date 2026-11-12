@@ -30,7 +30,7 @@ held: std.ArrayList([]u8) = .empty,
 
 /// Starts the server; its error output goes to the file `log` (replaced),
 /// if given, so a crash can be looked into.
-pub fn start(gpa: Allocator, io: Io, argv: []const []const u8, wake: *const fn () void, log: ?[]const u8) !*Client {
+pub fn start(gpa: Allocator, io: Io, argv: []const []const u8, wake: *const fn () void, log: ?[]const u8, environ: ?*const std.process.Environ.Map) !*Client {
     const c = try gpa.create(Client);
     errdefer gpa.destroy(c);
     const log_file: ?Io.File = if (log) |path| blk: {
@@ -46,6 +46,7 @@ pub fn start(gpa: Allocator, io: Io, argv: []const []const u8, wake: *const fn (
         .reader = undefined,
         .child = try std.process.spawn(io, .{
             .argv = argv,
+            .environ_map = environ,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = if (log_file) |f| .{ .file = f } else .ignore,

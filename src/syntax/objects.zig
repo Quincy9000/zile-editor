@@ -28,6 +28,8 @@ const Spec = struct {
     class_wrappers: []const []const u8 = &.{},
     /// Nodes that can be folded (when they span two lines or more).
     folds: []const []const u8 = &.{},
+    /// What the outline calls a function.
+    function_kind: []const u8 = "fn",
 };
 
 /// JavaScript, and TypeScript on top of it (TSX the same).
@@ -45,6 +47,16 @@ const js_spec = Spec{
 };
 
 const specs = std.StaticStringMap(Spec).initComptime(.{
+    // Markdown: a section (a heading and what's under it, its subsections
+    // included) is the "function": the outline, ]f [f between headings,
+    // `af` a section, and the sticky headings above the window.
+    .{ "markdown", Spec{
+        .functions = &.{"section"},
+        .classes = &.{},
+        .lists = &.{},
+        .folds = &.{ "section", "fenced_code_block", "list", "block_quote", "html_block", "pipe_table" },
+        .function_kind = "#",
+    } },
     .{ "json", Spec{ .functions = &.{}, .classes = &.{"object"}, .lists = &.{"array"}, .folds = &.{ "object", "array" } } },
     .{ "toml", Spec{
         .functions = &.{},
@@ -366,7 +378,7 @@ fn walk(gpa: std.mem.Allocator, spec: Spec, t: *const Text, node: c.TSNode, pref
             const line = t.lineOf(start);
             try out.append(gpa, .{
                 .name = qualified,
-                .kind = if (is_fn) "fn" else "type",
+                .kind = if (is_fn) spec.function_kind else "type",
                 .line = @intCast(line),
                 .col = @intCast(start - t.lineStart(line)),
             });
@@ -387,6 +399,15 @@ fn symbolName(spec: Spec, t: *const Text, node: c.TSNode) ?[]const u8 {
         // Rust's `impl Foo` names its type in the `type` field.
         const type_field = "type";
         named = c.ts_node_child_by_field_name(node, type_field.ptr, type_field.len);
+    }
+    if (c.ts_node_is_null(named)) {
+        // Markdown: a section is named by its heading's text.
+        const first = c.ts_node_named_child(node, 0);
+        const heading = "heading_content";
+        if (!c.ts_node_is_null(first)) {
+            const content = c.ts_node_child_by_field_name(first, heading.ptr, heading.len);
+            if (!c.ts_node_is_null(content)) return std.mem.trim(u8, t.slice(startOf(content), endOf(content)), " \t");
+        }
     }
     if (c.ts_node_is_null(named)) {
         // Zig: `const Foo = struct {...}` names the struct through its parent.
@@ -777,3 +798,29 @@ test "go: functions, methods, structs, arguments" {
     try std.testing.expectEqual(null, functionStart(&s, &t, std.mem.indexOf(u8, src, "f := ").?, true));
 }
 
+test "markdown: sections are the outline, ]f goes between headings, sticky headings" {
+    const gpa = testing.allocator;
+    const src = "# Intro\n\ntext\n\n## Install\n\nrun it\n\n# Usage\n\nmore\n";
+    var t = try Text.init(gpa, src);
+    defer t.deinit(gpa);
+    var s = Syntax.forPath("README.md").?;
+    defer s.deinit(gpa);
+    var out: std.ArrayList(Symbol) = .empty;
+    defer {
+        for (out.items) |sym| gpa.free(sym.name);
+        out.deinit(gpa);
+    }
+    try outline(gpa, &s, &t, &out);
+    try testing.expectEqual(3, out.items.len);
+    try testing.expectEqualStrings("Intro", out.items[0].name);
+    try testing.expectEqualStrings("#", out.items[0].kind);
+    try testing.expectEqualStrings("Install", out.items[1].name);
+    try testing.expectEqual(4, out.items[1].line);
+    try testing.expectEqualStrings("Usage", out.items[2].name);
+    // ]f from the first heading's text: the next heading.
+    const install = std.mem.indexOf(u8, src, "## Install").?;
+    try testing.expectEqual(install, functionStart(&s, &t, std.mem.indexOf(u8, src, "text").?, true).?);
+    // Inside "Install": its heading, under "Intro"'s.
+    var buf: [3]usize = undefined;
+    try testing.expectEqualSlices(usize, &.{ 0, 4 }, contextLines(&s, &t, 6, &buf));
+}

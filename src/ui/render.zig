@@ -683,13 +683,18 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         const ghost_at = if (ghost != null) v.cursor - ls else bytes.len + 1;
         const ghost_first = if (ghost) |g| std.mem.sliceTo(g, '\n') else "";
         const ghost_cells = cells(ghost_first);
+        var lig_buf: [max_ligature_line]u16 = undefined;
+        const cursor_off: ?usize = if (focused and is_current) v.cursor - ls else null;
+        const ligs = if (ed.options.ligatures) drawnLigatures(font, bytes, hints, ghost_at, ghost_cells, cursor_off, &lig_buf) else null;
         var it = Font.Utf8Lossy{ .bytes = bytes };
         var col: usize = 0;
+        var ci: usize = 0; // the codepoint's index, for `ligs`
         while (true) {
             const offset = it.i;
             const cp = it.next() orelse break;
             const next_col = if (cp == '\t') motions.nextTabStop(col, tab_width) else col + 1;
             defer col = next_col;
+            defer ci += 1;
             const shift: usize = (if (offset >= ghost_at) ghost_cells else 0) + Editor.hintShift(hints, offset);
             if (next_col + shift <= win_left) continue;
             if (col + shift >= winEnd(l)) break;
@@ -704,7 +709,8 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
                 .color => |c| color = Theme.contrast(.{ .r = c.r, .g = c.g, .b = c.b, .a = 255 }),
                 .hex_number => {},
             };
-            font.drawCodepoint(cp, x, y, color);
+            const lig: u16 = if (ligs) |lg| lg[ci] else 0;
+            if (lig != 0) font.drawGlyph(lig, x, y, color) else font.drawCodepoint(cp, x, y, color);
         }
         // Inlay hints: the server's labels, in front of the text they belong to.
         for (hints, 0..) |h, j| {
@@ -1224,6 +1230,47 @@ fn diagColor(theme: *const Theme, sev: Lsp.Severity) rl.Color {
         .info => theme.diag_info,
         .hint => theme.diag_hint,
     };
+}
+
+const max_ligature_line = 1024;
+
+/// A line's ligatures as drawn (per codepoint: a glyph, or 0 for its own):
+/// one with the cursor in it is drawn as its characters (as kitty's
+/// `disable_ligatures cursor`), and so is one whose cells don't sit side by
+/// side (a tab, an inlay hint or a suggestion inside it).
+fn drawnLigatures(font: *const Font, bytes: []const u8, hints: []const Editor.LineHint, ghost_at: usize, ghost_cells: usize, cursor_off: ?usize, out: *[max_ligature_line]u16) ?[]const u16 {
+    const shaped = font.ligatures(bytes) orelse return null;
+    if (shaped.len > out.len) return null;
+    const ligs = out[0..shaped.len];
+    @memcpy(ligs, shaped);
+    // Runs of substituted glyphs, kept or not as a whole.
+    var it = Font.Utf8Lossy{ .bytes = bytes };
+    var run_start: ?usize = null;
+    var run_shift: usize = 0;
+    var keep = true;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const off = it.i;
+        const cp = it.next();
+        const in_run = cp != null and ligs[i] != 0;
+        if (!in_run) {
+            if (run_start) |rs| if (!keep) @memset(ligs[rs..i], 0);
+            run_start = null;
+            if (cp == null) break;
+            continue;
+        }
+        const shift = (if (off >= ghost_at) ghost_cells else 0) + Editor.hintShift(hints, off);
+        if (run_start == null) {
+            run_start = i;
+            run_shift = shift;
+            keep = true;
+        }
+        if (cp.? == '\t' or shift != run_shift) keep = false;
+        if (cursor_off) |c| if (c >= off and c < it.i) {
+            keep = false;
+        };
+    }
+    return ligs;
 }
 
 /// Underlines each diagnostic's range on `line` and shows the first message
@@ -1749,4 +1796,28 @@ test "terminal mode: the mouse resting on a diagnostic pops it up" {
         if (std.mem.indexOf(u8, buf[0..grid.cols], "unused local") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "ligatures: drawn but for the one with the cursor in it, or one spread apart" {
+    const gpa = std.testing.allocator;
+    var font = Font.cells();
+    font.lig = Font.Ligatures.load(gpa, std.testing.io, "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf", 16) orelse return error.SkipZigTest;
+    defer font.lig.?.destroy();
+    const line = "a -> b != c";
+    var buf: [max_ligature_line]u16 = undefined;
+    const none = std.math.maxInt(usize);
+    var ligs = drawnLigatures(&font, line, &.{}, none, 0, null, &buf).?;
+    try std.testing.expect(ligs[2] != 0 and ligs[3] != 0); // ->
+    try std.testing.expect(ligs[7] != 0 and ligs[8] != 0); // !=
+    try std.testing.expect(ligs[0] == 0 and ligs[5] == 0);
+    // The cursor on the `>`: that one is drawn as `-` `>`, the other stays.
+    ligs = drawnLigatures(&font, line, &.{}, none, 0, 3, &buf).?;
+    try std.testing.expect(ligs[2] == 0 and ligs[3] == 0);
+    try std.testing.expect(ligs[7] != 0 and ligs[8] != 0);
+    // An inlay hint between `!` and `=`: drawn as its characters.
+    const hints = [_]Editor.LineHint{.{ .off = 8, .text = ": T" }};
+    ligs = drawnLigatures(&font, line, &hints, none, 0, null, &buf).?;
+    try std.testing.expect(ligs[2] != 0 and ligs[7] == 0 and ligs[8] == 0);
+    // Plain text has none.
+    try std.testing.expectEqual(null, drawnLigatures(&font, "plain text", &.{}, none, 0, null, &buf));
 }

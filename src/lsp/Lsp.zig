@@ -140,6 +140,10 @@ pub const Server = struct {
     /// Settings sent once it has started (`workspace/didChangeConfiguration`),
     /// as JSON.
     settings: ?[]const u8 = null,
+    /// A Postgres server: started for a SQL file whose database (its
+    /// `DATABASE_URL`, the environment's or a `.env`'s) is Postgres, with
+    /// that URL in its environment. Other SQL keeps the editor's own list.
+    postgres: bool = false,
 };
 
 /// The built-in servers. One row per server; one server for a project
@@ -162,6 +166,7 @@ const builtin_servers = [_]Server{
         \\ "javascript":{"referencesCodeLens":{"enabled":true,"showOnAllFunctions":true},"suggest":{"completeFunctionCalls":true}}}
         ,
     },
+    .{ .languages = &.{.{ "sql", "sql" }}, .name = "postgres-language-server", .command = &.{ "postgres-language-server", "lsp-proxy" }, .postgres = true },
     .{ .languages = &.{.{ "html", "html" }}, .name = "html", .command = &.{ "vscode-html-language-server", "--stdio" } },
     .{ .languages = &.{.{ "css", "css" }}, .name = "css", .command = &.{ "vscode-css-language-server", "--stdio" } },
     .{
@@ -268,12 +273,20 @@ pub fn isSignatureTrigger(l: *const Lsp, cp: u21, open: bool) bool {
     return open and std.mem.indexOfScalar(u8, l.sig_retriggers.items, c) != null;
 }
 
-/// Starts server `index` for the project at `root_path` (which must outlive it).
-pub fn start(ed: *Editor, index: usize, root_path: []const u8) !*Lsp {
+/// Starts server `index` for the project at `root_path` (which must outlive
+/// it). `database_url`: its `DATABASE_URL` (a Postgres server's).
+pub fn start(ed: *Editor, index: usize, root_path: []const u8, database_url: ?[]const u8) !*Lsp {
     const gpa = ed.gpa;
     const log = logPath(gpa, index);
     defer if (log) |p| gpa.free(p);
-    const client = try Client.start(gpa, ed.io, servers[index].command, ed.wake_fn, log);
+    // Our environment, with the database's URL in it.
+    var env: ?std.process.Environ.Map = null;
+    defer if (env) |*e| e.deinit();
+    if (database_url) |url| if (ed.environ) |ours| {
+        env = try ours.clone(gpa);
+        try env.?.put("DATABASE_URL", url);
+    };
+    const client = try Client.start(gpa, ed.io, servers[index].command, ed.wake_fn, log, if (env) |*e| e else null);
     errdefer client.deinit();
     const l = try gpa.create(Lsp);
     l.* = .{ .gpa = gpa, .client = client, .index = index, .root = root_path, .cwd = ed.cwd };

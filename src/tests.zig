@@ -54,6 +54,7 @@ comptime {
     _ = @import("ai/Ghost.zig");
     _ = @import("ai/WsServer.zig");
     _ = @import("tui/Grid.zig");
+    _ = @import("ui/Gsub.zig");
     _ = @import("core/hipatterns.zig");
     _ = @import("core/indent.zig");
     _ = @import("core/comment.zig");
@@ -63,5 +64,6 @@ comptime {
     _ = @import("git/Blame.zig");
     _ = @import("ui/icons.zig");
     _ = @import("ui/render.zig");
+    _ = @import("ui/picker_view.zig");
     _ = @import("ColorPicker.zig");
 }

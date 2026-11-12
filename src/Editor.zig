@@ -79,6 +79,9 @@ pub const Options = struct {
     /// them). Off: diagnostics are underlined, and the message pops up with
     /// the cursor or the mouse resting on one (as in Neovim and Helix).
     diagnostic_text: bool = false,
+    /// The font's ligatures (`->` `!=` `=>` as one sign) in the window; in a
+    /// terminal, the terminal's own setting decides.
+    ligatures: bool = true,
     /// Close brackets and quotes as they are typed.
     auto_pairs: bool = true,
     /// Format a file (language server, else its formatter) when saving it.
@@ -811,6 +814,9 @@ hover: ?[]u8 = null,
 mouse_hover: ?MouseHover = null,
 /// Where the text cursor rests (diagnostics under it pop up).
 cursor_rest: ?CursorRest = null,
+/// The process's environment (a server started with a variable added gets
+/// a copy); null in tests.
+environ: ?*const std.process.Environ.Map = null,
 /// The window border being dragged with the mouse.
 border_drag: ?*Windows.Split = null,
 completion: ?Completion = null,
@@ -1461,7 +1467,16 @@ fn tickLsp(ed: *Editor) void {
     for (ed.buffers.items) |b| {
         const i = Lsp.serverFor(b) orelse continue;
         if (ed.lsp_failed[i] or ed.lspFor(b) != null) continue;
-        const l = Lsp.start(ed, i, Lsp.bufferRoot(b, ed.cwd)) catch |err| {
+        // A Postgres server: once the file's database is known to be one.
+        var database_url: ?[]const u8 = null;
+        if (Lsp.servers[i].postgres) {
+            if (b != ed.buffer) continue;
+            const sc = ed.sql_schema orelse continue;
+            const client = sql.clientFor(sc.url) orelse continue;
+            if (client.client != .psql) continue;
+            database_url = sc.url;
+        }
+        const l = Lsp.start(ed, i, Lsp.bufferRoot(b, ed.cwd), database_url) catch |err| {
             ed.serverStartFailed(i, err);
             continue;
         };
@@ -1475,7 +1490,7 @@ fn tickLsp(ed: *Editor) void {
             if (l.index == i and l.wants(b)) break true;
         } else false;
         if (running or ed.linterAbsent(i, root)) continue;
-        const l = Lsp.start(ed, i, root) catch |err| {
+        const l = Lsp.start(ed, i, root, null) catch |err| {
             ed.serverStartFailed(i, err);
             continue;
         };
@@ -1758,8 +1773,9 @@ fn afterTyped(ed: *Editor, cp: u21) void {
     if (ed.cursors.items.len > 0 or ed.replaying) return; // completion is single-cursor
     // Signature help: `(` opens it, `,` updates it, `)` closes it.
     if (cp == ')') ed.closeSignature();
-    if (ed.isSql()) {
-        // Our own list: the database's tables and columns.
+    if (ed.isSql() and ed.lspFor(ed.buffer) == null) {
+        // No server (sqlite, or none installed): our own list, the
+        // database's tables and columns.
         if (cp == '.') ed.closeCompletion();
         if (ed.completion != null) return;
         const start = ed.wordStart();
@@ -1940,7 +1956,7 @@ fn askCompletion(ed: *Editor, l: *Lsp, start: usize) void {
 /// retyped from its start.
 fn afterDeleted(ed: *Editor) void {
     if (ed.cursors.items.len > 0 or ed.replaying) return;
-    if (ed.isSql()) {
+    if (ed.isSql() and ed.lspFor(ed.buffer) == null) {
         if (ed.completion != null) return;
         const start = ed.wordStart();
         const t = ed.text();

@@ -12,6 +12,7 @@ const rl = @import("raylib");
 const gfx = @import("gfx.zig");
 const Grid = @import("../tui/Grid.zig");
 const icons = @import("icons.zig");
+const Gsub = @import("Gsub.zig");
 
 const Font = @This();
 
@@ -28,6 +29,8 @@ grid_mode: bool = false,
 /// The font has the Nerd Font file icons (a terminal's font is its own
 /// business: assumed there).
 has_icons: bool = true,
+/// Its ligatures (null: it has none; a terminal draws its own).
+lig: ?*Ligatures = null,
 
 /// The "font" of terminal mode: a cell in the grid's pixel units.
 pub fn cells() Font {
@@ -102,6 +105,7 @@ pub fn load(gpa: Allocator, io: Io, path: ?[]const u8, size: i32) LoadError!Font
     // Only glyphs the font has are in the atlas.
     const probe = @as(usize, @intCast(rl.GetGlyphIndex(font, icons.folder.cp)));
     return .{
+        .lig = Ligatures.load(gpa, io, resolved, size),
         .has_icons = font.glyphs[probe].value == icons.folder.cp,
         .font = font,
         .size = size,
@@ -114,6 +118,7 @@ pub fn load(gpa: Allocator, io: Io, path: ?[]const u8, size: i32) LoadError!Font
 
 pub fn deinit(f: *Font) void {
     if (!f.grid_mode) rl.UnloadFont(f.font);
+    if (f.lig) |l| l.destroy();
     f.* = undefined;
 }
 
@@ -139,6 +144,21 @@ pub fn drawCodepoint(f: *const Font, cp: u21, x: f32, y: f32, color: rl.Color) v
     // Whole pixels: the atlas is sampled pixel for pixel, and a glyph drawn
     // between pixels comes out uneven (half rows, e.g. which-key padding).
     rl.DrawTextCodepoint(f.font, cp, .{ .x = @round(x), .y = @round(y + f.glyph_y) }, @floatFromInt(f.font.baseSize), color);
+}
+
+/// The ligatures of a line of text (UTF-8 `bytes`): per codepoint, the
+/// glyph to draw in its cell instead of its own, or 0 to keep its own. Null
+/// when the line has none (or the font, or the line is very long).
+pub fn ligatures(f: *const Font, bytes: []const u8) ?[]const u16 {
+    const l = f.lig orelse return null;
+    return l.line(bytes);
+}
+
+/// Draws glyph `glyph` (a ligature's part) with its cell's top-left at (x, y).
+pub fn drawGlyph(f: *const Font, glyph: u16, x: f32, y: f32, color: rl.Color) void {
+    const l = f.lig orelse return;
+    const g = l.glyph(glyph) orelse return;
+    rl.DrawTexture(g.tex, @as(c_int, @intFromFloat(@round(x))) + g.x, @as(c_int, @intFromFloat(@round(y + f.glyph_y))) + g.y, color);
 }
 
 /// Draws UTF-8 `s` one cell per codepoint. Returns the x after the last cell.
@@ -174,5 +194,135 @@ pub const Utf8Lossy = struct {
         };
         it.i += n;
         return cp;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Ligatures: the font's `calt` rules (Gsub.zig) pick each cell's glyph; the
+// glyphs raylib's atlas doesn't have (it is baked per codepoint) are
+// rasterized on demand (ttf.c, stb_truetype by glyph id).
+
+extern fn zile_ttf_open(data: [*]const u8, pixel_height: c_int) ?*anyopaque;
+extern fn zile_ttf_close(f: *anyopaque) void;
+extern fn zile_ttf_glyph(f: *const anyopaque, codepoint: c_int) c_int;
+extern fn zile_ttf_bitmap(f: *const anyopaque, glyph: c_int, w: *c_int, h: *c_int, xoff: *c_int, yoff: *c_int) ?[*]u8;
+extern fn zile_ttf_free(b: [*]u8) void;
+
+pub const Ligatures = struct {
+    gpa: Allocator,
+    /// The font file (the shaper and stb_truetype read it in place).
+    data: []u8,
+    ttf: *anyopaque,
+    gsub: Gsub,
+    /// Rasterized glyphs by id (null: an empty one, a ligature's spacer).
+    glyphs: std.AutoHashMapUnmanaged(u16, ?Glyph) = .empty,
+    /// Shaped lines by their text's hash (empty: none in it).
+    lines: std.AutoHashMapUnmanaged(u64, []u16) = .empty,
+
+    const Glyph = struct { tex: rl.Texture2D, x: c_int, y: c_int };
+    /// Longer lines aren't shaped.
+    const max_line = 1024;
+    /// Shaped lines kept before the cache starts over.
+    const max_lines = 4096;
+
+    /// Null when the font has no ligatures (or can't be read).
+    pub fn load(gpa: Allocator, io: Io, path: []const u8, size: i32) ?*Ligatures {
+        const data = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20)) catch return null;
+        const gsub = (Gsub.init(gpa, data) catch null) orelse {
+            gpa.free(data);
+            return null;
+        };
+        const ttf = zile_ttf_open(data.ptr, size) orelse {
+            var g = gsub;
+            g.deinit(gpa);
+            gpa.free(data);
+            return null;
+        };
+        const l = gpa.create(Ligatures) catch {
+            zile_ttf_close(ttf);
+            var g = gsub;
+            g.deinit(gpa);
+            gpa.free(data);
+            return null;
+        };
+        l.* = .{ .gpa = gpa, .data = data, .ttf = ttf, .gsub = gsub };
+        return l;
+    }
+
+    pub fn destroy(l: *Ligatures) void {
+        var it = l.glyphs.valueIterator();
+        while (it.next()) |g| if (g.*) |gl| rl.UnloadTexture(gl.tex);
+        l.glyphs.deinit(l.gpa);
+        l.forgetLines();
+        l.lines.deinit(l.gpa);
+        l.gsub.deinit(l.gpa);
+        zile_ttf_close(l.ttf);
+        l.gpa.free(l.data);
+        l.gpa.destroy(l);
+    }
+
+    fn forgetLines(l: *Ligatures) void {
+        var it = l.lines.valueIterator();
+        while (it.next()) |v| l.gpa.free(v.*);
+        l.lines.clearRetainingCapacity();
+    }
+
+    fn line(l: *Ligatures, bytes: []const u8) ?[]const u16 {
+        if (bytes.len == 0 or bytes.len > max_line) return null;
+        const key = std.hash.Wyhash.hash(0, bytes);
+        if (l.lines.get(key)) |v| return if (v.len == 0) null else v;
+        const shaped = l.shape(bytes) catch return null;
+        if (l.lines.count() >= max_lines) l.forgetLines();
+        l.lines.put(l.gpa, key, shaped) catch {
+            l.gpa.free(shaped);
+            return null;
+        };
+        return if (shaped.len == 0) null else shaped;
+    }
+
+    /// Per codepoint the substituted glyph or 0; empty when none changed.
+    fn shape(l: *Ligatures, bytes: []const u8) Allocator.Error![]u16 {
+        var base: [max_line]u16 = undefined;
+        var glyphs: [max_line]u16 = undefined;
+        var n: usize = 0;
+        var it = Utf8Lossy{ .bytes = bytes };
+        while (it.next()) |cp| : (n += 1) {
+            base[n] = @intCast(zile_ttf_glyph(l.ttf, cp));
+            glyphs[n] = base[n];
+        }
+        l.gsub.apply(glyphs[0..n]);
+        if (std.mem.eql(u16, base[0..n], glyphs[0..n])) return &.{};
+        const out = try l.gpa.alloc(u16, n);
+        for (out, base[0..n], glyphs[0..n]) |*o, b, g| o.* = if (g == b) 0 else g;
+        return out;
+    }
+
+    /// Glyph `id`, rasterized the first time it is drawn.
+    fn glyph(l: *Ligatures, id: u16) ?Glyph {
+        if (l.glyphs.get(id)) |g| return g;
+        const g = l.rasterize(id);
+        l.glyphs.put(l.gpa, id, g) catch {};
+        return g;
+    }
+
+    fn rasterize(l: *Ligatures, id: u16) ?Glyph {
+        var w: c_int = 0;
+        var h: c_int = 0;
+        var x: c_int = 0;
+        var y: c_int = 0;
+        const bitmap = zile_ttf_bitmap(l.ttf, id, &w, &h, &x, &y) orelse return null;
+        defer zile_ttf_free(bitmap);
+        if (w <= 0 or h <= 0) return null;
+        // White with the coverage as alpha, as raylib's own atlas.
+        const n: usize = @intCast(w * h);
+        const pixels = l.gpa.alloc(u8, 2 * n) catch return null;
+        defer l.gpa.free(pixels);
+        for (0..n) |i| {
+            pixels[2 * i] = 255;
+            pixels[2 * i + 1] = bitmap[i];
+        }
+        const tex = rl.LoadTextureFromImage(.{ .data = pixels.ptr, .width = w, .height = h, .mipmaps = 1, .format = rl.PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA });
+        rl.SetTextureFilter(tex, rl.TEXTURE_FILTER_POINT);
+        return .{ .tex = tex, .x = x, .y = y };
     }
 };

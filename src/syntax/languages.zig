@@ -16,9 +16,26 @@ pub const Language = struct {
     name: []const u8,
     extensions: []const []const u8,
     highlights_source: []const u8,
+    /// Where other languages are inside this one (markdown's text and code
+    /// fences); empty: nowhere.
+    injections_source: []const u8 = "",
     ts: *const fn () callconv(.c) *const c.TSLanguage,
     query: ?*Query = null,
     query_failed: bool = false,
+    injection_query: ?*InjectionQuery = null,
+    injection_failed: bool = false,
+
+    /// The compiled injection query, if it has one (and it compiles).
+    pub fn injections(lang: *Language) ?*const InjectionQuery {
+        if (lang.injection_query) |q| return q;
+        if (lang.injection_failed or lang.injections_source.len == 0) return null;
+        lang.injection_query = InjectionQuery.load(lang) catch |err| blk: {
+            std.log.warn("{s} injection query: {s}", .{ lang.name, @errorName(err) });
+            lang.injection_failed = true;
+            break :blk null;
+        };
+        return lang.injection_query;
+    }
 
     /// The compiled highlight query, or null if it failed to compile.
     pub fn highlights(lang: *Language) ?*const Query {
@@ -45,6 +62,7 @@ var registry: [max_languages]Language = blk: {
             .name = g.name,
             .extensions = g.extensions,
             .highlights_source = g.highlights,
+            .injections_source = g.injections,
             .ts = @extern(*const fn () callconv(.c) *const c.TSLanguage, .{ .name = "tree_sitter_" ++ g.name }),
         };
     }
@@ -113,6 +131,24 @@ pub fn forShebang(first_line: []const u8) ?*Language {
         if (std.mem.eql(u8, m[0], name)) break m[1];
     } else return null;
     return byName(lang);
+}
+
+/// The language a code fence or an injection names (`zig`, `js`, `sh`,
+/// `python`): by name, then as a file extension.
+pub fn forInjection(name: []const u8) ?*Language {
+    if (byName(name)) |l| return l;
+    var buf: [32]u8 = undefined;
+    const lower = std.ascii.lowerString(buf[0..@min(name.len, buf.len)], name[0..@min(name.len, buf.len)]);
+    if (byName(lower)) |l| return l;
+    for ([_][2][]const u8{ .{ "shell", "bash" }, .{ "console", "bash" }, .{ "jsonc", "json" } }) |a| {
+        if (std.mem.eql(u8, a[0], lower)) return byName(a[1]);
+    }
+    var i = registry_len;
+    while (i > 0) {
+        i -= 1;
+        for (registry[i].extensions) |e| if (std.mem.eql(u8, e, lower)) return &registry[i];
+    }
+    return null;
 }
 
 pub fn byName(name: []const u8) ?*Language {
@@ -185,6 +221,67 @@ pub const Query = struct {
             if (!p.holds(m, text)) return false;
         }
         return true;
+    }
+};
+
+/// Where other languages are inside a language: each match's
+/// `@injection.content` node is in the language its `@injection.language`
+/// capture names, or its pattern's `#set! injection.language`.
+pub const InjectionQuery = struct {
+    ts: *c.TSQuery,
+    content: ?u32 = null,
+    language: ?u32 = null,
+    /// Per pattern: the language `#set!` names, if any.
+    set_language: []?[]const u8,
+    predicates: [][]Predicate,
+
+    fn load(lang: *Language) Query.LoadError!*InjectionQuery {
+        var err_offset: u32 = 0;
+        var err_type: c.TSQueryError = c.TSQueryErrorNone;
+        const src = lang.injections_source;
+        const ts = c.ts_query_new(lang.ts(), src.ptr, @intCast(src.len), &err_offset, &err_type) orelse {
+            std.log.warn("{s}: injection query error {d} at byte {d}", .{ lang.name, err_type, err_offset });
+            return error.QueryCompile;
+        };
+        const q = try alloc.create(InjectionQuery);
+        q.* = .{ .ts = ts, .set_language = &.{}, .predicates = &.{} };
+        for (0..c.ts_query_capture_count(ts)) |i| {
+            var len: u32 = 0;
+            const name = c.ts_query_capture_name_for_id(ts, @intCast(i), &len);
+            if (std.mem.eql(u8, name[0..len], "injection.content")) q.content = @intCast(i);
+            if (std.mem.eql(u8, name[0..len], "injection.language")) q.language = @intCast(i);
+        }
+        const patterns = c.ts_query_pattern_count(ts);
+        q.set_language = try alloc.alloc(?[]const u8, patterns);
+        q.predicates = try alloc.alloc([]Predicate, patterns);
+        for (0..patterns) |i| {
+            q.set_language[i] = setLanguage(ts, @intCast(i));
+            q.predicates[i] = try parsePredicates(ts, @intCast(i));
+        }
+        return q;
+    }
+
+    pub fn matches(q: *const InjectionQuery, m: c.TSQueryMatch, text: []const u8) bool {
+        for (q.predicates[m.pattern_index]) |p| {
+            if (!p.holds(m, text)) return false;
+        }
+        return true;
+    }
+
+    /// `(#set! injection.language "html")` in pattern `pattern`.
+    fn setLanguage(ts: *c.TSQuery, pattern: u32) ?[]const u8 {
+        var count: u32 = 0;
+        const steps_ptr = c.ts_query_predicates_for_pattern(ts, pattern, &count);
+        if (count == 0) return null;
+        const steps = steps_ptr[0..count];
+        var i: usize = 0;
+        while (i + 3 < steps.len) : (i += 1) {
+            if (steps[i].type != c.TSQueryPredicateStepTypeString or steps[i + 1].type != c.TSQueryPredicateStepTypeString or steps[i + 2].type != c.TSQueryPredicateStepTypeString) continue;
+            if (!std.mem.eql(u8, stringValue(ts, steps[i].value_id), "set!")) continue;
+            if (!std.mem.eql(u8, stringValue(ts, steps[i + 1].value_id), "injection.language")) continue;
+            return stringValue(ts, steps[i + 2].value_id);
+        }
+        return null;
     }
 };
 
@@ -287,6 +384,24 @@ pub fn run(q: *const Query, cursor: *c.TSQueryCursor, root: c.TSNode, text: []co
     }
 }
 
+/// Like `run`, over styles already there: only bytes a capture styles
+/// change (another language's highlights over its host's).
+pub fn overlay(q: *const Query, cursor: *c.TSQueryCursor, root: c.TSNode, text: []const u8, start: usize, end: usize, out: []Style) void {
+    _ = c.ts_query_cursor_set_byte_range(cursor, @intCast(start), @intCast(end));
+    c.ts_query_cursor_exec(cursor, q.ts, root);
+    var m: c.TSQueryMatch = undefined;
+    var capture_index: u32 = 0;
+    while (c.ts_query_cursor_next_capture(cursor, &m, &capture_index)) {
+        const cap = m.captures[capture_index];
+        const style = q.capture_styles[cap.index];
+        if (style == .none) continue;
+        if (!q.matches(m, text)) continue;
+        const s = @max(c.ts_node_start_byte(cap.node), start);
+        const e = @min(c.ts_node_end_byte(cap.node), end);
+        if (e > s) @memset(out[s - start .. e - start], style);
+    }
+}
+
 test "every grammar's highlight query compiles" {
     for (all()) |*lang| {
         if (lang.highlights() == null) {
@@ -304,4 +419,14 @@ test "every grammar's highlight query compiles" {
     try std.testing.expectEqualStrings("bash", forShebang("#!/bin/sh -e").?.name);
     try std.testing.expectEqualStrings("python", forShebang("#!/usr/bin/env python3.12").?.name);
     try std.testing.expectEqual(null, forShebang("echo hi"));
+    // Injection queries compile too; a fence's language by name or extension.
+    for (all()) |*lang| if (lang.injections_source.len > 0 and lang.injections() == null) {
+        std.debug.print("injection query failed for {s}\n", .{lang.name});
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqualStrings("markdown", forPath("README.md").?.name);
+    try std.testing.expectEqualStrings("javascript", forInjection("js").?.name);
+    try std.testing.expectEqualStrings("bash", forInjection("sh").?.name);
+    try std.testing.expectEqualStrings("python", forInjection("Python").?.name);
+    try std.testing.expectEqual(null, forInjection("nonsense"));
 }

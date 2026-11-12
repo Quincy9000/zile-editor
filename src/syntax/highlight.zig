@@ -80,6 +80,21 @@ const capture_map = [_]struct { []const u8, Style }{
     .{ "supports", .keyword },
     .{ "keyframes", .keyword },
     .{ "charset", .keyword },
+    // Markdown (both naming schemes): headings stand out, code reads as a
+    // string, links as names, emphasis as parameters, strong as constants.
+    .{ "text.title", .keyword },
+    .{ "markup.heading", .keyword },
+    .{ "text.literal", .string },
+    .{ "markup.raw", .string },
+    .{ "text.uri", .module },
+    .{ "markup.link.url", .module },
+    .{ "text.reference", .function },
+    .{ "markup.link", .function },
+    .{ "text.emphasis", .parameter },
+    .{ "markup.italic", .parameter },
+    .{ "text.strong", .constant },
+    .{ "markup.strong", .constant },
+    .{ "markup.quote", .comment },
 };
 
 pub fn styleForCapture(name: []const u8) Style {
