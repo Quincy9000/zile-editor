@@ -2917,8 +2917,10 @@ const Debug = struct {
                 try out.text.print(ed.gpa, "{s}", .{f.name});
                 if (f.path) |p| try out.text.print(ed.gpa, "  {s}:{d}", .{ p, f.line + 1 });
                 try out.text.appendSlice(ed.gpa, "\n\n");
+                // Looked at: what's inside its variables is wanted too.
+                d.expand(i) catch {};
                 if (f.vars.items.len > 0) {
-                    try out.text.appendSlice(ed.gpa, f.vars.items);
+                    try f.writeVars(ed.gpa, &out.text);
                 } else if (f.vars_left > 0) {
                     try out.text.appendSlice(ed.gpa, "(asking gdb...)");
                 } else if (i < debugging.frames_with_variables) {

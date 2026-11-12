@@ -4,7 +4,11 @@
 //! its output, colours and input work as in a plain run, while gdb's own
 //! stdin/stdout carry the protocol. When the program stops (a breakpoint, a
 //! step, a crash) the stack is fetched, then each frame's arguments and
-//! locals.
+//! locals, and what is inside them (structs, slices, what pointers point
+//! at) a few levels down, for the frames you look at.
+//!
+//! gdb doesn't know Zig: `zig_gdb.py` (sent to it at the start) teaches it
+//! slices, optionals, error unions and tagged unions.
 //!
 //! `plan` works out, from a runner command (`zig build run`, `cargo run`,
 //! `./app args`, `make && ./app`), what to build first and which program
@@ -36,6 +40,8 @@ exit_code: ?i64 = null,
 pid: ?i64 = null,
 /// gdb's word on something that failed (owned), for the editor to show.
 note: ?[]u8 = null,
+/// The last `Var.id` given out.
+var_id: u32 = 0,
 
 pub const State = enum { starting, running, stopped, exited };
 
@@ -43,6 +49,35 @@ const max_frames = 64;
 /// Frames whose variables are fetched on a stop (the ones you'd look at).
 pub const max_var_frames = 16;
 const max_value = 240;
+/// A value with its insides listed under it is cut to this.
+const max_parent_value = 60;
+/// How far into a value its insides are listed.
+const max_depth = 3;
+/// Of one value's insides (a slice's items, a struct's fields).
+const max_children = 32;
+/// Of one frame.
+const max_vars = 400;
+
+/// `python exec(...)` of `zig_gdb.py`, as one gdb command (so no file has
+/// to be written for gdb to `source`).
+const printers_command = blk: {
+    const script = @embedFile("zig_gdb.py");
+    @setEvalBranchQuota(script.len * 20);
+    break :blk "python exec(bytes.fromhex('" ++ std.fmt.bytesToHex(script[0..script.len].*, .lower) ++ "').decode())";
+};
+
+/// An argument or a local, or something inside one.
+pub const Var = struct {
+    name: []u8,
+    value: []u8,
+    /// 0: of the frame itself.
+    depth: u8,
+    id: u32,
+    /// gdb's handle for what is inside it; 0: nothing.
+    ref: i64,
+    /// Its insides were asked for.
+    asked: bool = false,
+};
 
 pub const Frame = struct {
     name: []u8,
@@ -51,24 +86,57 @@ pub const Frame = struct {
     /// 0-based.
     line: u32,
     id: i64,
-    /// `name = value` lines: the arguments, then the locals.
-    vars: std.ArrayList(u8) = .empty,
+    /// The arguments, then the locals, each followed by what is inside it.
+    vars: std.ArrayList(Var) = .empty,
     /// Answers still to come for `vars`.
     vars_left: u32 = 0,
+    /// What is inside its variables is fetched too (`expand`).
+    expanded: bool = false,
 
     fn deinit(f: *Frame, gpa: Allocator) void {
         gpa.free(f.name);
         if (f.path) |p| gpa.free(p);
+        for (f.vars.items) |v| {
+            gpa.free(v.name);
+            gpa.free(v.value);
+        }
         f.vars.deinit(gpa);
     }
+
+    /// `name = value` lines, what is inside a value indented under it.
+    pub fn writeVars(f: *const Frame, gpa: Allocator, out: *std.ArrayList(u8)) !void {
+        for (f.vars.items, 0..) |v, i| {
+            try out.appendNTimes(gpa, ' ', @as(usize, v.depth) * 2);
+            try out.appendSlice(gpa, v.name);
+            const parent = i + 1 < f.vars.items.len and f.vars.items[i + 1].depth > v.depth;
+            // A struct's own value is its fields again, on one line.
+            if (v.value.len > 0 and !(parent and v.value[0] == '{')) {
+                try out.appendSlice(gpa, " = ");
+                const end = if (parent) cut(v.value, max_parent_value) else v.value.len;
+                try out.appendSlice(gpa, v.value[0..end]);
+                if (end < v.value.len) try out.appendSlice(gpa, "…");
+            }
+            try out.append(gpa, '\n');
+        }
+    }
 };
+
+/// At most `max` bytes of `value`, not through the middle of a character.
+fn cut(value: []const u8, max: usize) usize {
+    var end = @min(value.len, max);
+    while (end < value.len and end > 0 and value[end] & 0xC0 == 0x80) end -= 1;
+    return end;
+}
 
 const Waiting = union(enum) {
     stack: u32,
     scopes: struct { gen: u32, frame: u32 },
-    variables: struct { gen: u32, frame: u32 },
+    /// `parent`: the variable these are inside (its id); null: the frame's.
+    variables: struct { gen: u32, frame: u32, parent: ?u32 = null },
     launch,
     other,
+    /// Nothing is said when it fails.
+    quiet,
 };
 
 /// What changed in a `poll`, for the editor to show.
@@ -131,6 +199,7 @@ pub fn start(gpa: Allocator, io: Io, opts: Options) !*Debugger {
         .columnsStartAt1 = true,
         .pathFormat = "path",
     }, .other);
+    try d.send("evaluate", .{ .expression = printers_command, .context = "repl" }, .quiet);
     if (opts.tty) |tty| {
         const cmd = try std.fmt.allocPrint(gpa, "set inferior-tty {s}", .{tty});
         defer gpa.free(cmd);
@@ -271,6 +340,17 @@ fn onResponse(d: *Debugger, msg: std.json.Value, up: *Update) !void {
     const ok = if (field(msg, "success")) |s| s == .bool and s.bool else false;
     const body = field(msg, "body");
     if (!ok) {
+        // An answer that won't come still counts as one.
+        switch (why) {
+            .scopes => |s| d.varsAnswered(s.gen, s.frame, up),
+            .variables => |v| {
+                d.varsAnswered(v.gen, v.frame, up);
+                // Inside a value there's often nothing to read (a dangling pointer).
+                if (v.parent != null) return;
+            },
+            .quiet => return,
+            else => {},
+        }
         const command = str(field(msg, "command")) orelse "";
         const text = try std.fmt.allocPrint(d.gpa, "{s}: {s}", .{ command, str(field(msg, "message")) orelse "failed" });
         defer d.gpa.free(text);
@@ -299,6 +379,8 @@ fn onResponse(d: *Debugger, msg: std.json.Value, up: *Update) !void {
                 try d.frames.append(d.gpa, .{ .name = name, .path = path, .line = line, .id = int(field(f, "id")) orelse 0 });
             }
             for (d.frames.items[0..@min(d.frames.items.len, max_var_frames)], 0..) |*f, i| {
+                // Where it stopped is looked at first; the others when shown.
+                f.expanded = i == 0;
                 f.vars_left = 1;
                 try d.send("scopes", .{ .frameId = f.id }, .{ .scopes = .{ .gen = d.gen, .frame = @intCast(i) } });
             }
@@ -324,22 +406,86 @@ fn onResponse(d: *Debugger, msg: std.json.Value, up: *Update) !void {
             if (v.gen != d.gen or v.frame >= d.frames.items.len) return;
             const f = &d.frames.items[v.frame];
             f.vars_left -|= 1;
-            const list = field(body, "variables") orelse return;
-            if (list == .array) for (list.array.items) |x| {
-                const name = str(field(x, "name")) orelse continue;
-                const value = str(field(x, "value")) orelse "";
-                try f.vars.print(d.gpa, "{s} = ", .{name});
-                // One line each, cut short when long.
-                var end = @min(value.len, max_value);
-                // Not through the middle of a character.
-                while (end < value.len and end > 0 and value[end] & 0xC0 == 0x80) end -= 1;
-                for (value[0..end]) |b| try f.vars.append(d.gpa, if (b == '\n' or b == '\r') ' ' else b);
-                if (end < value.len) try f.vars.appendSlice(d.gpa, "…");
-                try f.vars.append(d.gpa, '\n');
-            };
             up.vars = true;
+            // After the variable they're inside (and what's inside it so far).
+            var at = f.vars.items.len;
+            var depth: u8 = 0;
+            if (v.parent) |id| {
+                const p = for (f.vars.items, 0..) |x, i| {
+                    if (x.id == id) break i;
+                } else return;
+                depth = f.vars.items[p].depth + 1;
+                at = p + 1;
+                while (at < f.vars.items.len and f.vars.items[at].depth >= depth) at += 1;
+            }
+            const list = field(body, "variables") orelse return;
+            if (list != .array) return;
+            // gdb puts what a pointer points at in a `value` of its own:
+            // a level that says nothing, so its insides go under the pointer.
+            const pointee = v.parent != null and list.array.items.len == 1 and
+                std.mem.eql(u8, str(field(list.array.items[0], "name")) orelse "", "value");
+            if (pointee) if (int(field(list.array.items[0], "variablesReference"))) |ref| if (ref > 0) {
+                f.vars_left += 1;
+                return d.send("variables", .{ .variablesReference = ref }, .{ .variables = v });
+            };
+            for (list.array.items, 0..) |x, n| {
+                if (n == max_children or f.vars.items.len >= max_vars) {
+                    const name = try std.fmt.allocPrint(d.gpa, "… {d} more", .{list.array.items.len - n});
+                    errdefer d.gpa.free(name);
+                    try d.addVar(f, at, .{ .name = name, .value = &.{}, .depth = depth, .id = 0, .ref = 0 });
+                    break;
+                }
+                const value = str(field(x, "value")) orelse "";
+                const name = try d.gpa.dupe(u8, if (pointee) "*" else str(field(x, "name")) orelse continue);
+                errdefer d.gpa.free(name);
+                // One line each, cut short when long.
+                const end = cut(value, max_value);
+                const shown = try std.mem.concat(d.gpa, u8, &.{ value[0..end], if (end < value.len) "…" else "" });
+                errdefer d.gpa.free(shown);
+                for (shown) |*b| if (b.* == '\n' or b.* == '\r') {
+                    b.* = ' ';
+                };
+                try d.addVar(f, at, .{ .name = name, .value = shown, .depth = depth, .id = 0, .ref = int(field(x, "variablesReference")) orelse 0 });
+                at += 1;
+            }
+            if (f.expanded) try d.askInside(v.frame);
         },
-        .other => {},
+        .other, .quiet => {},
+    }
+}
+
+fn varsAnswered(d: *Debugger, gen: u32, frame: u32, up: *Update) void {
+    if (gen != d.gen or frame >= d.frames.items.len) return;
+    d.frames.items[frame].vars_left -|= 1;
+    up.vars = true;
+}
+
+fn addVar(d: *Debugger, f: *Frame, at: usize, v: Var) !void {
+    var x = v;
+    d.var_id += 1;
+    x.id = d.var_id;
+    try f.vars.insert(d.gpa, at, x);
+}
+
+/// What is inside frame `index`'s variables is fetched too (it's being
+/// looked at). Again is fine.
+pub fn expand(d: *Debugger, index: usize) !void {
+    if (d.state != .stopped or index >= d.frames.items.len or index >= max_var_frames) return;
+    d.frames.items[index].expanded = true;
+    try d.askInside(@intCast(index));
+}
+
+fn askInside(d: *Debugger, index: u32) !void {
+    const f = &d.frames.items[index];
+    for (f.vars.items) |*v| {
+        if (v.asked or v.ref <= 0 or v.depth >= max_depth) continue;
+        if (f.vars.items.len + f.vars_left >= max_vars) break;
+        v.asked = true;
+        // Text is all there already; a null pointer points at nothing.
+        if (v.value.len > 0 and v.value[0] == '"') continue;
+        if (std.mem.eql(u8, v.value, "0x0")) continue;
+        f.vars_left += 1;
+        try d.send("variables", .{ .variablesReference = v.ref }, .{ .variables = .{ .gen = d.gen, .frame = index, .parent = v.id } });
     }
 }
 

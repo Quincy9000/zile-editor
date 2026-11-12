@@ -12861,7 +12861,10 @@ test "debugging: a breakpoint stops the program there, stepping, locals, the exi
     try testing.expectEqual(2, d.frames.items[0].line);
     try testing.expectEqualStrings("main", d.frames.items[1].name);
     // Arguments, then locals.
-    try testing.expect(std.mem.startsWith(u8, d.frames.items[0].vars.items, "a = 2\nb = 3\nc = "));
+    var vars: std.ArrayList(u8) = .empty;
+    defer vars.deinit(gpa);
+    try d.frames.items[0].writeVars(gpa, &vars);
+    try testing.expect(std.mem.startsWith(u8, vars.items, "a = 2\nb = 3\nc = "));
     // The editor is on the stop, marked, with the Debug picker open.
     try testing.expectEqual(2, ed.cursorLine());
     try testing.expect(debugging.marks(&ed, src, 2).here and debugging.marks(&ed, src, 2).breakpoint);
@@ -12871,7 +12874,9 @@ test "debugging: a breakpoint stops the program there, stepping, locals, the exi
     try ed.feed("n");
     try S.until(&ed, S.varsIn);
     try testing.expectEqual(3, ed.dbg.session.?.frames.items[0].line);
-    try testing.expect(std.mem.indexOf(u8, ed.dbg.session.?.frames.items[0].vars.items, "c = 5") != null);
+    vars.clearRetainingCapacity();
+    try ed.dbg.session.?.frames.items[0].writeVars(gpa, &vars);
+    try testing.expect(std.mem.indexOf(u8, vars.items, "c = 5") != null);
     try testing.expectEqual(3, ed.cursorLine());
 
     // `c`: runs to the end; the exit is reported in its output.
@@ -12921,6 +12926,80 @@ test "breakpoints: on/off keeps them, clearing and undo, runs choose gdb" {
     try testing.expectEqual(0, ed.dbg.breakpoints.items.len);
     try debugging.undoBreakpoints(&ed);
     try testing.expectEqual(1, ed.dbg.breakpoints.items.len);
+}
+
+test "debugging Zig: slices, optionals, unions and what is inside structs can be read" {
+    const gpa = testing.allocator;
+    if (!sources.onPath(testing.io, "gdb") or !sources.onPath(testing.io, "zig")) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "t.zig", .data =
+        \\const P = struct { x: i32, name: []const u8, next: ?*const P };
+        \\const U = union(enum) { a: i32, b: []const u8, none };
+        \\fn work(s: []const u8, nums: []u32, p: *const P, o: ?i32, u: U, eu: anyerror!u8) usize {
+        \\    const none: ?i32 = null;
+        \\    const total = s.len + nums.len;
+        \\    keep(.{ p, o, u, eu, none });
+        \\    return total;
+        \\}
+        \\fn keep(x: anytype) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    var nums = [_]u32{ 1, 2, 3, 4 };
+        \\    const a: P = .{ .x = 1, .name = "inner", .next = null };
+        \\    const b: P = .{ .x = 7, .name = "outer", .next = &a };
+        \\    _ = work("some text", &nums, &b, 42, .{ .b = "ub" }, error.Oops);
+        \\}
+        \\
+    });
+    const src = try std.fs.path.join(gpa, &.{ dir, "t.zig" });
+    defer gpa.free(src);
+    const out = try std.fs.path.join(gpa, &.{ dir, "t" });
+    defer gpa.free(out);
+    const emit = try std.fmt.allocPrint(gpa, "-femit-bin={s}", .{out});
+    defer gpa.free(emit);
+    const cache = try std.fs.path.join(gpa, &.{ dir, "cache" });
+    defer gpa.free(cache);
+    const zig = try std.process.run(gpa, testing.io, .{ .argv = &.{ "zig", "build-exe", src, emit, "--cache-dir", cache } });
+    gpa.free(zig.stdout);
+    gpa.free(zig.stderr);
+    if (zig.term != .exited or zig.term.exited != 0) return error.SkipZigTest;
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile(src);
+    try ed.feed("6G"); // `keep(...)`
+    try debugging.toggleBreakpoint(&ed);
+    const S = struct {
+        fn varsIn(e: *Editor) bool {
+            const d = e.dbg.session orelse return false;
+            return d.state == .stopped and d.frames.items.len > 0 and d.frames.items[0].vars_left == 0 and d.frames.items[0].vars.items.len > 0;
+        }
+    };
+    try debugging.start(&ed, out);
+    for (0..2000) |_| {
+        ed.tick();
+        if (S.varsIn(&ed)) break;
+        testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    } else return error.Timeout;
+    var vars: std.ArrayList(u8) = .empty;
+    defer vars.deinit(gpa);
+    try ed.dbg.session.?.frames.items[0].writeVars(gpa, &vars);
+    errdefer std.debug.print("{s}\n", .{vars.items});
+    for ([_][]const u8{
+        "s = \"some text\"\n", // a slice of bytes is its text
+        "nums = len 4\n  [0] = 1\n  [1] = 2\n", // a slice's items, under it
+        "o = 42\n", // an optional is what it holds
+        "none = null\n",
+        "eu = error.Oops\n",
+        "u = .b\n  b = \"ub\"\n", // a union's field in use
+        "\n  x = 7\n  name = \"outer\"\n", // through the pointer, into the struct
+        "\n    x = 1\n    name = \"inner\"\n    next = null\n", // and on through its optional pointer
+    }) |want| try testing.expect(std.mem.indexOf(u8, vars.items, want) != null);
+    debugging.stop(&ed);
 }
 
 test "debugging a build's program: the only one is used, several are asked for; remembered this session" {

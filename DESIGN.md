@@ -777,6 +777,13 @@ so its output and input work as in a plain run; Ctrl-C there pauses it.
   frame in your code (`▶`, tinted line) and `SPC d` opens: rows are the
   stack, the preview a frame's arguments and locals. `n` next, `s` step in,
   `f` finish, `c` continue, `p` pause, `x` stop, `o` output.
+- **Values**: what is inside a variable (a struct's fields, a slice's
+  items, what a pointer points at) is listed indented under it, three
+  levels down, 32 of each; for the frame it stopped in at once, for
+  another when you look at it. `src/zig_gdb.py` (embedded, sent to gdb at
+  the start) is the Zig part gdb lacks: a `[]u8` is its text, a slice its
+  items, an optional what it holds or `null`, an error union its value or
+  `error.X`, a tagged union `.tag` and that field.
 - **Breakpoints** (`●`, kept for the session): `b` on the cursor's line,
   `d` remove the row's, `B` remove all, `t` all on/off (off: kept, hollow
   `○`, runs run normally), `u` undo. `C-j` / `C-k` move the editor's cursor
