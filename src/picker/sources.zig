@@ -14,6 +14,7 @@
 //! Adding a source = adding a `Kind` tag and a struct below.
 
 const std = @import("std");
+const debugging = @import("../debugging.zig");
 const Io = std.Io;
 const Editor = @import("../Editor.zig");
 const Engine = @import("Engine.zig");
@@ -2779,11 +2780,11 @@ const Runner = struct {
     pub const alt_accept: AltAccept = .{ .label = "debug", .run = debugIt };
 
     fn debugIt(ed: *Editor, text: []const u8) anyerror!void {
-        try ed.debugFromRunner(text);
+        try debugging.fromRunner(ed, text);
     }
 
     fn openDebug(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.openDebug();
+        try debugging.open(ed);
     }
 
     fn edit(ed: *Editor, _: ?Item) anyerror!void {
@@ -2813,7 +2814,7 @@ const Runner = struct {
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
         const folder = ed.commandFolder() catch return;
         defer ed.gpa.free(folder);
-        const how = if (ed.projectHasBreakpoints()) "under gdb: this project has breakpoints\n(t in SPC d turns them off)" else "through your shell (C-Enter: under gdb)";
+        const how = if (debugging.hasBreakpoints(ed)) "under gdb: this project has breakpoints\n(t in SPC d turns them off)" else "through your shell (C-Enter: under gdb)";
         try out.text.print(ed.gpa, "Runs in {s}\n{s}:\n\n{s}", .{ folder, how, item.text });
     }
 };
@@ -2830,18 +2831,14 @@ const Debug = struct {
     pub const prefix: ?u8 = null;
     pub const start_mode: StartMode = .normal;
     pub const create_label = "Debug ";
-    const bp_base: u32 = 1 << 20;
-    /// A compiled program found on disk (asking which one a build made).
-    const found_id: u32 = 1 << 22;
-    /// The command the debugger runs.
-    const cmd_id: u32 = 1 << 23;
+    const Row = debugging.Row;
 
     pub const title = "Debug";
 
     /// The title, saying what the program is doing.
     pub fn liveTitle(ed: *Editor) []const u8 {
-        if (ed.debug_asking) return "Debug which program?";
-        const d = ed.debugger orelse return if (ed.breakpoints_on) "Debug: breakpoints on (runs go through gdb)" else "Debug: breakpoints off (runs run normally)";
+        if (ed.dbg.asking) return "Debug which program?";
+        const d = ed.dbg.session orelse return if (ed.dbg.breakpoints_on) "Debug: breakpoints on (runs go through gdb)" else "Debug: breakpoints off (runs run normally)";
         return switch (d.state) {
             .starting => "Debug: starting",
             .running => "Debug: running (p pauses)",
@@ -2853,124 +2850,127 @@ const Debug = struct {
     pub fn fill(ed: *Editor, items: *Items) !void {
         var detail: [Io.Dir.max_path_bytes + 32]u8 = undefined;
         // Asking which program a build made: only the programs found.
-        if (ed.debug_asking) {
-            for (ed.debug_found) |f| try items.append(.{ .text = f, .detail = "", .id = found_id });
+        if (ed.dbg.asking) {
+            for (ed.dbg.found, 0..) |f, i| try items.append(.{ .text = f, .detail = "", .id = Row.id(.{ .program = @intCast(i) }) });
             return;
         }
-        if (ed.debugger) |d| for (d.frames.items, 0..) |f, i| {
+        if (ed.dbg.session) |d| for (d.frames.items, 0..) |f, i| {
             const where = if (f.path) |p| std.fmt.bufPrint(&detail, "{s}:{d}", .{ std.fs.path.basename(p), f.line + 1 }) catch "" else "no source";
-            try items.append(.{ .text = f.name, .detail = where, .id = @intCast(i) });
+            try items.append(.{ .text = f.name, .detail = where, .id = Row.id(.{ .frame = @intCast(i) }) });
         };
         // Not debugging: the command Enter (or `R`) debugs.
-        if (ed.debugger == null) if (try ed.debugRow()) |row| {
+        if (ed.dbg.session == null) if (try debugging.commandRow(ed)) |row| {
             defer ed.gpa.free(row.cmd);
             defer ed.gpa.free(row.from);
-            try items.append(.{ .text = row.cmd, .detail = if (row.edited) "debug command" else "debug command (from the runner)", .id = cmd_id });
+            try items.append(.{ .text = row.cmd, .detail = if (row.edited) "debug command" else "debug command (from the runner)", .id = Row.id(.command) });
         };
-        for (ed.breakpoints.items, 0..) |b, i| {
-            const dot = if (ed.breakpoints_on) "●" else "○";
+        for (ed.dbg.breakpoints.items, 0..) |b, i| {
+            const dot = if (ed.dbg.breakpoints_on) "●" else "○";
             const shown = std.fmt.bufPrint(&detail, "{s} {s}:{d}", .{ dot, std.fs.path.basename(b.path), b.line + 1 }) catch continue;
-            try items.append(.{ .text = shown, .detail = if (ed.breakpoints_on) "breakpoint" else "breakpoint (off)", .id = bp_base + @as(u32, @intCast(i)) });
+            try items.append(.{ .text = shown, .detail = if (ed.dbg.breakpoints_on) "breakpoint" else "breakpoint (off)", .id = Row.id(.{ .breakpoint = @intCast(i) }) });
         }
     }
 
-    /// Not while stepping: the rows refill on every stop.
+    /// Typed: a program and its arguments.
     pub fn create(ed: *Editor, query: []const u8) !void {
-        try ed.debugProgramText(query);
+        try debugging.pickProgram(ed, query);
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        if (item.id == cmd_id) return ed.debugRowAccept();
-        if (item.id >= found_id) return ed.debugProgramText(item.text);
-        if (item.id < bp_base) return ed.showFrame(item.id);
-        const i = item.id - bp_base;
-        if (i >= ed.breakpoints.items.len) return;
-        const b = ed.breakpoints.items[i];
-        const path = try ed.gpa.dupe(u8, b.path);
-        defer ed.gpa.free(path);
-        try ed.jumpTo(path, b.line, 0);
-        ed.centerCursor();
+        switch (Row.of(item.id)) {
+            .command => try debugging.acceptCommandRow(ed),
+            .program => try debugging.pickProgram(ed, item.text),
+            .frame => |i| try debugging.showFrame(ed, i),
+            .breakpoint => |i| {
+                if (i >= ed.dbg.breakpoints.items.len) return;
+                const b = ed.dbg.breakpoints.items[i];
+                const path = try ed.gpa.dupe(u8, b.path);
+                defer ed.gpa.free(path);
+                try ed.jumpTo(path, b.line, 0);
+                ed.centerCursor();
+            },
+        }
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        if (item.id == cmd_id) {
-            try out.text.print(ed.gpa, "Enter: runs under gdb\n\n  {s}\n\nin {s}\n\n", .{ item.text, ed.projectRoot() });
-            const programs = try ed.debugPrograms();
-            defer {
-                for (programs) |x| ed.gpa.free(x);
-                ed.gpa.free(programs);
-            }
-            if (programs.len > 0) try out.text.print(ed.gpa, "its program: {s}\n\n", .{programs[0]});
-            try out.text.appendSlice(ed.gpa, "e: change it (a debug build, other arguments, or\n   `zig build && ./zig-out/bin/app` to name the program).\nIt holds for this session; the runner's command stays as it is.");
-            return;
+        switch (Row.of(item.id)) {
+            .command => {
+                try out.text.print(ed.gpa, "Enter: runs under gdb\n\n  {s}\n\nin {s}\n\n", .{ item.text, ed.projectRoot() });
+                const programs = try debugging.pickedPrograms(ed);
+                defer {
+                    for (programs) |x| ed.gpa.free(x);
+                    ed.gpa.free(programs);
+                }
+                if (programs.len > 0) try out.text.print(ed.gpa, "its program: {s}\n\n", .{programs[0]});
+                try out.text.appendSlice(ed.gpa, "e: change it (a debug build, other arguments, or\n   `zig build && ./zig-out/bin/app` to name the program).\nIt holds for this session; the runner's command stays as it is.");
+            },
+            .program => try out.text.print(ed.gpa, "Enter: debugs\n\n  {s}\n\n(type after it to add arguments)", .{item.text}),
+            .breakpoint => |i| {
+                if (i >= ed.dbg.breakpoints.items.len) return;
+                const b = ed.dbg.breakpoints.items[i];
+                try previewAt(ed, b.path, b.line, out);
+            },
+            .frame => |i| {
+                const d = ed.dbg.session orelse return;
+                if (i >= d.frames.items.len) return;
+                const f = d.frames.items[i];
+                try out.text.print(ed.gpa, "{s}", .{f.name});
+                if (f.path) |p| try out.text.print(ed.gpa, "  {s}:{d}", .{ p, f.line + 1 });
+                try out.text.appendSlice(ed.gpa, "\n\n");
+                if (f.vars.items.len > 0) {
+                    try out.text.appendSlice(ed.gpa, f.vars.items);
+                } else if (f.vars_left > 0) {
+                    try out.text.appendSlice(ed.gpa, "(asking gdb...)");
+                } else if (i < debugging.frames_with_variables) {
+                    try out.text.appendSlice(ed.gpa, "(no arguments or locals)");
+                } else try out.text.appendSlice(ed.gpa, "(Enter goes there)");
+            },
         }
-        if (item.id >= found_id) {
-            try out.text.print(ed.gpa, "Enter: debugs\n\n  {s}\n\n(type after it to add arguments)", .{item.text});
-            return;
-        }
-        if (item.id >= bp_base) {
-            const i = item.id - bp_base;
-            if (i >= ed.breakpoints.items.len) return;
-            const b = ed.breakpoints.items[i];
-            return previewAt(ed, b.path, b.line, out);
-        }
-        const d = ed.debugger orelse return;
-        if (item.id >= d.frames.items.len) return;
-        const f = d.frames.items[item.id];
-        try out.text.print(ed.gpa, "{s}", .{f.name});
-        if (f.path) |p| try out.text.print(ed.gpa, "  {s}:{d}", .{ p, f.line + 1 });
-        try out.text.appendSlice(ed.gpa, "\n\n");
-        if (f.vars.items.len > 0) {
-            try out.text.appendSlice(ed.gpa, f.vars.items);
-        } else if (f.vars_left > 0) {
-            try out.text.appendSlice(ed.gpa, "(asking gdb...)");
-        } else if (item.id < 16) {
-            try out.text.appendSlice(ed.gpa, "(no arguments or locals)");
-        } else try out.text.appendSlice(ed.gpa, "(Enter goes there)");
     }
 
     fn stepper(comptime how: @import("../Debugger.zig").Step) *const fn (*Editor, ?Item) anyerror!void {
         return &struct {
             fn run(ed: *Editor, _: ?Item) anyerror!void {
-                try ed.debugStep(how);
+                try debugging.step(ed, how);
             }
         }.run;
     }
 
     fn pause(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.debugPause();
+        try debugging.pause(ed);
     }
 
     fn stop(ed: *Editor, _: ?Item) anyerror!void {
-        ed.stopDebug();
+        debugging.stop(ed);
     }
 
     fn breakpoint(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.toggleBreakpoint();
+        try debugging.toggleBreakpoint(ed);
     }
 
     /// `d`: the row's breakpoint removed.
     fn removeRow(ed: *Editor, item: ?Item) anyerror!void {
-        const it = item orelse return;
-        if (it.id < bp_base or it.id >= found_id) return ed.setMessage(.info, "d removes a breakpoint row", .{});
-        try ed.removeBreakpoint(it.id - bp_base);
+        switch (Row.of((item orelse return).id)) {
+            .breakpoint => |i| try debugging.removeBreakpoint(ed, i),
+            else => ed.setMessage(.info, "d removes a breakpoint row", .{}),
+        }
     }
 
     /// `e`: the debugger's command, in the command editor.
     fn editRow(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.debugRowEdit();
+        try debugging.editCommandRow(ed);
     }
 
     fn clearAll(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.clearBreakpoints();
+        try debugging.clearBreakpoints(ed);
     }
 
     fn onOff(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.toggleBreakpointsOn();
+        try debugging.toggleBreakpointsOn(ed);
     }
 
     fn undo(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.undoBreakpoints();
+        try debugging.undoBreakpoints(ed);
     }
 
     /// `r`: the project's runner command (`SPC r Enter`): under gdb with
@@ -2981,7 +2981,7 @@ const Debug = struct {
 
     /// `R`: the runner command under gdb, breakpoints or not.
     fn runDebug(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.debugAgain();
+        try debugging.again(ed);
     }
 
     /// `C-j` / `C-k`: the editor's cursor down / up, the picker staying

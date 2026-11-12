@@ -1,6 +1,7 @@
 //! Draws editor state. Reads `Editor`, never mutates it.
 
 const std = @import("std");
+const debugging = @import("../debugging.zig");
 const rl = @import("raylib");
 const Editor = @import("../Editor.zig");
 const motions = @import("../core/motions.zig");
@@ -444,7 +445,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
     // (Resolved as `Editor.absolutePath` does, so `./a.c` is `a.c`.)
     var abs_fba: std.heap.FixedBufferAllocator = .init(&abs_buf);
-    const debug_path: ?[]const u8 = if (ed.breakpoints.items.len == 0 and ed.debugger == null) null else if (ed.buffer.path) |bp|
+    const debug_path: ?[]const u8 = if (ed.dbg.breakpoints.items.len == 0 and ed.dbg.session == null) null else if (ed.buffer.path) |bp|
         (std.fs.path.resolve(abs_fba.allocator(), &.{ ed.cwd, bp }) catch null)
     else
         null;
@@ -538,7 +539,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         if (fold != null) rect(0, y, l.width, font.cell_h, theme.fold_bg);
 
         if (is_current and focused) rect(0, y, l.width, font.cell_h, theme.cursorline_bg);
-        const marks: Editor.DebugMarks = if (debug_path) |dp| ed.debugMarks(dp, line) else .{};
+        const marks: debugging.Marks = if (debug_path) |dp| debugging.marks(ed, dp, line) else .{};
         // Where the debugger stopped: the line tinted.
         if (marks.here) rect(0, y, l.width, font.cell_h, withAlpha(theme.diag_warning, 40));
         if (selection) |sel| drawSelection(ed, font, theme, l, sel, line, y);
@@ -573,8 +574,8 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         drawGitSign(ed, theme, line, y, font.cell_h);
         if (first_piece and (marks.breakpoint or marks.here)) {
             // Breakpoints switched off stay, hollow.
-            const glyph = if (marks.here) "▶" else if (ed.breakpoints_on) "●" else "○";
-            _ = font.drawText(glyph, 0, y, if (marks.here) theme.diag_warning else if (ed.breakpoints_on) theme.diag_error else theme.gutter_fg);
+            const glyph = if (marks.here) "▶" else if (ed.dbg.breakpoints_on) "●" else "○";
+            _ = font.drawText(glyph, 0, y, if (marks.here) theme.diag_warning else if (ed.dbg.breakpoints_on) theme.diag_error else theme.gutter_fg);
         }
 
         if (ed.search_highlight) drawSearchMatches(ed, font, theme, l, line, y);

@@ -45,6 +45,7 @@ pub const Terminal = @import("terminal/Terminal.zig");
 const Pty = @import("terminal/Pty.zig");
 const RunMemory = @import("terminal/RunMemory.zig");
 const Debugger = @import("Debugger.zig");
+const debugging = @import("debugging.zig");
 pub const run_errors_mod = @import("terminal/errors.zig");
 const textobjects = @import("core/textobjects.zig");
 const textops = @import("textops.zig");
@@ -237,38 +238,9 @@ pub const WorkspaceSymbol = struct {
     col: usize,
 };
 
-/// A breakpoint: an absolute path and a 0-based line.
-pub const Breakpoint = struct { path: []u8, line: u32 };
-
-pub const DebugMarks = struct { breakpoint: bool = false, here: bool = false };
-
 /// `run`: it runs. `runner`: it runs as a runner command (remembered).
 /// `debug`: it runs under gdb, and is what its runner command debugs as.
 pub const CommandPurpose = enum { run, runner, debug };
-
-pub const DebugCommand = struct {
-    project: []u8,
-    from: []u8,
-    cmd: []u8,
-
-    fn deinit(d: DebugCommand, gpa: Allocator) void {
-        gpa.free(d.project);
-        gpa.free(d.from);
-        gpa.free(d.cmd);
-    }
-};
-
-/// The program a project's build command debugs (`text`: its absolute
-/// path).
-pub const DebugProgram = struct {
-    project: []u8,
-    text: []u8,
-
-    fn deinit(d: DebugProgram, gpa: Allocator) void {
-        gpa.free(d.project);
-        gpa.free(d.text);
-    }
-};
 
 /// A quickfix entry: a place (0-based line/col) and what's there.
 pub const QuickfixItem = struct {
@@ -620,41 +592,8 @@ run_root_owned: ?[]u8 = null,
 run_reported: bool = true,
 /// The last run was under the debugger (`r` in its popup debugs it again).
 run_debug: bool = false,
-/// The debugging session (`SPC d`), while there is one.
-debugger: ?*Debugger = null,
-/// The command being debugged (owned), for `r` to debug it again.
-debug_command: ?[]u8 = null,
-/// `debug_command` is a program row of the Debug picker ("zig-out/bin/app
-/// args"), not a runner command.
-debug_by_program: bool = false,
-/// The programs debugged this session, oldest first: what `zig build run`
-/// debugs in a project (not kept across sessions).
-debug_programs: std.ArrayList(DebugProgram) = .empty,
-/// The Debug picker is asking which program a build made (it lists only
-/// the programs).
-debug_asking: bool = false,
-/// A build's program is being looked for (off the main thread).
-debug_search: ?*Debugger.Search = null,
-/// While looking and asking: the plan waiting for its program. While
-/// asking: the programs found (the picker's rows) and the folder they
-/// are in. All owned.
-debug_ask: ?Debugger.Plan = null,
-debug_found: [][]u8 = &.{},
-debug_ask_root: ?[]u8 = null,
-/// The folder the debugged command runs in (owned): its build, its
-/// program's relative paths, the program itself. Set when a debug starts.
-debug_root: ?[]u8 = null,
-/// A command to debug once its build (running in the popup) succeeds.
-debug_plan: ?Debugger.Plan = null,
-/// The stack frame shown (its line is marked): an index in the debugger's.
-debug_frame: usize = 0,
-/// Breakpoints: absolute paths, 0-based lines. They stay across sessions.
-breakpoints: std.ArrayList(Breakpoint) = .empty,
-/// Off (`t` in the Debug picker): kept and shown, but runs run normally and
-/// gdb doesn't stop at them.
-breakpoints_on: bool = true,
-/// The breakpoints before each change, newest last (`u` in the Debug picker).
-breakpoint_undo: std.ArrayList([]Breakpoint) = .empty,
+/// Debugging: the session, breakpoints, what to debug (debugging.zig).
+dbg: debugging.State = .{},
 /// The quickfix list (`]q` / `[q`, `SPC f q`): places to step through,
 /// from a run's errors or a picker's results (`<C-q>`).
 quickfix: std.ArrayList(QuickfixItem) = .empty,
@@ -680,9 +619,6 @@ cmd_purpose: CommandPurpose = .run,
 /// For `.debug`: the runner command this is the debugger's version of
 /// (owned).
 cmd_from: ?[]u8 = null,
-/// The commands the debugger runs, this session: a runner command (`from`,
-/// per project) as you edited it the first time it was debugged.
-debug_commands: std.ArrayList(DebugCommand) = .empty,
 /// Which terminal the popup shows, if open. Keys go to it.
 popup: ?enum { shell, run } = null,
 /// The popup's size, kept current by the UI (new terminals start at it).
@@ -975,26 +911,8 @@ pub fn deinit(ed: *Editor) void {
         ed.gpa.destroy(w);
     }
     if (ed.shell) |t| t.destroy();
-    if (ed.debugger) |d| d.deinit();
-    if (ed.debug_plan) |pl| pl.deinit(ed.gpa);
-    if (ed.debug_command) |c| ed.gpa.free(c);
-    for (ed.debug_programs.items) |dp| dp.deinit(ed.gpa);
-    ed.debug_programs.deinit(ed.gpa);
-    for (ed.debug_commands.items) |dc| dc.deinit(ed.gpa);
-    ed.debug_commands.deinit(ed.gpa);
-    if (ed.debug_search) |sr| sr.destroy();
-    if (ed.debug_ask) |a| a.deinit(ed.gpa);
-    ed.setDebugFound(&.{});
-    if (ed.debug_ask_root) |r| ed.gpa.free(r);
-    if (ed.debug_root) |r| ed.gpa.free(r);
+    debugging.deinit(ed);
     if (ed.cmd_from) |f| ed.gpa.free(f);
-    freeBreakpoints(ed.gpa, ed.breakpoints.items);
-    ed.breakpoints.deinit(ed.gpa);
-    for (ed.breakpoint_undo.items) |list| {
-        freeBreakpoints(ed.gpa, list);
-        ed.gpa.free(list);
-    }
-    ed.breakpoint_undo.deinit(ed.gpa);
     if (ed.run) |t| t.destroy();
     if (ed.run_command) |cmd| ed.gpa.free(cmd);
     if (ed.run_root_owned) |r| ed.gpa.free(r);
@@ -1154,8 +1072,8 @@ pub fn tick(ed: *Editor) void {
     ed.tickInlayHints();
     ed.pollGitJob();
     ed.pollTerminals();
-    ed.tickDebugSearch();
-    ed.tickDebugger();
+    debugging.tickSearch(ed);
+    debugging.tick(ed);
     ed.pollAi();
     ed.tickClaude();
     ed.pollShellWindows();
@@ -4424,7 +4342,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
     }
 
     var loaded = try Buffer.load(ed.gpa, ed.io, norm);
-    loaded.line_listener = .{ .ctx = ed, .changed = breakpointLinesChanged };
+    loaded.line_listener = .{ .ctx = ed, .changed = debugging.breakpointLinesChanged };
     loaded.project = ed.projectOf(norm);
     ed.enterProject(loaded.project);
     // Replace an untouched scratch buffer instead of keeping it around, like vim.
@@ -4904,7 +4822,7 @@ fn spawnTerminal(ed: *Editor, argv: []const []const u8) !*Terminal {
     return ed.spawnTerminalIn(argv, folder);
 }
 
-fn spawnTerminalIn(ed: *Editor, argv: []const []const u8, cwd: []const u8) !*Terminal {
+pub fn spawnTerminalIn(ed: *Editor, argv: []const []const u8, cwd: []const u8) !*Terminal {
     const sz = ed.term_size;
     return Terminal.create(ed.gpa, ed.io, .{
         .argv = argv,
@@ -5044,8 +4962,8 @@ fn popupKey(ed: *Editor, ev: KeyEvent) bool {
         };
         return true;
     }
-    if (ed.popup == .run and ed.debugger != null and ev.mods.ctrl and !ev.mods.alt and ev.key == .codepoint and ev.key.codepoint == 'c') {
-        if (ed.debugger) |d| d.pause() catch {};
+    if (ed.popup == .run and ed.dbg.session != null and ev.mods.ctrl and !ev.mods.alt and ev.key == .codepoint and ev.key.codepoint == 'c') {
+        if (ed.dbg.session) |d| d.pause() catch {};
         return true;
     }
     if (!t.isRunning()) {
@@ -5161,7 +5079,7 @@ fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
                 .run => ed.startRun(cmd),
                 // The history is a line per command.
                 .runner => if (one_line) ed.runFromRunner(cmd) else ed.startRun(cmd),
-                .debug => ed.debugEdited(from orelse cmd, cmd),
+                .debug => debugging.edited(ed, from orelse cmd, cmd),
             }) catch |err| ed.setMessage(.err, "could not run: {s}", .{@errorName(err)});
         },
         else => return false,
@@ -5202,7 +5120,7 @@ pub fn runFromRunner(ed: *Editor, command: []const u8) !void {
 /// Runs `cmd`, under gdb when this project has breakpoints (and they're on)
 /// and gdb can run it; else as usual.
 fn runOrDebug(ed: *Editor, cmd: []const u8) !void {
-    if (!ed.projectHasBreakpoints() or !sources.onPath(ed.io, "gdb")) return ed.startRun(cmd);
+    if (!debugging.hasBreakpoints(ed) or !sources.onPath(ed.io, "gdb")) return ed.startRun(cmd);
     switch (try Debugger.plan(ed.gpa, cmd)) {
         .plan => |p| p.deinit(ed.gpa),
         .unsupported => |why| {
@@ -5211,18 +5129,7 @@ fn runOrDebug(ed: *Editor, cmd: []const u8) !void {
             return;
         },
     }
-    try ed.debugVia(cmd);
-}
-
-/// Breakpoints (switched on) in the project the runner's commands are for.
-pub fn projectHasBreakpoints(ed: *Editor) bool {
-    if (!ed.breakpoints_on or ed.breakpoints.items.len == 0) return false;
-    const key = ed.runKey() catch return false;
-    defer ed.gpa.free(key);
-    for (ed.breakpoints.items) |b| {
-        if (std.mem.startsWith(u8, b.path, key) and b.path.len > key.len and b.path[key.len] == '/') return true;
-    }
-    return false;
+    try debugging.debug(ed, cmd);
 }
 
 /// <Tab> in the runner: the selected command goes into the query line, to
@@ -5258,7 +5165,7 @@ pub fn shellPrompt(ed: *Editor) void {
     ed.startSearch(true, .run_command);
 }
 
-fn runMemoryPath(ed: *Editor) ?[]const u8 {
+pub fn runMemoryPath(ed: *Editor) ?[]const u8 {
     if (ed.run_memory_path == null) ed.run_memory_path = RunMemory.defaultPath(ed.gpa);
     return ed.run_memory_path;
 }
@@ -5267,7 +5174,7 @@ fn runMemoryPath(ed: *Editor) ?[]const u8 {
 /// else (a file in no project) its folder, so a file elsewhere doesn't
 /// borrow the commands of whatever project you were in before. No file: the
 /// current project. The caller frees it.
-fn runKey(ed: *Editor) ![]u8 {
+pub fn runKey(ed: *Editor) ![]u8 {
     const b = ed.buffer;
     if (b.project) |p| return ed.gpa.dupe(u8, p.root);
     if (b.path) |path| {
@@ -5279,7 +5186,7 @@ fn runKey(ed: *Editor) ![]u8 {
 }
 
 /// The remembered runner command for here. Caller frees.
-fn loadRunnerCommand(ed: *Editor) ?[]u8 {
+pub fn loadRunnerCommand(ed: *Editor) ?[]u8 {
     const path = ed.runMemoryPath() orelse return null;
     const key = ed.runKey() catch return null;
     defer ed.gpa.free(key);
@@ -5348,20 +5255,12 @@ pub fn runAgain(ed: *Editor) !void {
     try ed.runOrDebug(cmd);
 }
 
-/// `R` in the Debug picker: the runner's command under gdb (the runner
-/// opens if there is none yet).
-pub fn debugAgain(ed: *Editor) !void {
-    const cmd = ed.loadRunnerCommand() orelse return ed.runPrompt(true);
-    defer ed.gpa.free(cmd);
-    try ed.debugVia(cmd);
-}
-
 fn rerun(ed: *Editor) !void {
     // A debug run (or its build, which may have failed) again: all of it.
-    if (ed.run_debug) if (ed.debug_command) |dc| {
+    if (ed.run_debug) if (ed.dbg.command) |dc| {
         const cmd = try ed.gpa.dupe(u8, dc);
         defer ed.gpa.free(cmd);
-        return if (ed.debug_by_program) ed.debugProgramText(cmd) else ed.startDebug(cmd);
+        return if (ed.dbg.by_program) debugging.pickProgram(ed, cmd) else debugging.start(ed, cmd);
     };
     const cmd = try ed.gpa.dupe(u8, ed.run_command orelse return);
     defer ed.gpa.free(cmd);
@@ -5372,10 +5271,10 @@ fn rerun(ed: *Editor) !void {
 /// (replacing the previous run, stopping it if it is still going).
 pub fn startRun(ed: *Editor, cmd: []const u8) !void {
     // A run replaces the debugging session (its terminal is the popup's).
-    ed.endDebug();
-    ed.cancelDebugSearch();
-    if (ed.debug_plan) |pl| pl.deinit(ed.gpa);
-    ed.debug_plan = null;
+    debugging.end(ed);
+    debugging.cancelSearch(ed);
+    if (ed.dbg.plan) |pl| pl.deinit(ed.gpa);
+    ed.dbg.plan = null;
     for (ed.buffers.items) |b| if (b.modified and b.path != null) {
         _ = b.save(ed.gpa, ed.io) catch {};
         if (ed.lspFor(b)) |l| l.didSave(b);
@@ -5653,10 +5552,10 @@ fn pollTerminals(ed: *Editor) void {
             ed.setMessage(if (ok) .info else .err, "{s}: exited {d} in {d:.2}s (SPC r o shows the output)", .{ ed.run_command orelse "", t.exit_code, secs });
         }
         // A build for the debugger: the program starts once it's built.
-        if (ed.debug_plan) |pl| {
-            ed.debug_plan = null;
+        if (ed.dbg.plan) |pl| {
+            ed.dbg.plan = null;
             defer pl.deinit(ed.gpa);
-            if (ok) ed.launchDebug(pl) catch |err| ed.setMessage(.err, "could not start gdb: {s}", .{@errorName(err)});
+            if (ok) debugging.launch(ed, pl) catch |err| ed.setMessage(.err, "could not start gdb: {s}", .{@errorName(err)});
         }
     };
     if (ed.shell) |t| if (!t.isRunning()) {
@@ -5664,737 +5563,6 @@ fn pollTerminals(ed: *Editor) void {
         ed.shell = null;
         if (ed.popup == .shell) ed.popup = null;
     };
-}
-
-// ---------------------------------------------------------------------------
-// Debugging (`SPC d`, and Ctrl-Enter in the runner): gdb in its DAP mode
-// (Debugger.zig). The program runs in the run popup; when it stops, the
-// stop's line is shown and the Debug picker opens with the stack.
-
-/// Ctrl-Enter in the runner: `command` under gdb (remembered like a run).
-pub fn debugFromRunner(ed: *Editor, command: []const u8) !void {
-    const cmd = std.mem.trim(u8, command, " \t");
-    if (cmd.len == 0) return;
-    if (ed.runMemoryPath()) |path| {
-        const key = try ed.runKey();
-        defer ed.gpa.free(key);
-        RunMemory.save(ed.gpa, ed.io, path, key, cmd);
-    }
-    try ed.debugVia(cmd);
-}
-
-/// Debugs runner command `cmd`. The first time this session it comes up in
-/// the command editor, to change for the debugger (a debug build, other
-/// arguments, `zig build && ./zig-out/bin/app` to name the program); Enter
-/// there debugs it, and it's what `cmd` debugs as from then on.
-pub fn debugVia(ed: *Editor, cmd: []const u8) !void {
-    if (try ed.debugCommandFor(cmd)) |mine| {
-        defer ed.gpa.free(mine);
-        return ed.startDebug(mine);
-    }
-    if (!sources.onPath(ed.io, "gdb")) return ed.setMessage(.err, "gdb isn't installed", .{});
-    try ed.editCommand(cmd, .debug, cmd);
-    const release = switch (try Debugger.plan(ed.gpa, cmd)) {
-        .plan => |p| blk: {
-            defer p.deinit(ed.gpa);
-            break :blk p.release;
-        },
-        .unsupported => false,
-    };
-    if (release) {
-        ed.setMessage(.info, "the debugger's command: release flags lose variables under gdb (take them out here?)", .{});
-    } else ed.setMessage(.info, "the debugger's command for this session: change it or just Enter", .{});
-}
-
-/// What runner command `from` debugs as, if it was debugged this session.
-/// Caller frees.
-fn debugCommandFor(ed: *Editor, from: []const u8) !?[]u8 {
-    const key = try ed.runKey();
-    defer ed.gpa.free(key);
-    for (ed.debug_commands.items) |d| {
-        if (std.mem.eql(u8, d.project, key) and std.mem.eql(u8, d.from, from)) return try ed.gpa.dupe(u8, d.cmd);
-    }
-    return null;
-}
-
-/// Enter in the command editor: `cmd` is what `from` debugs as; debug it.
-/// Which program it starts is asked again if need be.
-fn debugEdited(ed: *Editor, from: []const u8, cmd: []const u8) !void {
-    const key = try ed.runKey();
-    var key_owned = true;
-    defer if (key_owned) ed.gpa.free(key);
-    var i: usize = 0;
-    while (i < ed.debug_commands.items.len) {
-        const d = ed.debug_commands.items[i];
-        if (std.mem.eql(u8, d.project, key) and std.mem.eql(u8, d.from, from)) {
-            d.deinit(ed.gpa);
-            _ = ed.debug_commands.orderedRemove(i);
-        } else i += 1;
-    }
-    ed.forgetDebugProgram();
-    const f = try ed.gpa.dupe(u8, from);
-    errdefer ed.gpa.free(f);
-    const c = try ed.gpa.dupe(u8, cmd);
-    errdefer ed.gpa.free(c);
-    try ed.debug_commands.append(ed.gpa, .{ .project = key, .from = f, .cmd = c });
-    key_owned = false;
-    try ed.startDebug(cmd);
-}
-
-/// The Debug picker's command row: the command last debugged here this
-/// session (`edited`), else the runner's. Caller frees `cmd` and `from`.
-pub const DebugRow = struct { cmd: []u8, from: []u8, edited: bool };
-
-pub fn debugRow(ed: *Editor) !?DebugRow {
-    const key = try ed.runKey();
-    defer ed.gpa.free(key);
-    var i = ed.debug_commands.items.len;
-    while (i > 0) {
-        i -= 1;
-        const d = ed.debug_commands.items[i];
-        if (!std.mem.eql(u8, d.project, key)) continue;
-        const c = try ed.gpa.dupe(u8, d.cmd);
-        errdefer ed.gpa.free(c);
-        return .{ .cmd = c, .from = try ed.gpa.dupe(u8, d.from), .edited = true };
-    }
-    const cmd = ed.loadRunnerCommand() orelse return null;
-    errdefer ed.gpa.free(cmd);
-    return .{ .cmd = cmd, .from = try ed.gpa.dupe(u8, cmd), .edited = false };
-}
-
-/// Enter on the command row: debug it (the first time, after a look).
-pub fn debugRowAccept(ed: *Editor) !void {
-    const row = try ed.debugRow() orelse return ed.runPrompt(true);
-    defer ed.gpa.free(row.cmd);
-    defer ed.gpa.free(row.from);
-    if (row.edited) return ed.startDebug(row.cmd);
-    try ed.debugVia(row.cmd);
-}
-
-/// `e` in the Debug picker: the debugger's command, in the command editor.
-pub fn debugRowEdit(ed: *Editor) !void {
-    const row = try ed.debugRow() orelse return ed.runPrompt(true);
-    defer ed.gpa.free(row.cmd);
-    defer ed.gpa.free(row.from);
-    try ed.editCommand(row.cmd, .debug, row.from);
-}
-
-/// Debugs `cmd`: a build-and-run command (`zig build run`, `cargo run`) is
-/// built first, in the popup, and the program it made starts under gdb.
-pub fn startDebug(ed: *Editor, cmd: []const u8) !void {
-    if (!sources.onPath(ed.io, "gdb")) return ed.setMessage(.err, "gdb isn't installed", .{});
-    var p = switch (try Debugger.plan(ed.gpa, cmd)) {
-        .unsupported => |why| return ed.setMessage(.err, "can't debug `{s}`: {s}", .{ cmd, why }),
-        .plan => |x| x,
-    };
-    var handed = false;
-    defer if (!handed) p.deinit(ed.gpa);
-    try ed.setDebugRoot();
-    // A build system's run (`zig build run`, `cargo run`) doesn't say which
-    // program it starts: the one found (or picked) here this session, else
-    // it's looked for once the build is done (`askProgram`).
-    if (p.newest_in) if (try ed.rememberedProgram()) |program| {
-        ed.gpa.free(p.program);
-        p.program = program;
-        p.newest_in = false;
-    };
-    try ed.setDebugCommand(cmd, false);
-    handed = true;
-    try ed.debugPlanned(p);
-}
-
-fn setDebugCommand(ed: *Editor, cmd: []const u8, by_program: bool) !void {
-    const owned = try ed.gpa.dupe(u8, cmd);
-    if (ed.debug_command) |old| ed.gpa.free(old);
-    ed.debug_command = owned;
-    ed.debug_by_program = by_program;
-}
-
-/// The debugged command runs where a runner command would, from the file
-/// you're in now (not where a stop takes you later).
-fn setDebugRoot(ed: *Editor) !void {
-    const folder = try ed.commandFolder();
-    if (ed.debug_root) |old| ed.gpa.free(old);
-    ed.debug_root = folder;
-}
-
-/// Builds (if the plan says so) then starts the program under gdb. Takes
-/// the plan, whether it fails or not.
-fn debugPlanned(ed: *Editor, plan: Debugger.Plan) !void {
-    var owned = true;
-    defer if (owned) plan.deinit(ed.gpa);
-    if (plan.build) |build| {
-        // startRun drops any plan waiting, so this one goes in after it.
-        try ed.startRun(build);
-        ed.debug_plan = plan;
-        owned = false;
-        // `r` in its popup (a build that failed, say) is the debug again.
-        ed.run_debug = true;
-        return;
-    }
-    ed.endDebug();
-    ed.cancelDebugSearch();
-    try ed.launchDebug(plan);
-}
-
-/// A program path relative to where the command runs made absolute (a name
-/// with no folder stays one to find on PATH, unless that file is there).
-fn inProject(ed: *Editor, plan: *Debugger.Plan) !void {
-    if (std.fs.path.isAbsolute(plan.program)) return;
-    const full = try std.fs.path.resolve(ed.gpa, &.{ ed.debug_root orelse ed.projectRoot(), plan.program });
-    if (std.mem.indexOfScalar(u8, plan.program, '/') == null and !ed.fileExists(full)) {
-        ed.gpa.free(full);
-        return;
-    }
-    ed.gpa.free(plan.program);
-    plan.program = full;
-}
-
-/// Enter on a program in the Debug picker. Asked which program a build
-/// made: that one starts (the build is done), with the command's arguments
-/// unless some are typed after it, and the command debugs it from now on.
-/// Typed in `SPC d` otherwise (`./app args`): that program as it is.
-pub fn debugProgramText(ed: *Editor, row: []const u8) !void {
-    const t = std.mem.trim(u8, row, " \t");
-    if (t.len == 0) return;
-    const asking = ed.debug_asking;
-    ed.debug_asking = false;
-    if (!sources.onPath(ed.io, "gdb")) return ed.setMessage(.err, "gdb isn't installed", .{});
-    var chosen = switch (try Debugger.plan(ed.gpa, t)) {
-        .unsupported => |why| return ed.setMessage(.err, "can't debug `{s}`: {s}", .{ t, why }),
-        .plan => |c| c,
-    };
-    var handed = false;
-    defer if (!handed) chosen.deinit(ed.gpa);
-    if (chosen.build != null or chosen.newest_in) {
-        return ed.setMessage(.info, "here it's a program and its arguments (zig-out/bin/app args)", .{});
-    }
-    if (asking) if (ed.debug_ask) |ask| {
-        const abs = try std.fs.path.resolve(ed.gpa, &.{ ed.debug_ask_root orelse ".", chosen.program });
-        ed.gpa.free(chosen.program);
-        chosen.program = abs;
-        try ed.rememberProgram(abs);
-        chosen.release = ask.release;
-        if (chosen.args.len == 0 and ask.args.len > 0) {
-            const args = try Debugger.dupeArgs(ed.gpa, ask.args);
-            ed.gpa.free(chosen.args);
-            chosen.args = args;
-        }
-        ed.endDebug();
-        return ed.launchDebug(chosen);
-    };
-    try ed.setDebugRoot();
-    try ed.inProject(&chosen);
-    try ed.setDebugCommand(t, true);
-    handed = true;
-    try ed.debugPlanned(chosen);
-}
-
-/// The program this project's build command debugs, this session (none or
-/// one). Caller frees each and the slice.
-pub fn debugPrograms(ed: *Editor) ![][]u8 {
-    const key = try ed.runKey();
-    defer ed.gpa.free(key);
-    var out: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (out.items) |x| ed.gpa.free(x);
-        out.deinit(ed.gpa);
-    }
-    for (ed.debug_programs.items) |d| {
-        if (std.mem.eql(u8, d.project, key)) try out.append(ed.gpa, try ed.gpa.dupe(u8, d.text));
-    }
-    return out.toOwnedSlice(ed.gpa);
-}
-
-/// That program, if it is still there (caller frees).
-fn rememberedProgram(ed: *Editor) !?[]u8 {
-    const key = try ed.runKey();
-    defer ed.gpa.free(key);
-    for (ed.debug_programs.items) |d| {
-        if (!std.mem.eql(u8, d.project, key)) continue;
-        if (ed.fileExists(d.text)) return try ed.gpa.dupe(u8, d.text);
-        break;
-    }
-    ed.forgetDebugProgram();
-    return null;
-}
-
-/// `abs` is what this project's build command debugs (for this session).
-fn rememberProgram(ed: *Editor, abs: []const u8) !void {
-    ed.forgetDebugProgram();
-    const key = try ed.runKey();
-    errdefer ed.gpa.free(key);
-    const t = try ed.gpa.dupe(u8, abs);
-    errdefer ed.gpa.free(t);
-    try ed.debug_programs.append(ed.gpa, .{ .project = key, .text = t });
-}
-
-/// Forgets it: the next debug of the build command looks again.
-pub fn forgetDebugProgram(ed: *Editor) void {
-    const key = ed.runKey() catch return;
-    defer ed.gpa.free(key);
-    var i: usize = 0;
-    while (i < ed.debug_programs.items.len) {
-        const d = ed.debug_programs.items[i];
-        if (std.mem.eql(u8, d.project, key)) {
-            d.deinit(ed.gpa);
-            _ = ed.debug_programs.orderedRemove(i);
-        } else i += 1;
-    }
-}
-
-/// After a build system's build: the program it made is looked for
-/// (`Debugger.Search`, off the main thread: a big folder takes a moment);
-/// `tickDebugSearch` goes on from there.
-fn askProgram(ed: *Editor, plan: Debugger.Plan, folder: []const u8) anyerror!void {
-    ed.cancelDebugSearch();
-    const out_dir = try std.fs.path.resolve(ed.gpa, &.{ folder, plan.program });
-    defer ed.gpa.free(out_dir);
-    const waiting = try plan.clone(ed.gpa);
-    if (ed.debug_ask) |old| old.deinit(ed.gpa);
-    ed.debug_ask = waiting;
-    ed.debug_search = try Debugger.Search.start(ed.gpa, ed.io, out_dir, folder, ed.wake_fn);
-    ed.setMessage(.info, "looking for the program the build made...", .{});
-}
-
-fn cancelDebugSearch(ed: *Editor) void {
-    if (ed.debug_search) |s| s.destroy();
-    ed.debug_search = null;
-}
-
-/// Takes `list` (and its strings) as the programs to pick from.
-fn setDebugFound(ed: *Editor, list: [][]u8) void {
-    for (ed.debug_found) |f| ed.gpa.free(f);
-    ed.gpa.free(ed.debug_found);
-    ed.debug_found = list;
-}
-
-/// The search is done: the only program is debugged; with several, the
-/// Debug picker lists them to pick from.
-fn tickDebugSearch(ed: *Editor) void {
-    const s = ed.debug_search orelse return;
-    if (!s.isDone()) return;
-    ed.debug_search = null;
-    defer s.destroy();
-    ed.searchDone(s) catch |err| ed.setMessage(.err, "could not start gdb: {s}", .{@errorName(err)});
-}
-
-fn searchDone(ed: *Editor, s: *Debugger.Search) !void {
-    const plan = ed.debug_ask orelse return;
-    if (s.found.len == 0) return ed.setMessage(.err, "the build made no program to debug (nothing compiled in {s})", .{s.folder});
-    if (s.found.len > 1) {
-        const root = try ed.gpa.dupe(u8, s.dir);
-        if (ed.debug_ask_root) |old| ed.gpa.free(old);
-        ed.debug_ask_root = root;
-        ed.setDebugFound(s.found);
-        s.found = &.{};
-        ed.debug_asking = true;
-        // The build's output would take the keys.
-        ed.popup = null;
-        try ed.openPicker(.debug, "");
-        ed.setMessage(.info, "which program? Enter debugs it (and `{s}` debugs it from now on, this session)", .{ed.debug_command orelse "the build"});
-        return;
-    }
-    // One: that's it.
-    var chosen = try plan.clone(ed.gpa);
-    defer chosen.deinit(ed.gpa);
-    const abs = try std.fs.path.resolve(ed.gpa, &.{ s.dir, s.found[0] });
-    ed.gpa.free(chosen.program);
-    chosen.program = abs;
-    chosen.newest_in = false;
-    try ed.rememberProgram(abs);
-    try ed.launchDebug(chosen);
-}
-
-/// Starts gdb on the planned program, its terminal the run popup.
-fn launchDebug(ed: *Editor, plan: Debugger.Plan) !void {
-    const folder = if (ed.debug_root) |r| try ed.gpa.dupe(u8, r) else try ed.commandFolder();
-    var folder_owned = true;
-    defer if (folder_owned) ed.gpa.free(folder);
-    const program = try ed.debugProgram(plan, folder) orelse {
-        if (plan.newest_in) return ed.askProgram(plan, folder);
-        return ed.setMessage(.err, "nothing to debug: no program at {s}", .{plan.program});
-    };
-    defer ed.gpa.free(program);
-    // The program's terminal, held open by a process that only waits (and
-    // ignores Ctrl-C, which pauses the program instead).
-    const t = try ed.spawnTerminalIn(&.{ "/bin/sh", "-c", "trap '' INT QUIT TSTP; exec sleep 2147483647" }, folder);
-    errdefer t.destroy();
-    var tty_buf: [128]u8 = undefined;
-    const tty = t.pty.deviceName(&tty_buf);
-
-    var arena_state: std.heap.ArenaAllocator = .init(ed.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var files: std.ArrayList(Debugger.Breakpoints) = .empty;
-    if (ed.breakpoints_on) for (ed.breakpoints.items) |b| {
-        const known = for (files.items) |f| {
-            if (std.mem.eql(u8, f.path, b.path)) break true;
-        } else false;
-        if (known) continue;
-        try files.append(arena, .{ .path = b.path, .lines = try ed.breakpointLines(arena, b.path) });
-    };
-    const log = config.dir(ed.gpa, .cache, "gdb.log");
-    defer if (log) |l| ed.gpa.free(l);
-    const args = try arena.alloc([]const u8, plan.args.len);
-    for (plan.args, args) |a, *out| out.* = a;
-    const d = try Debugger.start(ed.gpa, ed.io, .{
-        .program = program,
-        .args = args,
-        .cwd = folder,
-        .tty = tty,
-        .breakpoints = files.items,
-        .log = if (@import("builtin").is_test) null else log,
-        .wake = ed.wake_fn,
-    });
-    errdefer d.deinit();
-    const shown = try ed.gpa.dupe(u8, ed.debug_command orelse program);
-
-    // Nothing below fails: the session is the editor's from here.
-    if (ed.run) |old| old.destroy();
-    if (ed.run_command) |old| ed.gpa.free(old);
-    if (ed.run_root_owned) |old| ed.gpa.free(old);
-    ed.run = t;
-    ed.run_command = shown;
-    ed.run_root_owned = folder;
-    ed.run_root = folder;
-    folder_owned = false;
-    ed.run_started = Io.Timestamp.now(ed.io, .awake);
-    // Its end is reported from the debugger (the waiting process lives on).
-    ed.run_reported = true;
-    ed.run_debug = true;
-    ed.debugger = d;
-    ed.debug_frame = 0;
-    ed.popup = .run;
-    var line_buf: [512]u8 = undefined;
-    t.print(std.fmt.bufPrint(&line_buf, "\x1b[2mgdb: {s}   C-c pauses it{s}\x1b[0m\r\n", .{ program, if (plan.release) "\r\na release build: variables may be missing (SPC d, e changes the command)" else "" }) catch "");
-    ed.setMessage(.info, "debugging {s}: it stops at breakpoints and crashes", .{std.fs.path.basename(program)});
-}
-
-/// The program a plan starts, as an absolute path (caller frees), or null.
-fn debugProgram(ed: *Editor, plan: Debugger.Plan, folder: []const u8) !?[]u8 {
-    // Which program a build system runs isn't guessed (`startDebug`).
-    if (plan.newest_in) return null;
-    if (std.fs.path.isAbsolute(plan.program) or std.mem.indexOfScalar(u8, plan.program, '/') != null) {
-        const full = try std.fs.path.resolve(ed.gpa, &.{ folder, plan.program });
-        if (ed.fileExists(full)) return full;
-        ed.gpa.free(full);
-        return null;
-    }
-    // A name: found on PATH, as the shell would.
-    const path = std.c.getenv("PATH") orelse return null;
-    var dirs = std.mem.splitScalar(u8, std.mem.span(path), ':');
-    while (dirs.next()) |dir| {
-        if (dir.len == 0) continue;
-        const full = try std.fs.path.join(ed.gpa, &.{ dir, plan.program });
-        if (Io.Dir.accessAbsolute(ed.io, full, .{})) |_| return full else |_| ed.gpa.free(full);
-    }
-    return null;
-}
-
-/// Ends the debugging session, if any (the program is killed).
-pub fn endDebug(ed: *Editor) void {
-    const d = ed.debugger orelse return;
-    d.deinit();
-    ed.debugger = null;
-    ed.debug_frame = 0;
-}
-
-/// `x` in the Debug picker: stops the program (and gdb).
-pub fn stopDebug(ed: *Editor) void {
-    if (ed.debugger == null) return ed.setMessage(.info, "not debugging", .{});
-    ed.endDebug();
-    if (ed.run) |t| if (ed.run_debug) t.print("\r\n\x1b[1;31m✗ stopped\x1b[0;2m   r: debug again   q: close\x1b[0m");
-    ed.finishDebugTerminal();
-    ed.setMessage(.info, "stopped debugging", .{});
-}
-
-/// The program is gone: its terminal's waiting process can go too, so the
-/// popup is a finished run (q closes it, r debugs again).
-fn finishDebugTerminal(ed: *Editor) void {
-    if (!ed.run_debug) return;
-    if (ed.run) |t| t.pty.hangup();
-}
-
-fn tickDebugger(ed: *Editor) void {
-    const d = ed.debugger orelse return;
-    const up = d.poll();
-    if (up.note) if (d.takeNote()) |n| {
-        defer ed.gpa.free(n);
-        ed.notify(.err, "gdb: {s}", .{std.mem.sliceTo(n, '\n')});
-    };
-    if (up.ended) {
-        const code = d.exit_code;
-        ed.endDebug();
-        if (ed.picker) |p| if (p.kind == .debug) ed.closePicker();
-        if (ed.run) |t| if (ed.run_debug) {
-            var buf: [160]u8 = undefined;
-            const ok = code != null and code.? == 0;
-            const line = if (code) |c|
-                std.fmt.bufPrint(&buf, "\r\n\x1b[1;{s}m{s} exited {d}\x1b[0;2m   r: debug again   q: close\x1b[0m", .{ if (ok) "32" else "31", if (ok) "✓" else "✗", c }) catch ""
-            else
-                // No exit code: killed by a signal, or gdb itself went away.
-                std.fmt.bufPrint(&buf, "\r\n\x1b[1;31m✗ ended\x1b[0;2m   r: debug again   q: close\x1b[0m", .{}) catch "";
-            t.print(line);
-        };
-        ed.finishDebugTerminal();
-        ed.popup = .run;
-        if (code) |c| ed.setMessage(if (c == 0) .info else .err, "the program exited {d}", .{c}) else ed.setMessage(.err, "the debugging session ended (no exit code: killed, or gdb stopped)", .{});
-        return;
-    }
-    if (up.stopped) ed.showDebugStop();
-    if (up.vars) if (ed.picker) |p| if (p.kind == .debug) {
-        p.preview_for = null;
-    };
-}
-
-/// Where the program stopped: the innermost frame in your own code (a
-/// crash stops inside libc or the panic handler), shown in the editor,
-/// with the Debug picker over it.
-fn showDebugStop(ed: *Editor) void {
-    const d = ed.debugger orelse return;
-    const root = ed.run_root;
-    var pick: ?usize = null;
-    for (d.frames.items, 0..) |f, i| {
-        const path = f.path orelse continue;
-        if (!ed.fileExists(path)) continue;
-        if (pick == null) pick = i;
-        if (std.mem.startsWith(u8, path, root) and path.len > root.len and path[root.len] == '/') {
-            pick = i;
-            break;
-        }
-    }
-    ed.debug_frame = pick orelse 0;
-    const where = if (d.frames.items.len > 0) d.frames.items[ed.debug_frame].name else "?";
-    const level: Message.Kind = if (std.mem.startsWith(u8, d.reason, "signal") or std.mem.startsWith(u8, d.reason, "exception")) .err else .info;
-    // In the middle of something else (the command editor, another
-    // picker): it isn't taken away; `SPC d` goes to the stop.
-    const busy = ed.cmd_float != null or (ed.picker != null and ed.picker.?.kind != .debug);
-    if (busy) return ed.setMessage(level, "stopped ({s}) in {s}: SPC d", .{ d.reason, where });
-    ed.popup = null;
-    if (pick) |i| {
-        const f = d.frames.items[i];
-        ed.moveTo(f.path.?, f.line, 0) catch {};
-        ed.centerCursor();
-    }
-    ed.setMessage(level, "stopped ({s}) in {s}", .{ d.reason, where });
-    if (ed.picker) |p| {
-        p.refill() catch {};
-        p.selected = ed.debug_frame;
-        return;
-    }
-    ed.debug_asking = false;
-    ed.openPicker(.debug, "") catch return;
-    if (ed.picker) |p| p.selected = ed.debug_frame;
-}
-
-/// `n` / `s` / `f` / `c` in the Debug picker.
-pub fn debugStep(ed: *Editor, how: Debugger.Step) !void {
-    const d = ed.debugger orelse return ed.setMessage(.info, "not debugging: Ctrl-Enter on a command in SPC r", .{});
-    if (d.state != .stopped) return ed.setMessage(.info, "it's running (C-c in its output, or p, pauses it)", .{});
-    try d.step(how);
-    // Continuing shows the program until it stops again.
-    if (how == .cont) {
-        ed.closePicker();
-        ed.popup = .run;
-    }
-}
-
-/// `p` in the Debug picker: pauses the running program.
-pub fn debugPause(ed: *Editor) !void {
-    const d = ed.debugger orelse return;
-    try d.pause();
-}
-
-/// The Debug picker: in a session, the stack; else (or after it) the
-/// breakpoints. `SPC d`.
-pub fn openDebug(ed: *Editor) !void {
-    ed.debug_asking = false;
-    try ed.openPicker(.debug, "");
-    if (ed.picker) |p| if (ed.debugger) |d| if (d.state == .stopped) {
-        p.selected = ed.debug_frame;
-    };
-}
-
-/// Shows stack frame `i`: its line in the editor (and marked).
-pub fn showFrame(ed: *Editor, i: usize) !void {
-    const d = ed.debugger orelse return;
-    if (i >= d.frames.items.len) return;
-    ed.debug_frame = i;
-    const f = d.frames.items[i];
-    const path = f.path orelse return ed.setMessage(.info, "{s}: no source (a library without debug info)", .{f.name});
-    try ed.jumpTo(path, f.line, 0);
-    ed.centerCursor();
-}
-
-/// `b`: a breakpoint on the cursor's line, or off if there is one.
-pub fn toggleBreakpoint(ed: *Editor) !void {
-    const rel = ed.buffer.path orelse return ed.setMessage(.info, "breakpoints are for files", .{});
-    const path = try ed.absolutePath(rel);
-    var path_owned = true;
-    defer if (path_owned) ed.gpa.free(path);
-    const line: u32 = @intCast(ed.text().lineOf(ed.view.cursor));
-    try ed.saveBreakpoints();
-    for (ed.breakpoints.items, 0..) |b, i| if (b.line == line and std.mem.eql(u8, b.path, path)) {
-        ed.gpa.free(b.path);
-        _ = ed.breakpoints.orderedRemove(i);
-        ed.setMessage(.info, "breakpoint removed: line {d}", .{line + 1});
-        return ed.sendBreakpoints(path);
-    };
-    try ed.breakpoints.append(ed.gpa, .{ .path = path, .line = line });
-    path_owned = false;
-    if (ed.breakpoints_on) {
-        ed.setMessage(.info, "breakpoint: line {d} (runs go through gdb now)", .{line + 1});
-    } else ed.setMessage(.info, "breakpoint: line {d} (breakpoints are off: t in SPC d)", .{line + 1});
-    try ed.sendBreakpoints(path);
-}
-
-/// Removes breakpoint `i` (the Debug picker's row).
-pub fn removeBreakpoint(ed: *Editor, i: usize) !void {
-    if (i >= ed.breakpoints.items.len) return;
-    try ed.saveBreakpoints();
-    const b = ed.breakpoints.orderedRemove(i);
-    defer ed.gpa.free(b.path);
-    try ed.sendBreakpoints(b.path);
-}
-
-/// `B`: removes every breakpoint (`u` brings them back).
-pub fn clearBreakpoints(ed: *Editor) !void {
-    if (ed.breakpoints.items.len == 0) return ed.setMessage(.info, "no breakpoints", .{});
-    try ed.saveBreakpoints();
-    const old = try ed.breakpoints.toOwnedSlice(ed.gpa);
-    defer {
-        freeBreakpoints(ed.gpa, old);
-        ed.gpa.free(old);
-    }
-    try ed.sendAllBreakpoints(old);
-    ed.setMessage(.info, "removed {d} breakpoint{s} (u brings them back)", .{ old.len, if (old.len == 1) "" else "s" });
-}
-
-/// `t`: all breakpoints on or off. Off, they're kept (and shown hollow),
-/// but runs run normally and gdb doesn't stop at them.
-pub fn toggleBreakpointsOn(ed: *Editor) !void {
-    ed.breakpoints_on = !ed.breakpoints_on;
-    try ed.sendAllBreakpoints(&.{});
-    if (ed.breakpoints_on) {
-        ed.setMessage(.info, "breakpoints on: runs go through gdb", .{});
-    } else ed.setMessage(.info, "breakpoints off (kept): runs run normally", .{});
-}
-
-/// `u`: the breakpoints as they were before the last change.
-pub fn undoBreakpoints(ed: *Editor) !void {
-    const before = ed.breakpoint_undo.pop() orelse return ed.setMessage(.info, "no breakpoint changes to undo", .{});
-    defer ed.gpa.free(before);
-    const now = try ed.breakpoints.toOwnedSlice(ed.gpa);
-    defer {
-        freeBreakpoints(ed.gpa, now);
-        ed.gpa.free(now);
-    }
-    try ed.breakpoints.appendSlice(ed.gpa, before);
-    // Files that had some then and have none now are told too.
-    try ed.sendAllBreakpoints(now);
-    ed.setMessage(.info, "breakpoints back as they were ({d})", .{before.len});
-}
-
-/// Remembers the breakpoints before a change, for `u`.
-fn saveBreakpoints(ed: *Editor) !void {
-    const copy = try ed.gpa.alloc(Breakpoint, ed.breakpoints.items.len);
-    var n: usize = 0;
-    errdefer {
-        freeBreakpoints(ed.gpa, copy[0..n]);
-        ed.gpa.free(copy);
-    }
-    for (ed.breakpoints.items) |b| {
-        copy[n] = .{ .path = try ed.gpa.dupe(u8, b.path), .line = b.line };
-        n += 1;
-    }
-    try ed.breakpoint_undo.append(ed.gpa, copy);
-    if (ed.breakpoint_undo.items.len > 100) {
-        const oldest = ed.breakpoint_undo.orderedRemove(0);
-        freeBreakpoints(ed.gpa, oldest);
-        ed.gpa.free(oldest);
-    }
-}
-
-fn freeBreakpoints(gpa: Allocator, list: []const Breakpoint) void {
-    for (list) |b| gpa.free(b.path);
-}
-
-/// Tells gdb every file's breakpoints, and those of `also` (files that may
-/// have none left).
-fn sendAllBreakpoints(ed: *Editor, also: []const Breakpoint) !void {
-    if (ed.debugger == null) return;
-    var arena_state: std.heap.ArenaAllocator = .init(ed.gpa);
-    defer arena_state.deinit();
-    var paths: std.StringArrayHashMapUnmanaged(void) = .empty;
-    for (ed.breakpoints.items) |b| try paths.put(arena_state.allocator(), b.path, {});
-    for (also) |b| try paths.put(arena_state.allocator(), b.path, {});
-    for (paths.keys()) |p| try ed.sendBreakpoints(p);
-}
-
-/// Lines were added or removed in `b`: its breakpoints stay on their lines
-/// (one whose line is deleted moves to the line it was joined into), in
-/// the undo history too. gdb isn't told: what it runs was built from the
-/// file as it was; the next debug sends them where they are now.
-fn breakpointLinesChanged(ctx: *anyopaque, b: *const Buffer, edit: Buffer.LineEdit) void {
-    const ed: *Editor = @ptrCast(@alignCast(ctx));
-    if (ed.breakpoints.items.len == 0 and ed.breakpoint_undo.items.len == 0) return;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buf);
-    const path = std.fs.path.resolve(fba.allocator(), &.{ ed.cwd, b.path orelse return }) catch return;
-    for (ed.breakpoint_undo.items) |list| for (list) |*bp| {
-        if (std.mem.eql(u8, bp.path, path)) bp.line = edit.apply(bp.line);
-    };
-    for (ed.breakpoints.items) |*bp| {
-        if (std.mem.eql(u8, bp.path, path)) bp.line = edit.apply(bp.line);
-    }
-    // Two that ended up on one line are one.
-    var i: usize = 0;
-    while (i < ed.breakpoints.items.len) : (i += 1) {
-        const a = ed.breakpoints.items[i];
-        var j = i + 1;
-        while (j < ed.breakpoints.items.len) {
-            const o = ed.breakpoints.items[j];
-            if (o.line == a.line and std.mem.eql(u8, o.path, a.path)) {
-                ed.gpa.free(o.path);
-                _ = ed.breakpoints.orderedRemove(j);
-            } else j += 1;
-        }
-    }
-}
-
-/// The breakpoint lines in `path` (absolute), sorted.
-pub fn breakpointLines(ed: *Editor, gpa: Allocator, path: []const u8) ![]u32 {
-    var out: std.ArrayList(u32) = .empty;
-    for (ed.breakpoints.items) |b| if (std.mem.eql(u8, b.path, path)) try out.append(gpa, b.line);
-    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
-    return out.toOwnedSlice(gpa);
-}
-
-/// Tells gdb `path`'s breakpoints now, in a session.
-fn sendBreakpoints(ed: *Editor, path: []const u8) !void {
-    const d = ed.debugger orelse return;
-    if (!ed.breakpoints_on) return d.setBreakpoints(path, &.{});
-    const lines = try ed.breakpointLines(ed.gpa, path);
-    defer ed.gpa.free(lines);
-    try d.setBreakpoints(path, lines);
-}
-
-/// For drawing `b`'s gutter: whether `line` has a breakpoint, and whether
-/// it's where the program is stopped (the shown frame).
-pub fn debugMarks(ed: *const Editor, abs: []const u8, line: usize) DebugMarks {
-    var out: DebugMarks = .{};
-    for (ed.breakpoints.items) |bp| if (bp.line == line and std.mem.eql(u8, bp.path, abs)) {
-        out.breakpoint = true;
-        break;
-    };
-    if (ed.debugger) |d| if (d.state == .stopped and ed.debug_frame < d.frames.items.len) {
-        const f = d.frames.items[ed.debug_frame];
-        if (f.line == line) if (f.path) |p| {
-            out.here = std.mem.eql(u8, p, abs);
-        };
-    };
-    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -7883,7 +7051,7 @@ pub fn applyFormatEdits(ed: *Editor, b: *Buffer, edits: []const Lsp.TextEdit, th
     if (!then_save) ed.setMessage(.info, "formatted", .{});
 }
 
-fn fileExists(ed: *Editor, path: []const u8) bool {
+pub fn fileExists(ed: *Editor, path: []const u8) bool {
     Io.Dir.cwd().access(ed.io, path, .{}) catch return false;
     return true;
 }
@@ -13666,8 +12834,8 @@ test "debugging: a breakpoint stops the program there, stepping, locals, the exi
     defer ed.deinit();
     try ed.openFile(src);
     try ed.feed("3G"); // `int c = a + b;`
-    try ed.toggleBreakpoint();
-    try testing.expectEqual(1, ed.breakpoints.items.len);
+    try debugging.toggleBreakpoint(&ed);
+    try testing.expectEqual(1, ed.dbg.breakpoints.items.len);
     const S = struct {
         /// Ticks until `done`, or about ten seconds.
         fn until(e: *Editor, comptime done: fn (*Editor) bool) !void {
@@ -13679,16 +12847,16 @@ test "debugging: a breakpoint stops the program there, stepping, locals, the exi
             return error.Timeout;
         }
         fn varsIn(e: *Editor) bool {
-            const d = e.debugger orelse return false;
+            const d = e.dbg.session orelse return false;
             return d.state == .stopped and d.frames.items.len > 0 and d.frames.items[0].vars_left == 0 and d.frames.items[0].vars.items.len > 0;
         }
         fn ended(e: *Editor) bool {
-            return e.debugger == null;
+            return e.dbg.session == null;
         }
     };
-    try ed.startDebug(out);
+    try debugging.start(&ed, out);
     try S.until(&ed, S.varsIn);
-    const d = ed.debugger.?;
+    const d = ed.dbg.session.?;
     try testing.expectEqualStrings("add", d.frames.items[0].name);
     try testing.expectEqual(2, d.frames.items[0].line);
     try testing.expectEqualStrings("main", d.frames.items[1].name);
@@ -13696,14 +12864,14 @@ test "debugging: a breakpoint stops the program there, stepping, locals, the exi
     try testing.expect(std.mem.startsWith(u8, d.frames.items[0].vars.items, "a = 2\nb = 3\nc = "));
     // The editor is on the stop, marked, with the Debug picker open.
     try testing.expectEqual(2, ed.cursorLine());
-    try testing.expect(ed.debugMarks(src, 2).here and ed.debugMarks(src, 2).breakpoint);
+    try testing.expect(debugging.marks(&ed, src, 2).here and debugging.marks(&ed, src, 2).breakpoint);
     try testing.expect(ed.picker != null and ed.picker.?.kind == .debug);
 
     // `n`: on to `return c;`, where c is 5.
     try ed.feed("n");
     try S.until(&ed, S.varsIn);
-    try testing.expectEqual(3, ed.debugger.?.frames.items[0].line);
-    try testing.expect(std.mem.indexOf(u8, ed.debugger.?.frames.items[0].vars.items, "c = 5") != null);
+    try testing.expectEqual(3, ed.dbg.session.?.frames.items[0].line);
+    try testing.expect(std.mem.indexOf(u8, ed.dbg.session.?.frames.items[0].vars.items, "c = 5") != null);
     try testing.expectEqual(3, ed.cursorLine());
 
     // `c`: runs to the end; the exit is reported in its output.
@@ -13729,30 +12897,30 @@ test "breakpoints: on/off keeps them, clearing and undo, runs choose gdb" {
     var ed = try testEditor("");
     defer ed.deinit();
     try ed.openFile(src);
-    try ed.toggleBreakpoint();
+    try debugging.toggleBreakpoint(&ed);
     try ed.feed("j");
-    try ed.toggleBreakpoint();
-    try testing.expectEqual(2, ed.breakpoints.items.len);
-    try testing.expect(ed.projectHasBreakpoints());
+    try debugging.toggleBreakpoint(&ed);
+    try testing.expectEqual(2, ed.dbg.breakpoints.items.len);
+    try testing.expect(debugging.hasBreakpoints(&ed));
     // Off: kept, but runs run normally.
-    try ed.toggleBreakpointsOn();
-    try testing.expectEqual(2, ed.breakpoints.items.len);
-    try testing.expect(!ed.projectHasBreakpoints());
-    try ed.toggleBreakpointsOn();
+    try debugging.toggleBreakpointsOn(&ed);
+    try testing.expectEqual(2, ed.dbg.breakpoints.items.len);
+    try testing.expect(!debugging.hasBreakpoints(&ed));
+    try debugging.toggleBreakpointsOn(&ed);
     // Removing all, then undo brings them back; undo again: before the second.
-    try ed.clearBreakpoints();
-    try testing.expectEqual(0, ed.breakpoints.items.len);
-    try ed.undoBreakpoints();
-    try testing.expectEqual(2, ed.breakpoints.items.len);
-    try ed.undoBreakpoints();
-    try testing.expectEqual(1, ed.breakpoints.items.len);
-    try testing.expectEqual(0, ed.breakpoints.items[0].line);
+    try debugging.clearBreakpoints(&ed);
+    try testing.expectEqual(0, ed.dbg.breakpoints.items.len);
+    try debugging.undoBreakpoints(&ed);
+    try testing.expectEqual(2, ed.dbg.breakpoints.items.len);
+    try debugging.undoBreakpoints(&ed);
+    try testing.expectEqual(1, ed.dbg.breakpoints.items.len);
+    try testing.expectEqual(0, ed.dbg.breakpoints.items[0].line);
     // Toggling a line off and undoing it.
     try ed.feed("k");
-    try ed.toggleBreakpoint();
-    try testing.expectEqual(0, ed.breakpoints.items.len);
-    try ed.undoBreakpoints();
-    try testing.expectEqual(1, ed.breakpoints.items.len);
+    try debugging.toggleBreakpoint(&ed);
+    try testing.expectEqual(0, ed.dbg.breakpoints.items.len);
+    try debugging.undoBreakpoints(&ed);
+    try testing.expectEqual(1, ed.dbg.breakpoints.items.len);
 }
 
 test "debugging a build's program: the only one is used, several are asked for; remembered this session" {
@@ -13779,7 +12947,7 @@ test "debugging a build's program: the only one is used, several are asked for; 
         fn untilEnd(e: *Editor) !void {
             for (0..2000) |_| {
                 e.tick();
-                if (e.debugger == null) return;
+                if (e.dbg.session == null) return;
                 testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
             }
             return error.Timeout;
@@ -13788,7 +12956,7 @@ test "debugging a build's program: the only one is used, several are asked for; 
         fn untilFound(e: *Editor) !void {
             for (0..2000) |_| {
                 e.tick();
-                if (e.debug_search == null) return;
+                if (e.dbg.search == null) return;
                 testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
             }
             return error.Timeout;
@@ -13804,15 +12972,15 @@ test "debugging a build's program: the only one is used, several are asked for; 
     try ed.openFile(src);
     const plan: Debugger.Plan = .{ .program = @constCast("zig-out/bin"), .newest_in = true, .args = &.{} };
     // The build made one program: it's debugged, no question.
-    try ed.launchDebug(plan);
+    try debugging.launch(&ed, plan);
     try S.untilFound(&ed);
-    try testing.expect(ed.debugger != null);
+    try testing.expect(ed.dbg.session != null);
     try S.untilEnd(&ed);
     const shown = try ed.run.?.screenText(gpa);
     defer gpa.free(shown);
     try testing.expect(std.mem.indexOf(u8, shown, "exited 3") != null);
     {
-        const programs = try ed.debugPrograms();
+        const programs = try debugging.pickedPrograms(&ed);
         defer {
             for (programs) |x| gpa.free(x);
             gpa.free(programs);
@@ -13822,11 +12990,11 @@ test "debugging a build's program: the only one is used, several are asked for; 
 
     // Two programs, none picked: the Debug picker lists only them.
     try S.compile(dir, src, "out/u");
-    ed.forgetDebugProgram();
-    try ed.launchDebug(plan);
+    debugging.forgetProgram(&ed);
+    try debugging.launch(&ed, plan);
     try S.untilFound(&ed);
-    try testing.expect(ed.debugger == null);
-    try testing.expect(ed.debug_asking);
+    try testing.expect(ed.dbg.session == null);
+    try testing.expect(ed.dbg.asking);
     try testing.expectEqualStrings("Debug which program?", ed.picker.?.title());
     settlePicker(&ed);
     try testing.expectEqual(2, ed.picker.?.rowCount());
@@ -13834,10 +13002,10 @@ test "debugging a build's program: the only one is used, several are asked for; 
     try testing.expectEqualStrings("out/t", ed.picker.?.itemAt(1).?.text);
     // Enter: that one starts (nothing is built again) and is remembered.
     try ed.feed("<CR>");
-    try testing.expect(ed.debugger != null and !ed.debug_asking);
+    try testing.expect(ed.dbg.session != null and !ed.dbg.asking);
     try S.untilEnd(&ed);
     {
-        const programs = try ed.debugPrograms();
+        const programs = try debugging.pickedPrograms(&ed);
         defer {
             for (programs) |x| gpa.free(x);
             gpa.free(programs);
@@ -13850,12 +13018,12 @@ test "debugging a build's program: the only one is used, several are asked for; 
     // one, whatever else is lying about the project.
     try tmp.dir.createDirPath(testing.io, "zig-out/bin");
     try S.compile(dir, src, "zig-out/bin/app");
-    ed.forgetDebugProgram();
-    try ed.launchDebug(plan);
+    debugging.forgetProgram(&ed);
+    try debugging.launch(&ed, plan);
     try S.untilFound(&ed);
-    try testing.expect(ed.debugger != null and !ed.debug_asking);
+    try testing.expect(ed.dbg.session != null and !ed.dbg.asking);
     try S.untilEnd(&ed);
-    const programs = try ed.debugPrograms();
+    const programs = try debugging.pickedPrograms(&ed);
     defer {
         for (programs) |x| gpa.free(x);
         gpa.free(programs);
@@ -13877,7 +13045,7 @@ test "SPC d: C-j / C-k move the editor's cursor, the picker staying open; b ther
     try testing.expectEqual(1, ed.cursorLine());
     try testing.expect(ed.picker != null);
     try ed.feed("b");
-    try testing.expectEqual(1, ed.breakpoints.items[0].line);
+    try testing.expectEqual(1, ed.dbg.breakpoints.items[0].line);
 }
 
 test "debugging a runner command: the first time it comes up to change; remembered this session" {
@@ -13899,7 +13067,7 @@ test "debugging a runner command: the first time it comes up to change; remember
         fn untilEnd(e: *Editor) !void {
             for (0..2000) |_| {
                 e.tick();
-                if (e.debugger == null) return;
+                if (e.dbg.session == null) return;
                 testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
             }
             return error.Timeout;
@@ -13912,13 +13080,13 @@ test "debugging a runner command: the first time it comes up to change; remember
     const cmd = try std.fmt.allocPrint(gpa, "{s} a", .{prog});
     defer gpa.free(cmd);
     // First time: the command editor, on the command, in normal mode.
-    try ed.debugVia(cmd);
-    try testing.expect(ed.cmd_float != null and ed.debugger == null);
+    try debugging.debug(&ed, cmd);
+    try testing.expect(ed.cmd_float != null and ed.dbg.session == null);
     try testing.expectEqual(Mode.normal, ed.mode);
     try expectText(&ed, cmd);
     try ed.feed("A b<Esc><CR>"); // vim: another argument, then Enter debugs
     try testing.expectEqual(null, ed.cmd_float);
-    try testing.expect(ed.debugger != null);
+    try testing.expect(ed.dbg.session != null);
     try S.untilEnd(&ed);
     {
         const shown = try ed.run.?.screenText(gpa);
@@ -13926,18 +13094,18 @@ test "debugging a runner command: the first time it comes up to change; remember
         try testing.expect(std.mem.indexOf(u8, shown, "exited 3") != null); // t a b
     }
     // Again: no question, the changed command.
-    try ed.debugVia(cmd);
+    try debugging.debug(&ed, cmd);
     try testing.expectEqual(null, ed.cmd_float);
-    try testing.expect(ed.debugger != null);
-    try testing.expect(std.mem.endsWith(u8, ed.debug_command.?, " a b"));
+    try testing.expect(ed.dbg.session != null);
+    try testing.expect(std.mem.endsWith(u8, ed.dbg.command.?, " a b"));
     try S.untilEnd(&ed);
     // The Debug picker's row is that command; e changes it again.
-    const row = (try ed.debugRow()).?;
+    const row = (try debugging.commandRow(&ed)).?;
     defer gpa.free(row.cmd);
     defer gpa.free(row.from);
     try testing.expect(row.edited);
     try testing.expectEqualStrings(cmd, row.from);
-    try ed.debugRowEdit();
+    try debugging.editCommandRow(&ed);
     try testing.expect(ed.cmd_float != null);
     try ed.feed("<Esc>");
     try testing.expectEqual(null, ed.cmd_float);
@@ -13967,10 +13135,10 @@ test "breakpoints follow their lines through edits and undo" {
     ed.options.format_on_save = false;
     try ed.openFile(src);
     try ed.feed("3G"); // "three"
-    try ed.toggleBreakpoint();
+    try debugging.toggleBreakpoint(&ed);
     try ed.feed("4G");
-    try ed.toggleBreakpoint();
-    const bps = &ed.breakpoints;
+    try debugging.toggleBreakpoint(&ed);
+    const bps = &ed.dbg.breakpoints;
     try testing.expectEqual(2, bps.items[0].line);
     // A line added above (O on the breakpoint's own line too) moves it down.
     try ed.feed("ggOzero<Esc>");

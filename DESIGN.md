@@ -743,7 +743,8 @@ src/terminal/
 
 ## Debugger (gdb)
 
-`Debugger.zig` speaks the Debug Adapter Protocol to `gdb -i dap` (through the
+`debugging.zig` is the editor's side (what to debug, the stop, breakpoints;
+its state is `Editor.dbg`). `Debugger.zig` speaks the Debug Adapter Protocol to `gdb -i dap` (through the
 LSP's stdio client; started with `setsid` so gdb doesn't take the terminal,
 and killed with SIGKILL: gdb ignores SIGTERM). The program runs on the run
 popup's own terminal (gdb's `inferior-tty`, held open by a waiting process),
@@ -780,7 +781,10 @@ so its output and input work as in a plain run; Ctrl-C there pauses it.
   `d` remove the row's, `B` remove all, `t` all on/off (off: kept, hollow
   `○`, runs run normally), `u` undo. `C-j` / `C-k` move the editor's cursor
   with the picker open.
-- Not yet: breakpoints following edits, Zig pretty printers, values inline,
+- Breakpoints follow their lines as you edit (a buffer tells a line
+  listener when lines are added or removed); gdb gets the new lines at the
+  next debug. A build's program is looked for off the main thread.
+- Not yet: Zig pretty printers, values inline,
   expanding structs, evaluating expressions.
 
 ## Claude Code (IDE protocol)

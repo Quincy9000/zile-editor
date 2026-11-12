@@ -41,7 +41,7 @@ pub const State = enum { starting, running, stopped, exited };
 
 const max_frames = 64;
 /// Frames whose variables are fetched on a stop (the ones you'd look at).
-const max_var_frames = 16;
+pub const max_var_frames = 16;
 const max_value = 240;
 
 pub const Frame = struct {

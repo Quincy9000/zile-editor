@@ -10,6 +10,7 @@
 //! so each family is written once and every motion works with every operator.
 
 const std = @import("std");
+const debugging = @import("debugging.zig");
 const Editor = @import("Editor.zig");
 const Text = @import("core/Text.zig");
 const motions = @import("core/motions.zig");
@@ -2122,13 +2123,13 @@ fn debugCmd(comptime action: enum { menu, breakpoint, next, step_in, step_out, c
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
-                .menu => try ed.openDebug(),
-                .breakpoint => try ed.toggleBreakpoint(),
-                .next => try ed.debugStep(.next),
-                .step_in => try ed.debugStep(.step_in),
-                .step_out => try ed.debugStep(.step_out),
-                .cont => try ed.debugStep(.cont),
-                .stop => ed.stopDebug(),
+                .menu => try debugging.open(ed),
+                .breakpoint => try debugging.toggleBreakpoint(ed),
+                .next => try debugging.step(ed, .next),
+                .step_in => try debugging.step(ed, .step_in),
+                .step_out => try debugging.step(ed, .step_out),
+                .cont => try debugging.step(ed, .cont),
+                .stop => debugging.stop(ed),
             }
         }
     }.run;
