@@ -70,6 +70,9 @@ final_newline: bool = true,
 crlf: bool = false,
 /// View state while this buffer is not shown.
 saved: struct { cursor: usize = 0, top: usize = 0, left: usize = 0 } = .{},
+/// Just opened: the first time it is shown its cursor's line is centred
+/// (the window's height is known only then).
+center_on_show: bool = false,
 /// Times written to disk; the editor keeps the undo history on disk in
 /// step (`undo_kept` is the count it last did that for).
 saves: u64 = 0,

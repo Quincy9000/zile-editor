@@ -4249,6 +4249,12 @@ pub fn clickCell(ed: *Editor, row: usize, col: usize) void {
 pub fn setViewSize(ed: *Editor, rows: usize, cols: usize) void {
     ed.view.rows = @max(rows, 1);
     ed.view.cols = @max(cols, 1);
+    // A file just opened: where it was left (or where a jump goes) in the
+    // middle of the window, not at its edge.
+    if (ed.buffer.center_on_show) {
+        ed.buffer.center_on_show = false;
+        ed.centerCursor();
+    }
     ed.scrollToCursor();
 }
 
@@ -4449,6 +4455,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
     }
 
     var loaded = try Buffer.load(ed.gpa, ed.io, norm);
+    loaded.center_on_show = true;
     loaded.line_listener = .{ .ctx = ed, .changed = debugging.breakpointLinesChanged };
     loaded.project = ed.projectOf(norm);
     ed.enterProject(loaded.project);
@@ -4500,7 +4507,10 @@ pub fn moveTo(ed: *Editor, path: []const u8, line: usize, col: usize) !void {
     const t = ed.text();
     const l = @min(line, t.lineCount() - 1);
     ed.revealLine(l);
+    const before = ed.view.top;
     ed.setCursor(t.lineStart(l) + @min(col, t.lineLen(l)));
+    // A line that wasn't in view: in the middle of it, not at its edge.
+    if (!ed.buffer.center_on_show and (l < before or l >= before + ed.view.rows)) ed.centerCursor();
 }
 
 /// Paths inside the cwd are stored relative to it, without "./".
@@ -9660,6 +9670,33 @@ test "saving a TypeScript file with no servers running still saves" {
     const saved = try tmp.dir.readFileAlloc(testing.io, "a.ts", testing.allocator, .limited(64));
     defer testing.allocator.free(saved);
     try testing.expectEqualStrings("const x = 1;\n", saved);
+}
+
+test "opening a file: its cursor's line is centred in the window, not at the edge" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var lines: std.ArrayList(u8) = .empty;
+    defer lines.deinit(gpa);
+    for (0..300) |i| try lines.print(gpa, "line {d}\n", .{i});
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "long.txt", .data = lines.items });
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const path = try std.fs.path.join(gpa, &.{ dir, "long.txt" });
+    defer gpa.free(path);
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.setViewSize(40, 80);
+    // A jump far into it: the line in the middle.
+    try ed.jumpTo(path, 200, 0);
+    ed.setViewSize(40, 80); // the next frame
+    try testing.expectEqual(200, ed.cursorLine());
+    try testing.expectEqual(180, ed.view.top);
+    // Within the view: no scrolling.
+    try ed.jumpTo(path, 205, 0);
+    try testing.expectEqual(180, ed.view.top);
+    try ed.jumpTo(path, 20, 0);
+    try testing.expectEqual(0, ed.view.top);
 }
 
 test "SQL file: Ctrl-Enter runs the statement at the cursor; the runner has no SQL in it" {
