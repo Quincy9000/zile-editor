@@ -9534,6 +9534,20 @@ test "saving a TypeScript file with no servers running still saves" {
     try testing.expectEqualStrings("const x = 1;\n", saved);
 }
 
+test "SQL file: SPC r lists its statement first, so Enter runs it" {
+    var ed = try testEditorAs("q.sql", "select 1;\nselect 2;\n");
+    defer ed.deinit();
+    try ed.feed("j r");
+    const p = ed.picker orelse return error.TestUnexpectedResult;
+    p.sync();
+    try testing.expectEqualStrings("SQL: the statement at the cursor", p.itemAt(0).?.text);
+    try testing.expectEqualStrings("SQL: the whole file", p.itemAt(1).?.text);
+    // No database under tests: it gets as far as looking for one.
+    try ed.feed("<CR>");
+    try testing.expect(ed.picker == null);
+    try testing.expect(std.mem.startsWith(u8, ed.message.buf[0..ed.message.len], "no database"));
+}
+
 test "SQL completion: tables and columns from the database, after an alias its columns" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});

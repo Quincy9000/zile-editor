@@ -528,9 +528,10 @@ comments, `${VAR}`. They're not formatted on save (shfmt would rewrite
 
 **SQL** (tree-sitter-sql, pinned to its `gh-pages` commit: only that branch
 carries the generated parser): `.sql` `.psql` `.pgsql`, `--` comments,
-`pg_format` formatting. `SPC r s` runs the statement at the cursor (from the
-`;` before it to its own; quotes and `--` comments skipped), or the selected
-lines in visual mode; `SPC r f` the whole file (`sql.zig`). The database, as
+`pg_format` formatting. In a SQL file `SPC r` lists its SQL first: Enter
+runs the statement at the cursor (from the `;` before it to its own; quotes
+and `--` comments skipped), or the selected lines in visual mode; the next
+row the whole file (`sql.zig`). (`s` / `S` after Esc do the same.) The database, as
 the nvim config: `$DATABASE_URL`, else `DATABASE_URL` in the nearest `.env`
 above the file, then above the working folder. `postgres://` runs `psql -X -v
 ON_ERROR_STOP=1`, `sqlite:path` (or a `.db` / `.sqlite` path) `sqlite3 -header

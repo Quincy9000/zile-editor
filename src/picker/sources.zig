@@ -2766,10 +2766,27 @@ const Runner = struct {
             for (history) |c| ed.gpa.free(c);
             ed.gpa.free(history);
         }
+        // In a SQL file what you'd run is its SQL: those rows come first,
+        // so `SPC r Enter` runs the statement the cursor is in.
+        if (isSql(ed)) {
+            const selected = ed.mode == .visual;
+            try items.append(.{ .text = if (selected) "SQL: the selected lines" else "SQL: the statement at the cursor", .detail = "on the database", .id = sql_statement });
+            try items.append(.{ .text = "SQL: the whole file", .detail = "on the database", .id = sql_file });
+        }
         for (history, 0..) |c, i| try items.append(.{ .text = c, .detail = if (i == 0) "last" else "", .id = @intCast(i) });
     }
 
+    /// Rows that aren't commands of the history.
+    const sql_statement = std.math.maxInt(u32);
+    const sql_file = std.math.maxInt(u32) - 1;
+
+    fn isSql(ed: *Editor) bool {
+        const syn = ed.buffer.syntax orelse return false;
+        return std.mem.eql(u8, syn.lang.name, "sql");
+    }
+
     pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id == sql_statement or item.id == sql_file) return ed.runSql(item.id == sql_file);
         try ed.runFromRunner(item.text);
     }
 
@@ -2812,6 +2829,17 @@ const Runner = struct {
     };
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id == sql_statement or item.id == sql_file) {
+            const t = ed.text();
+            const all = t.slice(0, t.len());
+            const what = if (item.id == sql_file) all else if (ed.mode == .visual) blk: {
+                const first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
+                const last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
+                break :blk t.slice(t.lineStart(first), t.lineEnd(last));
+            } else @import("../sql.zig").statementAt(all, ed.view.cursor);
+            try out.text.print(ed.gpa, "Enter runs this on the database\n(DATABASE_URL: the environment, or a .env above the file):\n\n{s}", .{std.mem.trim(u8, what, " \t\r\n")});
+            return;
+        }
         const folder = ed.commandFolder() catch return;
         defer ed.gpa.free(folder);
         const how = if (debugging.hasBreakpoints(ed)) "under gdb: this project has breakpoints\n(t in SPC d turns them off)" else "through your shell (C-Enter: under gdb)";
