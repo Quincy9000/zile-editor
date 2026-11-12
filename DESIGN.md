@@ -534,14 +534,14 @@ skipped), in insert mode too (you stay typing); in visual mode the selected
 lines. The whole file: "Run the whole SQL file" in the command picker
 (`sql.zig`). The runner (`SPC r`) is shell commands only. A statement runs in the
 background (`sql.Results`: `psql -q --csv` / `sqlite3 -csv`, no shell) and
-its rows open in the **SQL results** picker: a row each however wide the
-table (values cut to 48 in the list), the preview the selected row with a
-line per column, typing filters on any value. Enter opens a row: the list
-is then its columns (the preview a value in full), Enter / `y` yank that
-one value, `b` back to the rows. On a row `y` yanks it (tabs between); `Y`
-all rows as CSV; `o` opens it all as a table in a buffer (`sql.tableText`:
-columns lined up, never wrapped), where vim selects: `V` rows, Ctrl-v a
-column, `/` finds; "SQL results" in the command picker
+its rows open in the **SQL results grid** (`ResultGrid.zig`, docked
+like a picker, over the code): a cell cursor moved with vim's keys (`hjkl`,
+`w` / `b` next / previous cell, on across rows, `0` `$` `gg` `G`, counts,
+Ctrl-d/u), `v` (or Ctrl-v) a block of cells, `V` rows, `y` yanks the cell
+or the selection (tabs between values, a line per row), `Y` the row, `/`
+searches the cells (`n` / `N`, around the end), `o` the results as a table
+in a buffer (`sql.tableText`, never wrapped), Esc / `q` closes. The line
+under the rows shows the cell at the cursor in full. "SQL results" in the command picker
 brings the last ones back. Results that arrive while you type don't open
 over you (a message says how many rows). An error is the database's own
 words in a box at the cursor; no rows back is a message. The whole file

@@ -14,6 +14,7 @@ const render = @import("render.zig");
 const gfx = @import("gfx.zig");
 const icons = @import("icons.zig");
 const Replace = @import("../Replace.zig");
+const ResultGrid = @import("../ResultGrid.zig");
 
 const rect = render.rect;
 const cells = render.cells;
@@ -200,7 +201,6 @@ fn drawQueryLine(p: *Picker, font: *const Font, theme: *const Theme, bx: f32, y:
             .buffers => "  j/k move · Enter open · i type",
             .runner => "  j/k move · Enter run · i type",
             .quickfix => "  j/k move · Enter open · x clear the list · i type",
-            .sql_results => if (p.ed.sql_row != null) "  j/k move · Enter yank the value · i type to filter · q close" else "  j/k move · Enter open the row · i type to filter · q close",
             else => if (sources.rowKeys(p.kind).len > 0) blk: {
                 // `q` may be a row (the start screen's Quit): then Esc closes.
                 const q_row = std.mem.indexOfScalar(u8, sources.rowKeys(p.kind), 'q') != null;
@@ -564,4 +564,129 @@ fn drawMarked(font: *const Font, line: []const u8, marks: []const [2]usize, x: f
         if (cp != ' ' and cp != '\r') font.drawCodepoint(cp, x + @as(f32, @floatFromInt(col)) * font.cell_w, y, if (marked) mark_color else color);
         col += 1;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The SQL results grid
+
+/// `value` in at most `width` cells at `x`, a line break or tab as a space;
+/// "…" where it is cut.
+fn drawCell(font: *const Font, value: []const u8, x: f32, y: f32, width: usize, color: rl.Color) void {
+    var it = Font.Utf8Lossy{ .bytes = value };
+    var n: usize = 0;
+    while (it.next()) |cp| {
+        if (n + 1 == width and it.i < value.len) {
+            font.drawCodepoint(0x2026, x + @as(f32, @floatFromInt(n)) * font.cell_w, y, color);
+            return;
+        }
+        if (n == width) return;
+        if (cp > ' ') font.drawCodepoint(cp, x + @as(f32, @floatFromInt(n)) * font.cell_w, y, color);
+        n += 1;
+    }
+}
+
+/// Docked at the bottom like a picker: a title line, the column names, the
+/// rows, then the cell under the cursor in full and the keys.
+pub fn drawGrid(g: *ResultGrid, font: *const Font, theme: *const Theme, l: render.Layout) void {
+    const cw = font.cell_w;
+    const ch = font.cell_h;
+    const d = dock(font, l, listRows(font, l) + 4);
+    drawPanel(theme, d);
+    const x0 = d.bx + cw;
+    const cols = d.cols -| 2;
+    // Title, rows, column names, the value, the keys: 5 lines that aren't rows.
+    const body = d.rows -| 5;
+    g.scrollTo(@max(body, 1), cols);
+
+    var buf: [160]u8 = undefined;
+    const mode: []const u8 = switch (g.visual) {
+        .none => "",
+        .cells => "  -- VISUAL --",
+        .rows => "  -- VISUAL LINE --",
+    };
+    var x = font.drawText("SQL results", x0, d.by, theme.mode_picker);
+    const where = std.fmt.bufPrint(&buf, "   row {d}/{d} · column {d}/{d}{s}", .{ g.row + 1, g.rows.len, g.col + 1, g.columns.len, mode }) catch "";
+    x = font.drawText(where, x, d.by, theme.status_dim);
+    if (g.typing) {
+        x = font.drawText("   /", x, d.by, theme.fg);
+        x = font.drawText(g.input.items, x, d.by, theme.fg);
+        gfx.cursor(x, d.by, .bar);
+        if (gfx.grid == null) rect(x, d.by + 2, 2, ch - 4, theme.cursor);
+    } else if (g.search.items.len > 0) {
+        const shown = std.fmt.bufPrint(&buf, "   /{s}", .{g.search.items}) catch "";
+        _ = font.drawText(shown, x, d.by, theme.status_dim);
+    }
+
+    // The columns that fit, from `left`.
+    var last = g.left;
+    var used: usize = 0;
+    while (last < g.columns.len) : (last += 1) {
+        const need = g.widths[last] + (if (last > g.left) @as(usize, 3) else 0);
+        if (used + need > cols and last > g.left) break;
+        used += need;
+    }
+    const header_y = d.by + ch;
+    rect(d.bx, header_y + ch, d.bw, 1, theme.popup_border);
+    {
+        var cx = x0;
+        for (g.left..last) |c| {
+            if (c > g.left) {
+                _ = font.drawText(" │ ", cx, header_y, theme.popup_border);
+                cx += 3 * cw;
+            }
+            const w = g.widths[c];
+            drawCell(font, g.columns[c], cx, header_y, w, if (c == g.col) theme.fg else theme.whichkey_group);
+            cx += @as(f32, @floatFromInt(w)) * cw;
+        }
+    }
+    const rows_y = header_y + ch;
+    for (0..body) |i| {
+        const r = g.top + i;
+        if (r >= g.rows.len) break;
+        const y = rows_y + @as(f32, @floatFromInt(i)) * ch;
+        if (r == g.row) rect(d.bx, y, d.bw, ch, theme.cursorline_bg);
+        var cx = x0;
+        for (g.left..last) |c| {
+            if (c > g.left) {
+                _ = font.drawText(" │ ", cx, y, theme.popup_border);
+                cx += 3 * cw;
+            }
+            const w = g.widths[c];
+            const cell_w = @as(f32, @floatFromInt(w)) * cw;
+            const here = r == g.row and c == g.col;
+            if (g.selected(r, c)) rect(cx, y, cell_w, ch, theme.selection_bg);
+            if (g.matches(r, c) and !here) rect(cx, y, cell_w, ch, theme.search_match);
+            var color = theme.fg;
+            if (here) {
+                rect(cx, y, cell_w, ch, theme.cursor);
+                color = theme.cursor_text;
+                gfx.cursor(cx, y, .block);
+            }
+            drawCell(font, g.cell(r, c), cx, y, w, color);
+            cx += cell_w;
+        }
+    }
+    if (last < g.columns.len or g.left > 0) {
+        const more = std.fmt.bufPrint(&buf, "{s}{d} more columns{s}", .{ if (g.left > 0) "‹ " else "", g.columns.len - (last - g.left), if (last < g.columns.len) " ›" else "" }) catch "";
+        _ = font.drawText(more, d.bx + @as(f32, @floatFromInt(d.cols -| (cells(more) + 1))) * cw, header_y, theme.status_dim);
+    }
+
+    // The cell under the cursor, all of it (on one line).
+    const value_y = d.by + @as(f32, @floatFromInt(d.rows - 2)) * ch;
+    rect(d.bx, value_y, d.bw, 1, theme.popup_border);
+    const name = if (g.col < g.columns.len) g.columns[g.col] else "";
+    x = font.drawText(name, x0, value_y, theme.whichkey_group);
+    x = font.drawText(" = ", x, value_y, theme.status_dim);
+    const room = cols -| (cells(name) + 3);
+    drawCell(font, g.cell(g.row, g.col), x, value_y, room, theme.fg);
+
+    const hint = "hjkl move · w/b next/prev cell · v cells · V rows · y yank · Y row · / search · o as text · q close";
+    _ = font.drawText(clipCells(hint, cols), x0, value_y + ch, theme.status_dim);
+}
+
+fn clipCells(s: []const u8, max: usize) []const u8 {
+    var it = Font.Utf8Lossy{ .bytes = s };
+    var n: usize = 0;
+    while (n < max) : (n += 1) _ = it.next() orelse return s;
+    return s[0..it.i];
 }

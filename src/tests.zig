@@ -23,6 +23,7 @@ comptime {
     _ = @import("lsp/Client.zig");
     _ = @import("lsp/Completion.zig");
     _ = @import("lsp/docs.zig");
+    _ = @import("ResultGrid.zig");
     _ = @import("lsp/balance.zig");
     _ = @import("emmet.zig");
     _ = @import("snippets.zig");

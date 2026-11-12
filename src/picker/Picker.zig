@@ -135,7 +135,6 @@ pub fn activeQuery(p: *const Picker) []const u8 {
 pub fn title(p: *const Picker) []const u8 {
     if (p.kind == .browse) return p.ed.browse_label.items;
     if (p.kind == .debug) return sources.debugTitle(p.ed);
-    if (p.kind == .sql_results) return sources.sqlResultsTitle(p.ed);
     return sources.title(p.kind);
 }
 

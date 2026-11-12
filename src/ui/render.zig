@@ -137,6 +137,7 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     drawStatus(ed, font, theme, l);
     drawToasts(ed, font, theme, l);
     if (ed.picker) |p| picker_view.draw(p, font, theme, l);
+    if (ed.grid) |*g| picker_view.drawGrid(g, font, theme, l);
     if (ed.search_prompt) |*sp| if (sp.kind.boxed()) {
         if (sp.kind == .replace) {
             if (ed.replace) |r| picker_view.drawReplace(r, font, theme, l, sp.input.items());

@@ -29,7 +29,7 @@ const Git = @import("../git/Git.zig");
 const hipatterns = @import("../core/hipatterns.zig");
 const keymap = @import("../input/keymap.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug, sql_results };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -79,7 +79,6 @@ fn Impl(comptime kind: Kind) type {
         .leader_quit => QuitMenu,
         .files_global => GlobalFiles,
         .debug => Debug,
-        .sql_results => SqlResults,
     };
 }
 
@@ -121,11 +120,6 @@ pub fn title(kind: Kind) []const u8 {
 /// The Debug picker's title, with the program's state.
 pub fn debugTitle(ed: *Editor) []const u8 {
     return Debug.liveTitle(ed);
-}
-
-/// "SQL results", or the row that is open.
-pub fn sqlResultsTitle(ed: *Editor) []const u8 {
-    return if (ed.sql_row != null) "SQL row (b: back to the rows)" else SqlResults.title;
 }
 
 pub fn prefix(kind: Kind) ?u8 {
@@ -3019,156 +3013,6 @@ const Debug = struct {
         .{ .label = "run", .key = 'r', .any = true, .run = run },
         .{ .label = "run under gdb", .key = 'R', .any = true, .run = runDebug },
         .{ .label = "stop", .key = 'x', .stay = true, .any = true, .run = stop },
-    };
-};
-
-/// The rows a SQL statement returned (Ctrl-Enter in a SQL file): one row
-/// each, however wide the table is; the preview is the selected row with a
-/// line per column. Typing filters on any value.
-///
-/// Enter opens a row (`ed.sql_row`): the list is then its columns, one
-/// each, to pick a single value from (Enter / `y` yanks it; `b` goes back).
-const SqlResults = struct {
-    pub const title = "SQL results";
-    pub const prefix: ?u8 = null;
-    pub const start_mode: StartMode = .normal;
-
-    /// Of a value in a row of the list (the preview has all of it).
-    const max_cell = 48;
-
-    fn results(ed: *Editor) ?*@import("../sql.zig").Results {
-        const r = ed.sql_results orelse return null;
-        return if (r.done.load(.acquire)) r else null;
-    }
-
-    /// The open row, when one is.
-    fn openRow(ed: *Editor) ?[]const []const u8 {
-        const r = results(ed) orelse return null;
-        const i = ed.sql_row orelse return null;
-        return if (i < r.rows.len) r.rows[i] else null;
-    }
-
-    /// `value` on one line, at most `max` bytes of it.
-    fn appendFlat(ed: *Editor, line: *std.ArrayList(u8), value: []const u8, max: usize) !void {
-        var end = @min(value.len, max);
-        while (end < value.len and end > 0 and value[end] & 0xC0 == 0x80) end -= 1;
-        for (value[0..end]) |b| try line.append(ed.gpa, if (b == '\n' or b == '\r' or b == '\t') ' ' else b);
-        if (end < value.len) try line.appendSlice(ed.gpa, "…");
-    }
-
-    pub fn fill(ed: *Editor, items: *Items) !void {
-        const r = results(ed) orelse return;
-        var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(ed.gpa);
-        // A row is open: its columns.
-        if (openRow(ed)) |row| {
-            var width: usize = 0;
-            for (r.columns) |name| width = @max(width, name.len);
-            for (row, 0..) |value, c| {
-                line.clearRetainingCapacity();
-                const name = if (c < r.columns.len) r.columns[c] else "";
-                try line.appendSlice(ed.gpa, name);
-                try line.appendNTimes(ed.gpa, ' ', width - @min(width, name.len));
-                try line.appendSlice(ed.gpa, " │ ");
-                try appendFlat(ed, &line, value, 200);
-                try items.append(.{ .text = line.items, .detail = "", .id = @intCast(c) });
-            }
-            return;
-        }
-        for (r.rows, 0..) |row, i| {
-            line.clearRetainingCapacity();
-            for (row, 0..) |value, c| {
-                if (c > 0) try line.appendSlice(ed.gpa, " │ ");
-                try appendFlat(ed, &line, value, max_cell);
-            }
-            try items.append(.{ .text = line.items, .detail = "", .id = @intCast(i) });
-        }
-    }
-
-    /// `y`: the selected value of an open row; else the row as you'd paste
-    /// it into a sheet (its values, tabs between).
-    fn yank(ed: *Editor, item: ?Item) anyerror!void {
-        const r = results(ed) orelse return;
-        const it = item orelse return;
-        if (openRow(ed)) |row| {
-            if (it.id >= row.len) return;
-            try ed.registers.store(null, .yank, row[it.id], false);
-            const name = if (it.id < r.columns.len) r.columns[it.id] else "the value";
-            return ed.setMessage(.info, "yanked {s}", .{name});
-        }
-        if (it.id >= r.rows.len) return;
-        const text = try std.mem.join(ed.gpa, "\t", r.rows[it.id]);
-        defer ed.gpa.free(text);
-        try ed.registers.store(null, .yank, text, false);
-        ed.setMessage(.info, "yanked the row ({d} values, tabs between)", .{r.rows[it.id].len});
-    }
-
-    fn yankAll(ed: *Editor, _: ?Item) anyerror!void {
-        const r = results(ed) orelse return;
-        try ed.registers.store(null, .yank, r.csv, false);
-        ed.setMessage(.info, "yanked {d} rows as CSV", .{r.rows.len});
-    }
-
-    /// `o`: all of it as text in a buffer, where vim's motions and
-    /// selections work (several rows, a column, a search).
-    fn asTable(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.openSqlTable();
-    }
-
-    /// `b`: from a row's columns back to the rows.
-    fn back(ed: *Editor, _: ?Item) anyerror!void {
-        // On the row that was open.
-        if (ed.picker) |p| p.want_id = ed.sql_row;
-        ed.sql_row = null;
-    }
-
-    /// Enter: a row opens (its columns to pick from); a column's value is
-    /// yanked.
-    pub fn accept(ed: *Editor, item: Item) !void {
-        if (ed.sql_row != null) return yank(ed, item);
-        ed.sql_row = item.id;
-        try ed.openPicker(.sql_results, "");
-    }
-
-    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        const r = results(ed) orelse return;
-        // A column of the open row: all of its value, as it is.
-        if (openRow(ed)) |row| {
-            if (item.id >= row.len) return;
-            const name = if (item.id < r.columns.len) r.columns[item.id] else "";
-            try out.text.print(ed.gpa, "{s}  (row {d} of {d})\n\n{s}", .{ name, ed.sql_row.? + 1, r.rows.len, row[item.id] });
-            return;
-        }
-        if (item.id >= r.rows.len) return;
-        const row = r.rows[item.id];
-        var width: usize = 0;
-        for (r.columns) |name| width = @max(width, name.len);
-        try out.text.print(ed.gpa, "row {d} of {d}\n\n", .{ item.id + 1, r.rows.len });
-        for (row, 0..) |value, c| {
-            const name = if (c < r.columns.len) r.columns[c] else "";
-            try out.text.appendSlice(ed.gpa, name);
-            try out.text.appendNTimes(ed.gpa, ' ', width - @min(width, name.len));
-            try out.text.appendSlice(ed.gpa, " │ ");
-            // A value of several lines keeps them, under its first.
-            var lines = std.mem.splitScalar(u8, value, '\n');
-            var first = true;
-            while (lines.next()) |l| {
-                if (!first) {
-                    try out.text.appendNTimes(ed.gpa, ' ', width);
-                    try out.text.appendSlice(ed.gpa, " │ ");
-                }
-                first = false;
-                try out.text.appendSlice(ed.gpa, std.mem.trimEnd(u8, l, "\r"));
-                try out.text.append(ed.gpa, '\n');
-            }
-        }
-    }
-
-    pub const item_actions = [_]Action{
-        .{ .label = "yank it", .key = 'y', .stay = true, .keep_rows = true, .run = yank },
-        .{ .label = "yank all rows (CSV)", .key = 'Y', .stay = true, .any = true, .keep_rows = true, .run = yankAll },
-        .{ .label = "back to the rows", .key = 'b', .stay = true, .any = true, .run = back },
-        .{ .label = "open as a table (vim selects rows, columns)", .key = 'o', .any = true, .run = asTable },
     };
 };
 

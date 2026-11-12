@@ -25,6 +25,7 @@ const Replace = @import("Replace.zig");
 const sources = @import("picker/sources.zig");
 const Completion = @import("lsp/Completion.zig");
 const lsp_docs = @import("lsp/docs.zig");
+const ResultGrid = @import("ResultGrid.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
 const pairs = @import("pairs.zig");
@@ -762,9 +763,8 @@ sql_schema: ?*sql.Schema = null,
 /// The last statement run with Ctrl-Enter: running, or its rows (kept for
 /// the results picker to come back to).
 sql_results: ?*sql.Results = null,
-/// The row of `sql_results` open in the results picker (its columns are
-/// listed), if one is.
-sql_row: ?u32 = null,
+/// The results grid over the code (Ctrl-Enter's rows), while it is open.
+grid: ?ResultGrid = null,
 /// `sql_results` has finished and was shown (or said).
 sql_results_seen: bool = true,
 sql_checked: ?*const Buffer = null,
@@ -936,6 +936,7 @@ pub fn deinit(ed: *Editor) void {
     ed.merged_diagnostics.deinit(ed.gpa);
     for (ed.zig_checks.items) |zc| zc.job.destroy();
     if (ed.sql_schema) |sc| sc.destroy(ed.gpa);
+    if (ed.grid) |*g| g.deinit();
     if (ed.sql_results) |r| r.destroy(ed.gpa);
     ed.zig_checks.deinit(ed.gpa);
     for (ed.check_results.items) |r| freeDiagnosticList(ed.gpa, r.diags);
@@ -1122,6 +1123,7 @@ pub fn text(ed: *Editor) *Text {
 pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
     if (ed.colorKey(ev)) return;
     if (ed.popupKey(ev)) return;
+    if (ed.gridKey(ev)) return;
     if (ed.cmdFloatKey(ev)) return;
     if (ed.macro_register != null) ed.macro_keys.append(ed.gpa, ev) catch {};
     ed.processKey(ev);
@@ -1825,8 +1827,43 @@ fn tickSqlResults(ed: *Editor) void {
     // Not over what you're in the middle of (typing, another picker).
     if (ed.mode != .normal or ed.picker != null or ed.popup != null)
         return ed.setMessage(.info, "{d} row{s}: \"SQL results\" in the command picker shows them", .{ r.rows.len, if (r.rows.len == 1) "" else "s" });
-    ed.sql_row = null;
-    ed.openPicker(.sql_results, "") catch {};
+    ed.openGrid() catch {};
+}
+
+fn openGrid(ed: *Editor) !void {
+    const r = ed.sql_results orelse return;
+    ed.closeGrid();
+    ed.grid = try ResultGrid.init(ed.gpa, r.columns, r.rows);
+    ed.setMessage(.info, "{d} row{s}, {d} column{s}", .{ r.rows.len, if (r.rows.len == 1) "" else "s", r.columns.len, if (r.columns.len == 1) "" else "s" });
+}
+
+fn closeGrid(ed: *Editor) void {
+    if (ed.grid) |*g| g.deinit();
+    ed.grid = null;
+}
+
+/// Keys while the results grid is open: all of them are its.
+fn gridKey(ed: *Editor, ev: KeyEvent) bool {
+    const g = &(ed.grid orelse return false);
+    const out = g.key(ev) catch return true;
+    switch (out) {
+        .stay => {},
+        .close => ed.closeGrid(),
+        .not_found => ed.setMessage(.info, "not found: {s}", .{g.search.items}),
+        .yank => |y| {
+            defer ed.gpa.free(y.text);
+            ed.registers.store(null, .yank, y.text, false) catch {};
+            if (y.n == 1 and std.mem.eql(u8, y.what, "the cell")) {
+                const name = if (g.col < g.columns.len) g.columns[g.col] else "the cell";
+                ed.setMessage(.info, "yanked {s}", .{name});
+            } else ed.setMessage(.info, "yanked {d} {s} (tabs between)", .{ y.n, y.what });
+        },
+        .table => {
+            ed.closeGrid();
+            ed.openSqlTable() catch {};
+        },
+    }
+    return true;
 }
 
 /// The command picker's "SQL results": the last statement's rows again.
@@ -1835,8 +1872,7 @@ pub fn showSqlResults(ed: *Editor) !void {
     if (!r.done.load(.acquire)) return ed.setMessage(.info, "the statement is still running", .{});
     if (r.failed) return ed.setMessage(.err, "{s}", .{std.mem.sliceTo(r.err, '\n')});
     if (r.rows.len == 0) return ed.setMessage(.info, "it returned no rows", .{});
-    ed.sql_row = null;
-    try ed.openPicker(.sql_results, "");
+    try ed.openGrid();
 }
 
 /// The schema for SQL completion: loaded (in the background) when a SQL
@@ -5335,6 +5371,8 @@ pub fn runSql(ed: *Editor, whole: bool) !void {
 pub fn startSqlStatement(ed: *Editor, url: []const u8, statement: []const u8, shown: []const u8) !void {
     if (ed.sql_results) |old| {
         if (!old.done.load(.acquire)) return ed.setMessage(.info, "the last statement is still running", .{});
+        // It looks at these rows.
+        ed.closeGrid();
         old.destroy(ed.gpa);
         ed.sql_results = null;
     }
@@ -9649,7 +9687,7 @@ test "Ctrl-Enter while typing outside SQL is Enter" {
     try testing.expectEqualStrings("two", ed.text().lineSlice(1));
 }
 
-test "SQL results: a statement's rows in a picker, a row's columns in the preview; an error at the cursor" {
+test "SQL results: a statement's rows in a grid (vim keys: cells, blocks, rows, search); an error at the cursor" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9670,53 +9708,42 @@ test "SQL results: a statement's rows in a picker, a row's columns in the previe
     };
     try ed.startSqlStatement(db, "select * from users", db);
     S.finish(&ed);
-    const p = ed.picker orelse return error.TestUnexpectedResult;
-    try testing.expect(p.kind == .sql_results);
-    p.sync();
-    try testing.expectEqual(2, p.rowCount());
-    try testing.expectEqualStrings("1 │ a@x.io │ two lines", p.itemAt(0).?.text);
-    try testing.expectEqualStrings("2 │ b@x.io │ has, a comma", p.itemAt(1).?.text);
-    p.updatePreview();
-    try testing.expectEqualStrings("row 1 of 2\n\nid    │ 1\nemail │ a@x.io\nnote  │ two\n      │ lines\n", p.preview.text.items);
-    // `y`: the row, for pasting.
-    try ed.feed("jy");
-    try testing.expectEqualStrings("2\tb@x.io\thas, a comma", ed.registers.get(null).?.text);
-    // Enter opens the row: its columns, to take one value from.
-    try ed.feed("<CR>");
-    const cols = ed.picker orelse return error.TestUnexpectedResult;
-    cols.sync();
-    try testing.expectEqual(3, cols.rowCount());
-    try testing.expectEqualStrings("email │ b@x.io", cols.itemAt(1).?.text);
-    try ed.feed("jy");
-    try testing.expectEqualStrings("b@x.io", ed.registers.get(null).?.text);
-    // `b`: the rows again; Enter on a column yanks it and closes.
-    try ed.feed("b");
-    ed.picker.?.sync();
-    try testing.expectEqual(2, ed.picker.?.rowCount());
-    try testing.expectEqual(1, ed.picker.?.selected); // on the row that was open
-    try ed.feed("k<CR>jj<CR>");
-    try testing.expect(ed.picker == null);
+    const g = &(ed.grid orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(2, g.rows.len);
+    // The grid has the keys: `l` is a cell to the right, not the code's.
+    try ed.feed("ly");
+    try testing.expectEqualStrings("a@x.io", ed.registers.get(null).?.text);
+    try ed.feed("w");
+    try testing.expectEqualStrings("two\nlines", ed.grid.?.cell(ed.grid.?.row, ed.grid.?.col));
+    try ed.feed("y");
     try testing.expectEqualStrings("two\nlines", ed.registers.get(null).?.text);
-
-    // `o`: the results as a table in a buffer, for vim to select in.
-    try ed.showSqlResults();
+    // Two rows.
+    try ed.feed("ggVjy");
+    try testing.expectEqualStrings("1\ta@x.io\ttwo\nlines\n2\tb@x.io\thas, a comma", ed.registers.get(null).?.text);
+    // A search lands on its cell.
+    try ed.feed("gg0/comma<CR>");
+    try testing.expectEqual(1, ed.grid.?.row);
+    try testing.expectEqual(2, ed.grid.?.col);
+    try testing.expectEqual(0, ed.cursorLine()); // the code didn't move
+    // `o`: as a table in a buffer.
     try ed.feed("o");
-    try testing.expect(ed.picker == null and ed.buffer.no_wrap);
+    try testing.expect(ed.grid == null and ed.buffer.no_wrap);
     try testing.expectEqualStrings("id │ email  │ note", ed.text().lineSlice(0));
     try testing.expectEqualStrings("2  │ b@x.io │ has, a comma", ed.text().lineSlice(3));
-    try testing.expectEqual(2, ed.cursorLine());
-    // Two rows at once.
-    try ed.feed("Vjy");
-    try testing.expectEqualStrings("1  │ a@x.io │ two lines\n2  │ b@x.io │ has, a comma\n", ed.registers.get(null).?.text);
+    // Back, and Esc closes it.
+    try ed.showSqlResults();
+    try testing.expect(ed.grid != null);
+    try ed.feed("<Esc>");
+    try testing.expect(ed.grid == null);
 
     // No rows back, and an error (the database's words, at the cursor).
     try ed.startSqlStatement(db, "update users set note = '' where id = 9", db);
     S.finish(&ed);
-    try testing.expect(ed.picker == null);
+    try testing.expect(ed.grid == null);
     try testing.expectEqualStrings("ran: no rows came back", ed.message.buf[0..ed.message.len]);
     try ed.startSqlStatement(db, "select * from nope", db);
     S.finish(&ed);
-    try testing.expect(ed.picker == null);
+    try testing.expect(ed.grid == null);
     try testing.expect(std.mem.indexOf(u8, ed.hover.?, "no such table: nope") != null);
 }
 
