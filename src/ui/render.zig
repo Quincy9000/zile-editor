@@ -98,6 +98,18 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
     return screen;
 }
 
+/// The text cell of the focused window under screen point (`x`, `y`), for
+/// the pointer resting there (null: elsewhere, the gutter, or something is
+/// open over the windows). The window and the terminal both ask this.
+pub fn hoverCell(ed: *Editor, font: *const Font, x: f32, y: f32) ?[2]usize {
+    if (ed.cmd_float != null or ed.popupTerminal() != null or ed.picker != null or ed.window.term != null) return null;
+    if (ed.windows.at(x, y) != ed.window) return null;
+    const l = windowLayout(ed, font, ed.window);
+    if (x - l.x0 < l.text_x) return null; // the gutter
+    const c = l.cellAt(font, x - l.x0, y - l.y0) orelse return null;
+    return .{ c.row, c.col };
+}
+
 /// The text area of window `w`: below its header (when there are several
 /// windows), in coordinates local to `x0`/`y0`.
 pub fn windowLayout(ed: *Editor, font: *const Font, w: *Editor.Windows.Window) Layout {
@@ -724,7 +736,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, line, y, last_piece);
         // Inline blame: who last changed the cursor's line.
         if (last_piece and focused and is_current and ed.options.git_blame and fold == null and ghost == null and ed.ghost == null and
-            !(line_diag != null and ed.options.diagnostic_text)) drawBlame(ed, font, theme, l, bytes, line, y);
+            !(line_diag != null and ed.showsDiagnosticText())) drawBlame(ed, font, theme, l, bytes, line, y);
 
         // The suggestion's further lines: rows of their own under this one
         // (no line numbers: they aren't in the file yet).
@@ -1311,7 +1323,7 @@ fn drawDiagHover(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout)
     if (ed.hover != null) return;
     var found: [4]*const Lsp.Diagnostic = undefined;
     // The mouse's, else the text cursor's (in a box under or over it).
-    var diags = ed.hoveredDiagnostics(ed.mouse_now, &found);
+    var diags = ed.hoveredDiagnostics(&found);
     var x0: f32 = 0;
     var y0: f32 = 0;
     if (diags.len > 0) {
@@ -1653,8 +1665,8 @@ test "terminal mode: a long diagnostic wraps under its line; resting the mouse o
     try std.testing.expect(grid.cells[15].ul != null);
     try std.testing.expect(grid.cells[14].ul == null);
     // The mouse on the `a`, a moment: the whole message in a box.
-    ed.mouseHover(.{ 0, 10 }, 1.0);
-    ed.mouse_now = 2.0;
+    ed.mouseHover(.{ 0, 10 });
+    ed.now = ed.timeAfter(500);
     l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
     draw(&ed, &font, theme, l);
     try std.testing.expect(std.mem.indexOf(u8, row(&grid, 1, &buf), "expected type 'u8', found") != null);
@@ -1693,15 +1705,49 @@ test "terminal mode: the cursor resting on a diagnostic pops it up" {
     draw(&ed, &font, theme, l);
     try std.testing.expect(!has(&grid, "unused local")); // not at once
     try std.testing.expect(ed.wantsFrames()); // but a frame will come
-    ed.cursor_rest.?.since = .{ .nanoseconds = ed.now.nanoseconds - std.time.ns_per_s };
+    ed.now = ed.timeAfter(500);
     l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
     draw(&ed, &font, theme, l);
     try std.testing.expect(has(&grid, "unused local"));
     // Off the range: gone.
     ed.setCursor(0);
     ed.tick();
-    ed.cursor_rest.?.since = .{ .nanoseconds = ed.now.nanoseconds - std.time.ns_per_s };
+    ed.now = ed.timeAfter(500);
     l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
     draw(&ed, &font, theme, l);
     try std.testing.expect(!has(&grid, "unused local"));
+}
+
+test "terminal mode: the mouse resting on a diagnostic pops it up" {
+    const Grid = @import("../tui/Grid.zig");
+    const gpa = std.testing.allocator;
+    var ed = try Editor.init(gpa, std.testing.io);
+    defer ed.deinit();
+    ed.terminal_ui = true;
+    try ed.text().insert(gpa, 0, "const a = 1;\nnext\nmore\n");
+    const diags = try gpa.alloc(Lsp.Diagnostic, 1);
+    diags[0] = .{ .line = 0, .col = 6, .end_line = 0, .end_col = 7, .severity = .err, .message = try gpa.dupe(u8, "unused local constant") };
+    try ed.check_results.append(gpa, .{ .buffer = ed.buffer, .diags = diags, .libc = false });
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 50, 12);
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    const theme = Theme.get(ed.theme_index);
+    const l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
+    // The pointer over the `a` (the gutter is 5 cells), the cursor elsewhere.
+    const cell = hoverCell(&ed, &font, (5 + 6 + 0.5) * Grid.cell_w, 0.5 * Grid.cell_h).?;
+    try std.testing.expectEqual([2]usize{ 0, 6 }, cell);
+    try std.testing.expectEqual(null, hoverCell(&ed, &font, 2 * Grid.cell_w, 0.5 * Grid.cell_h)); // the gutter
+    ed.mouseHover(cell);
+    ed.now = ed.timeAfter(500);
+    draw(&ed, &font, theme, l);
+    var found = false;
+    for (0..grid.rows) |r| {
+        var buf: [64]u8 = undefined;
+        for (0..grid.cols) |c| buf[c] = std.math.cast(u8, grid.cells[r * grid.cols + c].cp) orelse '?';
+        if (std.mem.indexOf(u8, buf[0..grid.cols], "unused local") != null) found = true;
+    }
+    try std.testing.expect(found);
 }

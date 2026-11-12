@@ -807,10 +807,10 @@ locations: std.ArrayList(Lsp.Location) = .empty,
 hover: ?[]u8 = null,
 /// Where the mouse rests (diagnostics under it pop up).
 mouse_hover: ?MouseHover = null,
-/// The time of this frame, for the mouse (seconds).
-mouse_now: f64 = 0,
 /// Where the text cursor rests (diagnostics under it pop up).
 cursor_rest: ?CursorRest = null,
+/// The window border being dragged with the mouse.
+border_drag: ?*Windows.Split = null,
 /// Running in a terminal: diagnostics are underlined only, their messages
 /// pop up with the cursor on them (no text after the line).
 terminal_ui: bool = false,
@@ -1571,32 +1571,40 @@ pub fn languageServer(ed: *Editor) ?*Lsp {
     return null;
 }
 
-/// Everything the servers say about `b`, by line: its main server's and
-/// its linters'. The slice is good until the next call.
-pub fn diagnostics(ed: *const Editor, b: *const Buffer) []const Lsp.Diagnostic {
-    const path = b.path orelse return &.{};
-    var lists: [5][]const Lsp.Diagnostic = undefined;
+/// At most this many lists of diagnostics per buffer: the compile check's
+/// and each server's.
+const max_diagnostic_lists = 5;
+
+/// The lists of diagnostics about `b` (each sorted by line, the most severe
+/// first within a line): the compile check's, its main server's and its
+/// linters'.
+pub fn diagnosticLists(ed: *const Editor, b: *const Buffer, buf: *[max_diagnostic_lists][]const Lsp.Diagnostic) [][]const Lsp.Diagnostic {
     var n: usize = 0;
-    for (ed.check_results.items) |r| if (r.buffer == b and r.diags.len > 0) {
-        lists[n] = r.diags;
+    for (ed.check_results.items) |r| if (r.buffer == b and r.diags.len > 0 and n < buf.len) {
+        buf[n] = r.diags;
         n += 1;
     };
-    for (ed.lsps.items) |l| if (l.wants(b) and n < lists.len) {
+    const path = b.path orelse return buf[0..n];
+    for (ed.lsps.items) |l| if (l.wants(b) and n < buf.len) {
         const d = l.diagnosticsFor(path);
         if (d.len == 0) continue;
-        lists[n] = d;
+        buf[n] = d;
         n += 1;
     };
-    if (n == 0) return &.{};
-    if (n == 1) return lists[0];
+    return buf[0..n];
+}
+
+/// Everything said about `b` in one list, by line. The slice is good until
+/// the next call.
+pub fn diagnostics(ed: *const Editor, b: *const Buffer) []const Lsp.Diagnostic {
+    var buf: [max_diagnostic_lists][]const Lsp.Diagnostic = undefined;
+    const lists = ed.diagnosticLists(b, &buf);
+    if (lists.len == 0) return &.{};
+    if (lists.len == 1) return lists[0];
     const self = @constCast(ed);
     self.merged_diagnostics.clearRetainingCapacity();
-    for (lists[0..n]) |d| self.merged_diagnostics.appendSlice(ed.gpa, d) catch return lists[0];
-    std.mem.sort(Lsp.Diagnostic, self.merged_diagnostics.items, {}, struct {
-        fn lessThan(_: void, a: Lsp.Diagnostic, c: Lsp.Diagnostic) bool {
-            return if (a.line != c.line) a.line < c.line else @intFromEnum(a.severity) < @intFromEnum(c.severity);
-        }
-    }.lessThan);
+    for (lists) |d| self.merged_diagnostics.appendSlice(ed.gpa, d) catch return lists[0];
+    Lsp.sortDiagnostics(self.merged_diagnostics.items);
     return self.merged_diagnostics.items;
 }
 
@@ -3835,7 +3843,13 @@ pub fn ghostText(ed: *const Editor, line: usize, k: u32) []const u8 {
 /// Whether some line can take more than one row (then rows can't be
 /// counted as lines).
 pub fn layered(ed: *const Editor) bool {
-    return ed.wraps() or ed.hasLenses() or (ed.options.diagnostic_text and ed.hasDiagnostics(ed.buffer));
+    return ed.wraps() or ed.hasLenses() or (ed.showsDiagnosticText() and ed.hasDiagnostics(ed.buffer));
+}
+
+/// Diagnostic messages after their lines (option `diagnostic_text`): in the
+/// window; a terminal underlines only, the message pops up on the cursor.
+pub fn showsDiagnosticText(ed: *const Editor) bool {
+    return ed.options.diagnostic_text and !ed.terminal_ui;
 }
 
 /// The rows (wrapped pieces) of `line`, written into `buf`: at least one.
@@ -3968,28 +3982,40 @@ pub fn isTextRow(ed: *const Editor, r: Row) bool {
     return r.sub >= lens and r.sub < lens + ed.segments(r.line, &buf).len;
 }
 
-/// Whether `b` has any diagnostics (without merging the lists).
+/// Whether `b` has any diagnostics.
 fn hasDiagnostics(ed: *const Editor, b: *const Buffer) bool {
-    for (ed.check_results.items) |r| if (r.buffer == b and r.diags.len > 0) return true;
-    const path = b.path orelse return false;
-    for (ed.lsps.items) |l| if (l.wants(b) and l.diagnosticsFor(path).len > 0) return true;
-    return false;
+    var buf: [max_diagnostic_lists][]const Lsp.Diagnostic = undefined;
+    return ed.diagnosticLists(b, &buf).len > 0;
 }
 
 /// The most severe diagnostic on `line` of the current buffer.
 pub fn lineDiagnostic(ed: *const Editor, line: usize) ?*const Lsp.Diagnostic {
+    var buf: [max_diagnostic_lists][]const Lsp.Diagnostic = undefined;
     var best: ?*const Lsp.Diagnostic = null;
-    const consider = struct {
-        fn f(list: []const Lsp.Diagnostic, l: usize, out: *?*const Lsp.Diagnostic) void {
-            for (list) |*d| if (d.line == l) {
-                if (out.* == null or @intFromEnum(d.severity) < @intFromEnum(out.*.?.severity)) out.* = d;
-            };
-        }
-    }.f;
-    for (ed.check_results.items) |r| if (r.buffer == ed.buffer) consider(r.diags, line, &best);
-    const path = ed.buffer.path orelse return best;
-    for (ed.lsps.items) |l| if (l.wants(ed.buffer)) consider(l.diagnosticsFor(path), line, &best);
+    for (ed.diagnosticLists(ed.buffer, &buf)) |list| {
+        // Most severe first within a line.
+        const on = Lsp.diagnosticsOnLine(list, line);
+        if (on.len == 0) continue;
+        if (best == null or @intFromEnum(on[0].severity) < @intFromEnum(best.?.severity)) best = &on[0];
+    }
     return best;
+}
+
+/// The current buffer's diagnostics starting on `line` (with `col`: only
+/// those whose range covers that byte of it), into `out`.
+pub fn diagnosticsOn(ed: *const Editor, line: usize, col: ?usize, out: []*const Lsp.Diagnostic) []*const Lsp.Diagnostic {
+    var buf: [max_diagnostic_lists][]const Lsp.Diagnostic = undefined;
+    var n: usize = 0;
+    for (ed.diagnosticLists(ed.buffer, &buf)) |list| for (Lsp.diagnosticsOnLine(list, line)) |*d| {
+        if (n == out.len) break;
+        if (col) |c| {
+            const end: usize = if (d.end_line == d.line) @max(d.end_col, d.col + 1) else std.math.maxInt(usize);
+            if (c < d.col or c >= end) continue;
+        }
+        out[n] = d;
+        n += 1;
+    };
+    return out[0..n];
 }
 
 /// A line's diagnostic message (option `diagnostic_text`), laid out: as
@@ -4012,7 +4038,7 @@ pub const DiagText = struct {
 
 /// `line`'s diagnostic message laid out for the window (`segs`: its rows).
 pub fn diagText(ed: *const Editor, line: usize, segs: []const Seg) ?DiagText {
-    if (!ed.options.diagnostic_text or ed.terminal_ui or ed.foldAt(line) != null) return null;
+    if (!ed.showsDiagnosticText() or ed.foldAt(line) != null) return null;
     const diag = ed.lineDiagnostic(line) orelse return null;
     const t = &ed.buffer.text;
     if (line >= t.lineCount()) return null;
@@ -4396,54 +4422,55 @@ fn cellOffset(ed: *const Editor, r: Row, col: usize) usize {
     return t.lineStart(r.line) + motions.byteAtCol(bytes, text_col, ed.options.tab_width);
 }
 
-/// The pointer resting over the text: a diagnostic under it (its range, or
-/// its message's rows) pops up in full after a moment.
-pub const MouseHover = struct {
-    row: usize,
-    col: usize,
-    /// When it came to rest on this cell (seconds).
-    since: f64,
-    /// The diagnostic's line, and the byte under the pointer (null: on its
-    /// message's rows, or past the line's end).
-    line: usize,
-    pos: ?usize,
-    buffer: *const Buffer,
-    version: u64,
-    top: Row,
-    /// Whether there is a diagnostic there (frames come until it shows).
-    shows: bool = false,
-};
+// Resting: the text cursor or the mouse staying on a diagnostic pops its
+// message up, after `hover_delay_ns` (as Neovim's diagnostic float on
+// CursorHold). Times are the editor's clock (`now`), in both front ends.
 
-/// How long the pointer rests before a diagnostic pops up (seconds).
-const hover_delay = 0.35;
+/// How long something rests before a diagnostic pops up.
+const hover_delay_ns = 350 * std.time.ns_per_ms;
 
-/// Where the text cursor came to rest, and when (diagnostics under it pop
-/// up after `hover_delay`, as Neovim's diagnostic float on CursorHold).
-pub const CursorRest = struct {
+/// Since when something has stayed put, on which buffer and version.
+const Rest = struct {
     buffer: *const Buffer,
-    pos: usize,
     version: u64,
     since: Io.Timestamp,
-    /// Whether a diagnostic is under it (frames come until it shows).
-    shows: bool,
+    /// Whether a diagnostic is there (frames come until it shows).
+    shows: bool = false,
+
+    fn start(ed: *const Editor) Rest {
+        return .{ .buffer = ed.buffer, .version = ed.buffer.edit_version, .since = Io.Timestamp.now(ed.io, .awake) };
+    }
+
+    /// Nothing under it has changed.
+    fn still(r: Rest, ed: *const Editor) bool {
+        return r.buffer == ed.buffer and r.version == ed.buffer.edit_version;
+    }
+
+    /// Still, for long enough.
+    fn long(r: Rest, ed: *const Editor) bool {
+        return r.still(ed) and r.since.durationTo(ed.now).nanoseconds >= hover_delay_ns;
+    }
+
+    /// A diagnostic is due to pop up: frames have to come.
+    fn waiting(r: Rest, ed: *const Editor) bool {
+        return r.shows and r.still(ed) and !r.long(ed);
+    }
 };
 
-fn tickCursorRest(ed: *Editor) void {
-    if (ed.cursor_rest) |r| if (r.buffer == ed.buffer and r.pos == ed.view.cursor and r.version == ed.buffer.edit_version) return;
-    var one: [1]*const Lsp.Diagnostic = undefined;
-    ed.cursor_rest = .{
-        .buffer = ed.buffer,
-        .pos = ed.view.cursor,
-        .version = ed.buffer.edit_version,
-        .since = ed.now,
-        .shows = ed.diagnosticsAt(ed.view.cursor, &one).len > 0,
-    };
-}
+/// The text cursor resting at `pos`.
+pub const CursorRest = struct { pos: usize, rest: Rest };
 
-fn cursorRested(ed: *const Editor) bool {
-    const r = ed.cursor_rest orelse return false;
-    return r.buffer == ed.buffer and r.pos == ed.view.cursor and r.version == ed.buffer.edit_version and
-        r.since.durationTo(ed.now).nanoseconds >= @as(i96, @intFromFloat(hover_delay * std.time.ns_per_s));
+/// The mouse resting on cell (`row`, `col`) of the focused window, with the
+/// window scrolled to `top`: on byte `pos` of `line`, or (null) on that
+/// line's message rows.
+pub const MouseHover = struct { row: usize, col: usize, top: Row, line: usize, pos: ?usize, rest: Rest };
+
+fn tickCursorRest(ed: *Editor) void {
+    if (ed.cursor_rest) |c| if (c.pos == ed.view.cursor and c.rest.still(ed)) return;
+    var rest = Rest.start(ed);
+    var one: [1]*const Lsp.Diagnostic = undefined;
+    rest.shows = ed.diagnosticsAt(ed.view.cursor, &one).len > 0;
+    ed.cursor_rest = .{ .pos = ed.view.cursor, .rest = rest };
 }
 
 /// The diagnostics whose range covers text position `pos`.
@@ -4456,70 +4483,93 @@ fn diagnosticsAt(ed: *const Editor, pos: usize, out: []*const Lsp.Diagnostic) []
 /// The diagnostics the text cursor has rested on, in normal mode, with
 /// nothing else popped up over it.
 pub fn cursorDiagnostics(ed: *const Editor, out: []*const Lsp.Diagnostic) []*const Lsp.Diagnostic {
-    if (ed.mode != .normal or ed.hover != null or ed.ghost != null or !ed.cursorRested()) return out[0..0];
+    if (ed.mode != .normal or ed.hover != null or ed.ghost != null) return out[0..0];
+    const c = ed.cursor_rest orelse return out[0..0];
+    if (c.pos != ed.view.cursor or !c.rest.long(ed)) return out[0..0];
     return ed.diagnosticsAt(ed.view.cursor, out);
 }
 
-/// The pointer is over cell (`row`, `col`) of the focused window at time
-/// `now` (null: not over its text).
-pub fn mouseHover(ed: *Editor, cell: ?[2]usize, now: f64) void {
+/// The mouse is over cell (`row`, `col`) of the focused window's text
+/// (null: not over it).
+pub fn mouseHover(ed: *Editor, cell: ?[2]usize) void {
     const c = cell orelse {
         ed.mouse_hover = null;
         return;
     };
     const top = ed.topRow();
-    if (ed.mouse_hover) |h| if (h.row == c[0] and h.col == c[1] and h.buffer == ed.buffer and h.version == ed.buffer.edit_version and h.top.eql(top)) return;
+    if (ed.mouse_hover) |h| if (h.row == c[0] and h.col == c[1] and h.top.eql(top) and h.rest.still(ed)) return;
     ed.mouse_hover = null;
     const r = ed.stepRows(top, @intCast(c[0]));
-    if (r.ghost != null or r.line >= ed.text().lineCount()) return;
-    const pos: ?usize = if (ed.isTextRow(r) and !ed.isLensRow(r)) ed.cellOffset(r, c[1]) else if (ed.isLensRow(r)) return else null;
-    ed.mouse_hover = .{ .row = c[0], .col = c[1], .since = now, .line = r.line, .pos = pos, .buffer = ed.buffer, .version = ed.buffer.edit_version, .top = top };
+    if (r.ghost != null or r.line >= ed.text().lineCount() or ed.isLensRow(r)) return;
+    var h: MouseHover = .{ .row = c[0], .col = c[1], .top = top, .line = r.line, .pos = if (ed.isTextRow(r)) ed.cellOffset(r, c[1]) else null, .rest = Rest.start(ed) };
     var one: [1]*const Lsp.Diagnostic = undefined;
-    ed.mouse_hover.?.shows = ed.diagnosticsUnder(ed.mouse_hover.?, &one).len > 0;
+    h.rest.shows = ed.diagnosticsUnder(h, &one).len > 0;
+    ed.mouse_hover = h;
+}
+
+// Window borders and the mouse: the pointer over a border shows resize
+// arrows, a press there takes it, and it follows the pointer until let go.
+// Both front ends call these with screen pixels.
+
+/// The pointer's shape for what it is over.
+pub const Pointer = enum { normal, resize_columns, resize_rows };
+
+/// The border within `slop` of screen point (`x`, `y`), unless something is
+/// open over the windows or text is being selected.
+fn borderUnder(ed: *Editor, x: f32, y: f32, slop: f32) ?*Windows.Split {
+    if (ed.cmd_float != null or ed.popupTerminal() != null or ed.picker != null or ed.mouse_drag != null) return null;
+    return ed.windows.borderAt(x, y, slop);
+}
+
+pub fn pointerAt(ed: *Editor, x: f32, y: f32, slop: f32) Pointer {
+    const b = ed.border_drag orelse ed.borderUnder(x, y, slop) orelse return .normal;
+    return if (b.axis == .horizontal) .resize_columns else .resize_rows;
+}
+
+/// A press at (`x`, `y`): true if it took a border (the press is used up).
+pub fn borderPress(ed: *Editor, x: f32, y: f32, slop: f32) bool {
+    ed.border_drag = ed.borderUnder(x, y, slop);
+    if (ed.border_drag != null) ed.mouse_hover = null;
+    return ed.border_drag != null;
+}
+
+/// The pointer moved with the button down: true while it drags a border.
+pub fn borderDrag(ed: *Editor, x: f32, y: f32) bool {
+    const s = ed.border_drag orelse return false;
+    // Its split may have gone (a window closed meanwhile).
+    if (!ed.windows.hasSplit(s)) {
+        ed.border_drag = null;
+        return false;
+    }
+    Windows.dragBorder(s, if (s.axis == .horizontal) x else y);
+    return true;
+}
+
+/// The button was let go: true if it was dragging a border.
+pub fn borderRelease(ed: *Editor) bool {
+    defer ed.border_drag = null;
+    return ed.border_drag != null;
 }
 
 fn isLensRow(ed: *const Editor, r: Row) bool {
     return r.ghost == null and ed.layered() and r.sub < ed.lensRows(r.line);
 }
 
-/// The diagnostics the pointer has rested on long enough (by `now`), into
-/// `out`: under it in the text, or the line's own on its message's rows.
-pub fn hoveredDiagnostics(ed: *const Editor, now: f64, out: []*const Lsp.Diagnostic) []*const Lsp.Diagnostic {
+/// The diagnostics the mouse has rested on long enough, into `out`: under
+/// it in the text, or the line's own on its message's rows.
+pub fn hoveredDiagnostics(ed: *const Editor, out: []*const Lsp.Diagnostic) []*const Lsp.Diagnostic {
     const h = ed.mouse_hover orelse return out[0..0];
-    if (now - h.since < hover_delay or h.buffer != ed.buffer or h.version != ed.buffer.edit_version or !h.top.eql(ed.topRow())) return out[0..0];
+    if (!h.rest.long(ed) or !h.top.eql(ed.topRow())) return out[0..0];
     return ed.diagnosticsUnder(h, out);
 }
 
 fn diagnosticsUnder(ed: *const Editor, h: MouseHover, out: []*const Lsp.Diagnostic) []*const Lsp.Diagnostic {
     const pos = h.pos orelse {
-        if (out.len == 0 or !ed.options.diagnostic_text) return out[0..0];
+        if (out.len == 0 or !ed.showsDiagnosticText()) return out[0..0];
         out[0] = ed.lineDiagnostic(h.line) orelse return out[0..0];
         return out[0..1];
     };
     return ed.diagnosticsOn(h.line, pos - ed.buffer.text.lineStart(h.line), out);
-}
-
-/// The current buffer's diagnostics starting on `line` (with `col`: only
-/// those whose range covers that byte of it), into `out`.
-pub fn diagnosticsOn(ed: *const Editor, line: usize, col: ?usize, out: []*const Lsp.Diagnostic) []*const Lsp.Diagnostic {
-    var n: usize = 0;
-    const take = struct {
-        fn f(list: []const Lsp.Diagnostic, l: usize, c: ?usize, o: []*const Lsp.Diagnostic, k: *usize) void {
-            for (list) |*d| {
-                if (k.* == o.len) return;
-                if (d.line != l) continue;
-                if (c) |cc| {
-                    const end: usize = if (d.end_line == d.line) @max(d.end_col, d.col + 1) else std.math.maxInt(usize);
-                    if (cc < d.col or cc >= end) continue;
-                }
-                o[k.*] = d;
-                k.* += 1;
-            }
-        }
-    }.f;
-    for (ed.check_results.items) |r| if (r.buffer == ed.buffer) take(r.diags, line, col, out, &n);
-    if (ed.buffer.path) |path| for (ed.lsps.items) |l| if (l.wants(ed.buffer)) take(l.diagnosticsFor(path), line, col, out, &n);
-    return out[0..n];
 }
 
 // ---------------------------------------------------------------------------
@@ -7767,7 +7817,7 @@ fn openInKey(ed: *Editor, ev: KeyEvent) !bool {
     const origin = ed.action_origin orelse return false;
     const b = std.math.cast(u8, ev.key.codepoint) orelse return false;
     // Its own keys (the bar shows them) win over an action's letter.
-    if (!ev.mods.ctrl and std.mem.indexOfScalar(u8, "jkiq", b) != null) return false;
+    if (!ev.mods.ctrl and std.mem.indexOfScalar(u8, sources.open_in_keys, b) != null) return false;
     const has_row = if (ed.pending_choice) |c| c != .none else false;
     for (sources.itemActions(origin), 0..) |a, i| {
         if (!has_row and !a.any) continue;
@@ -8346,7 +8396,7 @@ fn remember(ed: *Editor, kind: Message.Kind, s: []const u8) void {
 // Notifications (mini.notify): toasts at the top right for things that
 // happen on their own, fading after a few seconds.
 
-fn timeAfter(ed: *Editor, ms: i64) Io.Timestamp {
+pub fn timeAfter(ed: *const Editor, ms: i64) Io.Timestamp {
     const now = Io.Timestamp.now(ed.io, .awake);
     return .{ .nanoseconds = now.nanoseconds + @as(i96, ms) * std.time.ns_per_ms };
 }
@@ -8402,8 +8452,8 @@ pub fn wantsFrames(ed: *const Editor) bool {
     if (ed.indent_candidate != null) return true;
     if (ed.indent_guide) |g| if (g.growing(ed.now, ed.view.top, ed.view.top + ed.view.rows)) return true;
     // The pointer resting on a diagnostic: a frame has to come to show it.
-    if (ed.mouse_hover) |h| if (h.shows and ed.mouse_now - h.since < hover_delay + 0.05) return true;
-    if (ed.cursor_rest) |r| if (r.shows and ed.mode == .normal and !ed.cursorRested()) return true;
+    if (ed.mouse_hover) |h| if (h.rest.waiting(ed)) return true;
+    if (ed.cursor_rest) |c| if (ed.mode == .normal and c.rest.waiting(ed)) return true;
     return false;
 }
 
@@ -8577,6 +8627,7 @@ fn tickZigChecks(ed: *Editor) void {
         defer zc.job.destroy();
         if (!ed.bufferAlive(zc.buffer)) continue;
         const diags = zc.job.diagnostics.toOwnedSlice(ed.gpa) catch continue;
+        Lsp.sortDiagnostics(diags);
         for (ed.check_results.items) |*r| if (r.buffer == zc.buffer) {
             freeDiagnosticList(ed.gpa, r.diags);
             r.diags = diags;
@@ -14085,19 +14136,24 @@ test "diagnostics: the mouse resting on one (or its message) finds it after a mo
     try ed.check_results.append(ed.gpa, .{ .buffer = ed.buffer, .diags = diags, .libc = false });
     var out: [4]*const Lsp.Diagnostic = undefined;
     // On the `a`: nothing yet, then the diagnostic.
-    ed.mouseHover(.{ 0, 10 }, 1.0);
-    try testing.expect(ed.mouse_hover.?.shows);
-    try testing.expectEqual(0, ed.hoveredDiagnostics(1.1, &out).len);
-    try testing.expectEqual(1, ed.hoveredDiagnostics(1.5, &out).len);
+    ed.mouseHover(.{ 0, 10 });
+    try testing.expect(ed.mouse_hover.?.rest.shows);
+    ed.now = ed.timeAfter(100);
+    try testing.expectEqual(0, ed.hoveredDiagnostics(&out).len);
+    ed.now = ed.timeAfter(500);
+    try testing.expectEqual(1, ed.hoveredDiagnostics(&out).len);
     // Elsewhere on the line: nothing.
-    ed.mouseHover(.{ 0, 4 }, 2.0);
-    try testing.expectEqual(0, ed.hoveredDiagnostics(3.0, &out).len);
+    ed.mouseHover(.{ 0, 4 });
+    ed.now = ed.timeAfter(500);
+    try testing.expectEqual(0, ed.hoveredDiagnostics(&out).len);
     // On the message's row under the line: its diagnostic.
-    ed.mouseHover(.{ 1, 6 }, 4.0);
-    try testing.expectEqual(1, ed.hoveredDiagnostics(5.0, &out).len);
+    ed.mouseHover(.{ 1, 6 });
+    ed.now = ed.timeAfter(500);
+    try testing.expectEqual(1, ed.hoveredDiagnostics(&out).len);
     // On the next line: nothing.
-    ed.mouseHover(.{ 3, 1 }, 6.0);
-    try testing.expectEqual(0, ed.hoveredDiagnostics(7.0, &out).len);
+    ed.mouseHover(.{ 3, 1 });
+    ed.now = ed.timeAfter(500);
+    try testing.expectEqual(0, ed.hoveredDiagnostics(&out).len);
 }
 
 test "diagnostics: in a terminal, no message after the line (it pops up on the cursor)" {

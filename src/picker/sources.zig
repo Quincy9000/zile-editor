@@ -1434,7 +1434,10 @@ const Quickfix = struct {
     }
 };
 
-/// <Tab> in a picker: where to open the selection.
+/// The <Tab> menu's own keys in its normal mode (move, type, close): an
+/// action on one of these is run from the menu with Enter, not its key.
+pub const open_in_keys = "jkiq";
+
 /// <Tab> in a picker: what can be done with the row: its picker's actions
 /// (with their keys), and where to open it for pickers of places.
 const OpenIn = struct {
@@ -1462,10 +1465,12 @@ const OpenIn = struct {
         var buf: [16]u8 = undefined;
         for (itemActions(o), 0..) |a, i| {
             if (!has_row and !a.any) continue;
-            const key = if (a.ctrl != 0 and a.key != 0)
-                std.fmt.bufPrint(&buf, "{c}  Ctrl-{c}", .{ a.key, a.ctrl }) catch ""
-            else if (a.key != 0)
-                std.fmt.bufPrint(&buf, "{c}", .{a.key}) catch ""
+            // Only keys that work here.
+            const letter: u8 = if (std.mem.indexOfScalar(u8, open_in_keys, a.key) == null) a.key else 0;
+            const key = if (a.ctrl != 0 and letter != 0)
+                std.fmt.bufPrint(&buf, "{c}  Ctrl-{c}", .{ letter, a.ctrl }) catch ""
+            else if (letter != 0)
+                std.fmt.bufPrint(&buf, "{c}", .{letter}) catch ""
             else if (a.ctrl != 0) std.fmt.bufPrint(&buf, "Ctrl-{c}", .{a.ctrl}) catch "" else "";
             try items.append(.{ .text = a.label, .detail = key, .id = @intCast(action_base + i) });
         }

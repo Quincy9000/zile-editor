@@ -78,10 +78,10 @@ pub fn run(gpa: Allocator, io: Io, ed: *Editor, opts: Options) !void {
         // Alternate screen, kitty keys (disambiguate), bracketed paste,
         // mouse clicks, drags and wheel (SGR), focus reports (autosave),
         // cursor hidden while drawing.
-        writeAll("\x1b[?1049h\x1b[>1u\x1b[?2004h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?25l");
+        writeAll("\x1b[?1049h\x1b[>1u\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?25l");
     }
     defer if (tty) {
-        writeAll("\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?2004l\x1b[<u\x1b[0 q\x1b[?25h\x1b[?1049l");
+        writeAll("\x1b]22;default\x1b\\\x1b[?1004l\x1b[?1006l\x1b[?1003l\x1b[?2004l\x1b[<u\x1b[0 q\x1b[?25h\x1b[?1049l");
         _ = std.c.tcsetattr(stdin, .FLUSH, &saved);
     };
 
@@ -203,9 +203,45 @@ fn paste(ed: *Editor, text: []const u8) void {
     ed.feed("p") catch {};
 }
 
+/// Seconds on the editor's clock (double clicks).
+fn seconds(ed: *const Editor) f64 {
+    return @as(f64, @floatFromInt(Io.Timestamp.now(ed.io, .awake).toNanoseconds())) / std.time.ns_per_s;
+}
+
+/// The pointer shape last asked of the terminal (OSC 22; terminals without
+/// it ignore it).
+var pointer_shown: Editor.Pointer = .normal;
+
+fn showPointer(shape: Editor.Pointer) void {
+    if (shape == pointer_shown) return;
+    pointer_shown = shape;
+    writeAll(switch (shape) {
+        .normal => "\x1b]22;default\x1b\\",
+        .resize_columns => "\x1b]22;ew-resize\x1b\\",
+        .resize_rows => "\x1b]22;ns-resize\x1b\\",
+    });
+}
+
 fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
     const x = (@as(f32, @floatFromInt(m.col)) + 0.5) * Grid.cell_w;
     const y = (@as(f32, @floatFromInt(m.row)) + 0.5) * Grid.cell_h;
+    // Window borders (`Editor.borderPress` and co.): the cells either side
+    // of one take it.
+    const slop = Grid.cell_w * 0.6;
+    const busy = switch (m.kind) {
+        .drag => ed.borderDrag(x, y),
+        .release => ed.borderRelease(),
+        .press => ed.borderPress(x, y, slop),
+        else => false,
+    };
+    showPointer(ed.pointerAt(x, y, slop));
+    if (busy) return;
+    // The pointer resting on a diagnostic pops it up (as the cursor does).
+    if (m.kind == .move) {
+        ed.mouseHover(render.hoverCell(ed, font, x, y));
+        return;
+    }
+    ed.mouseHover(null);
     if (ed.popupTerminal()) |t| {
         switch (m.kind) {
             .wheel_up => t.scroll(-3),
@@ -233,7 +269,7 @@ fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
         .press => {
             ed.focusWindow(w);
             const l = render.windowLayout(ed, font, w);
-            const now = @as(f64, @floatFromInt(Io.Timestamp.now(ed.io, .awake).toNanoseconds())) / std.time.ns_per_s;
+            const now = seconds(ed);
             if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| ed.mousePress(cell.row, cell.col, clicks.count(cell.row, cell.col, now));
         },
         .drag => {
@@ -241,6 +277,7 @@ fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
             if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| ed.mouseDrag(cell.row, cell.col);
         },
         .release => ed.mouseRelease(),
+        .move => {},
     }
 }
 
@@ -272,12 +309,12 @@ fn frame(gpa: Allocator, out: *std.ArrayList(u8), g: *const Grid, prev: []const 
         const cell = g.cells[i];
         if (cell.eql(prev[i])) continue;
         if (at == null or at.?[0] != r or at.?[1] != c) try out.print(gpa, "\x1b[{d};{d}H", .{ r + 1, c + 1 });
-        const same_pen = if (pen) |p| p.eql(.{ .cp = p.cp, .fg = cell.fg, .bg = cell.bg, .ul = cell.ul }) else false;
+        const same_pen = if (pen) |p| p.eql(.{ .cp = p.cp, .fg = cell.fg, .bg = cell.bg, .ul = cell.ul, .curly = cell.curly }) else false;
         if (!same_pen) {
             try out.print(gpa, "\x1b[0;38;2;{d};{d};{d};48;2;{d};{d};{d}", .{ cell.fg.r, cell.fg.g, cell.fg.b, cell.bg.r, cell.bg.g, cell.bg.b });
-            // A curly underline in its colour (kitty's colon form; terminals
-            // without curls draw a plain one).
-            if (cell.ul) |u| try out.print(gpa, ";4:3;58:2::{d}:{d}:{d}", .{ u.r, u.g, u.b });
+            // An underline in its colour, curly for diagnostics (kitty's
+            // colon form; terminals without curls draw a plain one).
+            if (cell.ul) |u| try out.print(gpa, ";{s};58:2::{d}:{d}:{d}", .{ if (cell.curly) "4:3" else "4", u.r, u.g, u.b });
             try out.append(gpa, 'm');
             pen = cell;
         }

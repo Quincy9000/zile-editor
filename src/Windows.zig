@@ -379,6 +379,18 @@ fn borderIn(n: *Node, x: f32, y: f32, slop: f32) ?*Split {
     return if (@abs(along - s.border) <= slop) s else null;
 }
 
+/// Whether `s` is still one of the splits.
+pub fn hasSplit(ws: *const Windows, s: *const Split) bool {
+    return containsSplit(ws.root, s);
+}
+
+fn containsSplit(n: *const Node, s: *const Split) bool {
+    return switch (n.kind) {
+        .window => false,
+        .split => |*sp| sp == s or containsSplit(sp.first, s) or containsSplit(sp.second, s),
+    };
+}
+
 /// Moves `s`'s border to screen position `pos` (x or y, by its axis).
 pub fn dragBorder(s: *Split, pos: f32) void {
     const start, const size = if (s.axis == .horizontal) .{ s.rect.x, s.rect.w } else .{ s.rect.y, s.rect.h };
@@ -477,4 +489,16 @@ test "a border found by position and dragged" {
     dragBorder(s, 200);
     ws.layout(.{ .x = 0, .y = 0, .w = 800, .h = 600 }, 10, 20);
     try testing.expectEqual(200, a.rect.w);
+}
+
+test "a border at terminal cell sizes: the cells either side of it take it" {
+    var b: Buffer = undefined;
+    var ws = try Windows.init(testing.allocator, &b);
+    defer ws.deinit();
+    _ = try ws.split(ws.root.kind.window, .right, .{}, &b);
+    ws.layout(.{ .x = 0, .y = 0, .w = 800, .h = 400 }, 10, 20);
+    // Pointers at cell centres (x = col * 10 + 5); the border is at x 400.
+    try testing.expect(ws.borderAt(395, 50, 6) != null);
+    try testing.expect(ws.borderAt(405, 50, 6) != null);
+    try testing.expect(ws.borderAt(385, 50, 6) == null);
 }

@@ -366,6 +366,28 @@ fn freeDiagnostics(gpa: Allocator, list: []Diagnostic) void {
     gpa.free(list);
 }
 
+/// By line, the most severe first within a line: how every list of
+/// diagnostics is kept.
+pub fn sortDiagnostics(list: []Diagnostic) void {
+    std.mem.sort(Diagnostic, list, {}, struct {
+        fn lessThan(_: void, a: Diagnostic, b: Diagnostic) bool {
+            return if (a.line != b.line) a.line < b.line else @intFromEnum(a.severity) < @intFromEnum(b.severity);
+        }
+    }.lessThan);
+}
+
+/// The diagnostics on `line` in a sorted list.
+pub fn diagnosticsOnLine(list: []const Diagnostic, line: usize) []const Diagnostic {
+    const Cmp = struct {
+        fn order(l: usize, d: Diagnostic) std.math.Order {
+            return std.math.order(l, d.line);
+        }
+    };
+    const lo = std.sort.lowerBound(Diagnostic, list, line, Cmp.order);
+    const hi = std.sort.upperBound(Diagnostic, list, line, Cmp.order);
+    return list[lo..hi];
+}
+
 pub fn diagnosticsFor(l: *const Lsp, path: []const u8) []const Diagnostic {
     return l.diagnostics.get(path) orelse &.{};
 }
@@ -1222,11 +1244,7 @@ fn mergeDiagnostics(l: *Lsp, ed: *Editor, path: []const u8) !void {
             .message = try std.fmt.allocPrint(l.gpa, "unclosed {s}: missing '{c}'", .{ what, open.closer }),
         });
     };
-    std.mem.sort(Diagnostic, list.items, {}, struct {
-        fn lessThan(_: void, a: Diagnostic, b: Diagnostic) bool {
-            return if (a.line != b.line) a.line < b.line else @intFromEnum(a.severity) < @intFromEnum(b.severity);
-        }
-    }.lessThan);
+    sortDiagnostics(list.items);
     const gop = try l.diagnostics.getOrPut(l.gpa, path);
     if (gop.found_existing) {
         freeDiagnostics(l.gpa, gop.value_ptr.*);

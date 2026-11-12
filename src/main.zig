@@ -3,7 +3,6 @@ const rl = @import("raylib");
 
 const Editor = @import("Editor.zig");
 const glfw = @import("input/glfw.zig");
-const Windows = @import("Windows.zig");
 const Font = @import("ui/Font.zig");
 const Theme = @import("ui/Theme.zig");
 const render = @import("ui/render.zig");
@@ -291,7 +290,6 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
         return;
     }
     const clicked = rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
-    ed.mouse_now = rl.GetTime();
     hoverMouse(ed, font, pos);
     if (borderMouse(ed, pos, clicked)) return;
     // A press that started on text: dragging selects, letting go copies.
@@ -332,44 +330,28 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
 /// The pointer over the focused window's text, buttons up: a diagnostic
 /// under it pops up after a moment.
 fn hoverMouse(ed: *Editor, font: *const Font, pos: rl.Vector2) void {
-    const busy = rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT) or border_drag != null or ed.cmd_float != null or
-        ed.popupTerminal() != null or ed.picker != null or ed.window.term != null;
-    const over = !busy and ed.windows.at(pos.x, pos.y) == ed.window;
-    const cell: ?[2]usize = if (over) blk: {
-        const l = render.windowLayout(ed, font, ed.window);
-        if (pos.x - l.x0 < l.text_x) break :blk null; // the gutter
-        const c = l.cellAt(font, pos.x - l.x0, pos.y - l.y0) orelse break :blk null;
-        break :blk .{ c.row, c.col };
-    } else null;
-    ed.mouseHover(cell, ed.mouse_now);
+    const busy = rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT);
+    ed.mouseHover(if (busy) null else render.hoverCell(ed, font, pos.x, pos.y));
 }
 
-/// The border between windows being dragged, if one is.
-var border_drag: ?*Windows.Split = null;
-var border_cursor: c_int = rl.MOUSE_CURSOR_DEFAULT;
+/// The cursor shape last asked of raylib.
+var pointer_shown: Editor.Pointer = .normal;
 
-/// Window borders: the pointer turns into resize arrows over one, and a
-/// press there drags it. True while the mouse is busy with a border.
+/// Window borders (`Editor.borderPress` and co.): true while the mouse is
+/// busy with one.
 fn borderMouse(ed: *Editor, pos: rl.Vector2, clicked: bool) bool {
-    if (border_drag) |s| {
-        if (rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) {
-            Windows.dragBorder(s, if (s.axis == .horizontal) pos.x else pos.y);
-            return true;
-        }
-        border_drag = null;
+    const slop = 4;
+    const busy = if (rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) ed.borderDrag(pos.x, pos.y) else ed.borderRelease();
+    const shape = ed.pointerAt(pos.x, pos.y, slop);
+    if (shape != pointer_shown) {
+        pointer_shown = shape;
+        rl.SetMouseCursor(switch (shape) {
+            .normal => rl.MOUSE_CURSOR_DEFAULT,
+            .resize_columns => rl.MOUSE_CURSOR_RESIZE_EW,
+            .resize_rows => rl.MOUSE_CURSOR_RESIZE_NS,
+        });
     }
-    const covered = ed.cmd_float != null or ed.popupTerminal() != null or ed.picker != null;
-    const s = if (covered or ed.mouse_drag != null) null else ed.windows.borderAt(pos.x, pos.y, 4);
-    const want: c_int = if (s) |b| (if (b.axis == .horizontal) rl.MOUSE_CURSOR_RESIZE_EW else rl.MOUSE_CURSOR_RESIZE_NS) else rl.MOUSE_CURSOR_DEFAULT;
-    if (want != border_cursor) {
-        rl.SetMouseCursor(want);
-        border_cursor = want;
-    }
-    if (clicked) if (s) |b| {
-        border_drag = b;
-        return true;
-    };
-    return false;
+    return busy or (clicked and ed.borderPress(pos.x, pos.y, slop));
 }
 
 /// Double and triple clicks: presses on the same cell close together.

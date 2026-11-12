@@ -26,9 +26,9 @@ pub fn rect(x: f32, y: f32, w: f32, h: f32, c: Color) void {
 }
 
 /// A wavy underline `w` wide whose bottom is at `bottom` (in a terminal, a
-/// plain one).
+/// curly one).
 pub fn squiggle(x: f32, bottom: f32, w: f32, c: Color) void {
-    if (grid) |g| return g.rect(x, bottom - 2, w, 2, c);
+    if (grid) |g| return g.squiggle(x, bottom, w, c);
     // A triangle wave a pixel column at a time, from rectangles (raylib's
     // lines can pick up the glyph atlas after text and vanish).
     const heights = [_]f32{ 0, 1, 2, 3, 2, 1 };

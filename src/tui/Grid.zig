@@ -24,9 +24,11 @@ pub const Cell = struct {
     bg: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
     /// Underline color, if underlined.
     ul: ?Color = null,
+    /// A curly underline (diagnostics); else a straight one (dividers).
+    curly: bool = false,
 
     pub fn eql(a: Cell, b: Cell) bool {
-        const same_ul = if (a.ul) |x| (if (b.ul) |y| sameColor(x, y) else false) else b.ul == null;
+        const same_ul = if (a.ul) |x| (if (b.ul) |y| sameColor(x, y) and a.curly == b.curly else false) else b.ul == null;
         return a.cp == b.cp and sameColor(a.fg, b.fg) and sameColor(a.bg, b.bg) and same_ul;
     }
 };
@@ -135,6 +137,7 @@ pub fn rect(g: *Grid, x: f32, y: f32, w: f32, h: f32, color: Color) void {
         const s = g.span(x, row_f * cell_h - g.off[1], w, cell_h);
         for (s.r0..s.r1) |r| for (s.c0..s.c1) |c| {
             g.cells[r * g.cols + c].ul = color;
+            g.cells[r * g.cols + c].curly = false;
         };
         return;
     }
@@ -167,6 +170,16 @@ pub fn rect(g: *Grid, x: f32, y: f32, w: f32, h: f32, color: Color) void {
             cell.fg = blend(cell.fg, color);
             if (cell.ul) |u| cell.ul = blend(u, color);
         }
+    };
+}
+
+/// A curly underline `w` wide on the row whose bottom is at `bottom`.
+pub fn squiggle(g: *Grid, x: f32, bottom: f32, w: f32, color: Color) void {
+    if (w <= 0 or color.a == 0) return;
+    const s = g.span(x, bottom - cell_h, w, cell_h);
+    for (s.r0..s.r1) |r| for (s.c0..s.c1) |c| {
+        g.cells[r * g.cols + c].ul = color;
+        g.cells[r * g.cols + c].curly = true;
     };
 }
 
@@ -207,4 +220,19 @@ test "rectangles, lines and text map onto cells" {
     g.popOffset();
     try std.testing.expectEqual(' ', g.cells[1 * 10 + 1].cp);
     try std.testing.expectEqual(255, g.cells[1 * 10 + 2].bg.r);
+}
+
+test "a thin line underlines straight; a squiggle curly" {
+    const gpa = std.testing.allocator;
+    var g: Grid = .{};
+    defer g.deinit(gpa);
+    try g.resize(gpa, 4, 2);
+    g.clear(.{ .r = 0, .g = 0, .b = 0, .a = 255 });
+    const red: Color = .{ .r = 255, .g = 0, .b = 0, .a = 255 };
+    g.rect(0, cell_h - 1, 4 * cell_w, 1, red); // a window header's divider
+    g.squiggle(cell_w, 2 * cell_h, 2 * cell_w, red); // a diagnostic on row 1
+    try std.testing.expect(g.cells[0].ul != null and !g.cells[0].curly);
+    try std.testing.expect(g.cells[4].ul == null);
+    try std.testing.expect(g.cells[5].ul != null and g.cells[5].curly);
+    try std.testing.expect(g.cells[6].curly and !g.cells[7].curly);
 }

@@ -10,7 +10,8 @@ const KeyEvent = keys.KeyEvent;
 const Mods = keys.Mods;
 
 pub const Mouse = struct {
-    kind: enum { press, release, drag, wheel_up, wheel_down },
+    /// `move`: the pointer moved with no button down (any-event tracking).
+    kind: enum { press, release, drag, move, wheel_up, wheel_down },
     /// 0-based cell.
     col: u16,
     row: u16,
@@ -146,7 +147,7 @@ fn csi(bytes: []const u8, final: bool) Result {
         const y = std.fmt.parseInt(u16, it.next() orelse "", 10) catch return .{ .skip = len };
         const kind: @FieldType(Mouse, "kind") = if (btn & 64 != 0)
             (if (btn & 1 == 0) .wheel_up else .wheel_down)
-        else if (btn & 32 != 0) .drag else if (fin == 'm') .release else .press;
+        else if (btn & 32 != 0) (if (btn & 3 == 3) .move else .drag) else if (fin == 'm') .release else .press;
         return .{ .event = .{ .ev = .{ .mouse = .{ .kind = kind, .col = x -| 1, .row = y -| 1 } }, .len = len } };
     }
 
@@ -279,6 +280,15 @@ test "paste and mouse" {
             try testing.expectEqual(9, e.ev.mouse.col);
             try testing.expectEqual(4, e.ev.mouse.row);
         },
+        else => return error.TestUnexpectedResult,
+    }
+    // Moving with no button (35) vs. dragging with the left one (32).
+    switch (decode("\x1b[<35;3;2M", true)) {
+        .event => |e| try testing.expectEqual(.move, e.ev.mouse.kind),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (decode("\x1b[<32;3;2M", true)) {
+        .event => |e| try testing.expectEqual(.drag, e.ev.mouse.kind),
         else => return error.TestUnexpectedResult,
     }
 }
