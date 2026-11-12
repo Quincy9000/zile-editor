@@ -1,11 +1,22 @@
-# gdb pretty printers for Zig values, loaded by zile's debugger.
+# Sent to gdb by zile's debugger at the start of a session: the pretty
+# printers gdb doesn't find on its own.
 #
-# gdb has no Zig support: a slice shows as a pointer and a length, and the
+# C needs none, and C++'s come with the compiler (gdb loads them itself).
+#
+# Rust's come with the toolchain, but only `rust-gdb` tells gdb where: a
+# Rust program names the script it wants, and it is loaded from the
+# toolchain that `rustc` is, in the program's folder.
+#
+# Zig has none for gdb: a slice shows as a pointer and a length, and the
 # optionals, error unions and tagged unions of Zig's own backend (the default
-# for debug builds) can't be read at all, as gdb gets their size wrong. These
-# read each part at its own address instead. Both backends' layouts are known
-# (Zig's own: `has_value` / `is_error` / `tag` beside the payload fields;
-# LLVM's: `payload` with `some` / `error` / `tag`).
+# for debug builds) can't be read at all, as gdb gets their size wrong. The
+# ones here read each part at its own address instead. Both backends'
+# layouts are known (Zig's own: `has_value` / `is_error` / `tag` beside the
+# payload fields; LLVM's: `payload` with `some` / `error` / `tag`).
+
+import os
+import subprocess
+import sys
 
 import gdb
 import gdb.printing
@@ -94,11 +105,56 @@ def tag_name(tag):
     return str(tag).rsplit(".", 1)[-1]
 
 
+class Variant:
+    """A Rust enum: `Some`, with its fields inside (a tuple's as 0, 1...)."""
+
+    def __init__(self, name, payload):
+        self.name = name
+        self.payload = payload
+
+    def to_string(self):
+        return self.name
+
+    def children(self):
+        for f in self.payload.type.fields():
+            name = f.name or ""
+            yield (name[2:] if name.startswith("__") and name[2:].isdigit() else name), self.payload[f]
+
+
+def plain(val):
+    """Whether `val` shows whole on a line (a number, a string)."""
+    vis = gdb.default_visualizer(val)
+    if vis is not None:
+        return not hasattr(vis, "children")
+    code = val.type.strip_typedefs().code
+    return code not in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION, gdb.TYPE_CODE_ARRAY, gdb.TYPE_CODE_PTR)
+
+
+def rust_enum(val, t):
+    """The printer of a Rust enum with fields (gdb gives the variant in use
+    as a field of the variant's name, after an unnamed discriminant)."""
+    fs = t.fields()
+    if not fs or not t.name or any(f.name for f in fs[:-1]):
+        return None
+    last = fs[-1]
+    if not last.name or last.type.name != t.name + "::" + last.name:
+        return None
+    payload = val[last]
+    inside = payload.type.fields()
+    if not inside:
+        return Text(last.name)
+    if len(inside) == 1 and inside[0].name == "__0" and plain(payload[inside[0]]):
+        return Text("%s(%s)" % (last.name, payload[inside[0]].format_string()))
+    return Variant(last.name, payload)
+
+
 def lookup(val):
     try:
         t = val.type.strip_typedefs()
         if t.code not in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
             return None
+        if "::" in (t.name or ""):
+            return rust_enum(val, t)
         fs = fields(val)
         names = set(fs)
         # By Zig's names for its types, so C and Rust values are left alone.
@@ -149,3 +205,47 @@ def lookup(val):
 
 
 gdb.pretty_printers.append(lookup)
+
+
+RUST_SCRIPT = b"gdb_load_rust_pretty_printers.py"
+rust = {"dir": None}
+
+
+def wants_rust(path):
+    """Whether the program at `path` asks for Rust's printers."""
+    try:
+        with open(path, "rb") as f:
+            return RUST_SCRIPT in f.read()
+    except OSError:
+        return False
+
+
+def rust_printers(event):
+    objfile = event.new_objfile
+    try:
+        path = objfile.filename
+        if not path or not wants_rust(path):
+            return
+        if rust["dir"] is None:
+            # In the program's folder: a project can pin its own toolchain.
+            root = subprocess.run(
+                ["rustc", "--print", "sysroot"],
+                cwd=os.path.dirname(path),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+            rust["dir"] = os.path.join(root, "lib", "rustlib", "etc") if root else ""
+            if rust["dir"]:
+                sys.path.insert(0, rust["dir"])
+        if not rust["dir"]:
+            return
+        import gdb_lookup
+
+        gdb_lookup.register_printers(objfile)
+    except Exception:
+        # No rustc, or a toolchain without them: the values stay raw.
+        pass
+
+
+gdb.events.new_objfile.connect(rust_printers)

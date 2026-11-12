@@ -12928,14 +12928,58 @@ test "breakpoints: on/off keeps them, clearing and undo, runs choose gdb" {
     try testing.expectEqual(1, ed.dbg.breakpoints.items.len);
 }
 
-test "debugging Zig: slices, optionals, unions and what is inside structs can be read" {
-    const gpa = testing.allocator;
-    if (!sources.onPath(testing.io, "gdb") or !sources.onPath(testing.io, "zig")) return error.SkipZigTest;
+/// What the debugger shows of the frame a program stops in: `source` is
+/// written as `name`, built by `build` (then `src` and, after `out_flag`,
+/// the program to make), and stopped on line `stop` (as `G` counts).
+fn testStoppedVars(gpa: Allocator, name: []const u8, source: []const u8, build: []const []const u8, out_flag: []const u8, stop: []const u8) ![]u8 {
+    if (!sources.onPath(testing.io, "gdb") or !sources.onPath(testing.io, build[0])) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "t.zig", .data =
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = source });
+    const src = try std.fs.path.join(gpa, &.{ dir, name });
+    defer gpa.free(src);
+    const out = try std.fs.path.join(gpa, &.{ dir, "t" });
+    defer gpa.free(out);
+    const emit = try std.mem.concat(gpa, u8, &.{ out_flag, out });
+    defer gpa.free(emit);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, build);
+    try argv.appendSlice(gpa, &.{ src, emit });
+    const built = try std.process.run(gpa, testing.io, .{ .argv = argv.items, .cwd = .{ .path = dir } });
+    gpa.free(built.stdout);
+    gpa.free(built.stderr);
+    if (built.term != .exited or built.term.exited != 0) return error.SkipZigTest;
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile(src);
+    try ed.feed(stop);
+    try ed.feed("G");
+    try debugging.toggleBreakpoint(&ed);
+    try debugging.start(&ed, out);
+    defer debugging.stop(&ed);
+    for (0..2000) |_| {
+        ed.tick();
+        if (ed.dbg.session) |d| if (d.state == .stopped and d.frames.items.len > 0 and d.frames.items[0].vars_left == 0 and d.frames.items[0].vars.items.len > 0) break;
+        testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
+    } else return error.Timeout;
+    var vars: std.ArrayList(u8) = .empty;
+    errdefer vars.deinit(gpa);
+    try ed.dbg.session.?.frames.items[0].writeVars(gpa, &vars);
+    return vars.toOwnedSlice(gpa);
+}
+
+fn expectVars(vars: []const u8, wanted: []const []const u8) !void {
+    errdefer std.debug.print("{s}\n", .{vars});
+    for (wanted) |want| try testing.expect(std.mem.indexOf(u8, vars, want) != null);
+}
+
+test "debugging Zig: slices, optionals, unions and what is inside structs can be read" {
+    const gpa = testing.allocator;
+    const vars = try testStoppedVars(gpa, "t.zig",
         \\const P = struct { x: i32, name: []const u8, next: ?*const P };
         \\const U = union(enum) { a: i32, b: []const u8, none };
         \\fn work(s: []const u8, nums: []u32, p: *const P, o: ?i32, u: U, eu: anyerror!u8) usize {
@@ -12954,42 +12998,9 @@ test "debugging Zig: slices, optionals, unions and what is inside structs can be
         \\    _ = work("some text", &nums, &b, 42, .{ .b = "ub" }, error.Oops);
         \\}
         \\
-    });
-    const src = try std.fs.path.join(gpa, &.{ dir, "t.zig" });
-    defer gpa.free(src);
-    const out = try std.fs.path.join(gpa, &.{ dir, "t" });
-    defer gpa.free(out);
-    const emit = try std.fmt.allocPrint(gpa, "-femit-bin={s}", .{out});
-    defer gpa.free(emit);
-    const cache = try std.fs.path.join(gpa, &.{ dir, "cache" });
-    defer gpa.free(cache);
-    const zig = try std.process.run(gpa, testing.io, .{ .argv = &.{ "zig", "build-exe", src, emit, "--cache-dir", cache } });
-    gpa.free(zig.stdout);
-    gpa.free(zig.stderr);
-    if (zig.term != .exited or zig.term.exited != 0) return error.SkipZigTest;
-
-    var ed = try testEditor("");
-    defer ed.deinit();
-    try ed.openFile(src);
-    try ed.feed("6G"); // `keep(...)`
-    try debugging.toggleBreakpoint(&ed);
-    const S = struct {
-        fn varsIn(e: *Editor) bool {
-            const d = e.dbg.session orelse return false;
-            return d.state == .stopped and d.frames.items.len > 0 and d.frames.items[0].vars_left == 0 and d.frames.items[0].vars.items.len > 0;
-        }
-    };
-    try debugging.start(&ed, out);
-    for (0..2000) |_| {
-        ed.tick();
-        if (S.varsIn(&ed)) break;
-        testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
-    } else return error.Timeout;
-    var vars: std.ArrayList(u8) = .empty;
-    defer vars.deinit(gpa);
-    try ed.dbg.session.?.frames.items[0].writeVars(gpa, &vars);
-    errdefer std.debug.print("{s}\n", .{vars.items});
-    for ([_][]const u8{
+    , &.{ "zig", "build-exe", "--cache-dir", "cache" }, "-femit-bin=", "6");
+    defer gpa.free(vars);
+    try expectVars(vars, &.{
         "s = \"some text\"\n", // a slice of bytes is its text
         "nums = len 4\n  [0] = 1\n  [1] = 2\n", // a slice's items, under it
         "o = 42\n", // an optional is what it holds
@@ -12998,8 +13009,67 @@ test "debugging Zig: slices, optionals, unions and what is inside structs can be
         "u = .b\n  b = \"ub\"\n", // a union's field in use
         "\n  x = 7\n  name = \"outer\"\n", // through the pointer, into the struct
         "\n    x = 1\n    name = \"inner\"\n    next = null\n", // and on through its optional pointer
-    }) |want| try testing.expect(std.mem.indexOf(u8, vars.items, want) != null);
-    debugging.stop(&ed);
+    });
+}
+
+test "debugging C: what is inside structs, through pointers, and arrays" {
+    const gpa = testing.allocator;
+    const vars = try testStoppedVars(gpa, "t.c",
+        \\struct P { int x; const char *name; struct P *next; int arr[2]; };
+        \\int work(struct P *p, struct P byval) {
+        \\  int total = p->x + byval.x;
+        \\  return total;
+        \\}
+        \\int main(void) {
+        \\  struct P a = {1, "inner", 0, {1, 2}};
+        \\  struct P b = {7, "outer", &a, {4, 5}};
+        \\  return work(&b, a);
+        \\}
+        \\
+    , &.{ "cc", "-g", "-O0" }, "-o", "4");
+    defer gpa.free(vars);
+    try expectVars(vars, &.{
+        "\n  x = 7\n  name = ", // under `p`, through the pointer
+        "\"outer\"",
+        "\n    x = 1\n", // and through `next`
+        "byval\n  x = 1\n", // a struct has no value of its own
+        "  arr\n    0 = 1\n    1 = 2\n",
+        "  next = 0x0\n",
+    });
+}
+
+test "debugging Rust: the toolchain's printers are loaded; enums read as their variant" {
+    const gpa = testing.allocator;
+    const vars = try testStoppedVars(gpa, "t.rs",
+        \\struct P { x: i32, name: String }
+        \\enum U { A(i32), Named { a: u8, b: u8 }, Empty }
+        \\fn work(s: &str, p: &P, o: Option<i32>, u: U, r: Result<u8, String>) -> usize {
+        \\    let v: Vec<u32> = vec![1, 2, 3];
+        \\    let none: Option<i32> = None;
+        \\    let e = [U::A(3), U::Empty];
+        \\    keep(&(p.x, &o, &u, &r, &none, &e));
+        \\    s.len() + v.len()
+        \\}
+        \\#[inline(never)]
+        \\fn keep<T>(_x: &T) {}
+        \\fn main() {
+        \\    let b = P { x: 7, name: "outer".into() };
+        \\    work("some text", &b, Some(42), U::Named { a: 1, b: 2 }, Err("bad".into()));
+        \\}
+        \\
+    , &.{ "rustc", "-g" }, "-o", "7");
+    defer gpa.free(vars);
+    try expectVars(vars, &.{
+        "s = \"some text\"\n",
+        "\n  x = 7\n  name = \"outer\"\n", // a String, by the toolchain's printer
+        "o = Some(42)\n",
+        "none = None\n",
+        "r = Err(\"bad\")\n",
+        "u = Named\n  a = 1\n  b = 2\n",
+        "v = Vec(size=3)\n  [0] = 1\n",
+        "A(3)",
+        "Empty",
+    });
 }
 
 test "debugging a build's program: the only one is used, several are asked for; remembered this session" {

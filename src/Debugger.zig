@@ -7,7 +7,7 @@
 //! locals, and what is inside them (structs, slices, what pointers point
 //! at) a few levels down, for the frames you look at.
 //!
-//! gdb doesn't know Zig: `zig_gdb.py` (sent to it at the start) teaches it
+//! gdb doesn't know Zig: `gdb_setup.py` (sent to it at the start) teaches it
 //! slices, optionals, error unions and tagged unions.
 //!
 //! `plan` works out, from a runner command (`zig build run`, `cargo run`,
@@ -58,10 +58,10 @@ const max_children = 32;
 /// Of one frame.
 const max_vars = 400;
 
-/// `python exec(...)` of `zig_gdb.py`, as one gdb command (so no file has
+/// `python exec(...)` of `gdb_setup.py`, as one gdb command (so no file has
 /// to be written for gdb to `source`).
 const printers_command = blk: {
-    const script = @embedFile("zig_gdb.py");
+    const script = @embedFile("gdb_setup.py");
     @setEvalBranchQuota(script.len * 20);
     break :blk "python exec(bytes.fromhex('" ++ std.fmt.bytesToHex(script[0..script.len].*, .lower) ++ "').decode())";
 };
