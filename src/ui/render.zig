@@ -253,6 +253,18 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
     var right_buf: [96]u8 = undefined;
     const right, const right_color = if (ed.popup.? == .shell)
         .{ "Esc Esc hides", theme.status_dim }
+    else if (ed.run_debug and ed.dbg.session != null)
+        .{ "debugging   Esc Esc hides", theme.status_dim }
+    else if (ed.run_debug and ed.dbg.outcome != null)
+        // The program's own end: the terminal's process only stood in for it.
+        switch (ed.dbg.outcome.?) {
+            .exited => |code| if (code == 0)
+                .{ "done   r: again   q: close", theme.diff_add }
+            else
+                .{ std.fmt.bufPrint(&right_buf, "failed ({d})   r: again   q: close", .{code}) catch "", theme.diag_error },
+            .ended => .{ "ended (no exit code)   r: again   q: close", theme.diag_error },
+            .stopped => .{ "stopped   r: again   q: close", theme.status_dim },
+        }
     else if (t.isRunning())
         .{ std.fmt.bufPrint(&right_buf, "running {d:.1}s   Esc Esc hides", .{ed.runSeconds()}) catch "", theme.status_dim }
     else if (t.exit_code == 0)

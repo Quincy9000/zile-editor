@@ -5295,6 +5295,7 @@ pub fn startRun(ed: *Editor, cmd: []const u8) !void {
     ed.run_started = Io.Timestamp.now(ed.io, .awake);
     ed.run_reported = false;
     ed.run_debug = false;
+    ed.dbg.outcome = null;
     ed.popup = .run;
 }
 
@@ -12883,6 +12884,8 @@ test "debugging: a breakpoint stops the program there, stepping, locals, the exi
     try ed.feed("c");
     try S.until(&ed, S.ended);
     try testing.expect(ed.popup == .run);
+    // The popup's title goes by the program's exit, not its stand-in's.
+    try testing.expectEqual(7, ed.dbg.outcome.?.exited);
     try testing.expect(ed.run_debug);
     const shown = try ed.run.?.screenText(gpa);
     defer gpa.free(shown);

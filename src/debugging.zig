@@ -83,9 +83,22 @@ pub const Row = union(enum(u8)) {
 };
 
 /// What the editor keeps for debugging (`Editor.dbg`).
+/// How the last debugged program ended.
+pub const Outcome = union(enum) {
+    exited: i64,
+    /// No exit code: killed by a signal, or gdb itself went away.
+    ended,
+    /// By `x`.
+    stopped,
+};
+
 pub const State = struct {
     /// The debugging session (`SPC d`), while there is one.
     session: ?*Debugger = null,
+    /// How the session whose output the run popup shows ended; null while
+    /// it runs. (The popup's own process is a stand-in that is hung up on,
+    /// so its exit code says nothing.)
+    outcome: ?Outcome = null,
     /// The command being debugged (owned), for `r` to debug it again.
     command: ?[]u8 = null,
     /// `command` is a program typed in the Debug picker ("zig-out/bin/app
@@ -559,6 +572,7 @@ pub fn launch(ed: *Editor, plan: Debugger.Plan) !void {
     ed.run_reported = true;
     ed.run_debug = true;
     ed.dbg.session = d;
+    ed.dbg.outcome = null;
     ed.dbg.frame = 0;
     ed.popup = .run;
     var line_buf: [512]u8 = undefined;
@@ -599,6 +613,7 @@ pub fn end(ed: *Editor) void {
 pub fn stop(ed: *Editor) void {
     if (ed.dbg.session == null) return ed.setMessage(.info, "not debugging", .{});
     end(ed);
+    ed.dbg.outcome = .stopped;
     if (ed.run) |t| if (ed.run_debug) t.print("\r\n\x1b[1;31m✗ stopped\x1b[0;2m   r: debug again   q: close\x1b[0m");
     finishTerminal(ed);
     ed.setMessage(.info, "stopped debugging", .{});
@@ -621,6 +636,7 @@ pub fn tick(ed: *Editor) void {
     if (up.ended) {
         const code = d.exit_code;
         end(ed);
+        ed.dbg.outcome = if (code) |c| .{ .exited = c } else .ended;
         if (ed.picker) |p| if (p.kind == .debug) ed.closePicker();
         if (ed.run) |t| if (ed.run_debug) {
             var buf: [160]u8 = undefined;
