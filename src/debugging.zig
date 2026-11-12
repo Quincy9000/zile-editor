@@ -461,7 +461,7 @@ fn askProgram(ed: *Editor, plan: Debugger.Plan, folder: []const u8) anyerror!voi
     const waiting = try plan.clone(ed.gpa);
     if (ed.dbg.ask) |old| old.deinit(ed.gpa);
     ed.dbg.ask = waiting;
-    ed.dbg.search = try Debugger.Search.start(ed.gpa, ed.io, out_dir, folder, ed.wake_fn);
+    ed.dbg.search = try Debugger.Search.start(ed.gpa, ed.io, out_dir, folder, plan.query, ed.wake_fn);
     ed.setMessage(.info, "looking for the program the build made...", .{});
 }
 

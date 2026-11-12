@@ -772,13 +772,18 @@ so its output and input work as in a plain run; Ctrl-C there pauses it.
   Enter does too when the project has breakpoints switched on. `SPC d r`
   runs the last runner command the same way, `R` under gdb always.
 - **From a command to a program** (`Debugger.plan`): `./app args` and
-  `make && ./app` name it; `zig run x.zig` is built to a path zile chooses;
-  `cargo run --bin x` is `target/debug/x`. `zig build run` / `cargo run`
-  don't say: the build runs first, then compiled programs (ELF executables)
-  are looked for where the build system puts them (`zig-out/bin`,
-  `target/debug`) and, with none there, anywhere in the folder (hidden
-  folders skipped): one is used; several are listed in `SPC d` ("Debug
-  which program?", newest first; Enter starts it without building again).
+  `make && ./app` name it; `zig run x.zig` is built to a path zile chooses.
+  For `zig build <step>` and `cargo run` the build runs first, then the
+  build system is asked which program it made (`Debugger.Query`, off the
+  main thread): `zig build --print-configuration` (same options) gives the
+  step's run step, the artifact it runs, and whether it is installed in
+  the prefix's `bin` (`-p` / `--prefix-exe-dir` followed); `cargo build
+  --message-format=json` gives each bin / example's path. Only without an
+  answer (an older zig, a run step on a program that isn't installed) are
+  compiled programs (ELF executables) looked for in the output folder and
+  then the project (hidden folders skipped). Several (cargo without
+  `--bin`, or found by looking) are listed in `SPC d` ("Debug which
+  program?", newest first; Enter starts it without building again).
   The pick holds for the session only (nothing on disk).
 - **The debugger's command.** The first time a runner command is debugged
   in a session it comes up in the command editor (a vim buffer, "Debug

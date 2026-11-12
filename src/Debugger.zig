@@ -530,6 +530,10 @@ pub const Plan = struct {
     /// once the build is done).
     program: []u8,
     newest_in: bool = false,
+    /// With `newest_in`: how to ask the build system which program the
+    /// build made, once it is done (`Search` asks first, and only looks in
+    /// the folder when that gives no answer).
+    query: ?Query = null,
     /// The command asks for an optimized build (`--release`, `-O`): such a
     /// program loses variables and its lines jump about under a debugger.
     release: bool = false,
@@ -537,6 +541,7 @@ pub const Plan = struct {
 
     pub fn deinit(p: Plan, gpa: Allocator) void {
         if (p.build) |b| gpa.free(b);
+        if (p.query) |q| q.deinit(gpa);
         gpa.free(p.program);
         for (p.args) |a| gpa.free(a);
         gpa.free(p.args);
@@ -547,9 +552,198 @@ pub const Plan = struct {
         errdefer if (build) |b| gpa.free(b);
         const program = try gpa.dupe(u8, p.program);
         errdefer gpa.free(program);
-        return .{ .build = build, .program = program, .newest_in = p.newest_in, .release = p.release, .args = try dupeAll(gpa, p.args) };
+        const query: ?Query = if (p.query) |q| try q.clone(gpa) else null;
+        errdefer if (query) |q| q.deinit(gpa);
+        return .{ .build = build, .program = program, .newest_in = p.newest_in, .query = query, .release = p.release, .args = try dupeAll(gpa, p.args) };
     }
 };
+
+/// A build system's own answer to "which program did that build?".
+pub const Query = struct {
+    tool: enum {
+        /// `zig build --print-configuration`: the step's run step, the
+        /// artifact it runs, and where that is installed.
+        zig,
+        /// `cargo build --message-format=json`: each artifact, with its
+        /// path (`executable`).
+        cargo,
+    },
+    argv: [][]u8,
+    /// zig: the step that runs the program (`run`).
+    step: []u8 = &.{},
+    /// zig: where it installs programs (`-p`, `--prefix-exe-dir`).
+    bin_dir: []u8 = &.{},
+
+    pub fn deinit(q: Query, gpa: Allocator) void {
+        for (q.argv) |a| gpa.free(a);
+        gpa.free(q.argv);
+        gpa.free(q.step);
+        gpa.free(q.bin_dir);
+    }
+
+    pub fn clone(q: Query, gpa: Allocator) !Query {
+        const argv = try dupeAll(gpa, q.argv);
+        errdefer {
+            for (argv) |a| gpa.free(a);
+            gpa.free(argv);
+        }
+        const step_name = try gpa.dupe(u8, q.step);
+        errdefer gpa.free(step_name);
+        return .{ .tool = q.tool, .argv = argv, .step = step_name, .bin_dir = try gpa.dupe(u8, q.bin_dir) };
+    }
+
+    /// Runs it in `folder`: the programs (absolute paths) the build made.
+    /// Empty when it can't say. Caller frees.
+    fn programs(q: Query, gpa: Allocator, io: Io, folder: []const u8) ![][]u8 {
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const r = std.process.run(arena, io, .{ .argv = q.argv, .cwd = .{ .path = folder }, .stdout_limit = .limited(64 << 20) }) catch return &.{};
+        if (r.term != .exited or r.term.exited != 0) return &.{};
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (out.items) |x| gpa.free(x);
+            out.deinit(gpa);
+        }
+        switch (q.tool) {
+            .zig => if (try zigProgram(arena, r.stdout, q.step)) |name| {
+                try out.append(gpa, try std.fs.path.resolve(gpa, &.{ folder, q.bin_dir, name }));
+            },
+            .cargo => for (try cargoPrograms(arena, r.stdout)) |path| {
+                try out.append(gpa, try std.fs.path.resolve(gpa, &.{ folder, path }));
+            },
+        }
+        // Only what is there (a build that failed half-way).
+        var i: usize = 0;
+        while (i < out.items.len) {
+            if (Io.Dir.cwd().statFile(io, out.items[i], .{})) |_| {
+                i += 1;
+            } else |_| gpa.free(out.orderedRemove(i));
+        }
+        return out.toOwnedSlice(gpa);
+    }
+};
+
+/// `zig build` options whose value is the next word.
+fn isValuedOption(x: []const u8) bool {
+    for ([_][]const u8{ "-p", "--prefix", "--prefix-exe-dir", "--prefix-lib-dir", "--prefix-include-dir", "--build-file", "--cache-dir", "--global-cache-dir", "--zig-lib-dir", "--sysroot", "--search-prefix", "--libc", "--maxrss" }) |o| {
+        if (std.mem.eql(u8, x, o)) return true;
+    }
+    return false;
+}
+
+/// From `zig build --print-configuration` (ZON): the name of the program
+/// that `step` runs, if the build installs it among its programs.
+pub fn zigProgram(arena: Allocator, zon: []const u8, step_name: []const u8) !?[]const u8 {
+    const source = try arena.dupeSentinel(u8, zon, 0);
+    const tree = try std.zig.Ast.parse(arena, source, .{ .mode = .zon });
+    if (tree.errors.len > 0) return null;
+    const zoir = try std.zig.ZonGen.generate(arena, tree, .{});
+    if (zoir.hasCompileErrors()) return null;
+    const Z = struct {
+        zoir: *const std.zig.Zoir,
+        fn get(z: @This(), node: ?std.zig.Zoir.Node.Index, name: []const u8) ?std.zig.Zoir.Node.Index {
+            const n = node orelse return null;
+            const st = switch (n.get(z.zoir)) {
+                .struct_literal => |x| x,
+                else => return null,
+            };
+            for (st.names, 0..) |nm, i| if (std.mem.eql(u8, nm.get(z.zoir), name)) return st.vals.at(@intCast(i));
+            return null;
+        }
+        fn int(z: @This(), node: ?std.zig.Zoir.Node.Index) ?u32 {
+            return switch ((node orelse return null).get(z.zoir)) {
+                .int_literal => |v| switch (v) {
+                    .small => |x| std.math.cast(u32, x),
+                    .big => null,
+                },
+                else => null,
+            };
+        }
+        fn enumName(z: @This(), node: ?std.zig.Zoir.Node.Index) ?[]const u8 {
+            return switch ((node orelse return null).get(z.zoir)) {
+                .enum_literal => |x| x.get(z.zoir),
+                else => null,
+            };
+        }
+        fn str(z: @This(), node: ?std.zig.Zoir.Node.Index) ?[]const u8 {
+            return switch ((node orelse return null).get(z.zoir)) {
+                .string_literal => |x| x,
+                else => null,
+            };
+        }
+        fn list(z: @This(), node: ?std.zig.Zoir.Node.Index) ?std.zig.Zoir.Node.Index.Range {
+            return switch ((node orelse return null).get(z.zoir)) {
+                .array_literal => |r| r,
+                .empty_literal => .{ .start = .root, .len = 0 },
+                else => null,
+            };
+        }
+        fn tag(z: @This(), s: std.zig.Zoir.Node.Index) ?[]const u8 {
+            return z.enumName(z.get(z.get(z.get(s, "extended"), "flags"), "tag"));
+        }
+    };
+    const z: Z = .{ .zoir = &zoir };
+    const root: std.zig.Zoir.Node.Index = .root;
+    const steps = z.list(z.get(root, "steps")) orelse return null;
+    const top = z.int(z.get(z.get(root, "top_level_steps"), step_name)) orelse return null;
+    // Down from the step to the run step under it.
+    var seen = try arena.alloc(bool, steps.len);
+    @memset(seen, false);
+    var todo: std.ArrayList(u32) = .empty;
+    try todo.append(arena, top);
+    const producer = while (todo.pop()) |i| {
+        if (i >= steps.len or seen[i]) continue;
+        seen[i] = true;
+        const st = steps.at(i);
+        if (std.mem.eql(u8, z.tag(st) orelse "", "run")) {
+            if (z.int(z.get(z.get(st, "extended"), "producer"))) |p| break p;
+        }
+        const deps = z.list(z.get(st, "deps")) orelse continue;
+        for (0..deps.len) |d| if (z.int(deps.at(@intCast(d)))) |x| try todo.append(arena, x);
+    } else return null;
+    if (producer >= steps.len) return null;
+    const name = z.str(z.get(z.get(steps.at(producer), "extended"), "root_name")) orelse return null;
+    // Installed among the programs (`bin_dir = .bin`, under its own name)?
+    for (0..steps.len) |i| {
+        const st = steps.at(@intCast(i));
+        if (!std.mem.eql(u8, z.tag(st) orelse "", "install_artifact")) continue;
+        const deps = z.list(z.get(st, "deps")) orelse continue;
+        const on_it = for (0..deps.len) |d| {
+            if (z.int(deps.at(@intCast(d))) == producer) break true;
+        } else false;
+        if (!on_it) continue;
+        const ext = z.get(st, "extended");
+        if (!std.mem.eql(u8, z.enumName(z.get(ext, "bin_dir")) orelse "", "bin")) continue;
+        if (z.get(ext, "bin_sub_path")) |sub| if (sub.get(&zoir) != .null) continue;
+        return name;
+    }
+    return null;
+}
+
+/// From `cargo build --message-format=json`: the programs it built (bins
+/// and examples), as cargo says where.
+pub fn cargoPrograms(arena: Allocator, out: []const u8) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] != '{') continue;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch continue;
+        if (!std.mem.eql(u8, str(field(v, "reason")) orelse "", "compiler-artifact")) continue;
+        const exe = str(field(v, "executable")) orelse continue;
+        const kinds = field(field(v, "target"), "kind") orelse continue;
+        if (kinds != .array) continue;
+        const runnable = for (kinds.array.items) |k| {
+            const name = if (k == .string) k.string else continue;
+            if (std.mem.eql(u8, name, "bin") or std.mem.eql(u8, name, "example")) break true;
+        } else false;
+        if (!runnable) continue;
+        for (list.items) |x| {
+            if (std.mem.eql(u8, x, exe)) break;
+        } else try list.append(arena, exe);
+    }
+    return list.items;
+}
 
 pub const PlanResult = union(enum) {
     plan: Plan,
@@ -598,22 +792,70 @@ pub fn plan(gpa: Allocator, cmd: []const u8) !PlanResult {
     const tail = if (dash < t.len) t[dash + 1 ..] else t[t.len..];
 
     if (std.mem.eql(u8, t[0], "zig") and head.len >= 2 and std.mem.eql(u8, head[1], "build")) {
-        const run = for (head[2..], 2..) |x, i| {
-            if (std.mem.eql(u8, x, "run")) break i;
-        } else return .{ .unsupported = "`zig build` without `run`: which program does it start?" };
+        // A step to run, before anything is put together for it.
+        const has_step = for (head[2..], 2..) |x, i| {
+            const after_valued = i > 2 and isValuedOption(head[i - 1]);
+            if (x.len > 0 and x[0] != '-' and !after_valued) break true;
+        } else false;
+        if (!has_step) return .{ .unsupported = "`zig build` without a step (`run`): which program does it start?" };
         var build: std.ArrayList(u8) = .empty;
         errdefer build.deinit(gpa);
         try build.appendSlice(gpa, "zig build");
+        // The same options, asking for the configuration instead.
+        var argv: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (argv.items) |a| gpa.free(a);
+            argv.deinit(gpa);
+        }
+        try argv.append(gpa, try gpa.dupe(u8, "zig"));
+        try argv.append(gpa, try gpa.dupe(u8, "build"));
         var release = false;
-        for (head[2..], 2..) |x, i| {
-            if (i == run) continue;
+        var first_step: ?[]const u8 = null;
+        var prefix: []const u8 = "zig-out";
+        var exe_dir: ?[]const u8 = null;
+        var i: usize = 2;
+        while (i < head.len) : (i += 1) {
+            const x = head[i];
+            // Options with their value in the next word.
+            const valued = isValuedOption(x);
+            if (valued and i + 1 < head.len) {
+                const val = head[i + 1];
+                if (std.mem.eql(u8, x, "-p") or std.mem.eql(u8, x, "--prefix")) prefix = val;
+                if (std.mem.eql(u8, x, "--prefix-exe-dir")) exe_dir = val;
+                try appendWord(gpa, &build, x);
+                try appendWord(gpa, &build, val);
+                try argv.append(gpa, try gpa.dupe(u8, x));
+                try argv.append(gpa, try gpa.dupe(u8, val));
+                i += 1;
+                continue;
+            }
+            if (x.len > 0 and x[0] != '-') {
+                // A step: the first is the one that runs the program.
+                if (first_step == null) first_step = x;
+                continue;
+            }
             if (std.mem.eql(u8, x, "--release") or std.mem.startsWith(u8, x, "--release=") or (std.mem.startsWith(u8, x, "-Doptimize=") and !std.mem.endsWith(u8, x, "=Debug"))) release = true;
             try appendWord(gpa, &build, x);
+            try argv.append(gpa, try gpa.dupe(u8, x));
+        }
+        const run_step = first_step orelse return .{ .unsupported = "`zig build` without a step (`run`): which program does it start?" };
+        try argv.append(gpa, try gpa.dupe(u8, "--print-configuration"));
+        const bin_dir = if (exe_dir) |d| try gpa.dupe(u8, d) else try std.fs.path.join(gpa, &.{ prefix, "bin" });
+        errdefer gpa.free(bin_dir);
+        const step_owned = try gpa.dupe(u8, run_step);
+        errdefer gpa.free(step_owned);
+        const program = try gpa.dupe(u8, bin_dir);
+        errdefer gpa.free(program);
+        const argv_owned = try argv.toOwnedSlice(gpa);
+        errdefer {
+            for (argv_owned) |a| gpa.free(a);
+            gpa.free(argv_owned);
         }
         return .{ .plan = .{
             .build = try build.toOwnedSlice(gpa),
-            .program = try gpa.dupe(u8, "zig-out/bin"),
+            .program = program,
             .newest_in = true,
+            .query = .{ .tool = .zig, .argv = argv_owned, .step = step_owned, .bin_dir = bin_dir },
             .release = release,
             .args = try dupeAll(gpa, tail),
         } };
@@ -653,7 +895,30 @@ pub fn plan(gpa: Allocator, cmd: []const u8) !PlanResult {
         const dir = if (release) "target/release" else "target/debug";
         const program = if (bin) |b| try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, b }) else try gpa.dupe(u8, dir);
         errdefer gpa.free(program);
-        return .{ .plan = .{ .build = try build.toOwnedSlice(gpa), .program = program, .newest_in = bin == null, .release = release, .args = try dupeAll(gpa, tail) } };
+        // Cargo says where it put them (a target dir of its own, say).
+        var argv: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (argv.items) |a| gpa.free(a);
+            argv.deinit(gpa);
+        }
+        try argv.append(gpa, try gpa.dupe(u8, "cargo"));
+        try argv.append(gpa, try gpa.dupe(u8, "build"));
+        for (head[2..]) |x| try argv.append(gpa, try gpa.dupe(u8, x));
+        try argv.append(gpa, try gpa.dupe(u8, "--quiet"));
+        try argv.append(gpa, try gpa.dupe(u8, "--message-format=json"));
+        const argv_owned = try argv.toOwnedSlice(gpa);
+        errdefer {
+            for (argv_owned) |a| gpa.free(a);
+            gpa.free(argv_owned);
+        }
+        return .{ .plan = .{
+            .build = try build.toOwnedSlice(gpa),
+            .program = program,
+            .newest_in = true,
+            .query = .{ .tool = .cargo, .argv = argv_owned, .step = try gpa.dupe(u8, ""), .bin_dir = try gpa.dupe(u8, "") },
+            .release = release,
+            .args = try dupeAll(gpa, tail),
+        } };
     }
     const name = std.fs.path.basename(t[0]);
     for ([_][]const u8{ "go", "gopls" }) |x| if (std.mem.eql(u8, name, x))
@@ -726,6 +991,10 @@ pub const Search = struct {
     thread: std.Thread = undefined,
     out_dir: []u8,
     folder: []u8,
+    /// Asked first; the folders are looked in only without an answer.
+    query: ?Query = null,
+    /// The build system said which (not a guess from the folder).
+    answered: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     /// Once `done`: the folder the programs are in (`out_dir` or `folder`)
@@ -733,14 +1002,16 @@ pub const Search = struct {
     dir: []const u8 = "",
     found: [][]u8 = &.{},
 
-    pub fn start(gpa: Allocator, io: Io, out_dir: []const u8, folder: []const u8, wake: *const fn () void) !*Search {
+    pub fn start(gpa: Allocator, io: Io, out_dir: []const u8, folder: []const u8, query: ?Query, wake: *const fn () void) !*Search {
         const s = try gpa.create(Search);
         errdefer gpa.destroy(s);
         const o = try gpa.dupe(u8, out_dir);
         errdefer gpa.free(o);
         const f = try gpa.dupe(u8, folder);
         errdefer gpa.free(f);
-        s.* = .{ .gpa = gpa, .io = io, .wake = wake, .out_dir = o, .folder = f };
+        const q: ?Query = if (query) |x| try x.clone(gpa) else null;
+        errdefer if (q) |x| x.deinit(gpa);
+        s.* = .{ .gpa = gpa, .io = io, .wake = wake, .out_dir = o, .folder = f, .query = q };
         s.thread = try std.Thread.spawn(.{}, run, .{s});
         return s;
     }
@@ -753,6 +1024,7 @@ pub const Search = struct {
         s.gpa.free(s.found);
         s.gpa.free(s.out_dir);
         s.gpa.free(s.folder);
+        if (s.query) |q| q.deinit(s.gpa);
         s.gpa.destroy(s);
     }
 
@@ -761,6 +1033,18 @@ pub const Search = struct {
     }
 
     fn run(s: *Search) void {
+        if (s.query) |q| {
+            const said: [][]u8 = q.programs(s.gpa, s.io, s.folder) catch &.{};
+            if (said.len > 0) {
+                s.dir = s.folder;
+                s.found = said;
+                s.answered = true;
+                s.done.store(true, .release);
+                s.wake();
+                return;
+            }
+            s.gpa.free(said);
+        }
         var dir: []const u8 = s.out_dir;
         var found: [][]u8 = findPrograms(s.gpa, s.io, dir, &s.stop) catch &.{};
         if (found.len == 0 and !s.stop.load(.acquire)) {
@@ -870,7 +1154,9 @@ test "plan: what to build and which program to debug" {
         .{ .cmd = "zig run src/main.zig -- x", .build = "mkdir -p .zig-cache/zile-debug && zig build-exe src/main.zig -femit-bin=.zig-cache/zile-debug/main", .program = ".zig-cache/zile-debug/main", .args = &.{"x"} },
         .{ .cmd = "cargo run", .build = "cargo build", .program = "target/debug", .newest = true },
         // The command is built as written; release flags are only noted.
-        .{ .cmd = "cargo run --release --bin srv -- -p 80", .build = "cargo build --release --bin srv", .program = "target/release/srv", .release = true, .args = &.{ "-p", "80" } },
+        .{ .cmd = "cargo run --release --bin srv -- -p 80", .build = "cargo build --release --bin srv", .program = "target/release/srv", .newest = true, .release = true, .args = &.{ "-p", "80" } },
+        // Another step, another prefix: the programs are where it says.
+        .{ .cmd = "zig build demo -p out -Dx=1", .build = "zig build -p out -Dx=1", .program = "out/bin", .newest = true },
         .{ .cmd = "zig build run --release=fast", .build = "zig build --release=fast", .program = "zig-out/bin", .newest = true, .release = true },
         .{ .cmd = "zig run -O ReleaseFast a.zig", .build = "mkdir -p .zig-cache/zile-debug && zig build-exe -O ReleaseFast a.zig -femit-bin=.zig-cache/zile-debug/a", .program = ".zig-cache/zile-debug/a", .release = true },
         .{ .cmd = "./build/app --verbose \"two words\"", .build = null, .program = "./build/app", .args = &.{ "--verbose", "two words" } },
@@ -890,4 +1176,47 @@ test "plan: what to build and which program to debug" {
         const r = try plan(gpa, cmd);
         try std.testing.expect(r == .unsupported);
     }
+    // The question each build system is asked afterwards.
+    const z = (try plan(gpa, "zig build run -Doptimize=Debug -- x")).plan;
+    defer z.deinit(gpa);
+    try std.testing.expectEqualStrings("run", z.query.?.step);
+    try std.testing.expectEqual(4, z.query.?.argv.len);
+    try std.testing.expectEqualStrings("--print-configuration", z.query.?.argv[3]);
+    const cg = (try plan(gpa, "cargo run --bin srv")).plan;
+    defer cg.deinit(gpa);
+    try std.testing.expectEqualStrings("--message-format=json", cg.query.?.argv[cg.query.?.argv.len - 1]);
+}
+
+test "zigProgram: the run step's program, installed in bin" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const zon =
+        \\.{
+        \\    .top_level_steps = .{ .install = 0, .run = 1 },
+        \\    .steps = .{
+        \\        .{ .name = "install", .deps = .{2}, .extended = .{ .flags = .{ .tag = .top_level } } },
+        \\        .{ .name = "run", .deps = .{3}, .extended = .{ .flags = .{ .tag = .top_level } } },
+        \\        .{ .name = "install app", .deps = .{4}, .extended = .{ .flags = .{ .tag = .install_artifact }, .bin_dir = .bin, .bin_sub_path = null } },
+        \\        .{ .name = "run exe app", .deps = .{4}, .extended = .{ .flags = .{ .tag = .run }, .producer = 4 } },
+        \\        .{ .name = "compile exe app", .deps = .{}, .extended = .{ .flags = .{ .tag = .compile }, .root_name = "app" } },
+        \\    },
+        \\}
+    ;
+    try std.testing.expectEqualStrings("app", (try zigProgram(arena.allocator(), zon, "run")).?);
+    try std.testing.expect(try zigProgram(arena.allocator(), zon, "install") == null);
+    try std.testing.expect(try zigProgram(arena.allocator(), zon, "nope") == null);
+}
+
+test "cargoPrograms: bins and examples, not libraries or build scripts" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const out =
+        \\{"reason":"compiler-artifact","target":{"kind":["custom-build"]},"executable":"/t/build/x/build-script-build"}
+        \\{"reason":"compiler-artifact","target":{"kind":["lib"]},"executable":null}
+        \\{"reason":"compiler-artifact","target":{"kind":["bin"]},"executable":"/t/debug/srv"}
+        \\{"reason":"build-finished","success":true}
+    ;
+    const got = try cargoPrograms(arena.allocator(), out);
+    try std.testing.expectEqual(1, got.len);
+    try std.testing.expectEqualStrings("/t/debug/srv", got[0]);
 }
