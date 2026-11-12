@@ -28,7 +28,7 @@ const Git = @import("../git/Git.zig");
 const hipatterns = @import("../core/hipatterns.zig");
 const keymap = @import("../input/keymap.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -77,6 +77,7 @@ fn Impl(comptime kind: Kind) type {
         .leader_claude => ClaudeMenu,
         .leader_quit => QuitMenu,
         .files_global => GlobalFiles,
+        .debug => Debug,
     };
 }
 
@@ -113,6 +114,11 @@ pub fn title(kind: Kind) []const u8 {
     return switch (kind) {
         inline else => |k| Impl(k).title,
     };
+}
+
+/// The Debug picker's title, with the program's state.
+pub fn debugTitle(ed: *Editor) []const u8 {
+    return Debug.liveTitle(ed);
 }
 
 pub fn prefix(kind: Kind) ?u8 {
@@ -174,6 +180,7 @@ pub fn setup(kind: Kind, ed: *Editor, e: *Engine) !?Engine.Producer {
                 e.empty_limit = e.items.count();
                 try S.fillTyped(ed, e);
             }
+            if (@hasDecl(S, "wantsProduce") and !S.wantsProduce(ed)) return null;
             return if (@hasDecl(S, "produce")) S.produce else null;
         },
     }
@@ -223,8 +230,23 @@ pub const Action = struct {
     stay: bool = false,
     /// Needs no row (a new buffer, save all).
     any: bool = false,
+    /// With `stay`: the rows don't change, so they aren't listed again.
+    keep_rows: bool = false,
     run: *const fn (ed: *Editor, item: ?Item) anyerror!void,
 };
+
+/// Ctrl-Enter: a second way to accept (the runner: under the debugger).
+pub const AltAccept = struct {
+    label: []const u8,
+    /// Gets the selected row's text, or the query on the typed row.
+    run: *const fn (ed: *Editor, text: []const u8) anyerror!void,
+};
+
+pub fn altAccept(kind: Kind) ?AltAccept {
+    return switch (kind) {
+        inline else => |k| if (@hasDecl(Impl(k), "alt_accept")) Impl(k).alt_accept else null,
+    };
+}
 
 pub fn itemActions(kind: Kind) []const Action {
     return switch (kind) {
@@ -347,7 +369,8 @@ const Leader = Menu("Leader", &.{
     .{ .key = '.', .label = "Explore this folder", .command = "browse_files" },
     .{ .key = 'f', .label = "Find: every other picker", .command = "all_pickers" },
     .{ .key = 'l', .label = "Code", .command = "code_menu" },
-    .{ .key = 'r', .label = "Run", .command = "run_runner" },
+    .{ .key = 'r', .label = "Run (under gdb with breakpoints; C-Enter: always)", .command = "run_runner" },
+    .{ .key = 'd', .label = "Debug (stack, stepping, breakpoints)", .command = "debug_menu" },
     .{ .key = ';', .label = "Run a shell command", .command = "run_shell" },
     .{ .key = 'g', .label = "Git (changed files; commit, push, pull...)", .command = "git_changed_files" },
     .{ .key = 'w', .label = "Windows", .command = "pick_windows" },
@@ -414,6 +437,8 @@ const CodeMenu = Menu("Code", &.{
 /// last used first (so `SPC w Enter` goes back to the previous one), the
 /// one you're in last, then "+ New window right / below / terminal" (a new
 /// window opens once you pick what it shows). The preview draws the layout.
+/// Keys about where you are (split, sizes, maximise, only, its buffer,
+/// terminal) act on the window you're in; Enter, `x` and `X` on the row.
 const WindowList = struct {
     pub const title = "Windows";
     pub const prefix: ?u8 = null;
@@ -429,7 +454,7 @@ const WindowList = struct {
         var order: [64]usize = undefined;
         const n = @min(list.len, order.len);
         for (0..n) |i| order[i] = i;
-        // Last used first; the focused one at the end.
+        // Last used first; the one you're in at the end (so Enter flips).
         const Ctx = struct {
             ed: *Editor,
             fn less(c: @This(), a: usize, b: usize) bool {
@@ -565,16 +590,6 @@ const WindowList = struct {
         }
     }
 
-    /// Focuses the row's window, then runs `name` there.
-    fn inWindow(comptime name: []const u8) *const fn (*Editor, ?Item) anyerror!void {
-        return &struct {
-            fn run(ed: *Editor, item: ?Item) anyerror!void {
-                if (windowOf(ed, item)) |w| ed.focusWindow(w);
-                try command(name)(ed, item);
-            }
-        }.run;
-    }
-
     /// `h j k l`: to the window that way from the one you're in.
     fn toward(comptime dir: Editor.Windows.Dir) *const fn (*Editor, ?Item) anyerror!void {
         return &struct {
@@ -585,13 +600,13 @@ const WindowList = struct {
         }.run;
     }
 
-    /// The row's window bigger or smaller along `axis`, whichever side its
+    /// Your window bigger or smaller along `axis`, whichever side its
     /// divider is on.
     fn grow(comptime axis: Editor.Windows.Axis, comptime delta: f32) *const fn (*Editor, ?Item) anyerror!void {
         return &struct {
-            fn run(ed: *Editor, item: ?Item) anyerror!void {
+            fn run(ed: *Editor, _: ?Item) anyerror!void {
                 ed.zoom = null;
-                Editor.Windows.resize(windowOf(ed, item) orelse ed.window, axis, delta);
+                Editor.Windows.resize(ed.window, axis, delta);
             }
         }.run;
     }
@@ -606,19 +621,26 @@ const WindowList = struct {
         ed.focusWindow(best orelse return ed.setMessage(.info, "only one window", .{}));
     }
 
+    /// `X`: your window's contents and the row's trade places.
     fn swap(ed: *Editor, item: ?Item) anyerror!void {
         const w = windowOf(ed, item) orelse return;
         ed.swapWindows(ed.window, if (w == ed.window) ed.windows.next(w) else w);
     }
 
-    fn zoom(ed: *Editor, item: ?Item) anyerror!void {
-        ed.toggleZoom(windowOf(ed, item) orelse ed.window);
+    fn zoom(ed: *Editor, _: ?Item) anyerror!void {
+        ed.toggleZoom(ed.window);
     }
 
-    /// `b`: what the window shows, picked from the buffers.
-    fn chooseBuffer(ed: *Editor, item: ?Item) anyerror!void {
-        if (windowOf(ed, item)) |w| ed.focusWindow(w);
-        try command("switch_buffer")(ed, item);
+    /// `x`: closes the row's window; you stay in yours (unless it's yours).
+    fn closeThat(ed: *Editor, item: ?Item) anyerror!void {
+        const w = windowOf(ed, item) orelse return;
+        const mine = ed.window;
+        ed.focusWindow(w);
+        try command("window_close")(ed, null);
+        for (ed.window_list.items) |x| if (x == mine) {
+            ed.focusWindow(mine);
+            break;
+        };
     }
 
     pub const item_actions = [_]Action{
@@ -627,19 +649,21 @@ const WindowList = struct {
         .{ .label = "down", .key = 'j', .any = true, .run = toward(.down) },
         .{ .label = "up", .key = 'k', .any = true, .run = toward(.up) },
         .{ .label = "right", .key = 'l', .any = true, .run = toward(.right) },
-        .{ .label = "split right", .key = 'v', .run = inWindow("split_right") },
-        .{ .label = "split below", .key = 's', .run = inWindow("split_down") },
-        .{ .label = "close", .key = 'x', .ctrl = 'x', .stay = true, .run = inWindow("window_close") },
-        .{ .label = "swap with this one", .key = 'X', .stay = true, .run = swap },
+        // Where you are: these act on the window you're in.
+        .{ .label = "split right", .key = 'v', .any = true, .run = command("split_right") },
+        .{ .label = "split below", .key = 's', .any = true, .run = command("split_down") },
         .{ .label = "maximise / back", .key = 'z', .stay = true, .any = true, .run = zoom },
-        .{ .label = "choose its buffer", .key = 'b', .run = chooseBuffer },
-        .{ .label = "only this one", .key = 'o', .run = inWindow("window_only") },
+        .{ .label = "only this one", .key = 'o', .any = true, .run = command("window_only") },
+        .{ .label = "its buffer", .key = 'b', .any = true, .run = command("switch_buffer") },
+        .{ .label = "terminal here", .key = 't', .any = true, .run = command("terminal_window") },
         .{ .label = "equal sizes", .key = '=', .stay = true, .any = true, .run = command("window_balance") },
-        .{ .label = "wider", .key = '>', .stay = true, .run = grow(.horizontal, 0.05) },
-        .{ .label = "narrower", .key = '<', .stay = true, .run = grow(.horizontal, -0.05) },
-        .{ .label = "taller", .key = '+', .stay = true, .run = grow(.vertical, 0.05) },
-        .{ .label = "shorter", .key = '-', .stay = true, .run = grow(.vertical, -0.05) },
-        .{ .label = "terminal here", .key = 't', .run = inWindow("terminal_window") },
+        .{ .label = "wider", .key = '>', .stay = true, .any = true, .run = grow(.horizontal, 0.05) },
+        .{ .label = "narrower", .key = '<', .stay = true, .any = true, .run = grow(.horizontal, -0.05) },
+        .{ .label = "taller", .key = '+', .stay = true, .any = true, .run = grow(.vertical, 0.05) },
+        .{ .label = "shorter", .key = '-', .stay = true, .any = true, .run = grow(.vertical, -0.05) },
+        // A window as a thing: these act on the selected row.
+        .{ .label = "close", .key = 'x', .ctrl = 'x', .stay = true, .run = closeThat },
+        .{ .label = "swap with it", .key = 'X', .stay = true, .run = swap },
     };
 };
 
@@ -2728,6 +2752,7 @@ const WorkspaceSymbols = struct {
 /// Enter on the list runs the last one again, any other can be picked, and
 /// typed text is a new command (it stays the first row, so Enter runs what
 /// you typed, not an old command it resembles). `x` forgets one.
+/// Ctrl-Enter runs it under gdb instead (building it first if need be).
 const Runner = struct {
     pub const title = "Run";
     pub const prefix: ?u8 = null;
@@ -2752,6 +2777,16 @@ const Runner = struct {
         try ed.runFromRunner(query);
     }
 
+    pub const alt_accept: AltAccept = .{ .label = "debug", .run = debugIt };
+
+    fn debugIt(ed: *Editor, text: []const u8) anyerror!void {
+        try ed.debugFromRunner(text);
+    }
+
+    fn openDebug(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.openDebug();
+    }
+
     fn edit(ed: *Editor, _: ?Item) anyerror!void {
         try ed.runnerEdit();
     }
@@ -2759,6 +2794,7 @@ const Runner = struct {
     pub const item_actions = [_]Action{
         .{ .label = "edit it", .key = 'e', .ctrl = 'e', .stay = true, .run = edit },
         .{ .label = "forget it", .key = 'x', .ctrl = 'x', .stay = true, .run = command("picker_delete") },
+        .{ .label = "debugger", .key = 'd', .any = true, .run = openDebug },
         .{ .label = "new (several lines)", .key = 'c', .any = true, .run = command("run_command") },
         .{ .label = "again", .key = '.', .any = true, .run = command("run_again") },
         .{ .label = "output", .key = 'o', .any = true, .run = command("run_output") },
@@ -2772,8 +2808,223 @@ const Runner = struct {
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
         const folder = ed.commandFolder() catch return;
         defer ed.gpa.free(folder);
-        try out.text.print(ed.gpa, "Runs in {s}\nthrough your shell:\n\n{s}", .{ folder, item.text });
+        const how = if (ed.projectHasBreakpoints()) "under gdb: this project has breakpoints\n(t in SPC d turns them off)" else "through your shell (C-Enter: under gdb)";
+        try out.text.print(ed.gpa, "Runs in {s}\n{s}:\n\n{s}", .{ folder, how, item.text });
     }
+};
+
+/// `SPC d`: the debugger. Stopped, the rows are the stack (innermost first;
+/// the preview shows a frame's arguments and locals, Enter goes to it),
+/// then the breakpoints. The letters step: `n` next line, `s` into the call,
+/// `f` finish the function, `c` continue, `p` pause, `x` stop. Breakpoints:
+/// `b` on the cursor's line, `d` this one, `B` all, `t` all on/off (off:
+/// kept, but runs run normally), `u` undo. `r` runs the project's command
+/// (`SPC r Enter`: under gdb with breakpoints on), `R` under gdb always;
+/// in `SPC r` that's Enter and Ctrl-Enter.
+const Debug = struct {
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+    pub const create_label = "Debug ";
+    const bp_base: u32 = 1 << 20;
+    /// Programs debugged before (newest first), then the project's
+    /// executables found on disk.
+    const prog_base: u32 = 1 << 21;
+    const found_id: u32 = 1 << 22;
+
+    pub const title = "Debug";
+
+    /// The title, saying what the program is doing.
+    pub fn liveTitle(ed: *Editor) []const u8 {
+        if (ed.debug_asking) return "Debug which program?";
+        const d = ed.debugger orelse return if (ed.breakpoints_on) "Debug: breakpoints on (runs go through gdb)" else "Debug: breakpoints off (runs run normally)";
+        return switch (d.state) {
+            .starting => "Debug: starting",
+            .running => "Debug: running (p pauses)",
+            .stopped => "Debug: stopped",
+            .exited => "Debug: ended",
+        };
+    }
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        var detail: [Io.Dir.max_path_bytes + 32]u8 = undefined;
+        // Asking which program a build made: only the programs.
+        if (ed.debug_asking) return;
+        if (ed.debugger) |d| for (d.frames.items, 0..) |f, i| {
+            const where = if (f.path) |p| std.fmt.bufPrint(&detail, "{s}:{d}", .{ std.fs.path.basename(p), f.line + 1 }) catch "" else "no source";
+            try items.append(.{ .text = f.name, .detail = where, .id = @intCast(i) });
+        };
+        // The programs debugged here: the first is what `r` and `zig build
+        // run` debug.
+        const programs = try ed.debugPrograms();
+        defer {
+            for (programs) |x| ed.gpa.free(x);
+            ed.gpa.free(programs);
+        }
+        for (programs, 0..) |x, i| try items.append(.{ .text = x, .detail = if (i == 0) "program" else "", .id = prog_base + @as(u32, @intCast(i)) });
+        for (ed.breakpoints.items, 0..) |b, i| {
+            const dot = if (ed.breakpoints_on) "●" else "○";
+            const shown = std.fmt.bufPrint(&detail, "{s} {s}:{d}", .{ dot, std.fs.path.basename(b.path), b.line + 1 }) catch continue;
+            try items.append(.{ .text = shown, .detail = if (ed.breakpoints_on) "breakpoint" else "breakpoint (off)", .id = bp_base + @as(u32, @intCast(i)) });
+        }
+    }
+
+    /// Not while stepping: the rows refill on every stop.
+    pub fn wantsProduce(ed: *Editor) bool {
+        return ed.debugger == null or ed.debug_asking;
+    }
+
+    /// The project's compiled programs, newest first (`findPrograms`).
+    pub fn produce(e: *Engine) anyerror!void {
+        const found = try @import("../Debugger.zig").findPrograms(e.gpa, e.io, e.root);
+        defer {
+            for (found) |f| e.gpa.free(f);
+            e.gpa.free(found);
+        }
+        try e.checkpoint();
+        // Not the programs already listed (debugged this session).
+        const seeded = e.items.count();
+        outer: for (found) |f| {
+            for (0..seeded) |i| {
+                const t = e.items.get(i).text;
+                const prog = t[0 .. std.mem.indexOfScalar(u8, t, ' ') orelse t.len];
+                if (std.mem.eql(u8, prog, f)) continue :outer;
+            }
+            try e.items.append(.{ .text = f, .detail = "", .id = found_id });
+        }
+    }
+
+    pub fn create(ed: *Editor, query: []const u8) !void {
+        try ed.debugProgramText(query);
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id >= prog_base) return ed.debugProgramText(item.text);
+        if (item.id < bp_base) return ed.showFrame(item.id);
+        const i = item.id - bp_base;
+        if (i >= ed.breakpoints.items.len) return;
+        const b = ed.breakpoints.items[i];
+        const path = try ed.gpa.dupe(u8, b.path);
+        defer ed.gpa.free(path);
+        try ed.jumpTo(path, b.line, 0);
+        ed.centerCursor();
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= prog_base) {
+            const runner = ed.loadRunnerCommandPub();
+            defer if (runner) |r| ed.gpa.free(r);
+            try out.text.print(ed.gpa, "Enter: debugs\n\n  {s}\n\nin {s}", .{ item.text, ed.projectRoot() });
+            if (runner) |r| try out.text.print(ed.gpa, "\n\nbuilt first by the build part of\n\n  {s}", .{r});
+            try out.text.appendSlice(ed.gpa, "\n\nThis session, it's the program `zig build run` / `cargo run` debug here.\ne: add arguments   d: forget it");
+            return;
+        }
+        if (item.id >= bp_base) {
+            const i = item.id - bp_base;
+            if (i >= ed.breakpoints.items.len) return;
+            const b = ed.breakpoints.items[i];
+            return previewAt(ed, b.path, b.line, out);
+        }
+        const d = ed.debugger orelse return;
+        if (item.id >= d.frames.items.len) return;
+        const f = d.frames.items[item.id];
+        try out.text.print(ed.gpa, "{s}", .{f.name});
+        if (f.path) |p| try out.text.print(ed.gpa, "  {s}:{d}", .{ p, f.line + 1 });
+        try out.text.appendSlice(ed.gpa, "\n\n");
+        if (f.vars.items.len > 0) {
+            try out.text.appendSlice(ed.gpa, f.vars.items);
+        } else if (f.vars_left > 0) {
+            try out.text.appendSlice(ed.gpa, "(asking gdb...)");
+        } else if (item.id < 16) {
+            try out.text.appendSlice(ed.gpa, "(no arguments or locals)");
+        } else try out.text.appendSlice(ed.gpa, "(Enter goes there)");
+    }
+
+    fn stepper(comptime how: @import("../Debugger.zig").Step) *const fn (*Editor, ?Item) anyerror!void {
+        return &struct {
+            fn run(ed: *Editor, _: ?Item) anyerror!void {
+                try ed.debugStep(how);
+            }
+        }.run;
+    }
+
+    fn pause(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.debugPause();
+    }
+
+    fn stop(ed: *Editor, _: ?Item) anyerror!void {
+        ed.stopDebug();
+    }
+
+    fn breakpoint(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.toggleBreakpoint();
+    }
+
+    /// `d`: a breakpoint removed, or a program forgotten.
+    fn removeRow(ed: *Editor, item: ?Item) anyerror!void {
+        const it = item orelse return;
+        if (it.id >= prog_base and it.id < found_id) return ed.forgetDebugProgram(it.text);
+        if (it.id < bp_base or it.id >= prog_base) return ed.setMessage(.info, "d removes breakpoints and forgets programs", .{});
+        try ed.removeBreakpoint(it.id - bp_base);
+    }
+
+    /// `e`: the row into the query, to add arguments to.
+    fn editRow(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.runnerEdit();
+    }
+
+    fn clearAll(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.clearBreakpoints();
+    }
+
+    fn onOff(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.toggleBreakpointsOn();
+    }
+
+    fn undo(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.undoBreakpoints();
+    }
+
+    /// `r`: the project's runner command (`SPC r Enter`): under gdb with
+    /// breakpoints on, else a plain run. With none yet, the runner opens.
+    fn run(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.runAgain();
+    }
+
+    /// `R`: the runner command under gdb, breakpoints or not.
+    fn runDebug(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.debugAgain();
+    }
+
+    /// `C-j` / `C-k`: the editor's cursor down / up, the picker staying
+    /// open (to put a breakpoint on another line with `b`).
+    fn cursorBy(comptime name: []const u8) *const fn (*Editor, ?Item) anyerror!void {
+        return &struct {
+            fn run(ed: *Editor, _: ?Item) anyerror!void {
+                const c = commands.find(name) orelse return;
+                try c.run(.{ .ed = ed, .count = 1, .has_count = false });
+            }
+        }.run;
+    }
+
+    pub const item_actions = [_]Action{
+        .{ .label = "cursor down", .ctrl = 'j', .stay = true, .any = true, .keep_rows = true, .run = cursorBy("move_down") },
+        .{ .label = "cursor up", .ctrl = 'k', .stay = true, .any = true, .keep_rows = true, .run = cursorBy("move_up") },
+        .{ .label = "next", .key = 'n', .stay = true, .any = true, .run = stepper(.next) },
+        .{ .label = "step in", .key = 's', .stay = true, .any = true, .run = stepper(.step_in) },
+        .{ .label = "finish", .key = 'f', .stay = true, .any = true, .run = stepper(.step_out) },
+        .{ .label = "continue", .key = 'c', .any = true, .run = stepper(.cont) },
+        .{ .label = "pause", .key = 'p', .stay = true, .any = true, .run = pause },
+        .{ .label = "breakpoint here", .key = 'b', .stay = true, .any = true, .run = breakpoint },
+        .{ .label = "remove / forget", .key = 'd', .stay = true, .run = removeRow },
+        .{ .label = "arguments", .key = 'e', .ctrl = 'e', .stay = true, .run = editRow },
+        .{ .label = "breakpoints on/off", .key = 't', .stay = true, .any = true, .run = onOff },
+        .{ .label = "remove all breakpoints", .key = 'B', .stay = true, .any = true, .run = clearAll },
+        .{ .label = "undo (breakpoints)", .key = 'u', .stay = true, .any = true, .run = undo },
+        .{ .label = "output", .key = 'o', .any = true, .run = command("run_output") },
+        .{ .label = "run", .key = 'r', .any = true, .run = run },
+        .{ .label = "run under gdb", .key = 'R', .any = true, .run = runDebug },
+        .{ .label = "stop", .key = 'x', .stay = true, .any = true, .run = stop },
+    };
 };
 
 /// `x` / `dd` in the file browser: delete `ed.browse_target`?

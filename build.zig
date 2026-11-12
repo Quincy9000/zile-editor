@@ -98,7 +98,9 @@ pub fn build(b: *std.Build) void {
     addTerminal(b, test_mod, target, optimize);
     // For the terminal-mode grid's color type (no window code runs in tests).
     test_mod.addImport("raylib", raylibDep(b, target, optimize).module("raylib"));
-    const tests = b.addTest(.{ .root_module = test_mod });
+    // `zig build test -Dtest-filter=debugging`: only the tests whose names match.
+    const filters = b.option([]const []const u8, "test-filter", "Run only the tests whose names contain this") orelse &.{};
+    const tests = b.addTest(.{ .root_module = test_mod, .filters = filters });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

@@ -309,6 +309,13 @@ const base = [_]Command{
     .{ .name = "run_sql_file", .doc = "Run the whole SQL file", .run = runSql(true), .once = true },
     .{ .name = "run_output", .doc = "Show run output", .run = termCmd(.output), .once = true },
     .{ .name = "run_errors", .doc = "Errors from the last run", .run = termCmd(.errors), .once = true },
+    .{ .name = "debug_menu", .doc = "Debugger: stack, stepping, breakpoints", .run = debugCmd(.menu), .once = true },
+    .{ .name = "debug_breakpoint", .doc = "Breakpoint on this line (toggle)", .run = debugCmd(.breakpoint), .once = true },
+    .{ .name = "debug_next", .doc = "Debugger: next line", .run = debugCmd(.next), .once = true, .needs = "gdb" },
+    .{ .name = "debug_step_in", .doc = "Debugger: step into the call", .run = debugCmd(.step_in), .once = true, .needs = "gdb" },
+    .{ .name = "debug_finish", .doc = "Debugger: finish the function", .run = debugCmd(.step_out), .once = true, .needs = "gdb" },
+    .{ .name = "debug_continue", .doc = "Debugger: continue", .run = debugCmd(.cont), .once = true, .needs = "gdb" },
+    .{ .name = "debug_stop", .doc = "Debugger: stop the program", .run = debugCmd(.stop), .once = true },
     .{ .name = "quickfix_next", .doc = "Next quickfix entry", .run = qfCmd(.next), .once = true, .jump = true },
     .{ .name = "quickfix_previous", .doc = "Previous quickfix entry", .run = qfCmd(.previous), .once = true, .jump = true },
     .{ .name = "quickfix_list", .doc = "Quickfix list: errors, a run's or the project's", .run = qfCmd(.list), .once = true },
@@ -424,6 +431,7 @@ const base = [_]Command{
     .{ .name = "replace_previous", .doc = "Replace: previous line", .run = replaceCmd(.previous), .once = true, .hidden = true },
     .{ .name = "replace_skip_file", .doc = "Replace: skip (or take back) the whole file", .run = replaceCmd(.skip_file), .once = true, .hidden = true },
     .{ .name = "picker_accept", .doc = "Open the selection", .run = pickerAccept, .hidden = true },
+    .{ .name = "picker_accept_alt", .doc = "Accept the other way (the runner: under the debugger)", .run = pickerAcceptAlt, .hidden = true },
     .{ .name = "picker_open_menu", .doc = "Open in... (split)", .run = pickerOpen(null), .hidden = true },
     .{ .name = "picker_open_right", .doc = "Open in a split to the right", .run = pickerOpen(.right), .hidden = true },
     .{ .name = "picker_open_below", .doc = "Open in a split below", .run = pickerOpen(.below), .hidden = true },
@@ -2109,6 +2117,23 @@ fn termCmd(comptime action: enum { toggle, window, runner, command, again, outpu
     }.run;
 }
 
+fn debugCmd(comptime action: enum { menu, breakpoint, next, step_in, step_out, cont, stop }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            switch (action) {
+                .menu => try ed.openDebug(),
+                .breakpoint => try ed.toggleBreakpoint(),
+                .next => try ed.debugStep(.next),
+                .step_in => try ed.debugStep(.step_in),
+                .step_out => try ed.debugStep(.step_out),
+                .cont => try ed.debugStep(.cont),
+                .stop => ed.stopDebug(),
+            }
+        }
+    }.run;
+}
+
 fn qfCmd(comptime action: enum { next, previous, list, from_picker, clear }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
@@ -2647,6 +2672,10 @@ fn searchCancel(c: Context) !void {
 
 fn pickerAccept(c: Context) !void {
     try c.ed.acceptPicker();
+}
+
+fn pickerAcceptAlt(c: Context) !void {
+    try c.ed.acceptPickerAlt();
 }
 
 /// <Tab>: the "Open in..." menu; <C-v> / <C-s>: straight into a split.

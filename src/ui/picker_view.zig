@@ -128,6 +128,7 @@ fn drawActionBar(p: *const Picker, font: *const Font, theme: *const Theme, x0: f
     var buf: [16]u8 = undefined;
     const tab_label = if (typing) "actions" else "all actions";
     if (!putPart(font, theme, &x, x_end, y, "Tab", tab_label)) return;
+    if (sources.altAccept(p.kind)) |alt| if (!putPart(font, theme, &x, x_end, y, "C-⏎", alt.label)) return;
     for (sources.itemActions(p.kind)) |a| {
         const key = if (typing)
             (if (a.ctrl != 0) std.fmt.bufPrint(&buf, "C-{c}", .{a.ctrl}) catch continue else continue)

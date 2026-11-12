@@ -1,4 +1,4 @@
-//! A language server over stdio: JSON-RPC with `Content-Length` framing.
+//! A language server (or gdb's DAP) over stdio, with `Content-Length` framing.
 //!
 //! A reader thread splits the server's output into messages and queues them;
 //! the main thread takes them with `takeMessages` (and is woken via `wake`).
@@ -133,6 +133,12 @@ pub fn notify(c: *Client, method: []const u8, params: anytype) !void {
 /// Sends a notification immediately, even before `markReady`.
 pub fn notifyNow(c: *Client, method: []const u8, params: anytype) !void {
     try c.write(.{ .jsonrpc = "2.0", .method = method, .params = params }, true);
+}
+
+/// Sends `msg` as it is (any protocol framed by `Content-Length`: the
+/// debugger's DAP too), right away.
+pub fn send(c: *Client, msg: anytype) !void {
+    try c.write(msg, true);
 }
 
 /// Answers a request from the server.

@@ -134,6 +134,7 @@ pub fn activeQuery(p: *const Picker) []const u8 {
 
 pub fn title(p: *const Picker) []const u8 {
     if (p.kind == .browse) return p.ed.browse_label.items;
+    if (p.kind == .debug) return sources.debugTitle(p.ed);
     return sources.title(p.kind);
 }
 
@@ -272,6 +273,8 @@ pub fn createRow(p: *const Picker) ?usize {
         if (std.mem.eql(u8, p.shown.items.get(r.index).text, q)) return null;
     }
     if (sources.createFirst(p.kind)) return 0;
+    // The Debug picker: a program with arguments typed after it.
+    if (p.kind == .debug and std.mem.indexOfScalar(u8, q, ' ') != null) return 0;
     // The explorer: after everything found here and elsewhere (Enter on
     // something that matched opens it), or the only row.
     return p.snap.len + p.globalLen();

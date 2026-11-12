@@ -41,6 +41,7 @@ comptime {
     _ = @import("commands.zig");
     _ = @import("Editor.zig");
     _ = @import("Windows.zig");
+    _ = @import("Debugger.zig");
     _ = @import("terminal/Pty.zig");
     _ = @import("terminal/RunMemory.zig");
     _ = @import("terminal/Terminal.zig");

@@ -100,6 +100,15 @@ pub fn write(p: *const Pty, bytes: []const u8) void {
     }
 }
 
+extern "c" fn ptsname_r(fd: c_int, buf: [*]u8, len: usize) c_int;
+
+/// The terminal device the child has (`/dev/pts/N`), in `buf`: another
+/// program can be given it too (the debugger's program).
+pub fn deviceName(p: *const Pty, buf: []u8) ?[]const u8 {
+    if (ptsname_r(p.fd, buf.ptr, buf.len) != 0) return null;
+    return std.mem.sliceTo(buf, 0);
+}
+
 /// Tells the child its new window size (it gets SIGWINCH).
 pub fn resize(p: *const Pty, size: Size) void {
     const ws: Winsize = .{ .row = size.rows, .col = size.cols, .xpixel = size.cols *| size.cell_w, .ypixel = size.rows *| size.cell_h };

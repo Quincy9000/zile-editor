@@ -437,6 +437,12 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     const t = ed.text();
     const v = &ed.view;
     const cursor_line = ed.cursorLine();
+    // Breakpoints and the debugger's stop are kept by absolute path.
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const debug_path: ?[]const u8 = if (ed.breakpoints.items.len == 0 and ed.debugger == null) null else if (ed.buffer.path) |bp|
+        (if (std.fs.path.isAbsolute(bp)) bp else std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ ed.cwd, bp }) catch null)
+    else
+        null;
     const tab_width = ed.options.tab_width;
     var ghost_below: ?struct { text: []const u8, y: f32 } = null;
 
@@ -527,6 +533,9 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         if (fold != null) rect(0, y, l.width, font.cell_h, theme.fold_bg);
 
         if (is_current and focused) rect(0, y, l.width, font.cell_h, theme.cursorline_bg);
+        const marks: Editor.DebugMarks = if (debug_path) |dp| ed.debugMarks(dp, line) else .{};
+        // Where the debugger stopped: the line tinted.
+        if (marks.here) rect(0, y, l.width, font.cell_h, withAlpha(theme.diag_warning, 40));
         if (selection) |sel| drawSelection(ed, font, theme, l, sel, line, y);
         if (selection != null) for (ed.cursors.items) |c| {
             drawSelection(ed, font, theme, l, ed.selectionRange(c.anchor, c.pos), line, y);
@@ -557,6 +566,11 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         // The number on a line's first row only (later rows continue it).
         if (first_piece) _ = font.drawText(num, num_x, y, num_color);
         drawGitSign(ed, theme, line, y, font.cell_h);
+        if (first_piece and (marks.breakpoint or marks.here)) {
+            // Breakpoints switched off stay, hollow.
+            const glyph = if (marks.here) "▶" else if (ed.breakpoints_on) "●" else "○";
+            _ = font.drawText(glyph, 0, y, if (marks.here) theme.diag_warning else if (ed.breakpoints_on) theme.diag_error else theme.gutter_fg);
+        }
 
         if (ed.search_highlight) drawSearchMatches(ed, font, theme, l, line, y);
         drawYankFlash(ed, font, theme, l, line, y);
@@ -1481,4 +1495,8 @@ fn drawContext(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) v
     }
     const bottom = @as(f32, @floatFromInt(lines.len)) * font.cell_h;
     rect(0, bottom - 1, l.width, 1, theme.popup_border);
+}
+
+fn withAlpha(c: rl.Color, a: u8) rl.Color {
+    return .{ .r = c.r, .g = c.g, .b = c.b, .a = a };
 }

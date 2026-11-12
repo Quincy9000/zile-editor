@@ -72,7 +72,8 @@ the row, `/` types to filter.
 | `SPC` | Leader menu | every row below, on its key; `i` filters |
 | `SPC SPC` (and `SPC .`) | Files: the explorer | starts as the project's folder (`SPC .`: the current file's), its entries only; typing searches two ways at once: **here** (the folder's entries and every file below it, the ones you visit most first; instant, ranked by the file name then nearness) and, under a line, **elsewhere** (`files_global`, a second engine run per query: files you opened in other places, then `fd --fixed-strings` over `$HOME`, skipping `.git`, `node_modules`, caches and build output unless `SPC t` turns that off), so `main.zig` shows this project's first and `zshrc` finds `~/.zshrc` from any project; Create is the last row; a folder path typed out (`src/`, `~/code/x`, `/etc`, `../y`) goes there with `/` or Enter, `/` with nothing typed starts at the root, `BS` on nothing goes up; `c` works here (a cd: Files, search, the runner and the terminal start from this folder from now on); `o n r m x yy p` the explorer's file operations; `C-t` scopes: folder · buffers · recent everywhere · whole disk |
 | `SPC b` | Files, open scope | `x` / `C-x` close, `n` new, `s` save, `S` save all, `r` rename / move, `w` save as, `c` copy to, `R` revert, `D` delete the file, `o` close the others, `y` / `Y` copy path |
-| `SPC w` | Windows | rows: the other windows (last used first), the one you're in last (`SPC w Enter` flips back), then `+ New window right… / below…` (pick what it shows in Files; cancel: no window) and `+ New terminal window`; the preview draws the layout (selected window double-lined, yours `*`); `w` (`SPC w w`) back to the previous window and again to toggle, `h j k l` the window that way from yours, `v` / `s` split the selected one, `x` close, `X` swap with yours, `z` maximise / back, `b` choose its buffer, `o` only, `=` equal, `>` `<` `+` `-` grow / shrink (stays open), `t` terminal in it |
+| `SPC w` | Windows | rows: the other windows (last used first), the one you're in last (`SPC w Enter` flips back), then `+ New window right… / below…` (pick what it shows in Files; cancel: no window) and `+ New terminal window`; the preview draws the layout (selected window double-lined, yours `*`); `w` (`SPC w w`) back to the previous window and again to toggle, `h j k l` the window that way from yours, keys about where you are act on the window you're in: `v` / `s` split, `z` maximise / back, `b` its buffer, `o` only, `=` equal, `>` `<` `+` `-` grow / shrink (stays open), `t` terminal; keys about a window as a thing act on the selected row: Enter go there, `x` close, `X` swap with yours |
+| `SPC d` | Debug | gdb: see Debugger below |
 | `SPC t` | toggles | every setting with its on / off state; Enter flips it and the list stays; colour scheme, text size |
 | `SPC l` | code (menu) | `.` rename, `r` references, `a` actions, `f` format, `d` definition, `i` implementations, `k` docs, `l` symbols (`C-t`: project), `w` project symbols, `x` errors, `c` colour wheel, `m` man pages, `t` todo tag, `W` trim whitespace |
 | `SPC r` | runner | your commands, newest first: Enter runs, type a new one; `e` / `C-e` edit, `x` / `C-x` forget, `c` multi-line, `.` again, `o` output, `E` errors, `t` terminal, `T` terminal here, `s` / `S` SQL statement / file |
@@ -740,6 +741,36 @@ src/terminal/
 - Use ghostty's Unicode width functions in the editor too, so buffers and
   terminals agree on column widths.
 
+## Debugger (gdb)
+
+`Debugger.zig` speaks the Debug Adapter Protocol to `gdb -i dap` (through the
+LSP's stdio client; started with `setsid` so gdb doesn't take the terminal,
+and killed with SIGKILL: gdb ignores SIGTERM). The program runs on the run
+popup's own terminal (gdb's `inferior-tty`, held open by a waiting process),
+so its output and input work as in a plain run; Ctrl-C there pauses it.
+
+- **Starting.** In `SPC r`, Ctrl-Enter runs the command under gdb; plain
+  Enter does too when the project has breakpoints switched on. `SPC d r`
+  runs the last runner command the same way, `R` under gdb always.
+- **From a command to a program** (`Debugger.plan`): `./app args` and
+  `make && ./app` name it; `zig run x.zig` is built to a path zile chooses;
+  `cargo run --bin x` is `target/debug/x`. `zig build run` / `cargo run`
+  don't say: the build runs first, then the project's compiled programs (ELF
+  executables, hidden folders skipped) are looked at: one is used; several
+  are listed in `SPC d` ("Debug which program?", newest first). The pick
+  holds for the session only (nothing on disk). Release flags
+  (`--release`, `-Doptimize=`, `-O`) are left out of a debugger's build.
+- **Stopped** (breakpoint, step, crash): the editor goes to the innermost
+  frame in your code (`▶`, tinted line) and `SPC d` opens: rows are the
+  stack, the preview a frame's arguments and locals. `n` next, `s` step in,
+  `f` finish, `c` continue, `p` pause, `x` stop, `o` output.
+- **Breakpoints** (`●`, kept for the session): `b` on the cursor's line,
+  `d` remove the row's, `B` remove all, `t` all on/off (off: kept, hollow
+  `○`, runs run normally), `u` undo. `C-j` / `C-k` move the editor's cursor
+  with the picker open.
+- Not yet: breakpoints following edits, Zig pretty printers, values inline,
+  expanding structs, evaluating expressions.
+
 ## Claude Code (IDE protocol)
 
 `ai/WsServer.zig`: a WebSocket server on 127.0.0.1 (random port; the
@@ -852,6 +883,7 @@ terminal contents meanwhile.
 
 ```
 zig build test                                        # headless core tests
+zig build test -Dtest-filter=debugging                # only tests whose names match
 ZILE_TEST_KEYS='3jwi// hi<Esc><Space>f' ZILE_TEST_SCREENSHOT=/tmp/shot.png zig build run -- file.zig
 ```
 `ZILE_TEST_KEYS` feeds key notation at startup; `ZILE_TEST_SCREENSHOT` saves a

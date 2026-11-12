@@ -488,6 +488,7 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ PA, "<C-g>", "picker_close" },
     .{ PA, "<C-c>", "picker_close" },
     .{ PA, "<CR>", "picker_accept" },
+    .{ PA, "<C-CR>", "picker_accept_alt" },
     .{ PA, "<Tab>", "picker_open_menu" },
     .{ PA, "<C-q>", "picker_to_quickfix" },
     .{ PA, "<C-r>", "picker_replace" },
