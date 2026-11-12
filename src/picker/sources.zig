@@ -180,7 +180,6 @@ pub fn setup(kind: Kind, ed: *Editor, e: *Engine) !?Engine.Producer {
                 e.empty_limit = e.items.count();
                 try S.fillTyped(ed, e);
             }
-            if (@hasDecl(S, "wantsProduce") and !S.wantsProduce(ed)) return null;
             return if (@hasDecl(S, "produce")) S.produce else null;
         },
     }
@@ -2853,8 +2852,11 @@ const Debug = struct {
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         var detail: [Io.Dir.max_path_bytes + 32]u8 = undefined;
-        // Asking which program a build made: only the programs.
-        if (ed.debug_asking) return;
+        // Asking which program a build made: only the programs found.
+        if (ed.debug_asking) {
+            for (ed.debug_found) |f| try items.append(.{ .text = f, .detail = "", .id = found_id });
+            return;
+        }
         if (ed.debugger) |d| for (d.frames.items, 0..) |f, i| {
             const where = if (f.path) |p| std.fmt.bufPrint(&detail, "{s}:{d}", .{ std.fs.path.basename(p), f.line + 1 }) catch "" else "no source";
             try items.append(.{ .text = f.name, .detail = where, .id = @intCast(i) });
@@ -2873,23 +2875,6 @@ const Debug = struct {
     }
 
     /// Not while stepping: the rows refill on every stop.
-    /// Only when asking which program a build made.
-    pub fn wantsProduce(ed: *Editor) bool {
-        return ed.debug_asking;
-    }
-
-    /// The compiled programs where the build put them, newest first
-    /// (`findPrograms`; the picker's root is that folder).
-    pub fn produce(e: *Engine) anyerror!void {
-        const found = try @import("../Debugger.zig").findPrograms(e.gpa, e.io, e.root);
-        defer {
-            for (found) |f| e.gpa.free(f);
-            e.gpa.free(found);
-        }
-        try e.checkpoint();
-        for (found) |f| try e.items.append(.{ .text = f, .detail = "", .id = found_id });
-    }
-
     pub fn create(ed: *Editor, query: []const u8) !void {
         try ed.debugProgramText(query);
     }

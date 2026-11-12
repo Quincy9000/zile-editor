@@ -77,6 +77,9 @@ lenses: std.ArrayList(Lens) = .empty,
 /// The text version lenses were last asked for, and whether an answer is due.
 lens_version: u64 = std.math.maxInt(u64),
 lens_pending: bool = false,
+/// Told when lines are added or removed, so marks kept by line number
+/// outside the buffer (breakpoints) stay on their lines.
+line_listener: ?LineListener = null,
 /// The save count the last compile check (standalone Zig) was for.
 checked: u64 = std.math.maxInt(u64),
 /// Editor.use_counter when last shown, for most-recently-used ordering.
@@ -213,32 +216,54 @@ pub fn delete(b: *Buffer, start: usize, end: usize) void {
     b.edit_version += 1;
 }
 
-/// Lenses stay on their lines as lines are added above them (a newline at
-/// the very start of a lens's line moves it down too).
+/// A change in which line is which.
+pub const LineEdit = union(enum) {
+    /// `added` lines after `line` (before it, with `at_start`: a newline at
+    /// the very start of a line moves that line down).
+    insert: struct { line: u32, at_start: bool, added: u32 },
+    /// Lines `first + 1 ..= last` are gone, joined into `first`.
+    delete: struct { first: u32, last: u32 },
+
+    /// Where a mark on `line` is after the edit (on `first`, if its line
+    /// was deleted).
+    pub fn apply(e: LineEdit, line: u32) u32 {
+        return switch (e) {
+            .insert => |i| if (line > i.line or (line == i.line and i.at_start)) line + i.added else line,
+            .delete => |d| if (line > d.last) line - (d.last - d.first) else if (line > d.first) d.first else line,
+        };
+    }
+};
+
+pub const LineListener = struct {
+    ctx: *anyopaque,
+    /// Called before the text changes.
+    changed: *const fn (ctx: *anyopaque, b: *const Buffer, edit: LineEdit) void,
+};
+
+/// Lenses (and the listener's marks) stay on their lines as lines are added
+/// above them.
 fn shiftLensesForInsert(b: *Buffer, pos: usize, bytes: []const u8) void {
-    if (b.lenses.items.len == 0) return;
+    if (b.lenses.items.len == 0 and b.line_listener == null) return;
     const added: u32 = @intCast(std.mem.count(u8, bytes, "\n"));
     if (added == 0) return;
     const line = b.text.lineOf(pos);
-    const at_start = pos == b.text.lineStart(line);
-    for (b.lenses.items) |*l| {
-        if (l.line > line or (l.line == line and at_start)) l.line += added;
-    }
+    const edit: LineEdit = .{ .insert = .{ .line = @intCast(line), .at_start = pos == b.text.lineStart(line), .added = added } };
+    for (b.lenses.items) |*l| l.line = edit.apply(l.line);
+    if (b.line_listener) |l| l.changed(l.ctx, b, edit);
 }
 
 /// And as lines are deleted; a lens on a deleted line goes with it.
 fn shiftLensesForDelete(b: *Buffer, start: usize, end: usize) void {
-    if (b.lenses.items.len == 0) return;
+    if (b.lenses.items.len == 0 and b.line_listener == null) return;
     const first = b.text.lineOf(start);
     const last = b.text.lineOf(end);
     if (last == first) return;
-    const removed: u32 = @intCast(last - first);
+    const edit: LineEdit = .{ .delete = .{ .first = @intCast(first), .last = @intCast(last) } };
     for (b.lenses.items) |*l| {
-        if (l.line > first and l.line <= last) {
-            l.gone = true;
-            l.line = @intCast(first);
-        } else if (l.line > last) l.line -= removed;
+        if (l.line > first and l.line <= last) l.gone = true;
+        l.line = edit.apply(l.line);
     }
+    if (b.line_listener) |l| l.changed(l.ctx, b, edit);
 }
 
 pub fn displayName(b: *const Buffer) []const u8 {

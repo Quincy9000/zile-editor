@@ -633,9 +633,13 @@ debug_programs: std.ArrayList(DebugProgram) = .empty,
 /// The Debug picker is asking which program a build made (it lists only
 /// the programs).
 debug_asking: bool = false,
-/// While asking: the plan waiting for the answer, and the folder the
-/// programs listed are in (owned).
+/// A build's program is being looked for (off the main thread).
+debug_search: ?*Debugger.Search = null,
+/// While looking and asking: the plan waiting for its program. While
+/// asking: the programs found (the picker's rows) and the folder they
+/// are in. All owned.
 debug_ask: ?Debugger.Plan = null,
+debug_found: [][]u8 = &.{},
 debug_ask_root: ?[]u8 = null,
 /// The folder the debugged command runs in (owned): its build, its
 /// program's relative paths, the program itself. Set when a debug starts.
@@ -978,7 +982,9 @@ pub fn deinit(ed: *Editor) void {
     ed.debug_programs.deinit(ed.gpa);
     for (ed.debug_commands.items) |dc| dc.deinit(ed.gpa);
     ed.debug_commands.deinit(ed.gpa);
+    if (ed.debug_search) |sr| sr.destroy();
     if (ed.debug_ask) |a| a.deinit(ed.gpa);
+    ed.setDebugFound(&.{});
     if (ed.debug_ask_root) |r| ed.gpa.free(r);
     if (ed.debug_root) |r| ed.gpa.free(r);
     if (ed.cmd_from) |f| ed.gpa.free(f);
@@ -1148,6 +1154,7 @@ pub fn tick(ed: *Editor) void {
     ed.tickInlayHints();
     ed.pollGitJob();
     ed.pollTerminals();
+    ed.tickDebugSearch();
     ed.tickDebugger();
     ed.pollAi();
     ed.tickClaude();
@@ -2531,6 +2538,7 @@ fn reloadFromDisk(ed: *Editor) void {
 pub fn reloadBuffer(ed: *Editor, b: *Buffer) !void {
     const path = b.path orelse return error.NoPath;
     var fresh = try Buffer.load(ed.gpa, ed.io, path);
+    fresh.line_listener = b.line_listener;
     const cursor = if (b == ed.buffer) ed.view.cursor else b.saved.cursor;
     ed.lspCloseBuffer(b);
     const saved = b.saved;
@@ -4416,6 +4424,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
     }
 
     var loaded = try Buffer.load(ed.gpa, ed.io, norm);
+    loaded.line_listener = .{ .ctx = ed, .changed = breakpointLinesChanged };
     loaded.project = ed.projectOf(norm);
     ed.enterProject(loaded.project);
     // Replace an untouched scratch buffer instead of keeping it around, like vim.
@@ -5364,6 +5373,7 @@ fn rerun(ed: *Editor) !void {
 pub fn startRun(ed: *Editor, cmd: []const u8) !void {
     // A run replaces the debugging session (its terminal is the popup's).
     ed.endDebug();
+    ed.cancelDebugSearch();
     if (ed.debug_plan) |pl| pl.deinit(ed.gpa);
     ed.debug_plan = null;
     for (ed.buffers.items) |b| if (b.modified and b.path != null) {
@@ -5823,6 +5833,7 @@ fn debugPlanned(ed: *Editor, plan: Debugger.Plan) !void {
         return;
     }
     ed.endDebug();
+    ed.cancelDebugSearch();
     try ed.launchDebug(plan);
 }
 
@@ -5932,37 +5943,52 @@ pub fn forgetDebugProgram(ed: *Editor) void {
     }
 }
 
-/// After a build system's build: the program it made, looked for where the
-/// build system puts programs (`plan.program`: `zig-out/bin`,
-/// `target/debug`) and, with none there, anywhere in `folder`. The only
-/// one is debugged; with several, the Debug picker lists them to pick from.
+/// After a build system's build: the program it made is looked for
+/// (`Debugger.Search`, off the main thread: a big folder takes a moment);
+/// `tickDebugSearch` goes on from there.
 fn askProgram(ed: *Editor, plan: Debugger.Plan, folder: []const u8) anyerror!void {
+    ed.cancelDebugSearch();
     const out_dir = try std.fs.path.resolve(ed.gpa, &.{ folder, plan.program });
     defer ed.gpa.free(out_dir);
-    var dir: []const u8 = out_dir;
-    var found = try Debugger.findPrograms(ed.gpa, ed.io, dir);
-    if (found.len == 0) {
-        ed.gpa.free(found);
-        dir = folder;
-        found = try Debugger.findPrograms(ed.gpa, ed.io, dir);
-    }
-    defer {
-        for (found) |f| ed.gpa.free(f);
-        ed.gpa.free(found);
-    }
-    if (found.len == 0) return ed.setMessage(.err, "the build made no program to debug (nothing compiled in {s})", .{folder});
-    if (found.len > 1) {
-        const root = try ed.gpa.dupe(u8, dir);
-        errdefer ed.gpa.free(root);
-        const waiting = try plan.clone(ed.gpa);
-        // An earlier question's picker reads the root about to be freed.
-        if (ed.picker) |pk| if (pk.kind == .debug) ed.closePicker();
-        if (ed.debug_ask) |old| old.deinit(ed.gpa);
+    const waiting = try plan.clone(ed.gpa);
+    if (ed.debug_ask) |old| old.deinit(ed.gpa);
+    ed.debug_ask = waiting;
+    ed.debug_search = try Debugger.Search.start(ed.gpa, ed.io, out_dir, folder, ed.wake_fn);
+    ed.setMessage(.info, "looking for the program the build made...", .{});
+}
+
+fn cancelDebugSearch(ed: *Editor) void {
+    if (ed.debug_search) |s| s.destroy();
+    ed.debug_search = null;
+}
+
+/// Takes `list` (and its strings) as the programs to pick from.
+fn setDebugFound(ed: *Editor, list: [][]u8) void {
+    for (ed.debug_found) |f| ed.gpa.free(f);
+    ed.gpa.free(ed.debug_found);
+    ed.debug_found = list;
+}
+
+/// The search is done: the only program is debugged; with several, the
+/// Debug picker lists them to pick from.
+fn tickDebugSearch(ed: *Editor) void {
+    const s = ed.debug_search orelse return;
+    if (!s.isDone()) return;
+    ed.debug_search = null;
+    defer s.destroy();
+    ed.searchDone(s) catch |err| ed.setMessage(.err, "could not start gdb: {s}", .{@errorName(err)});
+}
+
+fn searchDone(ed: *Editor, s: *Debugger.Search) !void {
+    const plan = ed.debug_ask orelse return;
+    if (s.found.len == 0) return ed.setMessage(.err, "the build made no program to debug (nothing compiled in {s})", .{s.folder});
+    if (s.found.len > 1) {
+        const root = try ed.gpa.dupe(u8, s.dir);
         if (ed.debug_ask_root) |old| ed.gpa.free(old);
-        ed.debug_ask = waiting;
         ed.debug_ask_root = root;
+        ed.setDebugFound(s.found);
+        s.found = &.{};
         ed.debug_asking = true;
-        ed.next_picker_root = root;
         // The build's output would take the keys.
         ed.popup = null;
         try ed.openPicker(.debug, "");
@@ -5972,7 +5998,7 @@ fn askProgram(ed: *Editor, plan: Debugger.Plan, folder: []const u8) anyerror!voi
     // One: that's it.
     var chosen = try plan.clone(ed.gpa);
     defer chosen.deinit(ed.gpa);
-    const abs = try std.fs.path.resolve(ed.gpa, &.{ dir, found[0] });
+    const abs = try std.fs.path.resolve(ed.gpa, &.{ s.dir, s.found[0] });
     ed.gpa.free(chosen.program);
     chosen.program = abs;
     chosen.newest_in = false;
@@ -6304,6 +6330,37 @@ fn sendAllBreakpoints(ed: *Editor, also: []const Breakpoint) !void {
     for (ed.breakpoints.items) |b| try paths.put(arena_state.allocator(), b.path, {});
     for (also) |b| try paths.put(arena_state.allocator(), b.path, {});
     for (paths.keys()) |p| try ed.sendBreakpoints(p);
+}
+
+/// Lines were added or removed in `b`: its breakpoints stay on their lines
+/// (one whose line is deleted moves to the line it was joined into), in
+/// the undo history too. gdb isn't told: what it runs was built from the
+/// file as it was; the next debug sends them where they are now.
+fn breakpointLinesChanged(ctx: *anyopaque, b: *const Buffer, edit: Buffer.LineEdit) void {
+    const ed: *Editor = @ptrCast(@alignCast(ctx));
+    if (ed.breakpoints.items.len == 0 and ed.breakpoint_undo.items.len == 0) return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const path = std.fs.path.resolve(fba.allocator(), &.{ ed.cwd, b.path orelse return }) catch return;
+    for (ed.breakpoint_undo.items) |list| for (list) |*bp| {
+        if (std.mem.eql(u8, bp.path, path)) bp.line = edit.apply(bp.line);
+    };
+    for (ed.breakpoints.items) |*bp| {
+        if (std.mem.eql(u8, bp.path, path)) bp.line = edit.apply(bp.line);
+    }
+    // Two that ended up on one line are one.
+    var i: usize = 0;
+    while (i < ed.breakpoints.items.len) : (i += 1) {
+        const a = ed.breakpoints.items[i];
+        var j = i + 1;
+        while (j < ed.breakpoints.items.len) {
+            const o = ed.breakpoints.items[j];
+            if (o.line == a.line and std.mem.eql(u8, o.path, a.path)) {
+                ed.gpa.free(o.path);
+                _ = ed.breakpoints.orderedRemove(j);
+            } else j += 1;
+        }
+    }
 }
 
 /// The breakpoint lines in `path` (absolute), sorted.
@@ -13727,6 +13784,15 @@ test "debugging a build's program: the only one is used, several are asked for; 
             }
             return error.Timeout;
         }
+        /// The search for the build's program is over.
+        fn untilFound(e: *Editor) !void {
+            for (0..2000) |_| {
+                e.tick();
+                if (e.debug_search == null) return;
+                testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            return error.Timeout;
+        }
     };
     try S.compile(dir, src, "out/t");
     // In a hidden folder: a tool's, not looked in.
@@ -13739,6 +13805,7 @@ test "debugging a build's program: the only one is used, several are asked for; 
     const plan: Debugger.Plan = .{ .program = @constCast("zig-out/bin"), .newest_in = true, .args = &.{} };
     // The build made one program: it's debugged, no question.
     try ed.launchDebug(plan);
+    try S.untilFound(&ed);
     try testing.expect(ed.debugger != null);
     try S.untilEnd(&ed);
     const shown = try ed.run.?.screenText(gpa);
@@ -13757,14 +13824,10 @@ test "debugging a build's program: the only one is used, several are asked for; 
     try S.compile(dir, src, "out/u");
     ed.forgetDebugProgram();
     try ed.launchDebug(plan);
+    try S.untilFound(&ed);
     try testing.expect(ed.debugger == null);
     try testing.expect(ed.debug_asking);
     try testing.expectEqualStrings("Debug which program?", ed.picker.?.title());
-    for (0..400) |_| {
-        settlePicker(&ed);
-        if (ed.picker.?.snap.done) break;
-        testing.io.sleep(.fromMilliseconds(5), .awake) catch {};
-    }
     settlePicker(&ed);
     try testing.expectEqual(2, ed.picker.?.rowCount());
     try testing.expectEqualStrings("out/u", ed.picker.?.itemAt(0).?.text); // newest
@@ -13789,6 +13852,7 @@ test "debugging a build's program: the only one is used, several are asked for; 
     try S.compile(dir, src, "zig-out/bin/app");
     ed.forgetDebugProgram();
     try ed.launchDebug(plan);
+    try S.untilFound(&ed);
     try testing.expect(ed.debugger != null and !ed.debug_asking);
     try S.untilEnd(&ed);
     const programs = try ed.debugPrograms();
@@ -13887,4 +13951,45 @@ test "the runner: c changes a command in the vim command editor; Enter runs it" 
     try ed.feed("$ciwthree<Esc><CR>");
     waitForRun(&ed);
     try testing.expectEqualStrings("echo one three", ed.run_command.?);
+}
+
+test "breakpoints follow their lines through edits and undo" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.c", .data = "one\ntwo\nthree\nfour\n" });
+    const src = try std.fs.path.join(gpa, &.{ dir, "a.c" });
+    defer gpa.free(src);
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.options.format_on_save = false;
+    try ed.openFile(src);
+    try ed.feed("3G"); // "three"
+    try ed.toggleBreakpoint();
+    try ed.feed("4G");
+    try ed.toggleBreakpoint();
+    const bps = &ed.breakpoints;
+    try testing.expectEqual(2, bps.items[0].line);
+    // A line added above (O on the breakpoint's own line too) moves it down.
+    try ed.feed("ggOzero<Esc>");
+    try testing.expectEqual(3, bps.items[0].line);
+    try ed.feed("4GOnew<Esc>"); // above "three"
+    try testing.expectEqual(4, bps.items[0].line);
+    try testing.expectEqual(5, bps.items[1].line);
+    // A line added below it doesn't.
+    try ed.feed("5Gobelow<Esc>");
+    try testing.expectEqual(4, bps.items[0].line);
+    try testing.expectEqual(6, bps.items[1].line);
+    // Lines deleted above move it up; undo puts it back.
+    try ed.feed("ggdd");
+    try testing.expectEqual(3, bps.items[0].line);
+    try ed.feed("u");
+    try testing.expectEqual(4, bps.items[0].line);
+    // Its own line deleted with the next one's: both are one, on what's there now.
+    try ed.feed("5Gdj"); // "three" and "below"
+    try testing.expectEqual(4, bps.items[0].line);
+    try ed.feed("dd"); // "four", the other breakpoint's line
+    try testing.expectEqual(1, bps.items.len);
 }

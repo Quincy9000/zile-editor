@@ -526,7 +526,8 @@ pub fn dupeArgs(gpa: Allocator, list: []const []u8) ![][]u8 {
 /// The compiled programs (ELF executables) under `root`, as paths relative
 /// to it, newest first: what a build just made comes first. Hidden folders
 /// (`.zig-cache`, `.git`) aren't looked in. Caller frees each and the slice.
-pub fn findPrograms(gpa: Allocator, io: Io, root_path: []const u8) ![][]u8 {
+/// Setting `stop` ends it early (with what was found so far).
+pub fn findPrograms(gpa: Allocator, io: Io, root_path: []const u8, stop: ?*const std.atomic.Value(bool)) ![][]u8 {
     const Found = struct { path: []u8, time: Io.Timestamp };
     var found: std.ArrayList(Found) = .empty;
     defer found.deinit(gpa);
@@ -539,6 +540,7 @@ pub fn findPrograms(gpa: Allocator, io: Io, root_path: []const u8) ![][]u8 {
         w.deinit();
     }
     while (true) {
+        if (stop) |x| if (x.load(.acquire)) break;
         const entry = (w.next(io) catch continue) orelse break;
         switch (entry.kind) {
             .directory => if (entry.basename[0] != '.') w.enter(io, entry) catch {},
@@ -567,6 +569,65 @@ pub fn findPrograms(gpa: Allocator, io: Io, root_path: []const u8) ![][]u8 {
     found.clearRetainingCapacity();
     return out;
 }
+
+/// Looking for the program a build made, off the main thread: where the
+/// build system puts programs (`out_dir`) and, with none there, anywhere in
+/// `folder`.
+pub const Search = struct {
+    gpa: Allocator,
+    io: Io,
+    wake: *const fn () void,
+    thread: std.Thread = undefined,
+    out_dir: []u8,
+    folder: []u8,
+    stop: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    /// Once `done`: the folder the programs are in (`out_dir` or `folder`)
+    /// and their paths in it, newest first.
+    dir: []const u8 = "",
+    found: [][]u8 = &.{},
+
+    pub fn start(gpa: Allocator, io: Io, out_dir: []const u8, folder: []const u8, wake: *const fn () void) !*Search {
+        const s = try gpa.create(Search);
+        errdefer gpa.destroy(s);
+        const o = try gpa.dupe(u8, out_dir);
+        errdefer gpa.free(o);
+        const f = try gpa.dupe(u8, folder);
+        errdefer gpa.free(f);
+        s.* = .{ .gpa = gpa, .io = io, .wake = wake, .out_dir = o, .folder = f };
+        s.thread = try std.Thread.spawn(.{}, run, .{s});
+        return s;
+    }
+
+    /// Stops it if it is still looking.
+    pub fn destroy(s: *Search) void {
+        s.stop.store(true, .release);
+        s.thread.join();
+        for (s.found) |f| s.gpa.free(f);
+        s.gpa.free(s.found);
+        s.gpa.free(s.out_dir);
+        s.gpa.free(s.folder);
+        s.gpa.destroy(s);
+    }
+
+    pub fn isDone(s: *const Search) bool {
+        return s.done.load(.acquire);
+    }
+
+    fn run(s: *Search) void {
+        var dir: []const u8 = s.out_dir;
+        var found: [][]u8 = findPrograms(s.gpa, s.io, dir, &s.stop) catch &.{};
+        if (found.len == 0 and !s.stop.load(.acquire)) {
+            s.gpa.free(found);
+            dir = s.folder;
+            found = findPrograms(s.gpa, s.io, dir, &s.stop) catch &.{};
+        }
+        s.dir = dir;
+        s.found = found;
+        s.done.store(true, .release);
+        s.wake();
+    }
+};
 
 fn dupeAll(gpa: Allocator, list: []const []u8) ![][]u8 {
     const out = try gpa.alloc([]u8, list.len);
