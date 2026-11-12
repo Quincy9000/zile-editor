@@ -532,7 +532,17 @@ carries the generated parser): `.sql` `.psql` `.pgsql`, `--` comments,
 cursor (from the `;` before it to its own; quotes and `--` comments
 skipped), in insert mode too (you stay typing); in visual mode the selected
 lines. The whole file: "Run the whole SQL file" in the command picker
-(`sql.zig`). The runner (`SPC r`) is shell commands only. The database, as
+(`sql.zig`). The runner (`SPC r`) is shell commands only. A statement runs in the
+background (`sql.Results`: `psql -q --csv` / `sqlite3 -csv`, no shell) and
+its rows open in the **SQL results** picker: a row each however wide the
+table (values cut to 48 in the list), the preview the selected row with a
+line per column, typing filters on any value, Enter / `y` yank the row
+(tabs between), `Y` all of it as CSV; "SQL results" in the command picker
+brings the last ones back. Results that arrive while you type don't open
+over you (a message says how many rows). An error is the database's own
+words in a box at the cursor; no rows back is a message. The whole file
+still runs as a script in the run popup. Not yet: stopping a statement
+that runs long, row counts of an UPDATE. The database, as
 the nvim config: `$DATABASE_URL`, else `DATABASE_URL` in the nearest `.env`
 above the file, then above the working folder. `postgres://` runs `psql -X -v
 ON_ERROR_STOP=1`, `sqlite:path` (or a `.db` / `.sqlite` path) `sqlite3 -header

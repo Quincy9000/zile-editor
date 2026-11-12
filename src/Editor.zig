@@ -759,6 +759,11 @@ lsps: std.ArrayList(*Lsp) = .empty,
 /// SQL completion's tables and columns, the SQL buffer they were last
 /// looked up for, and whether a statement that changes tables has run.
 sql_schema: ?*sql.Schema = null,
+/// The last statement run with Ctrl-Enter: running, or its rows (kept for
+/// the results picker to come back to).
+sql_results: ?*sql.Results = null,
+/// `sql_results` has finished and was shown (or said).
+sql_results_seen: bool = true,
 sql_checked: ?*const Buffer = null,
 sql_reload: bool = false,
 sql_fresh: bool = false,
@@ -928,6 +933,7 @@ pub fn deinit(ed: *Editor) void {
     ed.merged_diagnostics.deinit(ed.gpa);
     for (ed.zig_checks.items) |zc| zc.job.destroy();
     if (ed.sql_schema) |sc| sc.destroy(ed.gpa);
+    if (ed.sql_results) |r| r.destroy(ed.gpa);
     ed.zig_checks.deinit(ed.gpa);
     for (ed.check_results.items) |r| freeDiagnosticList(ed.gpa, r.diags);
     ed.check_results.deinit(ed.gpa);
@@ -1062,6 +1068,7 @@ pub fn tick(ed: *Editor) void {
     ed.tickZigChecks();
     ed.tickSaveChain();
     ed.tickSqlSchema();
+    ed.tickSqlResults();
     ed.tickCodeLens();
     if (ed.yank_flash) |f| if (f.strength(ed.now) <= 0) {
         ed.yank_flash = null;
@@ -1790,6 +1797,41 @@ fn sqlCompletion(ed: *Editor, start: usize) void {
     var parsed = std.json.parseFromSlice(std.json.Value, ed.gpa, json, .{}) catch return;
     defer parsed.deinit();
     ed.showCompletion(ed.buffer, start, parsed.value) catch {};
+}
+
+/// A statement's results arrived: its rows in the results picker; an error
+/// in a box at the cursor (it points into the statement there).
+fn tickSqlResults(ed: *Editor) void {
+    const r = ed.sql_results orelse return;
+    if (ed.sql_results_seen or !r.done.load(.acquire)) return;
+    ed.sql_results_seen = true;
+    // Tables may have changed: completion reloads them.
+    for ([_][]const u8{ "create", "alter", "drop", "rename" }) |w| {
+        if (motions.indexOfFold(r.statement, 0, w) != null) {
+            ed.sql_fresh = false;
+            ed.sql_checked = null;
+        }
+    }
+    if (r.failed) {
+        if (ed.hover) |h| ed.gpa.free(h);
+        ed.hover = ed.gpa.dupe(u8, r.err) catch null;
+        return ed.setMessage(.err, "{s}", .{std.mem.sliceTo(r.err, '\n')});
+    }
+    if (r.columns.len == 0) return ed.setMessage(.info, "ran: no rows came back", .{});
+    if (r.rows.len == 0) return ed.setMessage(.info, "0 rows", .{});
+    // Not over what you're in the middle of (typing, another picker).
+    if (ed.mode != .normal or ed.picker != null or ed.popup != null)
+        return ed.setMessage(.info, "{d} row{s}: \"SQL results\" in the command picker shows them", .{ r.rows.len, if (r.rows.len == 1) "" else "s" });
+    ed.openPicker(.sql_results, "") catch {};
+}
+
+/// The command picker's "SQL results": the last statement's rows again.
+pub fn showSqlResults(ed: *Editor) !void {
+    const r = ed.sql_results orelse return ed.setMessage(.info, "no SQL has run yet (Ctrl-Enter in a SQL file)", .{});
+    if (!r.done.load(.acquire)) return ed.setMessage(.info, "the statement is still running", .{});
+    if (r.failed) return ed.setMessage(.err, "{s}", .{std.mem.sliceTo(r.err, '\n')});
+    if (r.rows.len == 0) return ed.setMessage(.info, "it returned no rows", .{});
+    try ed.openPicker(.sql_results, "");
 }
 
 /// The schema for SQL completion: loaded (in the background) when a SQL
@@ -5229,8 +5271,9 @@ fn finishRunPrompt(ed: *Editor, kind: PromptKind) !void {
 const libcSetenv = @extern(*const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) c_int, .{ .name = "setenv" });
 
 
-/// Ctrl-Enter in a SQL file (the whole file with `whole`: the command
-/// picker's "Run the whole SQL file"): SQL against the project's database,
+/// Ctrl-Enter in a SQL file: the statement's rows in the results picker.
+/// With `whole` (the command picker's "Run the whole SQL file") the file
+/// as a script. SQL against the project's database,
 /// the results in the run popup: the statement at the cursor, the selected
 /// lines in visual mode, or the whole file.
 pub fn runSql(ed: *Editor, whole: bool) !void {
@@ -5263,6 +5306,9 @@ pub fn runSql(ed: *Editor, whole: bool) !void {
     defer ed.gpa.free(shown);
     const client = sql.clientFor(found.url) orelse
         return ed.setMessage(.err, "can't run SQL on {s} (postgres:// or sqlite: URLs)", .{shown});
+    // A statement: in the background, its rows in the results picker. (The
+    // whole file is a script: its output scrolls by in the run popup.)
+    if (!whole) return ed.startSqlStatement(found.url, statement, shown);
     // The database by the environment, so a password stays out of the
     // command line (and out of messages).
     const target = try ed.gpa.dupeSentinel(u8, client.target, 0);
@@ -5279,6 +5325,17 @@ pub fn runSql(ed: *Editor, whole: bool) !void {
         }
     }
     ed.setMessage(.info, "{s} on {s} (from {s})", .{ @tagName(client.client), shown, found.from });
+}
+
+pub fn startSqlStatement(ed: *Editor, url: []const u8, statement: []const u8, shown: []const u8) !void {
+    if (ed.sql_results) |old| {
+        if (!old.done.load(.acquire)) return ed.setMessage(.info, "the last statement is still running", .{});
+        old.destroy(ed.gpa);
+        ed.sql_results = null;
+    }
+    ed.sql_results = try sql.Results.start(ed.gpa, ed.io, url, statement, ed.wake_fn);
+    ed.sql_results_seen = false;
+    ed.setMessage(.info, "running on {s}...", .{shown});
 }
 
 /// `SPC r .`: the runner's command again, without asking.
@@ -9566,6 +9623,51 @@ test "Ctrl-Enter while typing outside SQL is Enter" {
     defer ed.deinit();
     try ed.feed("A<C-CR>two");
     try testing.expectEqualStrings("two", ed.text().lineSlice(1));
+}
+
+test "SQL results: a statement's rows in a picker, a row's columns in the preview; an error at the cursor" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const db = try std.fs.path.join(gpa, &.{ dir, "app.db" });
+    defer gpa.free(db);
+    const made = std.process.run(gpa, testing.io, .{ .argv = &.{ "sqlite3", db, "create table users(id integer, email text, note text); insert into users values (1, 'a@x.io', 'two\nlines'), (2, 'b@x.io', 'has, a comma');" } }) catch return error.SkipZigTest;
+    gpa.free(made.stdout);
+    gpa.free(made.stderr);
+    var ed = try testEditorAs("q.sql", "select * from users;\n");
+    defer ed.deinit();
+    const S = struct {
+        fn finish(e: *Editor) void {
+            e.sql_results.?.wait();
+            e.tick();
+        }
+    };
+    try ed.startSqlStatement(db, "select * from users", db);
+    S.finish(&ed);
+    const p = ed.picker orelse return error.TestUnexpectedResult;
+    try testing.expect(p.kind == .sql_results);
+    p.sync();
+    try testing.expectEqual(2, p.rowCount());
+    try testing.expectEqualStrings("1 │ a@x.io │ two lines", p.itemAt(0).?.text);
+    try testing.expectEqualStrings("2 │ b@x.io │ has, a comma", p.itemAt(1).?.text);
+    p.updatePreview();
+    try testing.expectEqualStrings("row 1 of 2\n\nid    │ 1\nemail │ a@x.io\nnote  │ two\n      │ lines\n", p.preview.text.items);
+    // Enter: the row, for pasting.
+    try ed.feed("j<CR>");
+    try testing.expect(ed.picker == null);
+    try testing.expectEqualStrings("2\tb@x.io\thas, a comma", ed.registers.get(null).?.text);
+
+    // No rows back, and an error (the database's words, at the cursor).
+    try ed.startSqlStatement(db, "update users set note = '' where id = 9", db);
+    S.finish(&ed);
+    try testing.expect(ed.picker == null);
+    try testing.expectEqualStrings("ran: no rows came back", ed.message.buf[0..ed.message.len]);
+    try ed.startSqlStatement(db, "select * from nope", db);
+    S.finish(&ed);
+    try testing.expect(ed.picker == null);
+    try testing.expect(std.mem.indexOf(u8, ed.hover.?, "no such table: nope") != null);
 }
 
 test "SQL completion: tables and columns from the database, after an alias its columns" {

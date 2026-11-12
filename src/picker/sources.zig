@@ -29,7 +29,7 @@ const Git = @import("../git/Git.zig");
 const hipatterns = @import("../core/hipatterns.zig");
 const keymap = @import("../input/keymap.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug, sql_results };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -79,6 +79,7 @@ fn Impl(comptime kind: Kind) type {
         .leader_quit => QuitMenu,
         .files_global => GlobalFiles,
         .debug => Debug,
+        .sql_results => SqlResults,
     };
 }
 
@@ -3013,6 +3014,92 @@ const Debug = struct {
         .{ .label = "run", .key = 'r', .any = true, .run = run },
         .{ .label = "run under gdb", .key = 'R', .any = true, .run = runDebug },
         .{ .label = "stop", .key = 'x', .stay = true, .any = true, .run = stop },
+    };
+};
+
+/// The rows a SQL statement returned (Ctrl-Enter in a SQL file): one row
+/// each, however wide the table is; the preview is the selected row with a
+/// line per column. Typing filters on any value.
+const SqlResults = struct {
+    pub const title = "SQL results";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    /// Of a value in a row of the list (the preview has all of it).
+    const max_cell = 48;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const r = ed.sql_results orelse return;
+        if (!r.done.load(.acquire)) return;
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(ed.gpa);
+        for (r.rows, 0..) |row, i| {
+            line.clearRetainingCapacity();
+            for (row, 0..) |value, c| {
+                if (c > 0) try line.appendSlice(ed.gpa, " │ ");
+                var end = @min(value.len, max_cell);
+                while (end < value.len and end > 0 and value[end] & 0xC0 == 0x80) end -= 1;
+                for (value[0..end]) |b| try line.append(ed.gpa, if (b == '\n' or b == '\r' or b == '\t') ' ' else b);
+                if (end < value.len) try line.appendSlice(ed.gpa, "…");
+            }
+            try items.append(.{ .text = line.items, .detail = "", .id = @intCast(i) });
+        }
+    }
+
+    fn rowOf(ed: *Editor, item: Item) ?[]const []const u8 {
+        const r = ed.sql_results orelse return null;
+        return if (r.done.load(.acquire) and item.id < r.rows.len) r.rows[item.id] else null;
+    }
+
+    /// The row as you'd paste it into a sheet: its values, tabs between.
+    fn yankRow(ed: *Editor, item: ?Item) anyerror!void {
+        const row = rowOf(ed, item orelse return) orelse return;
+        const text = try std.mem.join(ed.gpa, "\t", row);
+        defer ed.gpa.free(text);
+        try ed.registers.store(null, .yank, text, false);
+        ed.setMessage(.info, "yanked the row ({d} values, tabs between)", .{row.len});
+    }
+
+    fn yankAll(ed: *Editor, _: ?Item) anyerror!void {
+        const r = ed.sql_results orelse return;
+        if (!r.done.load(.acquire)) return;
+        try ed.registers.store(null, .yank, r.csv, false);
+        ed.setMessage(.info, "yanked {d} rows as CSV", .{r.rows.len});
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try yankRow(ed, item);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const r = ed.sql_results orelse return;
+        const row = rowOf(ed, item.*) orelse return;
+        var width: usize = 0;
+        for (r.columns) |name| width = @max(width, name.len);
+        try out.text.print(ed.gpa, "row {d} of {d}\n\n", .{ item.id + 1, r.rows.len });
+        for (row, 0..) |value, c| {
+            const name = if (c < r.columns.len) r.columns[c] else "";
+            try out.text.appendSlice(ed.gpa, name);
+            try out.text.appendNTimes(ed.gpa, ' ', width - @min(width, name.len));
+            try out.text.appendSlice(ed.gpa, " │ ");
+            // A value of several lines keeps them, under its first.
+            var lines = std.mem.splitScalar(u8, value, '\n');
+            var first = true;
+            while (lines.next()) |l| {
+                if (!first) {
+                    try out.text.appendNTimes(ed.gpa, ' ', width);
+                    try out.text.appendSlice(ed.gpa, " │ ");
+                }
+                first = false;
+                try out.text.appendSlice(ed.gpa, std.mem.trimEnd(u8, l, "\r"));
+                try out.text.append(ed.gpa, '\n');
+            }
+        }
+    }
+
+    pub const item_actions = [_]Action{
+        .{ .label = "yank the row", .key = 'y', .stay = true, .keep_rows = true, .run = yankRow },
+        .{ .label = "yank all (CSV)", .key = 'Y', .stay = true, .any = true, .keep_rows = true, .run = yankAll },
     };
 };
 

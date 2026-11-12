@@ -1,6 +1,6 @@
 //! Running SQL (Ctrl-Enter in a SQL file): the statement at the cursor (or
 //! the selected lines, or the whole file from the command picker) against the project's database,
-//! the results in the run popup. As the nvim config's `sql.lua`:
+//! the rows in the results picker (the whole file: in the run popup). As the nvim config's `sql.lua`:
 //!
 //! The database is the first of `$DATABASE_URL`, `DATABASE_URL` in the
 //! nearest `.env` above the file, then above the working folder.
@@ -143,6 +143,151 @@ pub fn redact(gpa: Allocator, url: []const u8) ![]u8 {
     const auth_end = std.mem.indexOfScalarPos(u8, url, scheme_end + 3, '@') orelse return gpa.dupe(u8, url);
     const colon = std.mem.indexOfScalarPos(u8, url[0..auth_end], scheme_end + 3, ':') orelse return gpa.dupe(u8, url);
     return std.mem.concat(gpa, u8, &.{ url[0 .. colon + 1], "***", url[auth_end..] });
+}
+
+// ---------------------------------------------------------------------------
+// Results: a statement's rows, for the results picker
+
+/// A statement run in the background (psql / sqlite3, no shell), its output
+/// asked for as CSV and read into rows. Everything is in its arena.
+pub const Results = struct {
+    arena: std.heap.ArenaAllocator,
+    url: []const u8,
+    statement: []const u8,
+    /// The header: empty when the statement returned no table (an UPDATE).
+    columns: []const []const u8 = &.{},
+    rows: []const []const []const u8 = &.{},
+    /// The output as it came (CSV, header first).
+    csv: []const u8 = "",
+    /// What the client said when it failed (the database's error).
+    err: []const u8 = "",
+    failed: bool = false,
+    thread: std.Thread = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+    joined: bool = false,
+    io: Io,
+    wake: *const fn () void,
+
+    /// More than this much output is an error, not a frozen editor.
+    const max_output = 64 << 20;
+
+    pub fn start(gpa: Allocator, io: Io, url: []const u8, statement: []const u8, wake: *const fn () void) !*Results {
+        const r = try gpa.create(Results);
+        errdefer gpa.destroy(r);
+        r.* = .{ .arena = .init(gpa), .url = "", .statement = "", .io = io, .wake = wake };
+        errdefer r.arena.deinit();
+        r.url = try r.arena.allocator().dupe(u8, url);
+        r.statement = try r.arena.allocator().dupe(u8, statement);
+        r.thread = try std.Thread.spawn(.{}, run, .{r});
+        return r;
+    }
+
+    pub fn wait(r: *Results) void {
+        if (r.joined) return;
+        r.thread.join();
+        r.joined = true;
+    }
+
+    pub fn destroy(r: *Results, gpa: Allocator) void {
+        r.wait();
+        r.arena.deinit();
+        gpa.destroy(r);
+    }
+
+    fn fail(r: *Results, why: []const u8) void {
+        r.failed = true;
+        r.err = why;
+    }
+
+    fn run(r: *Results) void {
+        defer {
+            r.done.store(true, .release);
+            r.wake();
+        }
+        const a = r.arena.allocator();
+        const c = clientFor(r.url) orelse return r.fail("not a postgres:// or sqlite: database");
+        // `-q`: only the rows, not "INSERT 0 1" (which CSV can't tell from a
+        // header).
+        const argv: []const []const u8 = switch (c.client) {
+            .psql => &.{ "psql", c.target, "-X", "-q", "-v", "ON_ERROR_STOP=1", "--csv", "-c", r.statement },
+            .sqlite3 => &.{ "sqlite3", "-csv", "-header", "-bail", c.target, r.statement },
+        };
+        const out = std.process.run(a, r.io, .{ .argv = argv, .stdout_limit = .limited(max_output) }) catch |e| return r.fail(switch (e) {
+            error.FileNotFound => if (c.client == .psql) "psql is not installed" else "sqlite3 is not installed",
+            error.StreamTooLong => "more than 64 MB of results: add a LIMIT",
+            else => @errorName(e),
+        });
+        if (out.term != .exited or out.term.exited != 0) {
+            const said = std.mem.trim(u8, out.stderr, " \r\n");
+            return r.fail(if (said.len > 0) said else "the statement failed");
+        }
+        r.csv = out.stdout;
+        const table = parseCsv(a, out.stdout) catch return r.fail("out of memory");
+        if (table.len == 0) return;
+        r.columns = table[0];
+        r.rows = table[1..];
+    }
+};
+
+/// CSV into rows of cells (RFC 4180: `"` quotes a cell with commas or
+/// lines in it, `""` is a quote). The cells are in `a`.
+pub fn parseCsv(a: Allocator, csv: []const u8) ![]const []const []const u8 {
+    var rows: std.ArrayList([]const []const u8) = .empty;
+    var row: std.ArrayList([]const u8) = .empty;
+    var cell: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    var quoted = false;
+    // A row has begun (so a last line without a newline still counts).
+    var open = false;
+    while (i < csv.len) : (i += 1) {
+        const b = csv[i];
+        if (quoted) {
+            if (b != '"') {
+                try cell.append(a, b);
+            } else if (i + 1 < csv.len and csv[i + 1] == '"') {
+                try cell.append(a, '"');
+                i += 1;
+            } else quoted = false;
+            continue;
+        }
+        switch (b) {
+            '"' => {
+                quoted = true;
+                open = true;
+            },
+            ',' => {
+                try row.append(a, try cell.toOwnedSlice(a));
+                open = true;
+            },
+            '\n' => {
+                if (cell.items.len > 0 and cell.items[cell.items.len - 1] == '\r') _ = cell.pop();
+                try row.append(a, try cell.toOwnedSlice(a));
+                try rows.append(a, try row.toOwnedSlice(a));
+                open = false;
+            },
+            else => {
+                try cell.append(a, b);
+                open = true;
+            },
+        }
+    }
+    if (open) {
+        try row.append(a, try cell.toOwnedSlice(a));
+        try rows.append(a, try row.toOwnedSlice(a));
+    }
+    return rows.toOwnedSlice(a);
+}
+
+test "parseCsv: quoted cells hold commas, quotes and lines" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const rows = try parseCsv(arena.allocator(), "a,b,c\n1,\"x,\"\"y\"\"\nz\",\n2,,last");
+    try std.testing.expectEqual(3, rows.len);
+    try std.testing.expectEqualStrings("b", rows[0][1]);
+    try std.testing.expectEqualStrings("x,\"y\"\nz", rows[1][1]);
+    try std.testing.expectEqualStrings("", rows[1][2]);
+    try std.testing.expectEqual(3, rows[2].len);
+    try std.testing.expectEqualStrings("last", rows[2][2]);
 }
 
 // ---------------------------------------------------------------------------
