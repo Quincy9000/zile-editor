@@ -25,6 +25,24 @@ pub fn rect(x: f32, y: f32, w: f32, h: f32, c: Color) void {
     rl.DrawRectangleRec(.{ .x = x, .y = y, .width = w, .height = h }, c);
 }
 
+/// A wavy underline `w` wide whose bottom is at `bottom` (in a terminal, a
+/// plain one).
+pub fn squiggle(x: f32, bottom: f32, w: f32, c: Color) void {
+    if (grid) |g| return g.rect(x, bottom - 2, w, 2, c);
+    // A triangle wave a pixel column at a time, from rectangles (raylib's
+    // lines can pick up the glyph atlas after text and vanish).
+    const heights = [_]f32{ 0, 1, 2, 3, 2, 1 };
+    var i: usize = 0;
+    var px = @floor(x);
+    while (px < x + w) : ({
+        px += 1;
+        i += 1;
+    }) {
+        const top = bottom - 4 + heights[i % heights.len];
+        rl.DrawRectangleRec(.{ .x = px, .y = top, .width = 1, .height = 1.5 }, c);
+    }
+}
+
 /// One glyph with its cell's top-left at (x, y) (terminal mode).
 pub fn glyph(cp: u21, x: f32, y: f32, c: Color) void {
     if (grid) |g| g.put(cp, x, y, c);

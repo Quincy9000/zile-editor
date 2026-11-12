@@ -622,25 +622,39 @@ pub fn enclosingFunctionLine(s: *Syntax, t: *const Text, line: usize) ?usize {
 
 /// Sticky context: the first lines of the scopes `line` is inside that
 /// start above it (function, class, `if`, JSX element...), outermost first,
-/// at most `out.len` (the innermost ones).
+/// at most `out.len`: the function it is in, however deep, and the
+/// innermost others.
 pub fn contextLines(s: *Syntax, t: *const Text, line: usize, out: []usize) []usize {
     const spec = specs.get(s.lang.name) orelse return out[0..0];
     const root = rootOf(s, t) orelse return out[0..0];
-    if (line >= t.lineCount()) return out[0..0];
+    if (line >= t.lineCount() or out.len == 0) return out[0..0];
     const pos: u32 = @intCast(motions.firstNonBlank(t, line));
     var n = c.ts_node_descendant_for_byte_range(root, pos, pos);
-    // Innermost first, into a scratch list, then the last `out.len` reversed.
+    // Innermost first, into a scratch list, then the kept ones reversed.
     var found: [32]usize = undefined;
     var k: usize = 0;
+    // Where in `found` the innermost named function is.
+    var func: ?usize = null;
     while (!c.ts_node_is_null(n) and k < found.len) : (n = c.ts_node_parent(n)) {
         if (!isOneOf(n, spec.folds) or isOneOf(n, &.{ "comment", "block_comment", "template_string", "import_statement" })) continue;
         const first = t.lineOf(startOf(n));
         if (first >= line) continue;
-        if (k > 0 and found[k - 1] == first) continue;
+        const is_func = isNamedFunction(spec, n);
+        if (k > 0 and found[k - 1] == first) {
+            if (is_func and func == null) func = k - 1;
+            continue;
+        }
+        if (is_func and func == null) func = k;
         found[k] = first;
         k += 1;
     }
     const n_out = @min(k, out.len);
+    // Too deep for the function to fit: it takes the top row.
+    if (func) |f| if (f >= n_out) {
+        out[0] = found[f];
+        for (1..n_out) |i| out[i] = found[n_out - 1 - i];
+        return out[0..n_out];
+    };
     for (0..n_out) |i| out[i] = found[n_out - 1 - i];
     return out[0..n_out];
 }
@@ -701,6 +715,34 @@ test "structure: grow the selection, siblings, swaps, functions, context" {
     try std.testing.expectEqualSlices(usize, &.{0}, contextLines(&s, &t, 4, &buf));
 }
 
+test "context: the function stays however deep the line is" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\const S = struct {
+        \\    fn deep(a: u8) void {
+        \\        if (a > 0) {
+        \\            while (true) {
+        \\                if (a > 1) {
+        \\                    if (a > 2) {
+        \\                        foo();
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\};
+    ;
+    var t = try Text.init(gpa, src);
+    defer t.deinit(gpa);
+    var s = Syntax.forPath("x.zig").?;
+    defer s.deinit(gpa);
+    var buf: [3]usize = undefined;
+    // `fn deep`, then the two innermost `if`s.
+    try std.testing.expectEqualSlices(usize, &.{ 1, 4, 5 }, contextLines(&s, &t, 6, &buf));
+    // Shallow enough: the struct too.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, contextLines(&s, &t, 3, &buf));
+}
+
 test "lua: functions as text objects, folds and outline" {
     const gpa = std.testing.allocator;
     const src = "local M = {}\n\nfunction M.add(a, b)\n  return a + b\nend\n\nlocal f = function(x)\n  return x\nend\n\nreturn M\n";
@@ -734,3 +776,4 @@ test "go: functions, methods, structs, arguments" {
     try std.testing.expectEqual(std.mem.indexOf(u8, src, "func main").?, functionStart(&s, &t, ret, true).?);
     try std.testing.expectEqual(null, functionStart(&s, &t, std.mem.indexOf(u8, src, "f := ").?, true));
 }
+

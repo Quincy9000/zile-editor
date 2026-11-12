@@ -127,6 +127,7 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     const fl = if (ed.cmd_float != null and ed.window == ed.cmd_float.?) floatLayout(ed, font, ed.window) else windowLayout(ed, font, ed.window);
     gfx.pushOffset(fl.x0, fl.y0);
     drawHover(ed, font, theme, fl);
+    drawDiagHover(ed, font, theme, fl);
     drawSignature(ed, font, theme, fl);
     drawCompletion(ed, font, theme, fl);
     gfx.popOffset();
@@ -451,7 +452,6 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     defer unwrappedWindow(ed);
     const selection: ?operators.Range = if (ed.mode == .visual) ed.visualRange() else null;
     const syntax: ?*const Syntax = if (ed.buffer.syntax) |*s| s else null;
-    const diags = ed.diagnostics(ed.buffer);
     const t = ed.text();
     const v = &ed.view;
     const cursor_line = ed.cursorLine();
@@ -538,7 +538,15 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         }
         var seg_buf: [Editor.max_segments]Editor.Seg = undefined;
         const segs = ed.segments(line, &seg_buf);
-        const piece = @min(@as(usize, r.sub) - lens_n, segs.len - 1);
+        // A row of the line's diagnostic message, under it.
+        if (@as(usize, r.sub) - lens_n >= segs.len) {
+            if (ed.diagText(line, segs)) |d| {
+                const k = @as(usize, r.sub) - lens_n - segs.len + 1;
+                if (k < d.n) drawDiagPiece(font, theme, l, d, k, y);
+            }
+            continue;
+        }
+        const piece = @as(usize, r.sub) - lens_n;
         const first_piece = piece == 0;
         const last_piece = piece + 1 == segs.len;
         if (ed.wraps()) {
@@ -582,7 +590,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             line + 1;
         const num = std.fmt.bufPrint(&num_buf, "{d}", .{shown}) catch unreachable;
         const num_x = @as(f32, @floatFromInt(l.gutter_cols - 1 - num.len)) * font.cell_w;
-        const line_diag = firstDiagnostic(diags, line);
+        const line_diag = ed.lineDiagnostic(line);
         const num_color = if (line_diag) |d| diagColor(theme, d.severity) else if (fold != null) theme.fold_fg else if (is_current) theme.gutter_current_fg else theme.gutter_fg;
         // The number on a line's first row only (later rows continue it).
         if (first_piece) _ = font.drawText(num, num_x, y, num_color);
@@ -713,7 +721,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             const vals = inlineValuesAt(ed, debug_path.?, line, &values_buf).?;
             const end_col = dcol(bytes, bytes.len, tab_width) + 3;
             if (end_col >= win_left and end_col < winEnd(l)) _ = font.drawText(clip(vals, winEnd(l) - end_col), colX(font, l, end_col), y, theme.inlay_fg);
-        } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, diags, line, y, last_piece);
+        } else if (line_diag != null and ghost == null) drawDiagnostics(ed, font, theme, l, line, y, last_piece);
         // Inline blame: who last changed the cursor's line.
         if (last_piece and focused and is_current and ed.options.git_blame and fold == null and ghost == null and ed.ghost == null and
             !(line_diag != null and ed.options.diagnostic_text)) drawBlame(ed, font, theme, l, bytes, line, y);
@@ -1206,42 +1214,40 @@ fn diagColor(theme: *const Theme, sev: Lsp.Severity) rl.Color {
     };
 }
 
-/// The most severe diagnostic starting on `line` (the list is sorted).
-fn firstDiagnostic(diags: []const Lsp.Diagnostic, line: usize) ?*const Lsp.Diagnostic {
-    for (diags) |*d| {
-        if (d.line == line) return d;
-        if (d.line > line) break;
-    }
-    return null;
-}
-
 /// Underlines each diagnostic's range on `line` and shows the first message
 /// after the end of the line.
-fn drawDiagnostics(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, diags: []const Lsp.Diagnostic, line: usize, y: f32, last_piece: bool) void {
+fn drawDiagnostics(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, line: usize, y: f32, last_piece: bool) void {
     const t = ed.text();
     const bytes = t.lineSlice(line);
     const tab = ed.options.tab_width;
-    for (diags) |d| {
-        if (d.line != line) continue;
+    var on_buf: [16]*const Lsp.Diagnostic = undefined;
+    for (ed.diagnosticsOn(line, null, &on_buf)) |d| {
         const end_byte = if (d.end_line == d.line) @max(d.end_col, d.col + 1) else bytes.len;
         const c0 = dcol(bytes, @min(d.col, bytes.len), tab);
         const c1 = @min(@max(dcolEnd(bytes, @min(end_byte, bytes.len), tab), c0 + 1), winEnd(l));
         if (c1 <= win_left or c0 >= winEnd(l)) continue;
         const x = colX(font, l, @max(c0, win_left));
         const w = @as(f32, @floatFromInt(c1 - @max(c0, win_left))) * font.cell_w;
-        rect(x, y + font.cell_h - 2, w, 2, diagColor(theme, d.severity));
+        gfx.squiggle(x, y + font.cell_h, w, diagColor(theme, d.severity));
     }
-    // Virtual text: the first (most severe) message, after the line.
-    if (!ed.options.diagnostic_text or !last_piece) return;
-    const d = firstDiagnostic(diags, line).?;
-    const end_col = dcol(bytes, bytes.len, tab) + 3;
-    if (end_col < win_left or end_col >= winEnd(l)) return;
-    const x = colX(font, l, end_col);
-    const msg = std.mem.sliceTo(d.message, '\n');
-    const room = winEnd(l) - end_col;
+    // Virtual text: the most severe message, after the line (and on rows
+    // under it, for what doesn't fit).
+    if (!last_piece) return;
+    var seg_buf: [Editor.max_segments]Editor.Seg = undefined;
+    const d = ed.diagText(line, ed.segments(line, &seg_buf)) orelse return;
+    drawDiagPiece(font, theme, l, d, 0, y);
+}
+
+/// Piece `k` of a diagnostic message: 0 after the line's text, then a row
+/// each under it.
+fn drawDiagPiece(font: *const Font, theme: *const Theme, l: Layout, d: Editor.DiagText, k: usize, y: f32) void {
+    const piece = d.pieces[k];
+    if (piece.len == 0) return;
+    const col = if (k == 0) d.first_col else d.col;
+    if (col >= l.cols) return;
     var color = diagColor(theme, d.severity);
     color.a = 200;
-    _ = font.drawText(clip(msg, room), x, y, color);
+    _ = font.drawText(clip(piece, l.cols - col), l.text_x + @as(f32, @floatFromInt(col)) * font.cell_w, y, color);
 }
 
 /// The first `cells` codepoints of `s`.
@@ -1296,6 +1302,53 @@ fn drawHover(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) voi
     const box = popupBox(font, theme, l, at.x, at.y, cols, n);
     for (lines[0..n], 0..) |line, i| {
         _ = font.drawText(clip(line, cols - 2), box.x + font.cell_w, box.y + @as(f32, @floatFromInt(i)) * font.cell_h, theme.fg);
+    }
+}
+
+/// The diagnostics the mouse or the text cursor rests on, whole, in a box
+/// by it.
+fn drawDiagHover(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
+    if (ed.hover != null) return;
+    var found: [4]*const Lsp.Diagnostic = undefined;
+    // The mouse's, else the text cursor's (in a box under or over it).
+    var diags = ed.hoveredDiagnostics(ed.mouse_now, &found);
+    var x0: f32 = 0;
+    var y0: f32 = 0;
+    if (diags.len > 0) {
+        x0 = l.text_x + @as(f32, @floatFromInt(ed.mouse_hover.?.col)) * font.cell_w;
+        y0 = @as(f32, @floatFromInt(ed.mouse_hover.?.row)) * font.cell_h;
+    } else {
+        diags = ed.cursorDiagnostics(&found);
+        if (diags.len == 0) return;
+        const at = cellPos(ed, font, l, ed.view.cursor) orelse return;
+        x0 = at.x;
+        y0 = at.y;
+    }
+    // Rows: each message word-wrapped, a bullet in its colour first.
+    const max_cols: usize = @max(@min(l.cols -| 4, 80), 20);
+    const Piece = struct { text: []const u8, diag: usize, first: bool };
+    var pieces: [32]Piece = undefined;
+    var n: usize = 0;
+    var width: usize = 1;
+    for (diags, 0..) |d, di| {
+        var rest = std.mem.trim(u8, d.message, " \t\r\n");
+        var first = true;
+        while (rest.len > 0 and n < pieces.len) {
+            const p = Editor.wrapPiece(rest, max_cols - 2);
+            pieces[n] = .{ .text = p[0], .diag = di, .first = first };
+            width = @max(width, cells(p[0]));
+            n += 1;
+            rest = p[1];
+            first = false;
+        }
+    }
+    if (n == 0) return;
+    const cols = width + 4;
+    const box = popupBox(font, theme, l, x0, y0, cols, n);
+    for (pieces[0..n], 0..) |p, i| {
+        const y = box.y + @as(f32, @floatFromInt(i)) * font.cell_h;
+        if (p.first) _ = font.drawText("●", box.x + font.cell_w, y, diagColor(theme, diags[p.diag].severity));
+        _ = font.drawText(p.text, box.x + 3 * font.cell_w, y, theme.fg);
     }
 }
 
@@ -1565,4 +1618,90 @@ fn drawContext(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) v
 
 fn withAlpha(c: rl.Color, a: u8) rl.Color {
     return .{ .r = c.r, .g = c.g, .b = c.b, .a = a };
+}
+
+test "terminal mode: a long diagnostic wraps under its line; resting the mouse on it pops it up" {
+    const Grid = @import("../tui/Grid.zig");
+    const gpa = std.testing.allocator;
+    var ed = try Editor.init(gpa, std.testing.io);
+    defer ed.deinit();
+    try ed.text().insert(gpa, 0, "    const a = 1;\nnext\n");
+    const diags = try gpa.alloc(Lsp.Diagnostic, 1);
+    diags[0] = .{ .line = 0, .col = 10, .end_line = 0, .end_col = 11, .severity = .err, .message = try gpa.dupe(u8, "expected type 'u8', found 'comptime_int' because of reasons") };
+    try ed.check_results.append(gpa, .{ .buffer = ed.buffer, .diags = diags, .libc = false });
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 50, 12);
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    const theme = Theme.get(ed.theme_index);
+    var l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    const row = struct {
+        fn f(g: *const Grid, r: usize, out: []u8) []const u8 {
+            for (0..g.cols) |c| out[c] = std.math.cast(u8, g.cells[r * g.cols + c].cp) orelse '?';
+            return std.mem.trimEnd(u8, out[0..g.cols], " \x00");
+        }
+    }.f;
+    var buf: [64]u8 = undefined;
+    // The gutter is 5 cells: 45 for text.
+    try std.testing.expect(std.mem.endsWith(u8, row(&grid, 0, &buf), "const a = 1;   expected type 'u8', found"));
+    try std.testing.expect(std.mem.endsWith(u8, row(&grid, 1, &buf), "    'comptime_int' because of reasons"));
+    try std.testing.expect(std.mem.endsWith(u8, row(&grid, 2, &buf), "next"));
+    // The `a` is underlined in the error's colour.
+    try std.testing.expect(grid.cells[15].ul != null);
+    try std.testing.expect(grid.cells[14].ul == null);
+    // The mouse on the `a`, a moment: the whole message in a box.
+    ed.mouseHover(.{ 0, 10 }, 1.0);
+    ed.mouse_now = 2.0;
+    l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    try std.testing.expect(std.mem.indexOf(u8, row(&grid, 1, &buf), "expected type 'u8', found") != null);
+}
+
+test "terminal mode: the cursor resting on a diagnostic pops it up" {
+    const Grid = @import("../tui/Grid.zig");
+    const gpa = std.testing.allocator;
+    var ed = try Editor.init(gpa, std.testing.io);
+    defer ed.deinit();
+    try ed.text().insert(gpa, 0, "const a = 1;\nnext\nmore\n");
+    const diags = try gpa.alloc(Lsp.Diagnostic, 1);
+    diags[0] = .{ .line = 0, .col = 6, .end_line = 0, .end_col = 7, .severity = .err, .message = try gpa.dupe(u8, "unused local constant") };
+    try ed.check_results.append(gpa, .{ .buffer = ed.buffer, .diags = diags, .libc = false });
+    ed.options.diagnostic_text = false;
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 50, 12);
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    const theme = Theme.get(ed.theme_index);
+    const has = struct {
+        fn f(g: *const Grid, needle: []const u8) bool {
+            var buf: [64]u8 = undefined;
+            for (0..g.rows) |r| {
+                for (0..g.cols) |c| buf[c] = std.math.cast(u8, g.cells[r * g.cols + c].cp) orelse '?';
+                if (std.mem.indexOf(u8, buf[0..g.cols], needle) != null) return true;
+            }
+            return false;
+        }
+    }.f;
+    ed.setCursor(6); // on the `a`
+    ed.tick();
+    var l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    try std.testing.expect(!has(&grid, "unused local")); // not at once
+    try std.testing.expect(ed.wantsFrames()); // but a frame will come
+    ed.cursor_rest.?.since = .{ .nanoseconds = ed.now.nanoseconds - std.time.ns_per_s };
+    l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    try std.testing.expect(has(&grid, "unused local"));
+    // Off the range: gone.
+    ed.setCursor(0);
+    ed.tick();
+    ed.cursor_rest.?.since = .{ .nanoseconds = ed.now.nanoseconds - std.time.ns_per_s };
+    l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    try std.testing.expect(!has(&grid, "unused local"));
 }

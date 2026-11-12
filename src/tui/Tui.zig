@@ -54,6 +54,7 @@ fn termSize(tty: bool) [2]usize {
 pub fn run(gpa: Allocator, io: Io, ed: *Editor, opts: Options) !void {
     const tty = std.c.isatty(stdin) == 1 and std.c.isatty(stdout) == 1;
     if (!tty and opts.test_keys == null) return error.NotATerminal;
+    ed.terminal_ui = true;
 
     // Raw mode, restored on the way out.
     var saved: std.c.termios = undefined;
@@ -274,7 +275,9 @@ fn frame(gpa: Allocator, out: *std.ArrayList(u8), g: *const Grid, prev: []const 
         const same_pen = if (pen) |p| p.eql(.{ .cp = p.cp, .fg = cell.fg, .bg = cell.bg, .ul = cell.ul }) else false;
         if (!same_pen) {
             try out.print(gpa, "\x1b[0;38;2;{d};{d};{d};48;2;{d};{d};{d}", .{ cell.fg.r, cell.fg.g, cell.fg.b, cell.bg.r, cell.bg.g, cell.bg.b });
-            if (cell.ul) |u| try out.print(gpa, ";4;58;2;{d};{d};{d}", .{ u.r, u.g, u.b });
+            // A curly underline in its colour (kitty's colon form; terminals
+            // without curls draw a plain one).
+            if (cell.ul) |u| try out.print(gpa, ";4:3;58:2::{d}:{d}:{d}", .{ u.r, u.g, u.b });
             try out.append(gpa, 'm');
             pen = cell;
         }

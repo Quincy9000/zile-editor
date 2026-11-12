@@ -68,6 +68,10 @@ pub const Split = struct {
     ratio: f32 = 0.5,
     first: *Node,
     second: *Node,
+    /// Where the last `layout` put it: its area, and the border's position
+    /// (x for side by side, y for stacked).
+    rect: Rect = .{},
+    border: f32 = 0,
 };
 
 gpa: Allocator,
@@ -294,14 +298,18 @@ pub fn layout(ws: *Windows, area: Rect, cell_w: f32, cell_h: f32) void {
 fn layoutNode(n: *Node, r: Rect, cw: f32, ch: f32) void {
     switch (n.kind) {
         .window => |w| w.rect = r,
-        .split => |s| switch (s.axis) {
+        .split => |*s| switch (s.axis) {
             .horizontal => {
                 const a = @max(@round(r.w * s.ratio / cw) * cw, cw);
+                s.rect = r;
+                s.border = r.x + a;
                 layoutNode(s.first, .{ .x = r.x, .y = r.y, .w = a, .h = r.h }, cw, ch);
                 layoutNode(s.second, .{ .x = r.x + a, .y = r.y, .w = @max(r.w - a, 0), .h = r.h }, cw, ch);
             },
             .vertical => {
                 const a = @max(@round(r.h * s.ratio / ch) * ch, ch);
+                s.rect = r;
+                s.border = r.y + a;
                 layoutNode(s.first, .{ .x = r.x, .y = r.y, .w = r.w, .h = a }, cw, ch);
                 layoutNode(s.second, .{ .x = r.x, .y = r.y + a, .w = r.w, .h = @max(r.h - a, 0) }, cw, ch);
             },
@@ -351,6 +359,31 @@ pub fn next(ws: *const Windows, w: *Window) *Window {
     ws.list(&all) catch return w;
     for (all.items, 0..) |o, i| if (o == w) return all.items[(i + 1) % all.items.len];
     return w;
+}
+
+/// The split whose border is within `slop` of screen point (x, y): the
+/// innermost one, if borders meet.
+pub fn borderAt(ws: *const Windows, x: f32, y: f32, slop: f32) ?*Split {
+    return borderIn(ws.root, x, y, slop);
+}
+
+fn borderIn(n: *Node, x: f32, y: f32, slop: f32) ?*Split {
+    const s = switch (n.kind) {
+        .window => return null,
+        .split => |*s| s,
+    };
+    const r = s.rect;
+    if (x < r.x - slop or x > r.x + r.w + slop or y < r.y - slop or y > r.y + r.h + slop) return null;
+    if (borderIn(s.first, x, y, slop) orelse borderIn(s.second, x, y, slop)) |inner| return inner;
+    const along = if (s.axis == .horizontal) x else y;
+    return if (@abs(along - s.border) <= slop) s else null;
+}
+
+/// Moves `s`'s border to screen position `pos` (x or y, by its axis).
+pub fn dragBorder(s: *Split, pos: f32) void {
+    const start, const size = if (s.axis == .horizontal) .{ s.rect.x, s.rect.w } else .{ s.rect.y, s.rect.h };
+    if (size <= 0) return;
+    s.ratio = std.math.clamp((pos - start) / size, 0.05, 0.95);
 }
 
 /// The window containing screen point (x, y).
@@ -429,4 +462,19 @@ test "balance: three side by side get a third each" {
     ws.layout(.{ .w = 90, .h = 10 }, 1, 1);
     try testing.expectEqual(@as(f32, 30), a.rect.w);
     try testing.expectEqual(@as(f32, 30), c.rect.w);
+}
+
+test "a border found by position and dragged" {
+    var b: Buffer = undefined;
+    var ws = try Windows.init(testing.allocator, &b);
+    defer ws.deinit();
+    const a = ws.root.kind.window;
+    const right = try ws.split(a, .right, .{}, &b);
+    _ = right;
+    ws.layout(.{ .x = 0, .y = 0, .w = 800, .h = 600 }, 10, 20);
+    try testing.expectEqual(null, ws.borderAt(200, 100, 4));
+    const s = ws.borderAt(402, 100, 4).?;
+    dragBorder(s, 200);
+    ws.layout(.{ .x = 0, .y = 0, .w = 800, .h = 600 }, 10, 20);
+    try testing.expectEqual(200, a.rect.w);
 }

@@ -1390,7 +1390,7 @@ fn verticalRow(comptime dir: isize) Handler {
             }
             const delta = dir * @as(isize, @intCast(c.count));
             // Wrapped lines and lens rows: a row at a time on screen (lens
-            // rows skipped); a count moves whole lines.
+            // and diagnostic rows skipped); a count moves whole lines.
             if (ed.layered() and ed.mode == .normal and ed.ghost == null) {
                 if (c.has_count) {
                     const t = ed.text();
@@ -1401,13 +1401,13 @@ fn verticalRow(comptime dir: isize) Handler {
                 var n = @abs(delta);
                 while (n > 0) : (n -= 1) {
                     var next = if (dir > 0) ed.nextRow(r) else ed.prevRow(r);
-                    // Over a lens row (it isn't text).
-                    while (next.ghost == null and next.sub < ed.lensRows(next.line)) {
+                    // Over a lens row or a diagnostic's (they aren't text).
+                    while (!ed.isTextRow(next)) {
                         const further = if (dir > 0) ed.nextRow(next) else ed.prevRow(next);
                         if (further.eql(next)) break;
                         next = further;
                     }
-                    if (next.eql(r) or (next.ghost == null and next.sub < ed.lensRows(next.line))) break;
+                    if (next.eql(r) or !ed.isTextRow(next)) break;
                     r = next;
                 }
                 return ed.setCursorRow(r);

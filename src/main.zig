@@ -3,6 +3,7 @@ const rl = @import("raylib");
 
 const Editor = @import("Editor.zig");
 const glfw = @import("input/glfw.zig");
+const Windows = @import("Windows.zig");
 const Font = @import("ui/Font.zig");
 const Theme = @import("ui/Theme.zig");
 const render = @import("ui/render.zig");
@@ -290,6 +291,9 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
         return;
     }
     const clicked = rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
+    ed.mouse_now = rl.GetTime();
+    hoverMouse(ed, font, pos);
+    if (borderMouse(ed, pos, clicked)) return;
     // A press that started on text: dragging selects, letting go copies.
     if (ed.mouse_drag != null and !clicked) {
         if (rl.IsMouseButtonReleased(rl.MOUSE_BUTTON_LEFT) or !rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) {
@@ -323,6 +327,49 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
         const l = render.windowLayout(ed, font, w);
         if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.mousePress(cell.row, cell.col, clicks.count(cell.row, cell.col, rl.GetTime()));
     }
+}
+
+/// The pointer over the focused window's text, buttons up: a diagnostic
+/// under it pops up after a moment.
+fn hoverMouse(ed: *Editor, font: *const Font, pos: rl.Vector2) void {
+    const busy = rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT) or border_drag != null or ed.cmd_float != null or
+        ed.popupTerminal() != null or ed.picker != null or ed.window.term != null;
+    const over = !busy and ed.windows.at(pos.x, pos.y) == ed.window;
+    const cell: ?[2]usize = if (over) blk: {
+        const l = render.windowLayout(ed, font, ed.window);
+        if (pos.x - l.x0 < l.text_x) break :blk null; // the gutter
+        const c = l.cellAt(font, pos.x - l.x0, pos.y - l.y0) orelse break :blk null;
+        break :blk .{ c.row, c.col };
+    } else null;
+    ed.mouseHover(cell, ed.mouse_now);
+}
+
+/// The border between windows being dragged, if one is.
+var border_drag: ?*Windows.Split = null;
+var border_cursor: c_int = rl.MOUSE_CURSOR_DEFAULT;
+
+/// Window borders: the pointer turns into resize arrows over one, and a
+/// press there drags it. True while the mouse is busy with a border.
+fn borderMouse(ed: *Editor, pos: rl.Vector2, clicked: bool) bool {
+    if (border_drag) |s| {
+        if (rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) {
+            Windows.dragBorder(s, if (s.axis == .horizontal) pos.x else pos.y);
+            return true;
+        }
+        border_drag = null;
+    }
+    const covered = ed.cmd_float != null or ed.popupTerminal() != null or ed.picker != null;
+    const s = if (covered or ed.mouse_drag != null) null else ed.windows.borderAt(pos.x, pos.y, 4);
+    const want: c_int = if (s) |b| (if (b.axis == .horizontal) rl.MOUSE_CURSOR_RESIZE_EW else rl.MOUSE_CURSOR_RESIZE_NS) else rl.MOUSE_CURSOR_DEFAULT;
+    if (want != border_cursor) {
+        rl.SetMouseCursor(want);
+        border_cursor = want;
+    }
+    if (clicked) if (s) |b| {
+        border_drag = b;
+        return true;
+    };
+    return false;
 }
 
 /// Double and triple clicks: presses on the same cell close together.
