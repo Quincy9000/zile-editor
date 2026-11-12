@@ -539,7 +539,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         const piece = @min(@as(usize, r.sub) - lens_n, segs.len - 1);
         const first_piece = piece == 0;
         const last_piece = piece + 1 == segs.len;
-        if (ed.options.wrap) {
+        if (ed.wraps()) {
             win_left = segs[piece].start;
             win_right = segs[piece].end;
             win_indent = segs[piece].indent;
@@ -962,7 +962,7 @@ fn posRow(ed: *Editor, pos: usize) ?struct { row: usize, col: usize } {
     const vis = ed.visibleLine(line);
     const segs = ed.segments(vis, &seg_buf);
     const k = if (vis == line) Editor.segmentIndex(segs, col) else 0;
-    if (ed.options.wrap) {
+    if (ed.wraps()) {
         win_left = segs[k].start;
         win_right = segs[k].end;
         win_indent = segs[k].indent;

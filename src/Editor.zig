@@ -3783,7 +3783,7 @@ pub fn ghostText(ed: *const Editor, line: usize, k: u32) []const u8 {
 /// Whether some line can take more than one row (then rows can't be
 /// counted as lines).
 pub fn layered(ed: *const Editor) bool {
-    return ed.options.wrap or ed.hasLenses();
+    return ed.wraps() or ed.hasLenses();
 }
 
 /// The rows (wrapped pieces) of `line`, written into `buf`: at least one.
@@ -3791,7 +3791,7 @@ pub fn layered(ed: *const Editor) bool {
 pub fn segments(ed: *const Editor, line: usize, buf: *[max_segments]Seg) []Seg {
     const t = &ed.buffer.text;
     const cols = @max(ed.view.cols, 8);
-    if (!ed.options.wrap or line >= t.lineCount() or ed.foldAt(line) != null) {
+    if (!ed.wraps() or line >= t.lineCount() or ed.foldAt(line) != null) {
         buf[0] = .{ .start = 0, .end = std.math.maxInt(usize), .indent = 0 };
         return buf[0..1];
     }
@@ -4013,7 +4013,7 @@ pub fn setCursorRow(ed: *Editor, r: Row) void {
         ed.view.want_col = col;
     } else {
         ed.ghost = null;
-        if (ed.layered() and ed.options.wrap) return ed.setCursorScreenRow(r);
+        if (ed.layered() and ed.wraps()) return ed.setCursorScreenRow(r);
         ed.gotoLine(r.line);
         ed.view.want_col = col;
     }
@@ -4250,7 +4250,7 @@ pub fn scrollToCursor(ed: *Editor) void {
     }
 
     // Wrapped lines fit the width: no sideways scrolling.
-    if (ed.options.wrap and ed.ghost == null) {
+    if (ed.wraps() and ed.ghost == null) {
         v.left = 0;
         return;
     }
@@ -6391,6 +6391,25 @@ pub fn writeTodoTag(ed: *Editor, tag: []const u8) !void {
         try ed.insertAt(at + written.len, std.fmt.bufPrint(&cbuf, " {s}", .{st.close}) catch st.close);
     }
     ed.setCursor(at + written.len);
+}
+
+/// Long lines wrap in this buffer (the option, unless the buffer is a table).
+pub fn wraps(ed: *const Editor) bool {
+    return ed.options.wrap and !ed.buffer.no_wrap;
+}
+
+/// The last SQL results as a table in a buffer of its own: a header, a
+/// line per row, the columns lined up. Being text, vim does the rest:
+/// `V` and `j` take rows, Ctrl-v a column, `/` finds, `y` yanks.
+pub fn openSqlTable(ed: *Editor) !void {
+    const r = ed.sql_results orelse return ed.setMessage(.info, "no SQL has run yet (Ctrl-Enter in a SQL file)", .{});
+    if (!r.done.load(.acquire) or r.columns.len == 0) return ed.setMessage(.info, "no rows to show", .{});
+    const table = try sql.tableText(ed.gpa, r.columns, r.rows);
+    defer ed.gpa.free(table);
+    try ed.openTextBuffer("SQL results", table);
+    ed.buffer.no_wrap = true;
+    // On the first row, under the header.
+    if (ed.text().lineCount() > 2) ed.setCursor(ed.text().lineStart(2));
 }
 
 /// Opens `text` as a new buffer named `label` (a manual page, say): not a
@@ -9678,6 +9697,17 @@ test "SQL results: a statement's rows in a picker, a row's columns in the previe
     try ed.feed("k<CR>jj<CR>");
     try testing.expect(ed.picker == null);
     try testing.expectEqualStrings("two\nlines", ed.registers.get(null).?.text);
+
+    // `o`: the results as a table in a buffer, for vim to select in.
+    try ed.showSqlResults();
+    try ed.feed("o");
+    try testing.expect(ed.picker == null and ed.buffer.no_wrap);
+    try testing.expectEqualStrings("id │ email  │ note", ed.text().lineSlice(0));
+    try testing.expectEqualStrings("2  │ b@x.io │ has, a comma", ed.text().lineSlice(3));
+    try testing.expectEqual(2, ed.cursorLine());
+    // Two rows at once.
+    try ed.feed("Vjy");
+    try testing.expectEqualStrings("1  │ a@x.io │ two lines\n2  │ b@x.io │ has, a comma\n", ed.registers.get(null).?.text);
 
     // No rows back, and an error (the database's words, at the cursor).
     try ed.startSqlStatement(db, "update users set note = '' where id = 9", db);

@@ -278,6 +278,63 @@ pub fn parseCsv(a: Allocator, csv: []const u8) ![]const []const []const u8 {
     return rows.toOwnedSlice(a);
 }
 
+/// Columns are lined up to this width at most; a longer value runs on past
+/// it (whole: it is data, not cut), putting only its own row out of line.
+const max_column = 60;
+
+fn cellWidth(value: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(value) catch value.len;
+}
+
+/// The results as text: the header, a rule, a line per row, the columns
+/// lined up with ` │ ` between. A value's line breaks and tabs are spaces
+/// (a row is one line). Caller frees.
+pub fn tableText(gpa: Allocator, columns: []const []const u8, rows: []const []const []const u8) ![]u8 {
+    const widths = try gpa.alloc(usize, columns.len);
+    defer gpa.free(widths);
+    for (columns, widths) |name, *w| w.* = cellWidth(name);
+    for (rows) |row| for (row, 0..) |value, c| {
+        if (c < widths.len) widths[c] = @max(widths[c], @min(cellWidth(value), max_column));
+    };
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try tableRow(gpa, &out, columns, widths);
+    for (widths, 0..) |w, c| {
+        if (c > 0) try out.appendSlice(gpa, "─┼─");
+        for (0..w) |_| try out.appendSlice(gpa, "─");
+    }
+    try out.append(gpa, '\n');
+    for (rows) |row| try tableRow(gpa, &out, row, widths);
+    return out.toOwnedSlice(gpa);
+}
+
+fn tableRow(gpa: Allocator, out: *std.ArrayList(u8), row: []const []const u8, widths: []const usize) !void {
+    for (row, 0..) |value, c| {
+        if (c > 0) try out.appendSlice(gpa, " │ ");
+        for (value) |b| try out.append(gpa, if (b == '\n' or b == '\r' or b == '\t') ' ' else b);
+        // Nothing after the last value: no spaces at the ends of lines.
+        const w = if (c < widths.len) widths[c] else 0;
+        if (c + 1 < row.len) try out.appendNTimes(gpa, ' ', w -| cellWidth(value));
+    }
+    try out.append(gpa, '\n');
+}
+
+test "tableText: columns lined up, a row a line" {
+    const gpa = std.testing.allocator;
+    const text = try tableText(gpa, &.{ "id", "email", "note" }, &.{
+        &.{ "1", "a@x.io", "two\nlines" },
+        &.{ "20", "é", "" },
+    });
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(
+        \\id │ email  │ note
+        \\───┼────────┼──────────
+        \\1  │ a@x.io │ two lines
+        \\20 │ é      │ 
+        \\
+    , text);
+}
+
 test "parseCsv: quoted cells hold commas, quotes and lines" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

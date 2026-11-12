@@ -3109,6 +3109,12 @@ const SqlResults = struct {
         ed.setMessage(.info, "yanked {d} rows as CSV", .{r.rows.len});
     }
 
+    /// `o`: all of it as text in a buffer, where vim's motions and
+    /// selections work (several rows, a column, a search).
+    fn asTable(ed: *Editor, _: ?Item) anyerror!void {
+        try ed.openSqlTable();
+    }
+
     /// `b`: from a row's columns back to the rows.
     fn back(ed: *Editor, _: ?Item) anyerror!void {
         // On the row that was open.
@@ -3162,6 +3168,7 @@ const SqlResults = struct {
         .{ .label = "yank it", .key = 'y', .stay = true, .keep_rows = true, .run = yank },
         .{ .label = "yank all rows (CSV)", .key = 'Y', .stay = true, .any = true, .keep_rows = true, .run = yankAll },
         .{ .label = "back to the rows", .key = 'b', .stay = true, .any = true, .run = back },
+        .{ .label = "open as a table (vim selects rows, columns)", .key = 'o', .any = true, .run = asTable },
     };
 };
 
