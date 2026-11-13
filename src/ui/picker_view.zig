@@ -167,7 +167,7 @@ fn actionBarLines(p: *const Picker, font: *const Font, theme: *const Theme, x0: 
         else if (a.key != 0) std.fmt.bufPrint(&buf, "{c}", .{a.key}) catch continue else continue;
         f.put(key, a.label);
     }
-    if (typing) f.put("Esc", "for the letters");
+    if (typing) f.put("Esc", "normal mode");
     return f.line + 1;
 }
 

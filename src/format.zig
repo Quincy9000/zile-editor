@@ -32,10 +32,11 @@ fn prettier(comptime lang: []const u8) [2]Row {
 }
 
 /// Languages formatted by their formatter even when the language server
-/// could do it: the web languages go through prettier, as in most projects.
+/// could do it: the web languages go through prettier, as in most projects,
+/// and SQL through pg_format (its server is there for completion).
 pub fn preferred(lang: []const u8) bool {
     if (config.settingsFor(lang)) |s| if (s.formatter != null) return true;
-    for ([_][]const u8{ "javascript", "typescript", "tsx", "html", "css", "json", "yaml" }) |l| if (std.mem.eql(u8, l, lang)) return true;
+    for ([_][]const u8{ "javascript", "typescript", "tsx", "html", "css", "json", "yaml", "sql" }) |l| if (std.mem.eql(u8, l, lang)) return true;
     return false;
 }
 

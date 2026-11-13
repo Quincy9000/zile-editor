@@ -712,6 +712,15 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             const lig: u16 = if (ligs) |lg| lg[ci] else 0;
             if (lig != 0) font.drawGlyph(lig, x, y, color) else font.drawCodepoint(cp, x, y, color);
         }
+        // A snipe's labels: the key that jumps to a match, just after it.
+        if (focused) for (ed.snipeLabels()) |sl| {
+            if (sl.end < ls or sl.end > ls + bytes.len) continue;
+            const c = dcol(bytes, sl.end - ls, tab_width);
+            if (c < win_left or c >= winEnd(l)) continue;
+            const x = colX(font, l, c);
+            rect(x, y, font.cell_w, font.cell_h, theme.mode_visual);
+            font.drawCodepoint(sl.key, x, y, theme.mode_text);
+        };
         // Inlay hints: the server's labels, in front of the text they belong to.
         for (hints, 0..) |h, j| {
             const c = motions.displayCol(bytes, @min(h.off, bytes.len), tab_width) + Editor.hintShift(hints[0..j], std.math.maxInt(usize));

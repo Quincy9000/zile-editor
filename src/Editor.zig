@@ -384,6 +384,13 @@ pub const SearchPrompt = struct {
     within_end: usize = 0,
 };
 
+/// A key shown after a snipe's match: pressing it jumps there.
+pub const SnipeLabel = struct { pos: usize, end: usize, key: u8 };
+
+/// The label keys, for the nearest match first: out from the middle of the
+/// home row, then the row above, then the one below.
+pub const snipe_keys = "ghfjdksla;tyrueiwoqpbnvmcxz";
+
 pub const PromptKind = enum {
     /// `/` `?`: incremental search.
     search,
@@ -674,6 +681,10 @@ find_shown: bool = false,
 find_dot: bool = false,
 /// The same for a snipe (`t`): `.` / `,` go to the next / previous match.
 snipe_dot: bool = false,
+/// The keys that jump to a snipe's matches on screen, nearest match first
+/// (`snipeLabels`).
+snipe_label_buf: [snipe_keys.len]SnipeLabel = undefined,
+snipe_label_count: usize = 0,
 /// What was just yanked, lit for a moment.
 yank_flash: ?YankFlash = null,
 /// The screen column kept while moving up and down through wrapped lines,
@@ -1438,6 +1449,7 @@ fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 // Unbound keys while moving through results do nothing.
                 .picker_normal => {},
                 .picker, .search => {
+                    if (seq.len == 1) if (seq[0].text()) |cp| if (try ed.takeSnipeLabel(cp)) return;
                     const input = ed.activeInput() orelse return;
                     for (seq) |k| if (k.text()) |cp| try input.insert(ed.gpa, cp);
                     try ed.inputChanged();
@@ -2846,6 +2858,7 @@ pub fn inputChanged(ed: *Editor) !void {
 /// Opens the `/` / `?` prompt, or the `s` snipe prompt. Works from normal,
 /// visual and operator-pending mode (`d/foo`, `ds`).
 pub fn startSearch(ed: *Editor, forward: bool, kind: PromptKind) void {
+    ed.snipe_label_count = 0;
     ed.search_prompt = .{
         .forward = forward,
         .origin = ed.view.cursor,
@@ -2935,8 +2948,7 @@ fn offsetOf(ed: *Editor, line: usize, col: usize) usize {
 /// there is none). A snipe jumps once a single match is left on screen.
 fn searchIncremental(ed: *Editor) !void {
     const sp = &(ed.search_prompt orelse return);
-    const t = ed.text();
-    const hay = t.slice(0, t.len());
+    ed.snipe_label_count = 0;
     if (sp.kind.boxed()) return;
     if (sp.kind == .select_in) {
         // Only shows the matches (the cursors come on <CR> / <Tab>).
@@ -2955,17 +2967,129 @@ fn searchIncremental(ed: *Editor) !void {
         if (sp.kind == .snipe) {
             if (ed.onlyVisibleRowMatch(pattern)) |rp| return ed.finishSearchRow(rp);
         }
-        const m = ed.searchRows(pattern, ed.promptOrigin(sp), sp.forward) orelse return;
-        ed.setRowPos(m.pos);
+        if (sp.kind == .snipe) try ed.labelSnipeMatches(sp, pattern);
+        const pos = ed.promptRowMatch(sp, pattern) orelse return;
+        ed.setRowPos(pos);
         ed.search_highlight = true;
         return;
     }
     if (sp.kind == .snipe) {
         if (ed.onlyVisibleMatch(pattern)) |pos| return ed.finishSearch(pos);
+        try ed.labelSnipeMatches(sp, pattern);
     }
-    const m = pattern.next(hay, sp.origin, sp.forward) orelse return;
-    ed.view.cursor = m.pos;
+    ed.view.cursor = ed.promptMatch(sp, pattern) orelse return;
     ed.search_highlight = true;
+}
+
+/// A snipe from normal or visual mode goes to the match nearest the cursor,
+/// before it or after; `/`, `?` and a snipe after an operator go one way.
+fn snipesNearest(sp: *const SearchPrompt) bool {
+    return sp.kind == .snipe and sp.return_mode != .operator;
+}
+
+/// The match the prompt goes to: for a snipe the nearest one (by lines, then
+/// by bytes; the one after the cursor on a tie), else the next one its way,
+/// around the end of the text.
+fn promptMatch(ed: *Editor, sp: *const SearchPrompt, pattern: search.Pattern) ?usize {
+    const t = ed.text();
+    const hay = t.slice(0, t.len());
+    if (snipesNearest(sp)) {
+        const after = pattern.forward(hay, sp.origin + 1);
+        const before = pattern.backward(hay, sp.origin);
+        const a = after orelse return before;
+        const b = before orelse return a;
+        const line = t.lineOf(sp.origin);
+        const down = t.lineOf(a) - line;
+        const up = line - t.lineOf(b);
+        if (down != up) return if (down < up) a else b;
+        return if (a - sp.origin <= sp.origin - b) a else b;
+    }
+    return (pattern.next(hay, sp.origin, sp.forward) orelse return null).pos;
+}
+
+/// The same over rows (with ghost lines on screen).
+fn promptRowMatch(ed: *const Editor, sp: *const SearchPrompt, pattern: search.Pattern) ?RowPos {
+    const from = ed.promptOrigin(sp);
+    const one_way = ed.searchRows(pattern, from, sp.forward) orelse return null;
+    if (!snipesNearest(sp)) return one_way.pos;
+    const after = ed.searchRows(pattern, from, true) orelse return null;
+    const before = ed.searchRows(pattern, from, false) orelse return null;
+    if (before.wrapped) return after.pos;
+    if (after.wrapped) return before.pos;
+    const down = after.pos.row.line - from.row.line;
+    const up = from.row.line - before.pos.row.line;
+    return if (down <= up) after.pos else before.pos;
+}
+
+/// The snipe's labels while its prompt is open.
+pub fn snipeLabels(ed: *const Editor) []const SnipeLabel {
+    const sp = ed.search_prompt orelse return &.{};
+    return if (sp.kind == .snipe) ed.snipe_label_buf[0..ed.snipe_label_count] else &.{};
+}
+
+/// Whether `a` is nearer `origin` than `b`: by lines, then by bytes, the one
+/// after the cursor on a tie.
+fn nearer(t: *const Text, origin: usize, a: usize, b: usize) bool {
+    const line = t.lineOf(origin);
+    const la = t.lineOf(a);
+    const lb = t.lineOf(b);
+    const da = @max(la, line) - @min(la, line);
+    const db = @max(lb, line) - @min(lb, line);
+    if (da != db) return da < db;
+    const ba = @max(a, origin) - @min(a, origin);
+    const bb = @max(b, origin) - @min(b, origin);
+    return if (ba != bb) ba < bb else a > b;
+}
+
+/// Gives the matches on screen a key each, the nearest ones the easiest
+/// keys. A key that could be the pattern's next character (the one after
+/// some match) is left out, so typing on never jumps by accident.
+fn labelSnipeMatches(ed: *Editor, sp: *const SearchPrompt, pattern: search.Pattern) !void {
+    if (pattern.needle.len == 0) return;
+    const t = ed.text();
+    const first = @min(ed.view.top, t.lineCount() - 1);
+    const last = @min(ed.view.top + ed.view.rows, t.lineCount()) - 1;
+    const start = t.lineStart(first);
+    const visible = t.slice(start, t.lineEnd(last));
+    var matches: std.ArrayList(usize) = .empty;
+    defer matches.deinit(ed.gpa);
+    var continues: [256]bool = @splat(false);
+    var at: usize = 0;
+    while (pattern.forward(visible, at)) |m| : (at = m + 1) {
+        if (start + m != sp.origin) try matches.append(ed.gpa, start + m);
+        const end = m + pattern.needle.len;
+        if (end < visible.len) continues[std.ascii.toLower(visible[end])] = true;
+    }
+    const Ctx = struct { t: *const Text, origin: usize };
+    std.mem.sort(usize, matches.items, Ctx{ .t = t, .origin = sp.origin }, struct {
+        fn f(c: Ctx, a: usize, b: usize) bool {
+            return nearer(c.t, c.origin, a, b);
+        }
+    }.f);
+    var k: usize = 0;
+    for (matches.items) |pos| {
+        while (k < snipe_keys.len and continues[snipe_keys[k]]) k += 1;
+        if (k == snipe_keys.len) break;
+        ed.snipe_label_buf[ed.snipe_label_count] = .{ .pos = pos, .end = pos + pattern.needle.len, .key = snipe_keys[k] };
+        ed.snipe_label_count += 1;
+        k += 1;
+    }
+}
+
+/// A key typed into the snipe prompt that is a match's label: jumps there.
+fn takeSnipeLabel(ed: *Editor, cp: u21) !bool {
+    for (ed.snipeLabels()) |sl| if (sl.key == cp) {
+        const sp = &ed.search_prompt.?;
+        if (!ed.promptUsesRows(sp)) {
+            try ed.finishSearch(sl.pos);
+            return true;
+        }
+        const t = ed.text();
+        const line = t.lineOf(sl.pos);
+        try ed.finishSearchRow(.{ .row = .{ .line = line }, .col = sl.pos - t.lineStart(line) });
+        return true;
+    };
+    return false;
 }
 
 /// The position of the match of `pattern` if it is the only one on screen.
@@ -3031,13 +3155,14 @@ pub fn acceptSearch(ed: *Editor) !void {
     ed.last_search_forward = sp.forward;
     if (ed.promptUsesRows(sp)) {
         const pattern = search.Pattern.init(ed.last_search.items, false);
-        const m = ed.searchRows(pattern, ed.promptOrigin(sp), sp.forward) orelse {
+        const pos = ed.promptRowMatch(sp, pattern) orelse {
             ed.setMessage(.err, "pattern not found: {s}", .{ed.last_search.items});
             return ed.cancelSearch();
         };
-        return ed.finishSearchRow(m.pos);
+        return ed.finishSearchRow(pos);
     }
-    const pos = ed.searchNext(sp.origin, false, 1) orelse return ed.cancelSearch();
+    const pos = (if (snipesNearest(sp)) ed.promptMatch(sp, search.Pattern.init(ed.last_search.items, false)) else null) orelse
+        ed.searchNext(sp.origin, false, 1) orelse return ed.cancelSearch();
     try ed.finishSearch(pos);
 }
 
@@ -10735,6 +10860,38 @@ test "snipe: jumps when one match is left, RET takes the first, n continues" {
     try ed.feed("tw<Esc>"); // no 'w' anywhere: Esc puts the cursor back
     try testing.expectEqual(0, ed.view.cursor);
     try testing.expectEqual(.normal, ed.mode);
+}
+
+test "snipe goes to the nearest match, before the cursor or after" {
+    var ed = try testEditor("bar one\ntwo\nthree\nx bar bar\nfour\nfive bar");
+    defer ed.deinit();
+    try ed.feed("jjjjtbar"); // on "four": the line above is nearest
+    try testing.expectEqual(.search, ed.mode);
+    try testing.expectEqual(24, ed.view.cursor); // shown while typing
+    try ed.feed("<CR>");
+    try testing.expectEqual(24, ed.view.cursor); // the nearer of the line's two
+    try ed.feed("n");
+    try testing.expectEqual(38, ed.view.cursor); // n still goes on down
+    try ed.feed("ggjj/bar<CR>"); // `/` is vim's: the next one down
+    try testing.expectEqual(20, ed.view.cursor);
+}
+
+test "snipe: keys beside the matches jump to them, nearest first" {
+    var ed = try testEditor("foo bar baz\nqux bar");
+    defer ed.deinit();
+    try ed.feed("tba");
+    // `r` and `z` could be the next letter typed, so they are no labels.
+    const labels = ed.snipeLabels();
+    try testing.expectEqual(3, labels.len);
+    try testing.expectEqual(4, labels[0].pos);
+    try testing.expectEqual('g', labels[0].key);
+    try testing.expectEqual('h', labels[1].key);
+    try ed.feed("f"); // the third nearest: the one on the next line
+    try testing.expectEqual(.normal, ed.mode);
+    try testing.expectEqual(16, ed.view.cursor);
+    try testing.expectEqual(0, ed.snipeLabels().len);
+    try ed.feed("N"); // n / N go on from there
+    try testing.expectEqual(8, ed.view.cursor);
 }
 
 test "snipe and / work after an operator" {

@@ -144,7 +144,7 @@ The table below is the history of what was built, with its keys in this layout.
 | `SPC f r` | recent files (see mini.nvim features) | done |
 | `SPC f l` | search buffer lines | done |
 | `/` `?` `n` `N` `*` `#` | in-buffer search (incremental, highlighted) | done |
-| `t` | **snipe** (ours, "teleport"): type text, jumps as soon as one match is left on screen; `RET` = first match, then `n`/`N`; in visual mode too. After an operator `t` is still vim's till, and `s` is the snipe motion (`gUs…`) | done |
+| `t` | **snipe** (ours, "teleport"): type text, jumps as soon as one match is left on screen; while typing the cursor shows the match nearest to it (above or below), `RET` takes that one, then `n`/`N`; each match on screen also shows a key just after it (`g` `h` for the nearest two, out along the home row to `a` `;`, then the other rows; never a key that could be the next letter of the text) and that key jumps there; in visual mode too. After an operator `t` is still vim's till, and `s` is the snipe motion (`gUs…`) | done |
 | `SPC /`, `SPC f g` | live fuzzy grep over every project line | done |
 | `<C-r>` in `SPC /` | search and replace across the project (grug-far, simpler): the query becomes an exact search (smart case, `rg --fixed-strings`), a prompt takes the replacement, and every line with matches shows as it is (red) and as it will be (green), grouped by file; `↑`/`↓` move, `Tab` skips a line, `S-Tab` a file, `Enter` replaces (each file one undo step; autosave writes them; a match whose text changed since the search is left alone), `Esc` goes back to the grep picker (`Replace.zig`) | done |
 | `gd` / `SPC l d`, `SPC l u` | definition, references (zls). `r` is vim's replace-character again and `gr` is replace-with-register | done |
