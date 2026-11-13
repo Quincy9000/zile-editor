@@ -28,6 +28,21 @@ const motions = @import("../core/motions.zig");
 const Git = @import("../git/Git.zig");
 const hipatterns = @import("../core/hipatterns.zig");
 const keymap = @import("../input/keymap.zig");
+const state_files = @import("../editor/state_files.zig");
+const formatting = @import("../editor/formatting.zig");
+const file_ops = @import("../editor/file_ops.zig");
+const window_ops = @import("../editor/window_ops.zig");
+const project_ops = @import("../editor/project_ops.zig");
+const inlay = @import("../editor/inlay.zig");
+const jumplist = @import("../editor/jumplist.zig");
+const browser = @import("../editor/browser.zig");
+const picker_ops = @import("../editor/picker_ops.zig");
+const picker_query = @import("../editor/picker_query.zig");
+const quickfix_list = @import("../editor/quickfix_list.zig");
+const run_popup = @import("../editor/run_popup.zig");
+const prompts = @import("../editor/prompts.zig");
+const git_ops = @import("../editor/git_ops.zig");
+const lsp_actions = @import("../editor/lsp_actions.zig");
 
 pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug, stored_data };
 
@@ -317,7 +332,7 @@ fn command(comptime name: []const u8) *const fn (*Editor, ?Item) anyerror!void {
     return &struct {
         fn run(ed: *Editor, _: ?Item) anyerror!void {
             const c = commands.find(name) orelse return;
-            ed.restorePickerVisual();
+            picker_query.restorePickerVisual(ed);
             try ed.runCommand(c);
         }
     }.run;
@@ -349,7 +364,7 @@ fn Menu(comptime menu_title: []const u8, comptime entries: []const MenuEntry) ty
             if (item.id >= entries.len) return;
             const c = commands.find(entries[item.id].command) orelse return;
             // Opened from visual mode: the row acts on the selection.
-            ed.restorePickerVisual();
+            picker_query.restorePickerVisual(ed);
             try ed.runCommand(c);
         }
 
@@ -469,9 +484,9 @@ const WindowList = struct {
         var buf: [std.fs.max_path_bytes + 32]u8 = undefined;
         for (order[0..n]) |i| {
             const w = list[i];
-            const name = if (w.term != null) "terminal" else ed.windowBuffer(w).displayName();
+            const name = if (w.term != null) "terminal" else window_ops.windowBuffer(ed, w).displayName();
             const text = std.fmt.bufPrint(&buf, "{d}  {s}", .{ i + 1, name }) catch continue;
-            const detail: []const u8 = if (w == ed.window) "here" else if (w.term == null and ed.windowBuffer(w).modified) "[+]" else "";
+            const detail: []const u8 = if (w == ed.window) "here" else if (w.term == null and window_ops.windowBuffer(ed, w).modified) "[+]" else "";
             try items.append(.{ .text = text, .detail = detail, .id = @intCast(i) });
         }
         try items.append(.{ .text = "+ New window right...", .detail = "", .id = new_right });
@@ -490,7 +505,7 @@ const WindowList = struct {
             new_right => try newWindow(ed, .right),
             new_below => try newWindow(ed, .below),
             new_terminal => try command("terminal_window")(ed, null),
-            else => if (windowOf(ed, item)) |w| ed.focusWindow(w),
+            else => if (windowOf(ed, item)) |w| window_ops.focusWindow(ed, w),
         }
     }
 
@@ -508,9 +523,9 @@ const WindowList = struct {
         try drawLayout(ed, sel, out);
         const w = sel orelse return;
         if (w.term != null) return out.text.appendSlice(ed.gpa, "\n(a terminal)\n");
-        const b = ed.windowBuffer(w);
+        const b = window_ops.windowBuffer(ed, w);
         const t = &b.text;
-        const at = t.lineOf(@min(ed.windowView(w).cursor, t.len()));
+        const at = t.lineOf(@min(window_ops.windowView(ed, w).cursor, t.len()));
         try out.text.appendSlice(ed.gpa, "\n");
         for (at -| 3..@min(at + 12, t.lineCount())) |l| try out.text.print(ed.gpa, "{s}\n", .{t.lineSlice(l)});
     }
@@ -567,7 +582,7 @@ const WindowList = struct {
             grid[cy1][cx1] = if (double) '╝' else '┘';
             // Its number and name inside, the focused one marked.
             const i = std.mem.indexOfScalar(*Editor.Windows.Window, list, w) orelse 0;
-            const name = if (w.term != null) "terminal" else std.fs.path.basename(ed.windowBuffer(w).displayName());
+            const name = if (w.term != null) "terminal" else std.fs.path.basename(window_ops.windowBuffer(ed, w).displayName());
             var label_buf: [80]u8 = undefined;
             const label = std.fmt.bufPrint(&label_buf, "{d} {s}{s}", .{ i + 1, name, if (w == ed.window) " *" else "" }) catch continue;
             if (cy1 > cy0 + 1 and cx1 > cx0 + 2) {
@@ -596,7 +611,7 @@ const WindowList = struct {
         return &struct {
             fn run(ed: *Editor, _: ?Item) anyerror!void {
                 const w = ed.windows.neighbor(ed.window, dir) orelse return ed.setMessage(.info, "no window that way", .{});
-                ed.focusWindow(w);
+                window_ops.focusWindow(ed, w);
             }
         }.run;
     }
@@ -619,27 +634,27 @@ const WindowList = struct {
             if (w == ed.window) continue;
             if (best == null or w.used > best.?.used) best = w;
         }
-        ed.focusWindow(best orelse return ed.setMessage(.info, "only one window", .{}));
+        window_ops.focusWindow(ed, best orelse return ed.setMessage(.info, "only one window", .{}));
     }
 
     /// `X`: your window's contents and the row's trade places.
     fn swap(ed: *Editor, item: ?Item) anyerror!void {
         const w = windowOf(ed, item) orelse return;
-        ed.swapWindows(ed.window, if (w == ed.window) ed.windows.next(w) else w);
+        window_ops.swapWindows(ed, ed.window, if (w == ed.window) ed.windows.next(w) else w);
     }
 
     fn zoom(ed: *Editor, _: ?Item) anyerror!void {
-        ed.toggleZoom(ed.window);
+        window_ops.toggleZoom(ed, ed.window);
     }
 
     /// `x`: closes the row's window; you stay in yours (unless it's yours).
     fn closeThat(ed: *Editor, item: ?Item) anyerror!void {
         const w = windowOf(ed, item) orelse return;
         const mine = ed.window;
-        ed.focusWindow(w);
+        window_ops.focusWindow(ed, w);
         try command("window_close")(ed, null);
         for (ed.window_list.items) |x| if (x == mine) {
-            ed.focusWindow(mine);
+            window_ops.focusWindow(ed, mine);
             break;
         };
     }
@@ -687,7 +702,7 @@ const Toggles = struct {
     pub fn fill(ed: *Editor, items: *Items) !void {
         for (&commands.all, 0..) |*c, i| {
             if (!std.mem.startsWith(u8, c.name, "toggle_")) continue;
-            const state: []const u8 = if (ed.optionState(c.name["toggle_".len..])) |on| (if (on) "on" else "off") else "";
+            const state: []const u8 = if (picker_query.optionState(ed, c.name["toggle_".len..])) |on| (if (on) "on" else "off") else "";
             try items.append(.{ .text = c.doc, .detail = state, .id = @intCast(i) });
         }
         for (extra) |e| {
@@ -700,7 +715,7 @@ const Toggles = struct {
         if (item.id >= commands.all.len) return;
         const c = &commands.all[item.id];
         // These leave the list: a picker of their own, a buffer.
-        if (std.mem.eql(u8, c.name, "pick_theme") or std.mem.eql(u8, c.name, "toggle_scratch")) ed.closePicker();
+        if (std.mem.eql(u8, c.name, "pick_theme") or std.mem.eql(u8, c.name, "toggle_scratch")) picker_query.closePicker(ed);
         try ed.runCommand(c);
     }
 
@@ -765,8 +780,8 @@ const Files = struct {
         try OpenRows.fill(ed, items, true);
         const opened = items.count();
         const root = ed.picker_root;
-        const v = ed.loadedVisits();
-        v.rank(ed.unixNow());
+        const v = state_files.loadedVisits(ed);
+        v.rank(state_files.unixNow(ed));
         const current = if (ed.buffer.path) |p| try ed.absolutePath(p) else null;
         defer if (current) |c| ed.gpa.free(c);
         var n: usize = 0;
@@ -876,7 +891,7 @@ const Files = struct {
     pub const item_actions = OpenRows.actions;
 
     pub fn create(ed: *Editor, query: []const u8) !void {
-        const path = try ed.pickerPath(query);
+        const path = try project_ops.pickerPath(ed, query);
         defer ed.gpa.free(path);
         try ed.openFile(path);
         ed.setMessage(.info, "new file \"{s}\" (SPC s to create it on disk)", .{ed.buffer.displayName()});
@@ -886,7 +901,7 @@ const Files = struct {
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
         if (OpenRows.isOpen(item.*)) return OpenRows.preview(ed, item, out);
-        const path = try ed.pickerPath(item.text);
+        const path = try project_ops.pickerPath(ed, item.text);
         defer ed.gpa.free(path);
         try previewPath(ed, path, out);
     }
@@ -911,7 +926,7 @@ const Files = struct {
 };
 
 /// `SPC .`: one folder's contents (folders first, as "name/"). Enter or `/`
-/// goes into a folder, <BS> on an empty query goes up (see `Editor.browse*`).
+/// goes into a folder, <BS> on an empty query goes up (see `browser.browse*`).
 const Browse = struct {
     pub const title = "Browse";
     pub const prefix: ?u8 = null;
@@ -963,8 +978,8 @@ const Browse = struct {
         e.root = try e.items.arena.allocator().dupe(u8, dir);
         e.home_filter = ed.options.home_filter;
         e.path_rank = true;
-        const v = ed.loadedVisits();
-        v.rank(ed.unixNow());
+        const v = state_files.loadedVisits(ed);
+        v.rank(state_files.unixNow(ed));
         var n: usize = 0;
         for (v.entries.items) |entry| {
             if (n == 30) break;
@@ -1031,8 +1046,8 @@ const Browse = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        if (std.mem.endsWith(u8, item.text, "/")) return ed.browseInto(item.text);
-        const path = try ed.browsePath(item.text);
+        if (std.mem.endsWith(u8, item.text, "/")) return browser.browseInto(ed, item.text);
+        const path = try browser.browsePath(ed, item.text);
         defer ed.gpa.free(path);
         try ed.openFile(path);
     }
@@ -1045,7 +1060,7 @@ const Browse = struct {
     fn workHere(ed: *Editor, _: ?Item) anyerror!void {
         const dir = try ed.gpa.dupe(u8, ed.browse_dir.items);
         defer ed.gpa.free(dir);
-        try ed.workIn(dir);
+        try project_ops.workIn(ed, dir);
     }
 
     pub const item_actions = [_]Action{
@@ -1055,20 +1070,20 @@ const Browse = struct {
     pub fn create(ed: *Editor, query: []const u8) !void {
         // A folder typed out (`~/code/x`, `/etc`): into it, not a new file.
         {
-            const typed = try ed.browsePath(query);
+            const typed = try browser.browsePath(ed, query);
             defer ed.gpa.free(typed);
             if (Io.Dir.cwd().openDir(ed.io, typed, .{})) |d| {
                 var dir = d;
                 dir.close(ed.io);
-                return ed.browseInto(query);
+                return browser.browseInto(ed, query);
             } else |_| {}
         }
-        const path = try ed.browsePath(query);
+        const path = try browser.browsePath(ed, query);
         defer ed.gpa.free(path);
         if (std.mem.endsWith(u8, query, "/")) {
             Io.Dir.cwd().createDirPath(ed.io, path) catch |err|
                 return ed.setMessage(.err, "could not make the folder: {s}", .{@errorName(err)});
-            try ed.browseInto(query);
+            try browser.browseInto(ed, query);
             return ed.setMessage(.info, "made folder \"{s}\"", .{query});
         }
         try ed.openFile(path);
@@ -1076,7 +1091,7 @@ const Browse = struct {
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        const path = try ed.browsePath(item.text);
+        const path = try browser.browsePath(ed, item.text);
         defer ed.gpa.free(path);
         if (std.mem.endsWith(u8, item.text, "/")) {
             // A folder: its first entries.
@@ -1102,7 +1117,7 @@ const Browse = struct {
 /// A file's path for a list: inside the current project, relative to it;
 /// under the home folder, with `~`; else as it is.
 fn displayPath(ed: *Editor, abs: []const u8, buf: []u8) []const u8 {
-    const root = ed.projectRoot();
+    const root = project_ops.projectRoot(ed);
     if (abs.len > root.len + 1 and std.mem.startsWith(u8, abs, root) and abs[root.len] == '/') return abs[root.len + 1 ..];
     const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "";
     if (home.len > 1 and std.mem.startsWith(u8, abs, home)) return std.fmt.bufPrint(buf, "~{s}", .{abs[home.len..]}) catch abs;
@@ -1123,8 +1138,8 @@ fn Visited(comptime by_frecency: bool) type {
         pub const start_mode: StartMode = .insert;
 
         pub fn fill(ed: *Editor, items: *Items) !void {
-            const v = ed.loadedVisits();
-            if (by_frecency) v.rank(ed.unixNow()) else v.rankRecent();
+            const v = state_files.loadedVisits(ed);
+            if (by_frecency) v.rank(state_files.unixNow(ed)) else v.rankRecent();
             var buf: [Io.Dir.max_path_bytes]u8 = undefined;
             var count_buf: [24]u8 = undefined;
             // The file you're in last.
@@ -1250,7 +1265,7 @@ const Themes = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        ed.setTheme(item.id);
+        state_files.setTheme(ed, item.id);
         if (item.id < ed.theme_names.len) ed.setMessage(.info, "colour scheme: {s}", .{ed.theme_names[item.id]});
     }
 
@@ -1330,7 +1345,7 @@ const Start = struct {
     };
 
     pub fn fill(ed: *Editor, items: *Items) !void {
-        const v = ed.loadedVisits();
+        const v = state_files.loadedVisits(ed);
         v.rankRecent();
         var buf: [Io.Dir.max_path_bytes]u8 = undefined;
         var n: usize = 0;
@@ -1341,7 +1356,7 @@ const Start = struct {
             n += 1;
         }
         for (actions, 0..) |a, i| {
-            if (std.mem.eql(u8, a[2], "load_session") and !Editor.Session.exists(ed, ed.projectRoot())) continue;
+            if (std.mem.eql(u8, a[2], "load_session") and !Editor.Session.exists(ed, project_ops.projectRoot(ed))) continue;
             try items.append(.{ .text = a[0], .detail = a[1], .id = @intCast(i) });
         }
     }
@@ -1389,7 +1404,7 @@ const Jumps = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        if (item.id < ed.jumps.items.len) try ed.goJump(item.id);
+        if (item.id < ed.jumps.items.len) try jumplist.goJump(ed, item.id);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -1412,13 +1427,13 @@ const Quickfix = struct {
     pub fn fill(ed: *Editor, items: *Items) !void {
         for (ed.quickfix.items, 0..) |q, i| {
             var buf: [512]u8 = undefined;
-            const detail = std.fmt.bufPrint(&buf, "{s}:{d}", .{ shortPath(ed.projectRoot(), q.path), q.line + 1 }) catch q.path;
+            const detail = std.fmt.bufPrint(&buf, "{s}:{d}", .{ shortPath(project_ops.projectRoot(ed), q.path), q.line + 1 }) catch q.path;
             try items.append(.{ .text = q.text, .detail = detail, .id = @intCast(i) });
         }
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        try ed.goQuickfix(item.id);
+        try quickfix_list.goQuickfix(ed, item.id);
     }
 
     pub fn location(ed: *Editor, item: Item) !?Location {
@@ -1459,7 +1474,7 @@ const OpenIn = struct {
     pub fn fill(ed: *Editor, items: *Items) !void {
         const origin = ed.action_origin;
         const has_row = if (ed.pending_choice) |c| c != .none else false;
-        const places = if (origin) |o| Editor.opensPlaces(o) else true;
+        const places = if (origin) |o| picker_ops.opensPlaces(o) else true;
         if (places and has_row) for (targets, 0..) |t, i| try items.append(.{ .text = t[1], .detail = t[2], .id = @intCast(i) });
         const o = origin orelse return;
         var buf: [16]u8 = undefined;
@@ -1477,8 +1492,8 @@ const OpenIn = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        if (item.id < targets.len) return ed.openPendingIn(targets[item.id][0]);
-        if (item.id >= action_base) try ed.runPendingAction(item.id - action_base);
+        if (item.id < targets.len) return picker_ops.openPendingIn(ed, targets[item.id][0]);
+        if (item.id >= action_base) try picker_ops.runPendingAction(ed, item.id - action_base);
     }
 
     pub fn preview(ed: *Editor, _: *const Item, out: *Preview) !void {
@@ -1523,10 +1538,10 @@ const Projects = struct {
     pub fn fill(ed: *Editor, items: *Items) !void {
         project_dirs = ed.options.project_dirs;
         // The one you're in last.
-        const here = ed.projectRoot();
+        const here = project_ops.projectRoot(ed);
         var current: ?[]const u8 = null;
         var buf: [Io.Dir.max_path_bytes]u8 = undefined;
-        for (ed.knownProjects()) |root| {
+        for (project_ops.knownProjects(ed)) |root| {
             if (std.mem.eql(u8, root, here)) {
                 current = root;
                 continue;
@@ -1570,7 +1585,7 @@ const Projects = struct {
         var buf: [Io.Dir.max_path_bytes]u8 = undefined;
         const root = try ed.gpa.dupe(u8, expandHome(&buf, item.detail));
         defer ed.gpa.free(root);
-        try ed.switchProject(root);
+        try project_ops.switchProject(ed, root);
     }
 
     /// The row's project folder (owned).
@@ -1583,27 +1598,27 @@ const Projects = struct {
     fn files(ed: *Editor, item: ?Item) anyerror!void {
         const root = try rootOf(ed, item) orelse return;
         defer ed.gpa.free(root);
-        try ed.exploreProject(root);
+        try project_ops.exploreProject(ed, root);
     }
 
     fn restore(ed: *Editor, item: ?Item) anyerror!void {
         const root = try rootOf(ed, item) orelse return;
         defer ed.gpa.free(root);
-        if (!ed.restoreSession(root)) ed.setMessage(.info, "no session saved for it", .{});
+        if (!state_files.restoreSession(ed, root)) ed.setMessage(.info, "no session saved for it", .{});
     }
 
     fn grep(ed: *Editor, item: ?Item) anyerror!void {
         const root = try rootOf(ed, item) orelse return;
         defer ed.gpa.free(root);
         const f = @import("../core/Project.zig").detect(ed.io, root) orelse @import("../core/Project.zig").Found{ .root = root, .git = false };
-        ed.next_picker_root = (ed.internProject(f.root, f.git) orelse return).root;
+        ed.next_picker_root = (project_ops.internProject(ed, f.root, f.git) orelse return).root;
         try command("search_project")(ed, item);
     }
 
     fn forget(ed: *Editor, item: ?Item) anyerror!void {
         const root = try rootOf(ed, item) orelse return;
         defer ed.gpa.free(root);
-        ed.forgetProject(root);
+        project_ops.forgetProject(ed, root);
     }
 
     pub const item_actions = [_]Action{
@@ -1646,7 +1661,7 @@ const TodoTags = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        if (item.id < tags.len) try ed.writeTodoTag(tags[item.id][0]);
+        if (item.id < tags.len) try inlay.writeTodoTag(ed, tags[item.id][0]);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -1709,7 +1724,7 @@ const ManPages = struct {
         const text = try page(ed, item.text) orelse return ed.setMessage(.err, "no manual page for {s}", .{item.text});
         defer ed.gpa.free(text);
         var label: [300]u8 = undefined;
-        try ed.openTextBuffer(std.fmt.bufPrint(&label, "man {s}", .{item.text}) catch "man", text);
+        try inlay.openTextBuffer(ed, std.fmt.bufPrint(&label, "man {s}", .{item.text}) catch "man", text);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -1778,8 +1793,8 @@ const GlobalFiles = struct {
         e.path_rank = true;
         e.strict_from = 0; // matched by file name (unless the query has a /)
         if (@import("builtin").is_test) return;
-        const v = ed.loadedVisits();
-        v.rank(ed.unixNow());
+        const v = state_files.loadedVisits(ed);
+        v.rank(state_files.unixNow(ed));
         var n: usize = 0;
         var buf: [Io.Dir.max_path_bytes]u8 = undefined;
         for (v.entries.items) |entry| {
@@ -1850,7 +1865,7 @@ const OpenRows = struct {
     /// `relative`: paths relative to the picker's project, as Files lists
     /// them (so the project's own row for the file is dropped).
     fn fill(ed: *Editor, items: *Items, relative: bool) !void {
-        const order = try ed.buffersByRecency(ed.gpa);
+        const order = try formatting.buffersByRecency(ed, ed.gpa);
         defer ed.gpa.free(order);
         var rest: ?*@import("../core/Buffer.zig") = null;
         for (order) |b| {
@@ -1878,7 +1893,7 @@ const OpenRows = struct {
             }
         };
         const detail: []const u8 = if (b == ed.buffer) "here" else if (b.modified) "[+]" else "";
-        try items.append(.{ .text = text, .detail = detail, .id = flag | @as(u32, @intCast(ed.bufferIndex(b))) });
+        try items.append(.{ .text = text, .detail = detail, .id = flag | @as(u32, @intCast(formatting.bufferIndex(ed, b))) });
     }
 
     fn bufferOf(ed: *Editor, item: ?Item) ?*@import("../core/Buffer.zig") {
@@ -1892,26 +1907,26 @@ const OpenRows = struct {
     pub fn accept(ed: *Editor, item: Item) !void {
         if (bufferOf(ed, item)) |b| return ed.switchTo(b);
         // A file row (Files): open it.
-        const path = try ed.pickerPath(item.text);
+        const path = try project_ops.pickerPath(ed, item.text);
         defer ed.gpa.free(path);
         try ed.openFile(path);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
         const b = bufferOf(ed, item.*) orelse {
-            const path = try ed.pickerPath(item.text);
+            const path = try project_ops.pickerPath(ed, item.text);
             defer ed.gpa.free(path);
             return Files.previewPath(ed, path, out);
         };
         try out.setCode(ed.gpa, b.text.slice(0, b.text.len()), b.path);
-        out.focus_line = b.text.lineOf(ed.cursorOf(b));
+        out.focus_line = b.text.lineOf(formatting.cursorOf(ed, b));
     }
 
     /// The row's buffer, opening its file first if it's a file row.
     fn openRow(ed: *Editor, item: ?Item) !?*@import("../core/Buffer.zig") {
         if (bufferOf(ed, item)) |b| return b;
         const it = item orelse return null;
-        const path = try ed.pickerPath(it.text);
+        const path = try project_ops.pickerPath(ed, it.text);
         defer ed.gpa.free(path);
         try ed.openFile(path);
         return ed.buffer;
@@ -1947,7 +1962,7 @@ const OpenRows = struct {
     fn save(ed: *Editor, item: ?Item) anyerror!void {
         const b = bufferOf(ed, item) orelse return ed.setMessage(.info, "not open: nothing to save", .{});
         if (b.path == null) return ed.setMessage(.err, "no file name: save it as (w)", .{});
-        ed.saveBufferNow(b);
+        file_ops.saveBufferNow(ed, b);
     }
 
     fn copyPath(comptime absolute: bool) *const fn (*Editor, ?Item) anyerror!void {
@@ -1955,7 +1970,7 @@ const OpenRows = struct {
             fn run(ed: *Editor, item: ?Item) anyerror!void {
                 const it = item orelse return;
                 const path: []const u8 = if (bufferOf(ed, item)) |b| (b.path orelse return ed.setMessage(.info, "no file", .{})) else it.text;
-                const full = try ed.pickerPath(path);
+                const full = try project_ops.pickerPath(ed, path);
                 defer ed.gpa.free(full);
                 const shown = if (absolute) try ed.absolutePath(full) else try ed.gpa.dupe(u8, path);
                 defer ed.gpa.free(shown);
@@ -2164,20 +2179,20 @@ const Grep = struct {
 
     pub fn location(ed: *Editor, item: Item) !?Location {
         const loc = parseLocation(item.detail) orelse return null;
-        return .{ .path = try ed.pickerPath(loc.path), .line = loc.line, .col = loc.col };
+        return .{ .path = try project_ops.pickerPath(ed, loc.path), .line = loc.line, .col = loc.col };
     }
 
     // Paths are relative to the project searched.
     pub fn accept(ed: *Editor, item: Item) !void {
         const loc = parseLocation(item.detail) orelse return;
-        const path = try ed.pickerPath(loc.path);
+        const path = try project_ops.pickerPath(ed, loc.path);
         defer ed.gpa.free(path);
         try ed.jumpTo(path, loc.line, loc.col);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
         const loc = parseLocation(item.detail) orelse return;
-        const path = try ed.pickerPath(loc.path);
+        const path = try project_ops.pickerPath(ed, loc.path);
         defer ed.gpa.free(path);
         try previewAt(ed, path, loc.line, out);
     }
@@ -2376,7 +2391,7 @@ const ConfirmDelete = struct {
         ed.confirm_target = null;
         if (item.id != 1) return ed.setMessage(.info, "kept \"{s}\"", .{b.displayName()});
         // The buffer may have been closed while the picker was open.
-        for (ed.buffers.items) |o| if (o == b) return ed.deleteFile(b);
+        for (ed.buffers.items) |o| if (o == b) return file_ops.deleteFile(ed, b);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -2422,7 +2437,7 @@ const RegisterList = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        try ed.pasteRegister(@intCast(item.id));
+        try inlay.pasteRegister(ed, @intCast(item.id));
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -2462,8 +2477,8 @@ const Marks = struct {
 
     pub fn accept(ed: *Editor, item: Item) !void {
         if (item.id >= ed.marks.items.len) return;
-        ed.pushJump();
-        try ed.goMark(ed.marks.items[item.id], true);
+        jumplist.pushJump(ed);
+        try jumplist.goMark(ed, ed.marks.items[item.id], true);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -2507,7 +2522,7 @@ const UndoHistory = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        try ed.undoTo(item.id);
+        try inlay.undoTo(ed, item.id);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -2679,7 +2694,7 @@ fn Anywhere(comptime folders: bool) type {
 
         pub fn accept(ed: *Editor, item: Item) !void {
             if (!folders) return ed.openFile(item.text);
-            try ed.switchProject(std.mem.trimEnd(u8, item.text, "/"));
+            try project_ops.switchProject(ed, std.mem.trimEnd(u8, item.text, "/"));
         }
 
         pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -2708,7 +2723,7 @@ const CodeActions = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        try ed.applyCodeAction(item.id);
+        try lsp_actions.applyCodeAction(ed, item.id);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -2719,7 +2734,7 @@ const CodeActions = struct {
 };
 
 /// `SPC f w`: symbols across the project. The language server searches as
-/// you type (`Editor.inputChanged` asks it; its answer refills the list).
+/// you type (`prompts.inputChanged` asks it; its answer refills the list).
 const WorkspaceSymbols = struct {
     pub const title = "Project symbols";
     pub const prefix: ?u8 = null;
@@ -2767,7 +2782,7 @@ const Runner = struct {
     pub const create_label = "Run ";
 
     pub fn fill(ed: *Editor, items: *Items) !void {
-        const history = try ed.runnerHistory();
+        const history = try run_popup.runnerHistory(ed);
         defer {
             for (history) |c| ed.gpa.free(c);
             ed.gpa.free(history);
@@ -2776,11 +2791,11 @@ const Runner = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        try ed.runFromRunner(item.text);
+        try run_popup.runFromRunner(ed, item.text);
     }
 
     pub fn create(ed: *Editor, query: []const u8) !void {
-        try ed.runFromRunner(query);
+        try run_popup.runFromRunner(ed, query);
     }
 
     pub const alt_accept: AltAccept = .{ .label = "debug", .run = debugIt };
@@ -2794,13 +2809,13 @@ const Runner = struct {
     }
 
     fn edit(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.runnerEdit();
+        try run_popup.runnerEdit(ed);
     }
 
     /// `c`: the command in the command editor (a vim buffer, any number of
     /// lines); with no row, an empty one.
     fn change(ed: *Editor, item: ?Item) anyerror!void {
-        try ed.editCommand(if (item) |it| it.text else "", .runner, null);
+        try run_popup.editCommand(ed, if (item) |it| it.text else "", .runner, null);
     }
 
     pub const item_actions = [_]Action{
@@ -2816,7 +2831,7 @@ const Runner = struct {
     };
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
-        const folder = ed.commandFolder() catch return;
+        const folder = run_popup.commandFolder(ed) catch return;
         defer ed.gpa.free(folder);
         const how = if (debugging.hasBreakpoints(ed)) "under gdb: this project has breakpoints\n(t in SPC d turns them off)" else "through your shell (C-Enter: under gdb)";
         try out.text.print(ed.gpa, "Runs in {s}\n{s}:\n\n{s}", .{ folder, how, item.text });
@@ -2891,7 +2906,7 @@ const Debug = struct {
                 const path = try ed.gpa.dupe(u8, b.path);
                 defer ed.gpa.free(path);
                 try ed.jumpTo(path, b.line, 0);
-                ed.centerCursor();
+                picker_ops.centerCursor(ed);
             },
         }
     }
@@ -2899,7 +2914,7 @@ const Debug = struct {
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
         switch (Row.of(item.id)) {
             .command => {
-                try out.text.print(ed.gpa, "Enter: runs under gdb\n\n  {s}\n\nin {s}\n\n", .{ item.text, ed.projectRoot() });
+                try out.text.print(ed.gpa, "Enter: runs under gdb\n\n  {s}\n\nin {s}\n\n", .{ item.text, project_ops.projectRoot(ed) });
                 const programs = try debugging.pickedPrograms(ed);
                 defer {
                     for (programs) |x| ed.gpa.free(x);
@@ -2982,7 +2997,7 @@ const Debug = struct {
     /// `r`: the project's runner command (`SPC r Enter`): under gdb with
     /// breakpoints on, else a plain run. With none yet, the runner opens.
     fn run(ed: *Editor, _: ?Item) anyerror!void {
-        try ed.runAgain();
+        try run_popup.runAgain(ed);
     }
 
     /// `R`: the runner command under gdb, breakpoints or not.
@@ -3037,7 +3052,7 @@ const StoredDataList = struct {
     pub fn fill(ed: *Editor, items: *Items) !void {
         var buf: [64]u8 = undefined;
         for (std.enums.values(Store)) |store| {
-            const path = ed.storePath(store);
+            const path = state_files.storePath(ed, store);
             defer if (path) |p| ed.gpa.free(p);
             const u = if (path) |p| (if (store == .logs) logUsage(ed, p) else StoredData.usage(ed.io, p)) else StoredData.Usage{};
             try items.append(.{ .text = store.label(), .detail = StoredData.describe(&buf, store, u), .id = @intFromEnum(store) });
@@ -3061,10 +3076,10 @@ const StoredDataList = struct {
 
     pub fn accept(ed: *Editor, item: Item) !void {
         const store = storeOf(item) orelse return;
-        const path = ed.storePath(store) orelse return;
+        const path = state_files.storePath(ed, store) orelse return;
         defer ed.gpa.free(path);
         if (store.isFolder()) {
-            try ed.setBrowseDir(path);
+            try browser.setBrowseDir(ed, path);
             return ed.openPicker(.browse, "");
         }
         ed.openFile(path) catch ed.setMessage(.info, "nothing stored there yet", .{});
@@ -3072,7 +3087,7 @@ const StoredDataList = struct {
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
         const store = storeOf(item.*) orelse return;
-        const path = ed.storePath(store);
+        const path = state_files.storePath(ed, store);
         defer if (path) |p| ed.gpa.free(p);
         try out.text.print(ed.gpa, "{s}\n\n{s}\n\nx clears it (x again to be sure):\n{s}\n\nKept in {s}", .{ store.about(), if (store == .sessions) "At most 100 kept, the oldest go." else if (store == .undo) "At most 300 files and 256 MB kept, the oldest go." else "", store.effect(), path orelse "(nowhere: tests)" });
     }
@@ -3085,7 +3100,7 @@ const StoredDataList = struct {
             return ed.setMessage(.info, "x again clears: {s}", .{store.label()});
         }
         ed.stored_confirm = null;
-        ed.clearStore(store);
+        state_files.clearStore(ed, store);
         ed.setMessage(.info, "cleared: {s}", .{store.label()});
     }
 
@@ -3095,7 +3110,7 @@ const StoredDataList = struct {
             return ed.setMessage(.info, "X again clears everything zile stores", .{});
         }
         ed.stored_confirm = null;
-        for (std.enums.values(Store)) |store| ed.clearStore(store);
+        for (std.enums.values(Store)) |store| state_files.clearStore(ed, store);
         ed.setMessage(.info, "cleared everything zile stores", .{});
     }
 
@@ -3118,7 +3133,7 @@ const ConfirmRemove = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        try ed.browseRemove(item.id == 1);
+        try browser.browseRemove(ed, item.id == 1);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -3159,15 +3174,15 @@ const GitActions = struct {
 
     pub fn accept(ed: *Editor, item: Item) !void {
         switch (item.id) {
-            0 => ed.gitCommitPrompt(),
-            1 => try ed.gitPush(),
-            2 => try ed.gitPull(),
+            0 => git_ops.gitCommitPrompt(ed),
+            1 => try git_ops.gitPush(ed),
+            2 => try git_ops.gitPull(ed),
             3 => try ed.openPicker(.git_branches, ""),
             4 => try ed.openPicker(.git_changes, ""),
-            5 => try ed.gitRemotePrompt(),
-            6 => if (ed.hunkAtCursor()) |h| try ed.restoreHunk(h) else ed.setMessage(.info, "no change here", .{}),
-            7 => ed.reloadGit(),
-            8 => try ed.gitInit(),
+            5 => try git_ops.gitRemotePrompt(ed),
+            6 => if (git_ops.hunkAtCursor(ed)) |h| try git_ops.restoreHunk(ed, h) else ed.setMessage(.info, "no change here", .{}),
+            7 => git_ops.reloadGit(ed),
+            8 => try git_ops.gitInit(ed),
             9 => if (commands.find("git_line_commit")) |c| try ed.runCommand(c),
             else => {},
         }
@@ -3196,8 +3211,8 @@ const GitBranches = struct {
     pub const start_mode: StartMode = .insert;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
-        if (!ed.inRepo()) return;
-        const list = Git.branches(ed.gpa, ed.io, ed.gitRoot().?) orelse return;
+        if (!git_ops.inRepo(ed)) return;
+        const list = Git.branches(ed.gpa, ed.io, project_ops.gitRoot(ed).?) orelse return;
         defer list.deinit(ed.gpa);
         var it = list.iterator();
         var current: ?[]const u8 = null;
@@ -3215,11 +3230,11 @@ const GitBranches = struct {
 
     pub fn accept(ed: *Editor, item: Item) !void {
         if (std.mem.eql(u8, item.detail, "current")) return ed.setMessage(.info, "already on {s}", .{item.text});
-        try ed.gitSwitch(item.text, false);
+        try git_ops.gitSwitch(ed, item.text, false);
     }
 
     pub fn create(ed: *Editor, name: []const u8) !void {
-        try ed.gitSwitch(name, true);
+        try git_ops.gitSwitch(ed, name, true);
     }
 
     pub fn preview(_: *Editor, _: *const Item, _: *Preview) !void {}
@@ -3234,8 +3249,8 @@ const GitChanges = struct {
     pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
-        if (!ed.inRepo()) return;
-        const out = Git.status(ed.gpa, ed.io, ed.gitRoot().?) orelse return;
+        if (!git_ops.inRepo(ed)) return;
+        const out = Git.status(ed.gpa, ed.io, project_ops.gitRoot(ed).?) orelse return;
         defer ed.gpa.free(out);
         var it = std.mem.splitScalar(u8, out, '\n');
         while (it.next()) |line| {
@@ -3243,7 +3258,7 @@ const GitChanges = struct {
             var path = line[3..];
             // Renames: "old -> new"
             if (std.mem.indexOf(u8, path, " -> ")) |arrow| path = path[arrow + 4 ..];
-            const abs = try std.fs.path.join(ed.gpa, &.{ ed.gitRoot().?, path });
+            const abs = try std.fs.path.join(ed.gpa, &.{ project_ops.gitRoot(ed).?, path });
             defer ed.gpa.free(abs);
             const rel = try ed.relativePath(abs);
             defer ed.gpa.free(rel);
@@ -3271,14 +3286,14 @@ const GitChanges = struct {
     }
 
     pub const item_actions = [_]Action{
-        .{ .label = "commit all...", .key = 'c', .any = true, .run = run(Editor.gitCommitPrompt) },
-        .{ .label = "push", .key = 'p', .any = true, .run = run(Editor.gitPush) },
-        .{ .label = "pull", .key = 'P', .any = true, .run = run(Editor.gitPull) },
+        .{ .label = "commit all...", .key = 'c', .any = true, .run = run(git_ops.gitCommitPrompt) },
+        .{ .label = "push", .key = 'p', .any = true, .run = run(git_ops.gitPush) },
+        .{ .label = "pull", .key = 'P', .any = true, .run = run(git_ops.gitPull) },
         .{ .label = "branches", .key = 'b', .any = true, .run = command("git_branches") },
         .{ .label = "restore the change at the cursor", .key = 'r', .any = true, .run = command("git_restore_hunk") },
         .{ .label = "this line's commit", .key = 'l', .any = true, .run = command("git_line_commit") },
-        .{ .label = "remote URL...", .key = 'R', .any = true, .run = run(Editor.gitRemotePrompt) },
-        .{ .label = "reload HEAD", .key = 'u', .stay = true, .any = true, .run = run(Editor.reloadGit) },
-        .{ .label = "git init", .key = 'i', .any = true, .run = run(Editor.gitInit) },
+        .{ .label = "remote URL...", .key = 'R', .any = true, .run = run(git_ops.gitRemotePrompt) },
+        .{ .label = "reload HEAD", .key = 'u', .stay = true, .any = true, .run = run(git_ops.reloadGit) },
+        .{ .label = "git init", .key = 'i', .any = true, .run = run(git_ops.gitInit) },
     };
 };

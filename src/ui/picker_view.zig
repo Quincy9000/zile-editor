@@ -123,17 +123,17 @@ fn filterKey(p: *const Picker) []const u8 {
 }
 
 fn actionBar(p: *const Picker) bool {
-    return sources.itemActions(p.kind).len > 0 or sources.rowKeys(p.kind).len > 0 or sources.scopeGroup(p.kind) != null;
+    return sources.itemActions(p.kind).len > 0 or sources.rowKeys(p.kind).len > 0 or sources.scopeGroup(p.kind) != null or Editor.opensPlaces(p.kind);
 }
 
-/// `C-t project · open · recent · disk`, the current scope bright.
+/// `Tab project · open · recent · disk`, the current scope bright.
 fn drawScopes(p: *const Picker, f: *Flow) void {
     const group = sources.scopeGroup(p.kind) orelse return;
     var need: usize = 4;
     for (group) |sc| need += cells(sc.name) + 3;
     f.fit(need);
     if (f.line < f.paint) {
-        var x = f.font.drawText("C-t", f.x, f.y(), f.theme.whichkey_group) + f.font.cell_w;
+        var x = f.font.drawText("Tab", f.x, f.y(), f.theme.whichkey_group) + f.font.cell_w;
         for (group, 0..) |sc, i| {
             if (i > 0) x = f.font.drawText(" · ", x, f.y(), f.theme.status_dim);
             x = f.font.drawText(sc.name, x, f.y(), if (sc.kind == p.kind) f.theme.fg else f.theme.status_dim);
@@ -142,9 +142,10 @@ fn drawScopes(p: *const Picker, f: *Flow) void {
     f.x += @as(f32, @floatFromInt(need + 3)) * f.font.cell_w;
 }
 
-/// The bottom lines: what the picker does besides Enter. After <Esc>, the
-/// letters; while typing, the Ctrl keys; <Tab> for all of them. Every key
-/// is there, over as many lines as they take. Returns that many; draws
+/// The bottom lines: the picker's keys. <Tab> and the scopes, where Enter
+/// and the split keys open the row, then its actions: after <Esc> their
+/// letters, while typing their Ctrl keys (`Esc c` for one with a letter
+/// only); <S-Tab> lists them all. Over as many lines as they take. Returns that many; draws
 /// `paint` lines of them (0: none, to know the height first).
 fn actionBarLines(p: *const Picker, font: *const Font, theme: *const Theme, x0: f32, y: f32, cols: usize, paint: usize) usize {
     const cw = font.cell_w;
@@ -157,16 +158,28 @@ fn actionBarLines(p: *const Picker, font: *const Font, theme: *const Theme, x0: 
         return f.line + 1;
     }
     drawScopes(p, &f);
-    if (sources.itemActions(p.kind).len == 0) return f.line + 1;
+    const places = Editor.opensPlaces(p.kind);
+    const actions = sources.itemActions(p.kind);
+    if (!places and actions.len == 0) return f.line + 1;
     var buf: [16]u8 = undefined;
-    f.put("Tab", if (typing) "actions" else "all actions");
+    if (places) {
+        f.put("⏎", "open");
+        f.put("C-v", "split right");
+        f.put("C-s", "split below");
+    }
     if (sources.altAccept(p.kind)) |alt| f.put("C-⏎", alt.label);
-    for (sources.itemActions(p.kind)) |a| {
-        const key = if (typing)
-            (if (a.ctrl != 0) std.fmt.bufPrint(&buf, "C-{c}", .{a.ctrl}) catch continue else continue)
-        else if (a.key != 0) std.fmt.bufPrint(&buf, "{c}", .{a.key}) catch continue else continue;
+    for (actions) |a| {
+        const key = if (!typing and a.key != 0)
+            std.fmt.bufPrint(&buf, "{c}", .{a.key}) catch continue
+        else if (a.ctrl != 0)
+            std.fmt.bufPrint(&buf, "C-{c}", .{a.ctrl}) catch continue
+        else if (a.key != 0)
+            std.fmt.bufPrint(&buf, "Esc {c}", .{a.key}) catch continue
+        else
+            continue;
         f.put(key, a.label);
     }
+    f.put("S-Tab", "all");
     if (typing) f.put("Esc", "normal mode");
     return f.line + 1;
 }

@@ -11,6 +11,8 @@ const Editor = @import("Editor.zig");
 const Text = @import("core/Text.zig");
 const textobjects = @import("core/textobjects.zig");
 const motions = @import("core/motions.zig");
+const jumplist = @import("editor/jumplist.zig");
+const indenting = @import("editor/indenting.zig");
 const Range = textobjects.Range;
 
 // ---------------------------------------------------------------------------
@@ -117,7 +119,7 @@ pub fn splitPair(ed: *Editor) !bool {
     w.writeAll("\n") catch return false;
     w.writeAll(indent) catch return false;
     var unit_buf: [16]u8 = undefined;
-    w.writeAll(ed.indentUnit(&unit_buf)) catch return false;
+    w.writeAll(indenting.indentUnit(ed, &unit_buf)) catch return false;
     const inner_end = w.end;
     w.writeAll("\n") catch return false;
     w.writeAll(indent) catch return false;

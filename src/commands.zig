@@ -23,6 +23,36 @@ const Picker = @import("picker/Picker.zig");
 const textops = @import("textops.zig");
 const indents = @import("core/indent.zig");
 const comment = @import("core/comment.zig");
+const blame = @import("editor/blame.zig");
+const bracket_jumps = @import("editor/bracket_jumps.zig");
+const color_wheel = @import("editor/color_wheel.zig");
+const state_files = @import("editor/state_files.zig");
+const formatting = @import("editor/formatting.zig");
+const file_ops = @import("editor/file_ops.zig");
+const window_ops = @import("editor/window_ops.zig");
+const project_ops = @import("editor/project_ops.zig");
+const jumplist = @import("editor/jumplist.zig");
+const indenting = @import("editor/indenting.zig");
+const browser = @import("editor/browser.zig");
+const picker_ops = @import("editor/picker_ops.zig");
+const picker_query = @import("editor/picker_query.zig");
+const claude_panel = @import("editor/claude_panel.zig");
+const quickfix_list = @import("editor/quickfix_list.zig");
+const run_popup = @import("editor/run_popup.zig");
+const multicursor = @import("editor/multicursor.zig");
+const row_model = @import("editor/row_model.zig");
+const folding = @import("editor/folding.zig");
+const code_motion = @import("editor/code_motion.zig");
+const row_search = @import("editor/row_search.zig");
+const replacing = @import("editor/replacing.zig");
+const prompts = @import("editor/prompts.zig");
+const git_ops = @import("editor/git_ops.zig");
+const snippet_ops = @import("editor/snippet_ops.zig");
+const ai_ghost = @import("editor/ai_ghost.zig");
+const lsp_actions = @import("editor/lsp_actions.zig");
+const sql_ops = @import("editor/sql_ops.zig");
+const completion_ops = @import("editor/completion_ops.zig");
+const lsp_ops = @import("editor/lsp_ops.zig");
 
 const Operator = operators.Operator;
 const MotionKind = operators.MotionKind;
@@ -641,7 +671,7 @@ fn textObject(comptime kind: ObjectKind, comptime scope: textobjects.Scope, comp
             } orelse return fail(ed);
             switch (ed.mode) {
                 .operator => try ed.applyPending(r),
-                .visual => ed.selectRange(r),
+                .visual => code_motion.selectRange(ed, r),
                 else => {},
             }
         }
@@ -670,7 +700,7 @@ fn commentObject(c: Context) !void {
     const r = operators.linesRange(t, b[0], b[1]);
     switch (ed.mode) {
         .operator => try ed.applyPending(r),
-        .visual => ed.selectRange(r),
+        .visual => code_motion.selectRange(ed, r),
         else => {},
     }
 }
@@ -710,7 +740,7 @@ fn toggleComment(c: Context) !void {
     if (ed.mode == .visual) {
         first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
         last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
-        ed.exitVisual();
+        code_motion.exitVisual(ed);
     }
     const col = ed.view.cursor - t.lineStart(line);
     const indent = motions.firstNonBlank(t, line) - t.lineStart(line);
@@ -740,9 +770,9 @@ fn bracketed(comptime what: enum { diagnostic, conflict, comment }, comptime for
     return &struct {
         fn run(c: Context) anyerror!void {
             for (0..c.count) |_| switch (what) {
-                .diagnostic => c.ed.jumpDiagnostic(forward),
-                .conflict => c.ed.jumpConflict(forward),
-                .comment => c.ed.jumpComment(forward),
+                .diagnostic => bracket_jumps.jumpDiagnostic(c.ed, forward),
+                .conflict => bracket_jumps.jumpConflict(c.ed, forward),
+                .comment => bracket_jumps.jumpComment(c.ed, forward),
             };
         }
     }.run;
@@ -753,15 +783,15 @@ fn sessionCmd(comptime what: enum { save, load }) Handler {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (what) {
-                .save => ed.saveSession(true),
-                .load => if (!ed.restoreSession(ed.projectRoot())) ed.setMessage(.info, "no saved session for this project", .{}),
+                .save => state_files.saveSession(ed, true),
+                .load => if (!state_files.restoreSession(ed, project_ops.projectRoot(ed))) ed.setMessage(.info, "no saved session for this project", .{}),
             }
         }
     }.run;
 }
 
 fn setMark(c: Context) !void {
-    c.ed.setMark(c.char);
+    jumplist.setMark(c.ed, c.char);
 }
 
 /// `'x` (the mark's line) and `` `x `` (the exact place): motions inside
@@ -770,19 +800,19 @@ fn gotoMark(comptime exact: bool) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            const m = ed.findMark(c.char) orelse {
+            const m = jumplist.findMark(ed, c.char) orelse {
                 fail(ed);
                 return ed.setMessage(.info, "mark {u} is not set", .{c.char});
             };
             if (m.buffer != ed.buffer) {
                 if (ed.mode != .normal) return fail(ed);
-                try ed.goMark(m.*, exact);
+                try jumplist.goMark(ed, m.*, exact);
                 return;
             }
             const t = ed.text();
             const pos = @min(m.pos, t.len());
             const from = ed.view.cursor;
-            ed.revealLine(t.lineOf(pos));
+            row_model.revealLine(ed, t.lineOf(pos));
             if (exact) return finishMotion(ed, from, pos, .exclusive, .reset);
             try finishMotion(ed, from, motions.firstNonBlank(t, t.lineOf(pos)), .linewise, .reset);
         }
@@ -790,11 +820,11 @@ fn gotoMark(comptime exact: bool) Handler {
 }
 
 fn pickColor(c: Context) !void {
-    c.ed.openColorPicker();
+    color_wheel.openColorPicker(c.ed);
 }
 
 fn gitLineCommit(c: Context) !void {
-    try c.ed.showLineCommit();
+    try blame.showLineCommit(c.ed);
 }
 
 // ---------------------------------------------------------------------------
@@ -895,16 +925,16 @@ fn right(ed: *Editor, from: usize, c: Context) ?usize {
 fn down(ed: *Editor, from: usize, c: Context) ?usize {
     const t = ed.text();
     const line = t.lineOf(from);
-    const target = ed.stepVisible(line, @intCast(c.count));
-    if (target == ed.visibleLine(line)) return null;
+    const target = folding.stepVisible(ed, line, @intCast(c.count));
+    if (target == folding.visibleLine(ed, line)) return null;
     return t.lineStart(target);
 }
 
 fn up(ed: *Editor, from: usize, c: Context) ?usize {
     const t = ed.text();
     const line = t.lineOf(from);
-    const target = ed.stepVisible(line, -@as(isize, @intCast(c.count)));
-    if (target == ed.visibleLine(line)) return null;
+    const target = folding.stepVisible(ed, line, -@as(isize, @intCast(c.count)));
+    if (target == folding.visibleLine(ed, line)) return null;
     return t.lineStart(target);
 }
 
@@ -921,7 +951,7 @@ fn wordMotion(comptime which: enum { forward, backward, end }, comptime big: boo
             // Across ghost lines (on one, or with some on screen) words are
             // found row by row, so they reach into and through ghost lines.
             const row_mode = ed.mode == .normal or (ed.mode == .visual and ed.ghost != null);
-            if (row_mode and (ed.ghost != null or ed.hasGhosts())) return rowWords(ed, which, big, c.count);
+            if (row_mode and (ed.ghost != null or row_model.hasGhosts(ed))) return rowWords(ed, which, big, c.count);
             const t = ed.text();
             const from = ed.view.cursor;
             // vim's special case: `cw` on a word changes to its end, not up to
@@ -986,7 +1016,7 @@ fn firstWordIn(line: []const u8) usize {
 }
 
 fn rowText(ed: *Editor, r: Editor.Row) []const u8 {
-    return ed.rowText(r);
+    return row_search.rowText(ed, r);
 }
 
 /// n / N: over ghost lines too (from normal mode), else the text motion.
@@ -995,8 +1025,8 @@ fn searchNextCmd(comptime reverse: bool) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            if (ed.mode == .normal and ed.usesRows()) {
-                if (ed.searchNextRows(reverse, c.count)) |rp| ed.setRowPos(rp);
+            if (ed.mode == .normal and row_search.usesRows(ed)) {
+                if (row_search.searchNextRows(ed, reverse, c.count)) |rp| row_search.setRowPos(ed, rp);
                 return;
             }
             return text_motion(c);
@@ -1027,7 +1057,7 @@ fn ghostFind(comptime kind: anytype, comptime normal: Handler) Handler {
                 ed.last_find = f;
             }
             // Search the ghost line as a one-line text.
-            var tmp = try Text.init(ed.gpa, ed.ghostText(g.line, g.k));
+            var tmp = try Text.init(ed.gpa, row_model.ghostText(ed, g.line, g.k));
             defer tmp.deinit(ed.gpa);
             if (motions.findInLine(&tmp, @min(g.col, tmp.len()), f, c.count, repeat)) |col| {
                 g.col = col;
@@ -1040,7 +1070,7 @@ fn ghostFind(comptime kind: anytype, comptime normal: Handler) Handler {
 /// w / b / e over rows: within the current line, then on to the next/previous
 /// row (ghost or text). Empty lines count as words, like vim.
 fn rowWords(ed: *Editor, which: anytype, big: bool, count: usize) void {
-    var r = ed.cursorRow();
+    var r = row_model.cursorRow(ed);
     var col = if (ed.ghost) |g| g.col else ed.view.cursor - ed.text().lineStart(ed.cursorLine());
     for (0..count) |_| {
         const line = rowText(ed, r);
@@ -1048,7 +1078,7 @@ fn rowWords(ed: *Editor, which: anytype, big: bool, count: usize) void {
             .forward => if (nextWordIn(line, col, big)) |c| {
                 col = c;
             } else {
-                const next = ed.nextRow(r);
+                const next = row_model.nextRow(ed, r);
                 if (next.eql(r)) break;
                 r = next;
                 col = firstWordIn(rowText(ed, r));
@@ -1059,7 +1089,7 @@ fn rowWords(ed: *Editor, which: anytype, big: bool, count: usize) void {
                 // The first word end on a following non-empty row.
                 var n = r;
                 while (true) {
-                    const next = ed.nextRow(n);
+                    const next = row_model.nextRow(ed, n);
                     if (next.eql(n)) break;
                     n = next;
                     const text = rowText(ed, n);
@@ -1077,7 +1107,7 @@ fn rowWords(ed: *Editor, which: anytype, big: bool, count: usize) void {
             .backward => if (prevWordIn(line, col, big)) |c| {
                 col = c;
             } else {
-                const prev = ed.prevRow(r);
+                const prev = row_model.prevRow(ed, r);
                 if (prev.eql(r)) break;
                 r = prev;
                 const text = rowText(ed, r);
@@ -1253,7 +1283,7 @@ fn foldCmd(comptime action: FoldAction) Handler {
                 .open_all_here => _ = folds.open(t, line, true),
                 .open_everything => folds.clear(),
                 .close => try closeFold(ed, line),
-                .toggle => if (ed.foldAt(line) != null) {
+                .toggle => if (folding.foldAt(ed, line) != null) {
                     _ = folds.open(t, line, false);
                 } else try closeFold(ed, line),
                 .close_everything => {
@@ -1264,7 +1294,7 @@ fn foldCmd(comptime action: FoldAction) Handler {
                     for (ranges.items) |f| try folds.add(ed.gpa, t, f.first, f.last);
                 },
             }
-            if (ed.foldAt(ed.cursorLine())) |f| ed.setCursor(motions.firstNonBlank(t, f.first));
+            if (folding.foldAt(ed, ed.cursorLine())) |f| ed.setCursor(motions.firstNonBlank(t, f.first));
         }
     }.run;
 }
@@ -1302,7 +1332,7 @@ fn placeLine(comptime where: enum { center, top, bottom }, comptime first_non_bl
                 .top => so,
                 .bottom => rows -| (so + 1),
             };
-            ed.setTop(ed.stepRows(ed.cursorRow(), -@as(isize, @intCast(up_rows))));
+            row_model.setTop(ed, row_model.stepRows(ed, row_model.cursorRow(ed), -@as(isize, @intCast(up_rows))));
         }
     }.run;
 }
@@ -1316,8 +1346,8 @@ fn operator(comptime op: Operator) Handler {
             const ed = c.ed;
             switch (ed.mode) {
                 .visual => {
-                    const r = ed.visualRange();
-                    ed.exitVisual();
+                    const r = code_motion.visualRange(ed);
+                    code_motion.exitVisual(ed);
                     try operators.apply(ed, op, r, c.register);
                     // A yank leaves the cursor where it was before `v`.
                     if (op == .yank) ed.setCursor(@min(ed.visual_origin, ed.text().len()));
@@ -1338,9 +1368,9 @@ fn operateLine(c: Context) !void {
         const op = ed.op orelse return;
         ed.op = null;
         ed.mode = .normal;
-        const h = ed.ghostHunk(g.line) orelse return;
+        const h = row_model.ghostHunk(ed, g.line) orelse return;
         const last: u32 = @intCast(@min(g.k + c.count - 1, h.old_count - 1));
-        return ed.yankGhostLines(g.line, g.k, last, op.register);
+        return git_ops.yankGhostLines(ed, g.line, g.k, last, op.register);
     }
     const t = ed.text();
     const first = ed.cursorLine();
@@ -1392,38 +1422,38 @@ fn verticalRow(comptime dir: isize) Handler {
             const delta = dir * @as(isize, @intCast(c.count));
             // Wrapped lines and lens rows: a row at a time on screen (lens
             // and diagnostic rows skipped); a count moves whole lines.
-            if (ed.layered() and ed.mode == .normal and ed.ghost == null) {
+            if (row_model.layered(ed) and ed.mode == .normal and ed.ghost == null) {
                 if (c.has_count) {
                     const t = ed.text();
-                    const line = ed.stepVisible(t.lineOf(ed.view.cursor), delta);
-                    return ed.setCursorRow(.{ .line = line, .sub = @intCast(ed.lensRows(line)) });
+                    const line = folding.stepVisible(ed, t.lineOf(ed.view.cursor), delta);
+                    return row_model.setCursorRow(ed, .{ .line = line, .sub = @intCast(row_model.lensRows(ed, line)) });
                 }
-                var r = ed.cursorRow();
+                var r = row_model.cursorRow(ed);
                 var n = @abs(delta);
                 while (n > 0) : (n -= 1) {
-                    var next = if (dir > 0) ed.nextRow(r) else ed.prevRow(r);
+                    var next = if (dir > 0) row_model.nextRow(ed, r) else row_model.prevRow(ed, r);
                     // Over a lens row or a diagnostic's (they aren't text).
-                    while (!ed.isTextRow(next)) {
-                        const further = if (dir > 0) ed.nextRow(next) else ed.prevRow(next);
+                    while (!row_model.isTextRow(ed, next)) {
+                        const further = if (dir > 0) row_model.nextRow(ed, next) else row_model.prevRow(ed, next);
                         if (further.eql(next)) break;
                         next = further;
                     }
-                    if (next.eql(r) or !ed.isTextRow(next)) break;
+                    if (next.eql(r) or !row_model.isTextRow(ed, next)) break;
                     r = next;
                 }
-                return ed.setCursorRow(r);
+                return row_model.setCursorRow(ed, r);
             }
-            var target = ed.stepRows(ed.cursorRow(), delta);
+            var target = row_model.stepRows(ed, row_model.cursorRow(ed), delta);
             if (ed.mode == .visual) {
                 // A selection of ghost lines stays within its hunk.
                 const g = ed.ghost.?;
-                const h = ed.ghostHunk(g.line) orelse return;
+                const h = row_model.ghostHunk(ed, g.line) orelse return;
                 if (target.line != g.line or target.ghost == null) {
                     const k = std.math.clamp(@as(isize, g.k) + delta, 0, @as(isize, h.old_count) - 1);
                     target = .{ .line = g.line, .ghost = @intCast(k) };
                 }
             }
-            ed.setCursorRow(target);
+            row_model.setCursorRow(ed, target);
         }
     }.run;
 }
@@ -1434,7 +1464,7 @@ fn ghostCol(comptime action: enum { left, right, start, first_non_blank, end }, 
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             const g = &(ed.ghost orelse return normal(c));
-            const text = ed.ghostText(g.line, g.k);
+            const text = row_model.ghostText(ed, g.line, g.k);
             g.col = switch (action) {
                 .left => g.col -| c.count,
                 .right => @min(g.col + c.count, text.len -| 1),
@@ -1452,8 +1482,8 @@ fn yankCmd(c: Context) !void {
     const ed = c.ed;
     if (ed.ghost) |g| {
         if (ed.mode == .visual) {
-            try ed.yankGhostLines(g.line, g.anchor orelse g.k, g.k, c.register);
-            ed.exitVisual();
+            try git_ops.yankGhostLines(ed, g.line, g.anchor orelse g.k, g.k, c.register);
+            code_motion.exitVisual(ed);
             return;
         }
         if (ed.mode == .normal) return ed.beginOperator(.yank, c);
@@ -1466,7 +1496,7 @@ fn yankCmd(c: Context) !void {
 fn yankToLineEnd(c: Context) !void {
     const ed = c.ed;
     if (ed.ghost) |g| {
-        const text = ed.ghostText(g.line, g.k);
+        const text = row_model.ghostText(ed, g.line, g.k);
         try ed.registers.store(c.register, .yank, text[@min(g.col, text.len)..], false);
         return;
     }
@@ -1477,11 +1507,11 @@ fn gitAction(comptime action: enum { commit, push, pull, remote, init }) Handler
     return &struct {
         fn run(c: Context) anyerror!void {
             switch (action) {
-                .commit => c.ed.gitCommitPrompt(),
-                .push => try c.ed.gitPush(),
-                .pull => try c.ed.gitPull(),
-                .remote => try c.ed.gitRemotePrompt(),
-                .init => try c.ed.gitInit(),
+                .commit => git_ops.gitCommitPrompt(c.ed),
+                .push => try git_ops.gitPush(c.ed),
+                .pull => try git_ops.gitPull(c.ed),
+                .remote => try git_ops.gitRemotePrompt(c.ed),
+                .init => try git_ops.gitInit(c.ed),
             }
         }
     }.run;
@@ -1505,16 +1535,16 @@ fn gitCmd(comptime action: enum { restore, next, previous, reload }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            if (ed.gitRoot() == null) return ed.setMessage(.info, "not in a git repository", .{});
+            if (project_ops.gitRoot(ed) == null) return ed.setMessage(.info, "not in a git repository", .{});
             switch (action) {
                 .restore => {
-                    const h = ed.hunkAtCursor() orelse return ed.setMessage(.info, "no change here", .{});
-                    try ed.restoreHunk(h);
+                    const h = git_ops.hunkAtCursor(ed) orelse return ed.setMessage(.info, "no change here", .{});
+                    try git_ops.restoreHunk(ed, h);
                 },
-                .next => ed.jumpHunk(true),
-                .previous => ed.jumpHunk(false),
+                .next => git_ops.jumpHunk(ed, true),
+                .previous => git_ops.jumpHunk(ed, false),
                 .reload => {
-                    ed.reloadGit();
+                    git_ops.reloadGit(ed);
                     ed.setMessage(.info, "reloaded HEAD", .{});
                 },
             }
@@ -1540,8 +1570,8 @@ fn pasteMode(comptime before: bool, comptime inline_: bool) Handler {
             const value: @TypeOf(v) = .{ .text = text, .linewise = v.linewise and !inline_ };
             if (ed.mode == .visual) {
                 // Replace the selection, keeping the pasted text in the register.
-                const r = ed.visualRange();
-                ed.exitVisual();
+                const r = code_motion.visualRange(ed);
+                code_motion.exitVisual(ed);
                 try operators.apply(ed, .delete, r, '_');
                 return operators.paste(ed, value, c.count, true, true);
             }
@@ -1560,15 +1590,15 @@ fn structureCmd(comptime action: enum { grow, shrink, next, previous, swap_next,
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             for (0..@max(c.count, 1)) |_| switch (action) {
-                .grow => try ed.growSelection(),
-                .shrink => ed.shrinkSelection(),
-                .next => ed.siblingNode(true),
-                .previous => ed.siblingNode(false),
-                .swap_next => try ed.swapNode(true),
-                .swap_previous => try ed.swapNode(false),
-                .function_next => ed.functionJump(true),
-                .function_previous => ed.functionJump(false),
-                .case => try ed.cycleCase(),
+                .grow => try code_motion.growSelection(ed),
+                .shrink => code_motion.shrinkSelection(ed),
+                .next => code_motion.siblingNode(ed, true),
+                .previous => code_motion.siblingNode(ed, false),
+                .swap_next => try code_motion.swapNode(ed, true),
+                .swap_previous => try code_motion.swapNode(ed, false),
+                .function_next => code_motion.functionJump(ed, true),
+                .function_previous => code_motion.functionJump(ed, false),
+                .case => try code_motion.cycleCase(ed),
             };
         }
     }.run;
@@ -1577,25 +1607,25 @@ fn structureCmd(comptime action: enum { grow, shrink, next, previous, swap_next,
 /// `SPC SPC`: the explorer at the project's root; typing searches every
 /// file below it as well as its own entries.
 fn findFile(c: Context) !void {
-    const root = try c.ed.gpa.dupe(u8, c.ed.projectRoot());
+    const root = try c.ed.gpa.dupe(u8, project_ops.projectRoot(c.ed));
     defer c.ed.gpa.free(root);
-    try c.ed.setBrowseDir(root);
+    try browser.setBrowseDir(c.ed, root);
     try openPicker(.browse)(c);
 }
 
 fn jumpToggle(c: Context) !void {
-    try c.ed.jumpToggle();
+    try jumplist.jumpToggle(c.ed);
 }
 
 fn pickerScope(c: Context) !void {
-    try c.ed.pickerNextScope();
+    try picker_query.pickerNextScope(c.ed);
 }
 
 fn replaceCmd(comptime action: enum { start, next, previous, skip_file }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            if (action == .start) return ed.startReplace();
+            if (action == .start) return replacing.startReplace(ed);
             const r = ed.replace orelse return;
             switch (action) {
                 .start => unreachable,
@@ -1617,7 +1647,7 @@ fn joinLines(c: Context) !void {
         const t = ed.text();
         const a = t.lineOf(ed.view.anchor);
         const b = t.lineOf(ed.view.cursor);
-        ed.exitVisual();
+        code_motion.exitVisual(ed);
         ed.gotoLine(@min(a, b));
         return operators.join(ed, @max(a, b) - @min(a, b) + 1);
     }
@@ -1687,7 +1717,7 @@ fn moveLines(ed: *Editor, to_down: bool) !bool {
 fn moveSideways(ed: *Editor, to_right: bool) !bool {
     const t = ed.text();
     if (ed.mode == .visual and !ed.visual_line) {
-        const r = ed.visualRange();
+        const r = code_motion.visualRange(ed);
         const line = t.lineOf(r.start);
         if (t.lineOf(r.end -| 1) != line) return false;
         var delta: usize = undefined;
@@ -1716,7 +1746,7 @@ fn moveSideways(ed: *Editor, to_right: bool) !bool {
         return true;
     }
     const visual = ed.mode == .visual;
-    const range = if (visual) ed.visualRange() else operators.linesRange(t, ed.cursorLine(), ed.cursorLine());
+    const range = if (visual) code_motion.visualRange(ed) else operators.linesRange(t, ed.cursorLine(), ed.cursorLine());
     const col = ed.view.cursor - t.lineStart(t.lineOf(ed.view.cursor));
     const old_len = t.lineLen(t.lineOf(ed.view.cursor));
     const anchor_line = t.lineOf(ed.view.anchor);
@@ -1748,11 +1778,11 @@ fn toggleCaseChar(c: Context) !void {
 }
 
 fn undo(c: Context) !void {
-    try c.ed.undo(c.count);
+    try code_motion.undo(c.ed, c.count);
 }
 
 fn redo(c: Context) !void {
-    try c.ed.redo(c.count);
+    try code_motion.redo(c.ed, c.count);
 }
 
 /// `.`: the find just made again (`f` then `.` walks the matches), else the
@@ -1766,18 +1796,18 @@ fn repeatChange(c: Context) !void {
         const again = comptime ghostFind(.repeat, repeatFind(false));
         return again(c);
     }
-    try c.ed.repeatLastChange(c.count, c.has_count);
+    try code_motion.repeatLastChange(c.ed, c.count, c.has_count);
 }
 
 fn recordMacro(c: Context) !void {
     // `QQ` quits at once, unsaved changes or not (like `SPC Q Q`). Macros
     // record into lower-case registers: `Qq` is the one for register q.
     if (c.char == 'Q') return quitWithoutSaving(c);
-    c.ed.startMacro(c.char);
+    code_motion.startMacro(c.ed, c.char);
 }
 
 fn playMacro(c: Context) !void {
-    try c.ed.playMacro(c.char, c.count);
+    try code_motion.playMacro(c.ed, c.char, c.count);
 }
 
 // ---------------------------------------------------------------------------
@@ -1789,7 +1819,7 @@ fn visualMode(comptime line: bool) Handler {
             const ed = c.ed;
             if (ed.ghost) |*g| {
                 // Selections on ghost lines are always whole lines.
-                if (ed.mode == .visual) return ed.exitVisual();
+                if (ed.mode == .visual) return code_motion.exitVisual(ed);
                 ed.mode = .visual;
                 ed.visual_line = true;
                 g.anchor = g.k;
@@ -1803,7 +1833,7 @@ fn visualMode(comptime line: bool) Handler {
                 return;
             }
             // Same key leaves visual mode; the other switches kind.
-            if (ed.visual_line == line) ed.exitVisual() else ed.visual_line = line;
+            if (ed.visual_line == line) code_motion.exitVisual(ed) else ed.visual_line = line;
         }
     }.run;
 }
@@ -1815,7 +1845,7 @@ fn visualSwap(c: Context) !void {
 }
 
 fn exitVisual(c: Context) !void {
-    c.ed.exitVisual();
+    code_motion.exitVisual(c.ed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1883,16 +1913,16 @@ fn openLine(comptime asked: OpenWhere) Handler {
             var indent_buf: [256]u8 = undefined;
             var indent: []const u8 = undefined;
             if (where == .below) {
-                indent = ed.newlineIndent(line, t.lineEnd(line), &indent_buf);
-            } else if (ed.isBlankLine(t, line)) {
+                indent = indenting.newlineIndent(ed, line, t.lineEnd(line), &indent_buf);
+            } else if (indenting.isBlankLine(ed, t, line)) {
                 // Above a blank line: where the code above it is.
-                indent = ed.contextIndent(line, &indent_buf);
+                indent = indenting.contextIndent(ed, line, &indent_buf);
             } else {
                 const own = copyIndent(ed, line, &indent_buf);
                 const first = motions.firstNonBlank(t, line);
                 const closes = first < t.lineEnd(line) and std.mem.indexOfScalar(u8, "})]", t.byteAt(first)) != null;
                 var unit_buf: [16]u8 = undefined;
-                const unit: []const u8 = if (closes) ed.indentUnit(&unit_buf) else "";
+                const unit: []const u8 = if (closes) indenting.indentUnit(ed, &unit_buf) else "";
                 if (own.len + unit.len <= indent_buf.len) @memcpy(indent_buf[own.len..][0..unit.len], unit);
                 indent = indent_buf[0..@min(own.len + unit.len, indent_buf.len)];
             }
@@ -1926,7 +1956,7 @@ fn copyIndent(ed: *Editor, line: usize, buf: []u8) []const u8 {
 fn normalMode(c: Context) !void {
     const ed = c.ed;
     // Arguments never filled in don't stay behind as text.
-    try ed.dropUnfilledPlaceholders();
+    try snippet_ops.dropUnfilledPlaceholders(ed);
     // Like vim, leaving insert mode steps back onto the last inserted char.
     const pos = leftInLine(ed.text(), ed.view.cursor);
     ed.setMode(.normal);
@@ -1957,17 +1987,17 @@ fn insertNewline(c: Context) !void {
     if (try pairs.splitPair(c.ed)) return;
     // The line's indentation, a level deeper after an opening bracket.
     var indent_buf: [256]u8 = undefined;
-    const indent = c.ed.newlineIndent(c.ed.cursorLine(), c.ed.view.cursor, &indent_buf);
+    const indent = indenting.newlineIndent(c.ed, c.ed.cursorLine(), c.ed.view.cursor, &indent_buf);
     try c.ed.insertText("\n");
     try c.ed.insertText(indent);
 }
 
 /// <A-;> / <A-l> / <A-Right>: all of the gray AI suggestion, a line of
 /// it, or one character.
-fn aiAccept(comptime part: Editor.AiPart) Handler {
+fn aiAccept(comptime part: ai_ghost.AiPart) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            _ = try c.ed.acceptAiSuggestion(part);
+            _ = try ai_ghost.acceptAiSuggestion(c.ed, part);
         }
     }.run;
 }
@@ -1980,7 +2010,7 @@ fn toggleAi(c: Context) !void {
     const on = !ed.options.ai_complete or ed.ai_unreachable;
     ed.options.ai_complete = on;
     ed.ai_unreachable = false;
-    ed.clearAiSuggestion();
+    ai_ghost.clearAiSuggestion(ed);
     ed.setMessage(.info, "AI completion {s}", .{if (on) "on" else "off"});
 }
 
@@ -1991,10 +2021,10 @@ fn formatCmd(c: Context) !void {
         const t = ed.text();
         const first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
         const last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
-        ed.exitVisual();
-        return ed.formatBuffer(.{ first, last }, false);
+        code_motion.exitVisual(ed);
+        return formatting.formatBuffer(ed, .{ first, last }, false);
     }
-    try ed.formatBuffer(null, false);
+    try formatting.formatBuffer(ed, null, false);
 }
 
 fn zoom(comptime how: enum { in, out, reset }) Handler {
@@ -2010,29 +2040,29 @@ fn zoom(comptime how: enum { in, out, reset }) Handler {
 }
 
 fn snippetOrTab(c: Context) !void {
-    if (c.ed.snippetStep(true)) return;
+    if (snippet_ops.snippetStep(c.ed, true)) return;
     // After an Emmet abbreviation in markup: its markup.
-    if (try c.ed.expandEmmet()) return;
+    if (try completion_ops.expandEmmet(c.ed)) return;
     // Before a closing bracket or quote: step over it (`f("x|")` -> `f("x"|)`).
     if (try pairs.tabOut(c.ed)) return;
     try insertTab(c);
 }
 
 fn snippetPrevious(c: Context) !void {
-    _ = c.ed.snippetStep(false);
+    _ = snippet_ops.snippetStep(c.ed, false);
 }
 
 /// <BS>: a fresh placeholder goes whole, else one character.
 fn deleteBackward(c: Context) !void {
-    if (try c.ed.snippetBackspace()) return;
+    if (try snippet_ops.snippetBackspace(c.ed)) return;
     try deleteBy(motions.prevChar)(c);
 }
 
 fn insertTab(c: Context) !void {
     const ed = c.ed;
-    if (ed.usesTabs()) return ed.insertText("\t");
+    if (indenting.usesTabs(ed)) return ed.insertText("\t");
     const col = ed.cursorCol();
-    const spaces = motions.nextTabStop(col, @max(ed.indentWidth(), 1)) - col;
+    const spaces = motions.nextTabStop(col, @max(indenting.indentWidth(ed), 1)) - col;
     const buf: [16]u8 = @splat(' ');
     try ed.insertText(buf[0..@min(spaces, buf.len)]);
 }
@@ -2083,8 +2113,8 @@ fn surroundStep(comptime step: enum { add, delete, change_from, change_to, visua
                 .change_to => try pairs.change(ed, ed.surround_from, c.char, c.count),
                 .visual => {
                     if (ed.mode != .visual) return;
-                    const r = ed.visualRange();
-                    ed.exitVisual();
+                    const r = code_motion.visualRange(ed);
+                    code_motion.exitVisual(ed);
                     try pairs.add(ed, r, c.char, r.linewise);
                 },
             }
@@ -2097,11 +2127,11 @@ fn claudeCmd(comptime action: enum { panel, send, ask, accept, reject }) Handler
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
-                .panel => ed.toggleClaude() catch |err| ed.setMessage(.err, "could not start Claude Code: {s}", .{@errorName(err)}),
-                .send => try ed.claudeMention(),
-                .ask => try ed.claudeAskPrompt(),
-                .accept => ed.claudeResolve(true),
-                .reject => ed.claudeResolve(false),
+                .panel => claude_panel.toggleClaude(ed) catch |err| ed.setMessage(.err, "could not start Claude Code: {s}", .{@errorName(err)}),
+                .send => try claude_panel.claudeMention(ed),
+                .ask => try claude_panel.claudeAskPrompt(ed),
+                .accept => claude_panel.claudeResolve(ed, true),
+                .reject => claude_panel.claudeResolve(ed, false),
             }
         }
     }.run;
@@ -2112,14 +2142,14 @@ fn termCmd(comptime action: enum { toggle, window, runner, command, again, outpu
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
-                .toggle => try ed.toggleShell(),
-                .window => ed.openTermWindow() catch |err| ed.setMessage(.err, "could not start the shell: {s}", .{@errorName(err)}),
-                .runner => try ed.runPrompt(true),
-                .shell => ed.shellPrompt(),
-                .command => try ed.runPrompt(false),
-                .again => try ed.runAgain(),
-                .output => ed.showRunOutput(),
-                .errors => try ed.showRunErrors(),
+                .toggle => try run_popup.toggleShell(ed),
+                .window => window_ops.openTermWindow(ed) catch |err| ed.setMessage(.err, "could not start the shell: {s}", .{@errorName(err)}),
+                .runner => try run_popup.runPrompt(ed, true),
+                .shell => run_popup.shellPrompt(ed),
+                .command => try run_popup.runPrompt(ed, false),
+                .again => try run_popup.runAgain(ed),
+                .output => run_popup.showRunOutput(ed),
+                .errors => try quickfix_list.showRunErrors(ed),
             }
         }
     }.run;
@@ -2146,11 +2176,11 @@ fn qfCmd(comptime action: enum { next, previous, list, from_picker, clear }) Han
     return &struct {
         fn run(c: Context) anyerror!void {
             switch (action) {
-                .next => try c.ed.stepQuickfix(true, c.count),
-                .previous => try c.ed.stepQuickfix(false, c.count),
-                .list => try c.ed.showQuickfix(),
-                .from_picker => try c.ed.pickerToQuickfix(),
-                .clear => c.ed.resetQuickfix(),
+                .next => try quickfix_list.stepQuickfix(c.ed, true, c.count),
+                .previous => try quickfix_list.stepQuickfix(c.ed, false, c.count),
+                .list => try quickfix_list.showQuickfix(c.ed),
+                .from_picker => try quickfix_list.pickerToQuickfix(c.ed),
+                .clear => quickfix_list.resetQuickfix(c.ed),
             }
         }
     }.run;
@@ -2160,8 +2190,8 @@ fn jumpCmd(comptime dir: enum { older, newer }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             switch (dir) {
-                .older => try c.ed.jumpOlder(c.count),
-                .newer => try c.ed.jumpNewer(c.count),
+                .older => try jumplist.jumpOlder(c.ed, c.count),
+                .newer => try jumplist.jumpNewer(c.ed, c.count),
             }
         }
     }.run;
@@ -2172,14 +2202,14 @@ fn bufferCmd(comptime action: enum { new, last, kill_others, revert, save_all })
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
-                .new => try ed.newBuffer(),
-                .last => try ed.lastBuffer(),
-                .kill_others => try ed.killOtherBuffers(),
+                .new => try formatting.newBuffer(ed),
+                .last => try formatting.lastBuffer(ed),
+                .kill_others => try formatting.killOtherBuffers(ed),
                 .revert => {
-                    ed.reloadBuffer(ed.buffer) catch |err| return ed.setMessage(.err, "could not revert: {s}", .{@errorName(err)});
+                    git_ops.reloadBuffer(ed, ed.buffer) catch |err| return ed.setMessage(.err, "could not revert: {s}", .{@errorName(err)});
                     ed.setMessage(.info, "reverted \"{s}\" from disk", .{ed.buffer.displayName()});
                 },
-                .save_all => ed.saveAll(),
+                .save_all => formatting.saveAll(ed),
             }
         }
     }.run;
@@ -2200,11 +2230,11 @@ fn windowCmd(comptime action: WindowAction) Handler {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
-                .split => |d| try ed.splitWindow(d),
-                .focus => |d| for (0..c.count) |_| ed.focusDirection(d),
-                .next => for (0..c.count) |_| ed.focusNext(),
-                .close => ed.closeWindow(),
-                .only => try ed.onlyWindow(),
+                .split => |d| try window_ops.splitWindow(ed, d),
+                .focus => |d| for (0..c.count) |_| window_ops.focusDirection(ed, d),
+                .next => for (0..c.count) |_| window_ops.focusNext(ed),
+                .close => window_ops.closeWindow(ed),
+                .only => try window_ops.onlyWindow(ed),
                 .balance => ed.windows.balance(),
                 .border => |d| {
                     // Two columns (or one row) per press.
@@ -2218,11 +2248,11 @@ fn windowCmd(comptime action: WindowAction) Handler {
 }
 
 fn browseFiles(c: Context) !void {
-    try c.ed.browse();
+    try browser.browse(c.ed);
 }
 
 fn saveFile(c: Context) !void {
-    try c.ed.saveCurrent();
+    try file_ops.saveCurrent(c.ed);
 }
 
 fn fileCmd(comptime action: enum { new, save_as, rename, copy, delete, yank_path, yank_absolute_path }) Handler {
@@ -2230,13 +2260,13 @@ fn fileCmd(comptime action: enum { new, save_as, rename, copy, delete, yank_path
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
-                .new => try ed.filePrompt(.new_file),
-                .save_as => try ed.filePrompt(.save_as),
-                .rename => try ed.filePrompt(.rename_file),
-                .copy => try ed.filePrompt(.copy_file),
-                .delete => try ed.deleteFilePrompt(),
-                .yank_path => try ed.yankPath(false),
-                .yank_absolute_path => try ed.yankPath(true),
+                .new => try file_ops.filePrompt(ed, .new_file),
+                .save_as => try file_ops.filePrompt(ed, .save_as),
+                .rename => try file_ops.filePrompt(ed, .rename_file),
+                .copy => try file_ops.filePrompt(ed, .copy_file),
+                .delete => try file_ops.deleteFilePrompt(ed),
+                .yank_path => try file_ops.yankPath(ed, false),
+                .yank_absolute_path => try file_ops.yankPath(ed, true),
             }
         }
     }.run;
@@ -2249,11 +2279,11 @@ fn smartClose(c: Context) !void {
     const ed = c.ed;
     // A terminal panel (Claude) closes like a window, but doesn't count as
     // one of the code windows: the last code window hides the panel first.
-    if (ed.window.term != null or ed.codeWindowCount() > 1) return ed.closeWindow();
+    if (ed.window.term != null or window_ops.codeWindowCount(ed) > 1) return window_ops.closeWindow(ed);
     for (ed.window_list.items) |w| if (w.term) |t| {
-        const claude = ed.isClaudeTerm(t);
-        ed.focusWindow(w);
-        ed.closeWindow();
+        const claude = window_ops.isClaudeTerm(ed, t);
+        window_ops.focusWindow(ed, w);
+        window_ops.closeWindow(ed);
         if (claude) ed.setMessage(.info, "Claude panel hidden (SPC a a shows it again)", .{}) else ed.setMessage(.info, "terminal closed", .{});
         return;
     };
@@ -2289,7 +2319,7 @@ fn saveAndQuit(c: Context) !void {
             ed.setMessage(.err, "could not save \"{s}\": {s}", .{ b.displayName(), @errorName(err) });
             return;
         };
-        if (ed.lspFor(b)) |l| l.didSave(b);
+        if (lsp_ops.lspFor(ed, b)) |l| l.didSave(b);
     };
     ed.should_quit = true;
 }
@@ -2308,7 +2338,7 @@ fn openPicker(comptime kind: Picker.Kind) Handler {
             // A menu keeps the selection for the row it runs.
             const menu = @import("picker/sources.zig").rowKeys(kind).len > 0;
             if (ed.mode == .visual and !menu) {
-                const r = ed.visualRange();
+                const r = code_motion.visualRange(ed);
                 const text = std.mem.trim(u8, ed.text().slice(r.start, r.end), " \t");
                 if (!r.linewise and text.len > 0 and text.len < buf.len and std.mem.indexOfScalar(u8, text, '\n') == null) {
                     // A first character that would switch pickers (`@import`
@@ -2318,7 +2348,7 @@ fn openPicker(comptime kind: Picker.Kind) Handler {
                     @memcpy(buf[guard..][0..text.len], text);
                     query = buf[0 .. text.len + guard];
                 }
-                ed.exitVisual();
+                code_motion.exitVisual(ed);
             }
             try ed.openPicker(kind, query);
         }
@@ -2344,7 +2374,7 @@ fn killBuffer(c: Context) !void {
 fn cycleBuffer(comptime delta: isize) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            c.ed.cycleBuffer(delta * @as(isize, @intCast(c.count)));
+            formatting.cycleBuffer(c.ed, delta * @as(isize, @intCast(c.count)));
         }
     }.run;
 }
@@ -2368,16 +2398,16 @@ fn browseStep(comptime dir: enum { up, in }) Handler {
             const p = c.ed.picker orelse return;
             if (p.kind != .browse) return;
             switch (dir) {
-                .up => try c.ed.browseUp(),
+                .up => try browser.browseUp(c.ed),
                 .in => {
                     // Folders: go in, staying in normal mode. Files: open.
                     p.sync();
                     if (p.itemAt(p.selected)) |item| if (std.mem.endsWith(u8, item.text, "/")) {
                         const name = try c.ed.gpa.dupe(u8, item.text);
                         defer c.ed.gpa.free(name);
-                        return c.ed.browseInto(name);
+                        return browser.browseInto(c.ed, name);
                     };
-                    try c.ed.acceptPicker();
+                    try picker_ops.acceptPicker(c.ed);
                 },
             }
         }
@@ -2386,24 +2416,24 @@ fn browseStep(comptime dir: enum { up, in }) Handler {
 
 /// Keys that act on the selected row: file operations in the browser, and
 /// in the buffer list closing a buffer or starting a new one.
-fn pickerOp(comptime op: Editor.BrowseOp) Handler {
+fn pickerOp(comptime op: browser.BrowseOp) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             const p = ed.picker orelse return;
             switch (p.kind) {
-                .browse => try ed.browseOp(op),
-                .runner => if (op == .delete) try ed.pickerForgetCommand(),
+                .browse => try browser.browseOp(ed, op),
+                .runner => if (op == .delete) try run_popup.pickerForgetCommand(ed),
                 // The quickfix list: back to the project's live errors.
                 .quickfix => if (op == .delete) {
-                    ed.closePicker();
-                    ed.resetQuickfix();
+                    picker_query.closePicker(ed);
+                    quickfix_list.resetQuickfix(ed);
                 },
                 .buffers => switch (op) {
-                    .delete => try ed.pickerKillBuffer(),
+                    .delete => try picker_ops.pickerKillBuffer(ed),
                     .new_folder, .new_file => {
-                        ed.closePicker();
-                        try ed.newBuffer();
+                        picker_query.closePicker(ed);
+                        try formatting.newBuffer(ed);
                     },
                     else => {},
                 },
@@ -2441,35 +2471,35 @@ fn browserKey(comptime char: u8) Handler {
                 switch (char) {
                     '/' => {
                         // Nothing typed: the start of a path from the root.
-                        if (empty) return ed.browseInto("/");
+                        if (empty) return browser.browseInto(ed, "/");
                         // What you typed names a folder here (`src`,
                         // `src/core`, `~/code`): into it.
                         {
-                            const typed = try ed.browsePath(p.query.items());
+                            const typed = try browser.browsePath(ed, p.query.items());
                             defer ed.gpa.free(typed);
                             if (std.Io.Dir.cwd().openDir(ed.io, typed, .{})) |d| {
                                 var dir = d;
                                 dir.close(ed.io);
                                 const name = try ed.gpa.dupe(u8, p.query.items());
                                 defer ed.gpa.free(name);
-                                return ed.browseInto(name);
+                                return browser.browseInto(ed, name);
                             } else |_| {}
                         }
                         p.sync();
                         if (p.itemAt(p.selected)) |item| if (std.mem.endsWith(u8, item.text, "/")) {
                             const name = try ed.gpa.dupe(u8, item.text);
                             defer ed.gpa.free(name);
-                            return ed.browseInto(name);
+                            return browser.browseInto(ed, name);
                         };
                     },
                     '~' => if (empty) {
-                        if (std.c.getenv("HOME")) |h| return ed.browseInto(std.mem.span(h));
+                        if (std.c.getenv("HOME")) |h| return browser.browseInto(ed, std.mem.span(h));
                     },
                     else => comptime unreachable,
                 }
             }
             try p.query.insert(ed.gpa, char);
-            try ed.inputChanged();
+            try prompts.inputChanged(ed);
         }
     }.run;
 }
@@ -2477,7 +2507,7 @@ fn browserKey(comptime char: u8) Handler {
 fn inputMove(comptime to: enum { left, right, home, end }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            const input = c.ed.activeInput() orelse return;
+            const input = prompts.activeInput(c.ed) orelse return;
             input.cursor = switch (to) {
                 .left => input.prev(input.cursor),
                 .right => input.next(input.cursor),
@@ -2492,7 +2522,7 @@ fn inputEdit(comptime what: enum { char, word, all }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            const input = ed.activeInput() orelse return;
+            const input = prompts.activeInput(ed) orelse return;
             if (what == .char and input.items().len == 0) {
                 // <BS> on an empty `/` or snipe prompt cancels it, like vim; in
                 // the file browser it goes up a folder. Boxed prompts (run a
@@ -2500,16 +2530,16 @@ fn inputEdit(comptime what: enum { char, word, all }) Handler {
                 // how you start over, and a held <BS> shouldn't close them.
                 if (ed.mode == .search) {
                     if (ed.search_prompt) |sp| if (sp.kind.boxed()) return;
-                    return ed.cancelSearch();
+                    return prompts.cancelSearch(ed);
                 }
-                if (ed.picker) |p| if (p.kind == .browse) return ed.browseUp();
+                if (ed.picker) |p| if (p.kind == .browse) return browser.browseUp(ed);
             }
             switch (what) {
                 .char => input.deleteChar(),
                 .word => input.deleteWord(),
                 .all => input.clear(),
             }
-            try ed.inputChanged();
+            try prompts.inputChanged(ed);
         }
     }.run;
 }
@@ -2520,13 +2550,13 @@ fn inputEdit(comptime what: enum { char, word, all }) Handler {
 fn startSearch(comptime forward: bool, comptime kind: Editor.PromptKind) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            c.ed.startSearch(forward, kind);
+            prompts.startSearch(c.ed, forward, kind);
         }
     }.run;
 }
 
 fn selectIn(c: Context) !void {
-    c.ed.startSelectIn();
+    multicursor.startSelectIn(c.ed);
 }
 
 fn previewScroll(comptime by: isize) Handler {
@@ -2543,14 +2573,14 @@ fn storedData(c: Context) anyerror!void {
 }
 
 fn sqlResults(c: Context) anyerror!void {
-    try c.ed.showSqlResults();
+    try sql_ops.showSqlResults(c.ed);
 }
 
 /// Insert-mode Ctrl-Enter: in a SQL file the statement being written is
 /// run (you stay typing); in any other file it is Enter.
 fn runSqlOrNewline(c: Context) anyerror!void {
     const lang = if (c.ed.buffer.syntax) |syn| syn.lang.name else "";
-    if (std.mem.eql(u8, lang, "sql")) return c.ed.runSql(false);
+    if (std.mem.eql(u8, lang, "sql")) return run_popup.runSql(c.ed, false);
     const enter = find("completion_accept_or_newline") orelse return;
     try enter.run(c);
 }
@@ -2558,7 +2588,7 @@ fn runSqlOrNewline(c: Context) anyerror!void {
 fn runSql(comptime whole: bool) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            try c.ed.runSql(whole);
+            try run_popup.runSql(c.ed, whole);
         }
     }.run;
 }
@@ -2584,18 +2614,18 @@ fn toggleScratch(c: Context) !void {
 }
 
 fn gotoSymbol(c: Context) !void {
-    try c.ed.showSymbols();
+    try lsp_ops.showSymbols(c.ed);
 }
 
 fn renameSymbol(c: Context) !void {
-    try c.ed.startRename();
+    try prompts.startRename(c.ed);
 }
 
 fn searchNext(comptime reverse: bool) Target {
     return struct {
         fn target(ed: *Editor, from: usize, c: Context) ?usize {
-            const pos = ed.searchNext(from, reverse, c.count) orelse return null;
-            ed.revealLine(ed.text().lineOf(pos));
+            const pos = row_search.searchNext(ed, from, reverse, c.count) orelse return null;
+            row_model.revealLine(ed, ed.text().lineOf(pos));
             return pos;
         }
     }.target;
@@ -2604,7 +2634,7 @@ fn searchNext(comptime reverse: bool) Target {
 fn searchWord(comptime forward: bool) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            try c.ed.searchWord(forward, c.count);
+            try row_search.searchWord(c.ed, forward, c.count);
         }
     }.run;
 }
@@ -2615,7 +2645,7 @@ fn searchWord(comptime forward: bool) Handler {
 fn lspRequest(comptime what: enum { definition, references, hover, implementation, code_actions, workspace_symbols }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            const l = c.ed.languageServer() orelse return;
+            const l = lsp_ops.languageServer(c.ed) orelse return;
             switch (what) {
                 .definition => try l.requestDefinition(c.ed),
                 .references => try l.requestReferences(c.ed),
@@ -2630,11 +2660,11 @@ fn lspRequest(comptime what: enum { definition, references, hover, implementatio
                     if (ed.mode == .visual) {
                         first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
                         last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
-                        ed.exitVisual();
+                        code_motion.exitVisual(ed);
                     }
                     try l.requestCodeActions(ed, first, last);
                 },
-                .workspace_symbols => try c.ed.showWorkspaceSymbols(),
+                .workspace_symbols => try lsp_actions.showWorkspaceSymbols(c.ed),
             }
         }
     }.run;
@@ -2646,20 +2676,20 @@ fn completionKey(comptime action: enum { next, previous, accept }, comptime fall
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
-            if (ed.completionShown()) |comp| return switch (action) {
+            if (completion_ops.completionShown(ed)) |comp| return switch (action) {
                 .next => comp.move(1),
                 .previous => comp.move(-1),
-                .accept => ed.acceptCompletion(),
+                .accept => completion_ops.acceptCompletion(ed),
             };
             if (fallback) |f| return f(c);
-            if (action != .accept) try ed.requestCompletion();
+            if (action != .accept) try completion_ops.requestCompletion(ed);
         }
     }.run;
 }
 
 fn clearSearchHighlight(c: Context) !void {
     // With extra cursors, <Esc> removes them first.
-    if (c.ed.cursors.items.len > 0) return c.ed.clearCursors();
+    if (c.ed.cursors.items.len > 0) return multicursor.clearCursors(c.ed);
     c.ed.search_highlight = false;
     if (c.ed.exchange_mark != null) {
         c.ed.exchange_mark = null;
@@ -2673,55 +2703,55 @@ fn cursorCmd(comptime action: enum { next, previous, skip, all, down, up, undo, 
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
-                .next => try ed.cursorAtMatch(.next),
-                .previous => try ed.cursorAtMatch(.previous),
-                .skip => try ed.cursorAtMatch(.skip),
-                .all => try ed.cursorAtMatch(.all),
+                .next => try multicursor.cursorAtMatch(ed, .next),
+                .previous => try multicursor.cursorAtMatch(ed, .previous),
+                .skip => try multicursor.cursorAtMatch(ed, .skip),
+                .all => try multicursor.cursorAtMatch(ed, .all),
                 .down, .up => {
                     for (0..c.count) |_| {
-                        try ed.addCursorHere();
+                        try multicursor.addCursorHere(ed);
                         try move(.{ .ed = ed, .count = 1, .has_count = false });
                     }
                     ed.setMessage(.info, "{d} cursors", .{ed.cursors.items.len + 1});
                 },
-                .undo => ed.removeLastCursor(),
-                .clear => ed.clearCursors(),
-                .line_starts => try ed.cursorsOnLines(false, false),
-                .line_ends => try ed.cursorsOnLines(true, false),
-                .insert_starts => try ed.cursorsOnLines(false, true),
-                .insert_ends => try ed.cursorsOnLines(true, true),
-                .from_prompt => try ed.cursorsFromPrompt(),
+                .undo => multicursor.removeLastCursor(ed),
+                .clear => multicursor.clearCursors(ed),
+                .line_starts => try multicursor.cursorsOnLines(ed, false, false),
+                .line_ends => try multicursor.cursorsOnLines(ed, true, false),
+                .insert_starts => try multicursor.cursorsOnLines(ed, false, true),
+                .insert_ends => try multicursor.cursorsOnLines(ed, true, true),
+                .from_prompt => try multicursor.cursorsFromPrompt(ed),
             }
         }
     }.run;
 }
 
 fn searchAccept(c: Context) !void {
-    try c.ed.acceptSearch();
+    try prompts.acceptSearch(c.ed);
 }
 
 fn searchCancel(c: Context) !void {
-    c.ed.cancelSearch();
+    prompts.cancelSearch(c.ed);
 }
 
 fn pickerAccept(c: Context) !void {
-    try c.ed.acceptPicker();
+    try picker_ops.acceptPicker(c.ed);
 }
 
 fn pickerAcceptAlt(c: Context) !void {
-    try c.ed.acceptPickerAlt();
+    try picker_ops.acceptPickerAlt(c.ed);
 }
 
 /// <Tab>: the "Open in..." menu; <C-v> / <C-s>: straight into a split.
 fn pickerOpen(comptime target: ?Editor.OpenTarget) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
-            if (target) |t| return c.ed.acceptPickerAs(t);
-            try c.ed.pickerOpenMenu();
+            if (target) |t| return picker_ops.acceptPickerAs(c.ed, t);
+            try picker_ops.pickerOpenMenu(c.ed);
         }
     }.run;
 }
 
 fn pickerClose(c: Context) !void {
-    c.ed.closePicker();
+    picker_query.closePicker(c.ed);
 }

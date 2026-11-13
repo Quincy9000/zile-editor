@@ -29,6 +29,9 @@ tree-sitter, and an embedded terminal (libghostty-vt).
 src/
   main.zig            window, main loop: drain input -> update -> draw
   Editor.zig          all editor state; handleKey; editing primitives
+  tests/             the editor's tests by topic (`support.zig`: shared helpers)
+  editor/            what the editor does, a file per feature: free functions on
+                      `*Editor` (`prompts.startSearch(ed, ...)`), state stays in Editor.zig
   commands.zig        command registry (comptime-generated families)
   core/
     Text.zig          text storage (array + line index now; rope later)
@@ -62,9 +65,10 @@ files with it as the query). No ex command line. Bindings are tables in
 The leader keeps a few entry points, and each opens a picker that *is* the
 menu: you see every row, type to filter, and act on rows right there, so
 there is no which-key hunting for the key of one action. Every picker shows
-its actions along its bottom: the letters after `<Esc>`, the Ctrl keys while
-typing, and `<Tab>` for the full list (with "open in a split" for pickers of
-places). Menus (`SPC l`, `SPC g`) show each row's key beside it: the key runs
+its keys along its bottom: `Tab` and the scopes it goes through (`C-t` too),
+Enter and the split keys for pickers of places, then the actions (their
+letters after `<Esc>`, their Ctrl keys while typing), and `<S-Tab>` for the
+full list as a menu (the only way to "split left / above"). Menus (`SPC l`, `SPC g`) show each row's key beside it: the key runs
 the row, `/` types to filter.
 
 | key | picker | its actions / rows |
@@ -111,7 +115,7 @@ The table below is the history of what was built, with its keys in this layout.
 | `SPC w d` / `SPC w c`, `SPC w o`, `SPC w =` | close window, close the others, equal sizes | done |
 | `SPC w r` + `h/j/k/l`, `=` | resize mode (stays open): move the border on that side (the window's other border if none) left/down/up/right, two columns or one row per press; `=` equal sizes; any other key leaves and acts as usual. `SPC w <` / `>` move a border left / right the same way | done |
 | `SPC b e`, `SPC b b` / `SPC b b` / ``SPC ` ``, `SPC b o`, `SPC b d`, `SPC b s` / `SPC b a` | new empty buffer, flip to the other buffer (picker: `SPC f b` / `SPC ,`), kill others (keeps unsaved), revert from disk, save / save all | done |
-| in pickers: `<Tab>`, `<C-v>`, `<C-s>` | "Open in..." menu (this window, split right/below/left/above); open in a split right / below. Works for files, buffers, grep, references, symbols, diagnostics, jumps, run errors, git changes, explorer files; on a project (`SPC p p`) the split opens once a file is picked | done |
+| in pickers: `<S-Tab>`, `<C-v>`, `<C-s>` | "Open in..." menu (this window, split right/below/left/above); open in a split right / below. Works for files, buffers, grep, references, symbols, diagnostics, jumps, run errors, git changes, explorer files; on a project (`SPC p p`) the split opens once a file is picked | done |
 | `zile -t` | terminal mode: the same editor drawn in the terminal; automatic when there is no display (SSH) or no window can open | done |
 | `zile <path>` | a file (trailing `/` and `..` resolved); a folder opens the explorer there; a file that can't be opened leaves a message instead of not starting | done |
 | `SPC p p`, `SPC f f` | switch project (projects opened before, most recent first; picking one finds a file in it); find file in project | done |
@@ -207,7 +211,7 @@ code actions, buffers, jumplist, registers, terminals.
   path completion and `>theme ` lists themes. A picker with zero items is the
   generic text prompt.
 - **Actions.** `Enter` runs the default; `C-v`/`C-s` open in a split; `Tab`
-  marks items; `C-q` freezes results into a resumable list (the quickfix
+  goes to the next scope; `C-q` freezes results into a resumable list (the quickfix
   replacement); `SPC '` resumes the last picker. (Ctrl keys *inside* the picker
   are list navigation, not commands.)
 - **What you're on goes last.** A picker never starts on the thing you

@@ -10,6 +10,14 @@ const keys = @import("input/keys.zig");
 const Tui = @import("tui/Tui.zig");
 const config = @import("config/config.zig");
 const grammars = @import("config/grammars.zig");
+const state_files = @import("editor/state_files.zig");
+const notifications = @import("editor/notifications.zig");
+const window_ops = @import("editor/window_ops.zig");
+const smooth_scrolling = @import("editor/smooth_scrolling.zig");
+const run_popup = @import("editor/run_popup.zig");
+const borders = @import("editor/borders.zig");
+const resting = @import("editor/resting.zig");
+const row_model = @import("editor/row_model.zig");
 
 const usage =
     \\usage: zile [options] [file]
@@ -92,21 +100,21 @@ pub fn main(init: std.process.Init) !void {
     defer ed.deinit();
     ed.environ = init.environ_map;
     // Old sessions and undo histories past the limits go.
-    ed.pruneStoredData();
+    state_files.pruneStoredData(&ed);
     // What is remembered between runs: the session and the visits, saved on
     // the way out (however we leave).
     defer {
-        ed.saveSession(false);
-        ed.rememberPositions();
-        ed.saveVisits();
+        state_files.saveSession(&ed, false);
+        state_files.rememberPositions(&ed);
+        state_files.saveVisits(&ed);
     }
-    for (config_report.problems) |p| ed.notify(.err, "{s}", .{p});
+    for (config_report.problems) |p| notifications.notify(&ed, .err, "{s}", .{p});
     ed.theme_names = &Theme.names;
-    ed.loadTheme();
+    state_files.loadTheme(&ed);
     if (args.file) |path| ed.openArg(path);
     // No file: the start screen (not under scripted keys, which expect to
     // begin in normal mode).
-    if (args.file == null and test_keys == null) ed.openStarter() catch {};
+    if (args.file == null and test_keys == null) state_files.openStarter(&ed) catch {};
 
     var theme = Theme.get(ed.theme_index);
     syncTerminalColors(&ed, theme);
@@ -158,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
     while (!rl.WindowShouldClose() and !ed.should_quit) : (frame += 1) {
         // Autosave: modified files are written when zile loses focus.
         const now_focused = rl.IsWindowFocused();
-        if (focused and !now_focused) ed.focusLost();
+        if (focused and !now_focused) state_files.focusLost(&ed);
         focused = now_focused;
         if (frame == next_segment_frame and screenshot_frame == null) {
             if (script.next()) |segment| {
@@ -182,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
         // After everything that scrolls this frame (keys and the wheel): a
         // scroll the glide hasn't taken in yet would show for one frame as
         // a jump ahead and back.
-        ed.animate(rl.GetFrameTime());
+        smooth_scrolling.animate(&ed, rl.GetFrameTime());
         const l = render.prepare(&ed, &font, rl.GetScreenWidth(), rl.GetScreenHeight());
         title.update(&ed);
 
@@ -202,7 +210,7 @@ pub fn main(init: std.process.Init) !void {
         }
         // Something is still moving (a gliding scroll, a fading toast):
         // draw the next frame without waiting for input.
-        if (ed.wantsFrames()) glfw.wake();
+        if (notifications.wantsFrames(&ed)) glfw.wake();
         rl.EndDrawing();
     }
 }
@@ -296,10 +304,10 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
     // A press that started on text: dragging selects, letting go copies.
     if (ed.mouse_drag != null and !clicked) {
         if (rl.IsMouseButtonReleased(rl.MOUSE_BUTTON_LEFT) or !rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) {
-            ed.mouseRelease();
+            row_model.mouseRelease(ed);
         } else if (rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) {
             const l = render.windowLayout(ed, font, ed.window);
-            if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.mouseDrag(cell.row, cell.col);
+            if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| row_model.mouseDrag(ed, cell.row, cell.col);
         }
     }
     if (wheel == 0 and !clicked) return;
@@ -310,21 +318,21 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
         return;
     }
     // The terminal popup takes the wheel (scrollback) while it is open.
-    if (ed.popupTerminal()) |t| {
+    if (run_popup.popupTerminal(ed)) |t| {
         if (lines != 0) t.scroll(lines);
         return;
     }
     const w = ed.windows.at(pos.x, pos.y) orelse return;
-    ed.focusWindow(w);
+    window_ops.focusWindow(ed, w);
     if (w.term) |t| {
         if (lines != 0) t.scroll(lines);
         return;
     }
     // Editor windows take the wheel as it is, fractions and all.
-    ed.scrollSmooth(-wheel * 3);
+    smooth_scrolling.scrollSmooth(ed, -wheel * 3);
     if (clicked) {
         const l = render.windowLayout(ed, font, w);
-        if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| ed.mousePress(cell.row, cell.col, clicks.count(cell.row, cell.col, rl.GetTime()));
+        if (l.cellAt(font, pos.x - l.x0, pos.y - l.y0)) |cell| row_model.mousePress(ed, cell.row, cell.col, clicks.count(cell.row, cell.col, rl.GetTime()));
     }
 }
 
@@ -332,18 +340,18 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
 /// under it pops up after a moment.
 fn hoverMouse(ed: *Editor, font: *const Font, pos: rl.Vector2) void {
     const busy = rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT);
-    ed.mouseHover(if (busy) null else render.hoverCell(ed, font, pos.x, pos.y));
+    resting.mouseHover(ed, if (busy) null else render.hoverCell(ed, font, pos.x, pos.y));
 }
 
 /// The cursor shape last asked of raylib.
-var pointer_shown: Editor.Pointer = .normal;
+var pointer_shown: borders.Pointer = .normal;
 
-/// Window borders (`Editor.borderPress` and co.): true while the mouse is
+/// Window borders (`borders.borderPress` and co.): true while the mouse is
 /// busy with one.
 fn borderMouse(ed: *Editor, pos: rl.Vector2, clicked: bool) bool {
     const slop = 4;
-    const busy = if (rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) ed.borderDrag(pos.x, pos.y) else ed.borderRelease();
-    const shape = ed.pointerAt(pos.x, pos.y, slop);
+    const busy = if (rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) borders.borderDrag(ed, pos.x, pos.y) else borders.borderRelease(ed);
+    const shape = borders.pointerAt(ed, pos.x, pos.y, slop);
     if (shape != pointer_shown) {
         pointer_shown = shape;
         rl.SetMouseCursor(switch (shape) {
@@ -352,7 +360,7 @@ fn borderMouse(ed: *Editor, pos: rl.Vector2, clicked: bool) bool {
             .resize_rows => rl.MOUSE_CURSOR_RESIZE_NS,
         });
     }
-    return busy or (clicked and ed.borderPress(pos.x, pos.y, slop));
+    return busy or (clicked and borders.borderPress(ed, pos.x, pos.y, slop));
 }
 
 /// Double and triple clicks: presses on the same cell close together.

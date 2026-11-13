@@ -19,6 +19,24 @@ const hipatterns = @import("../core/hipatterns.zig");
 const indent = @import("../core/indent.zig");
 const search = @import("../core/search.zig");
 const Blame = @import("../git/Blame.zig");
+const blame = @import("../editor/blame.zig");
+const state_files = @import("../editor/state_files.zig");
+const formatting = @import("../editor/formatting.zig");
+const notifications = @import("../editor/notifications.zig");
+const window_ops = @import("../editor/window_ops.zig");
+const project_ops = @import("../editor/project_ops.zig");
+const inlay = @import("../editor/inlay.zig");
+const quickfix_list = @import("../editor/quickfix_list.zig");
+const run_popup = @import("../editor/run_popup.zig");
+const borders = @import("../editor/borders.zig");
+const resting = @import("../editor/resting.zig");
+const row_model = @import("../editor/row_model.zig");
+const folding = @import("../editor/folding.zig");
+const code_motion = @import("../editor/code_motion.zig");
+const row_search = @import("../editor/row_search.zig");
+const prompts = @import("../editor/prompts.zig");
+const ai_ghost = @import("../editor/ai_ghost.zig");
+const completion_ops = @import("../editor/completion_ops.zig");
 
 /// Screen geometry in pixels and cells, recomputed every frame.
 pub const Layout = struct {
@@ -71,7 +89,7 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
         .cell_w = @intFromFloat(font.cell_w),
         .cell_h = @intFromFloat(font.cell_h),
     };
-    if (ed.popupTerminal()) |t| t.resize(ed.term_size.cols, ed.term_size.rows, ed.term_size.cell_w, ed.term_size.cell_h);
+    if (run_popup.popupTerminal(ed)) |t| t.resize(ed.term_size.cols, ed.term_size.rows, ed.term_size.cell_w, ed.term_size.cell_h);
     if (ed.cmd_float) |f| {
         f.rect = cmdFloatRect(ed, font, screen);
         const fl = floatLayout(ed, font, f);
@@ -102,7 +120,7 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
 /// the pointer resting there (null: elsewhere, the gutter, or something is
 /// open over the windows). The window and the terminal both ask this.
 pub fn hoverCell(ed: *Editor, font: *const Font, x: f32, y: f32) ?[2]usize {
-    if (ed.cmd_float != null or ed.popupTerminal() != null or ed.picker != null or ed.window.term != null) return null;
+    if (ed.cmd_float != null or run_popup.popupTerminal(ed) != null or ed.picker != null or ed.window.term != null) return null;
     if (ed.windows.at(x, y) != ed.window) return null;
     const l = windowLayout(ed, font, ed.window);
     if (x - l.x0 < l.text_x) return null; // the gutter
@@ -114,7 +132,7 @@ pub fn hoverCell(ed: *Editor, font: *const Font, x: f32, y: f32) ?[2]usize {
 /// windows), in coordinates local to `x0`/`y0`.
 pub fn windowLayout(ed: *Editor, font: *const Font, w: *Editor.Windows.Window) Layout {
     const header: f32 = if (ed.window_list.items.len > 1) font.cell_h else 0;
-    const lines = ed.windowBuffer(w).text.lineCount();
+    const lines = window_ops.windowBuffer(ed, w).text.lineCount();
     const gutter_cols = @max(std.math.log10_int(lines) + 1, 3) + 2;
     const text_x = @as(f32, @floatFromInt(gutter_cols)) * font.cell_w;
     const text_h = @max(w.rect.h - header, 0);
@@ -177,7 +195,7 @@ pub fn rect(x: f32, y: f32, w: f32, h: f32, color: rl.Color) void {
 /// A path for lists: relative inside the current project, else its last
 /// two parts.
 fn shortPath(ed: *Editor, path: []const u8) []const u8 {
-    const root = ed.projectRoot();
+    const root = project_ops.projectRoot(ed);
     if (path.len > root.len + 1 and std.mem.startsWith(u8, path, root) and path[root.len] == '/') return path[root.len + 1 ..];
     if (!std.fs.path.isAbsolute(path)) return path;
     const base = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
@@ -188,7 +206,7 @@ fn shortPath(ed: *Editor, path: []const u8) []const u8 {
 /// The command editor: a box growing with its text (3 to 16 lines), at the
 /// upper third of the screen.
 fn cmdFloatRect(ed: *Editor, font: *const Font, screen: Layout) Editor.Windows.Rect {
-    const lines = ed.windowBuffer(ed.cmd_float.?).text.lineCount();
+    const lines = window_ops.windowBuffer(ed, ed.cmd_float.?).text.lineCount();
     const rows: f32 = @floatFromInt(std.math.clamp(lines + 1, 3, 16));
     const w = @max(@min(@floor(screen.width * 0.7 / font.cell_w), 120), 30) * font.cell_w;
     const h = (rows + 1) * font.cell_h; // + the title row
@@ -196,7 +214,7 @@ fn cmdFloatRect(ed: *Editor, font: *const Font, screen: Layout) Editor.Windows.R
 }
 
 fn floatLayout(ed: *Editor, font: *const Font, f: *Editor.Windows.Window) Layout {
-    const lines = ed.windowBuffer(f).text.lineCount();
+    const lines = window_ops.windowBuffer(ed, f).text.lineCount();
     const gutter_cols = @max(std.math.log10_int(lines) + 1, 2) + 2;
     const text_x = @as(f32, @floatFromInt(gutter_cols)) * font.cell_w;
     const text_h = f.rect.h - font.cell_h;
@@ -249,7 +267,7 @@ fn rgbColor(c: Editor.Terminal.Rgb) rl.Color {
 
 /// A terminal (shell or run) in the popup: a header line, then its screen.
 fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout) void {
-    const t = ed.popupTerminal() orelse return;
+    const t = run_popup.popupTerminal(ed) orelse return;
     const r = popupRect(font, screen);
     const cw = font.cell_w;
     const ch = font.cell_h;
@@ -281,7 +299,7 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
             .stopped => .{ "stopped   r: again   q: close", theme.status_dim },
         }
     else if (t.isRunning())
-        .{ std.fmt.bufPrint(&right_buf, "running {d:.1}s   Esc Esc hides", .{ed.runSeconds()}) catch "", theme.status_dim }
+        .{ std.fmt.bufPrint(&right_buf, "running {d:.1}s   Esc Esc hides", .{quickfix_list.runSeconds(ed)}) catch "", theme.status_dim }
     else if (t.exit_code == 0)
         .{ "done   r: again   q: close", theme.diff_add }
     else
@@ -420,7 +438,7 @@ fn drawWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Editor.Wi
 
 /// The inlay hints of the line being drawn (set per line by `drawText`; the
 /// helpers below read it so every column on the line allows for them).
-var line_hints: []const Editor.LineHint = &.{};
+var line_hints: []const inlay.LineHint = &.{};
 
 /// The part of the line on the row being drawn: visual columns
 /// `[win_left, win_right)`, drawn `win_indent` cells in (one row of a
@@ -449,20 +467,20 @@ fn unwrappedWindow(ed: *const Editor) void {
 /// The screen column of byte `off` of the line being drawn: where its
 /// character is, after the hints in front of it.
 fn dcol(bytes: []const u8, off: usize, tab: usize) usize {
-    return motions.displayCol(bytes, off, tab) + Editor.hintShift(line_hints, off);
+    return motions.displayCol(bytes, off, tab) + inlay.hintShift(line_hints, off);
 }
 
 /// The screen column where a range ending at byte `off` ends: a hint in
 /// front of the next character isn't part of it.
 fn dcolEnd(bytes: []const u8, off: usize, tab: usize) usize {
-    return motions.displayCol(bytes, off, tab) + Editor.hintShiftBefore(line_hints, off);
+    return motions.displayCol(bytes, off, tab) + inlay.hintShiftBefore(line_hints, off);
 }
 
 fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focused: bool) void {
     defer line_hints = &.{};
     unwrappedWindow(ed);
     defer unwrappedWindow(ed);
-    const selection: ?operators.Range = if (ed.mode == .visual) ed.visualRange() else null;
+    const selection: ?operators.Range = if (ed.mode == .visual) code_motion.visualRange(ed) else null;
     const syntax: ?*const Syntax = if (ed.buffer.syntax) |*s| s else null;
     const t = ed.text();
     const v = &ed.view;
@@ -482,7 +500,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     // mini.nvim decorations, worked out once per window.
     const cword: ?search.Pattern = if (cursorWord(ed, focused)) |w| .{ .needle = w, .case_sensitive = true, .whole_word = true } else null;
     // The indent guide appears once the cursor has settled in a scope
-    // (`Editor.tickIndentGuide`), so it doesn't flash while travelling.
+    // (`notifications.tickIndentGuide`), so it doesn't flash while travelling.
     const guide: ?Editor.IndentGuide = if (focused) (if (ed.indent_guide) |g| (if (g.buffer == ed.buffer) g else null) else null) else null;
     const guide_reach: f32 = if (guide) |g| g.reach(ed.now) else 0;
     const show_trail = ed.options.trailing_space and ed.buffer.path != null;
@@ -495,12 +513,12 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     const draw_off = v.drawOffset();
     // The first row in view, and where it is relative to `top`: rows above
     // `top` while the text is lower, rows below it while it is higher.
-    var first_row = ed.topRow();
+    var first_row = row_model.topRow(ed);
     var first_index: f32 = 0;
     if (draw_off > 0) {
         var n: usize = @intFromFloat(@ceil(draw_off));
         while (n > 0) : (n -= 1) {
-            const prev = ed.prevRow(first_row);
+            const prev = row_model.prevRow(ed, first_row);
             if (prev.eql(first_row)) break;
             first_row = prev;
             first_index -= 1;
@@ -508,7 +526,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     } else if (draw_off < 0) {
         var n: usize = @intFromFloat(@floor(-draw_off));
         while (n > 0) : (n -= 1) {
-            const next = ed.nextRow(first_row);
+            const next = row_model.nextRow(ed, first_row);
             if (next.eql(first_row)) break;
             first_row = next;
             first_index += 1;
@@ -526,7 +544,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     var r = first_row;
     while (true) : (row += 1) {
         if (row > 0) {
-            const next = ed.nextRow(r);
+            const next = row_model.nextRow(ed, r);
             if (next.eql(r)) break;
             r = next;
         }
@@ -541,18 +559,18 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         const line = r.line;
         if (line >= t.lineCount()) break;
         // A code lens row: the server's note above the line, at its indent.
-        const lens_n = ed.lensRows(line);
+        const lens_n = row_model.lensRows(ed, line);
         if (r.sub < lens_n) {
             const lb = t.lineSlice(line);
             const ind = motions.displayCol(lb, std.mem.indexOfNone(u8, lb, " \t") orelse 0, tab_width) -| v.left;
-            if (ed.lensText(line)) |lt| _ = font.drawText(clip(lt, l.cols -| ind), l.text_x + @as(f32, @floatFromInt(ind)) * font.cell_w, y, theme.inlay_fg);
+            if (row_model.lensText(ed, line)) |lt| _ = font.drawText(clip(lt, l.cols -| ind), l.text_x + @as(f32, @floatFromInt(ind)) * font.cell_w, y, theme.inlay_fg);
             continue;
         }
         var seg_buf: [Editor.max_segments]Editor.Seg = undefined;
-        const segs = ed.segments(line, &seg_buf);
+        const segs = row_model.segments(ed, line, &seg_buf);
         // A row of the line's diagnostic message, under it.
         if (@as(usize, r.sub) - lens_n >= segs.len) {
-            if (ed.diagText(line, segs)) |d| {
+            if (row_model.diagText(ed, line, segs)) |d| {
                 const k = @as(usize, r.sub) - lens_n - segs.len + 1;
                 if (k < d.n) drawDiagPiece(font, theme, l, d, k, y);
             }
@@ -561,15 +579,15 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         const piece = @as(usize, r.sub) - lens_n;
         const first_piece = piece == 0;
         const last_piece = piece + 1 == segs.len;
-        if (ed.wraps()) {
+        if (inlay.wraps(ed)) {
             win_left = segs[piece].start;
             win_right = segs[piece].end;
             win_indent = segs[piece].indent;
         } else unwrappedWindow(ed);
-        var hint_buf: [Editor.max_line_hints]Editor.LineHint = undefined;
-        const hints = ed.lineHints(ed.buffer, line, &hint_buf);
+        var hint_buf: [inlay.max_line_hints]inlay.LineHint = undefined;
+        const hints = inlay.lineHints(ed, ed.buffer, line, &hint_buf);
         line_hints = hints;
-        const fold = ed.foldAt(line);
+        const fold = folding.foldAt(ed, line);
         const is_current = line == cursor_line;
         if (fold != null) rect(0, y, l.width, font.cell_h, theme.fold_bg);
 
@@ -579,7 +597,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         if (marks.here) rect(0, y, l.width, font.cell_h, withAlpha(theme.diag_warning, 40));
         if (selection) |sel| drawSelection(ed, font, theme, l, sel, line, y);
         if (selection != null) for (ed.cursors.items) |c| {
-            drawSelection(ed, font, theme, l, ed.selectionRange(c.anchor, c.pos), line, y);
+            drawSelection(ed, font, theme, l, code_motion.selectionRange(ed, c.anchor, c.pos), line, y);
         };
         // Snippet placeholders: the current one (typing replaces it) like a
         // selection, the ones still ahead faintly.
@@ -602,7 +620,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             line + 1;
         const num = std.fmt.bufPrint(&num_buf, "{d}", .{shown}) catch unreachable;
         const num_x = @as(f32, @floatFromInt(l.gutter_cols - 1 - num.len)) * font.cell_w;
-        const line_diag = ed.lineDiagnostic(line);
+        const line_diag = row_model.lineDiagnostic(ed, line);
         const num_color = if (line_diag) |d| diagColor(theme, d.severity) else if (fold != null) theme.fold_fg else if (is_current) theme.gutter_current_fg else theme.gutter_fg;
         // The number on a line's first row only (later rows continue it).
         if (first_piece) _ = font.drawText(num, num_x, y, num_color);
@@ -679,7 +697,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         var hp_i: usize = 0;
         // An AI suggestion at the cursor: its first line goes inline (the
         // rest of the line moves right), more lines are drawn below.
-        const ghost: ?[]const u8 = if (focused and is_current) ed.aiSuggestionHere() else null;
+        const ghost: ?[]const u8 = if (focused and is_current) ai_ghost.aiSuggestionHere(ed) else null;
         const ghost_at = if (ghost != null) v.cursor - ls else bytes.len + 1;
         const ghost_first = if (ghost) |g| std.mem.sliceTo(g, '\n') else "";
         const ghost_cells = cells(ghost_first);
@@ -695,7 +713,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             const next_col = if (cp == '\t') motions.nextTabStop(col, tab_width) else col + 1;
             defer col = next_col;
             defer ci += 1;
-            const shift: usize = (if (offset >= ghost_at) ghost_cells else 0) + Editor.hintShift(hints, offset);
+            const shift: usize = (if (offset >= ghost_at) ghost_cells else 0) + inlay.hintShift(hints, offset);
             if (next_col + shift <= win_left) continue;
             if (col + shift >= winEnd(l)) break;
             if (cp == '\t' or cp == ' ') continue;
@@ -713,7 +731,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             if (lig != 0) font.drawGlyph(lig, x, y, color) else font.drawCodepoint(cp, x, y, color);
         }
         // A snipe's labels: the key that jumps to a match, just after it.
-        if (focused) for (ed.snipeLabels()) |sl| {
+        if (focused) for (prompts.snipeLabels(ed)) |sl| {
             if (sl.end < ls or sl.end > ls + bytes.len) continue;
             const c = dcol(bytes, sl.end - ls, tab_width);
             if (c < win_left or c >= winEnd(l)) continue;
@@ -723,7 +741,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         };
         // Inlay hints: the server's labels, in front of the text they belong to.
         for (hints, 0..) |h, j| {
-            const c = motions.displayCol(bytes, @min(h.off, bytes.len), tab_width) + Editor.hintShift(hints[0..j], std.math.maxInt(usize));
+            const c = motions.displayCol(bytes, @min(h.off, bytes.len), tab_width) + inlay.hintShift(hints[0..j], std.math.maxInt(usize));
             const w = h.cells();
             if (c < win_left or c >= winEnd(l)) continue;
             const hx = colX(font, l, c);
@@ -830,10 +848,10 @@ fn drawSpan(ed: *Editor, font: *const Font, l: Layout, bytes: []const u8, a: usi
 fn drawBlame(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, bytes: []const u8, line: usize, y: f32) void {
     var buf: [200]u8 = undefined;
     var ago_buf: [32]u8 = undefined;
-    const text = switch (ed.blameLine(line)) {
+    const text = switch (blame.blameLine(ed, line)) {
         .unknown => return,
         .uncommitted => "not committed yet",
-        .commit => |c| std.fmt.bufPrint(&buf, "{s}, {s} \u{b7} {s}", .{ c.author, Blame.ago(&ago_buf, ed.unixNow() - c.time), c.summary }) catch return,
+        .commit => |c| std.fmt.bufPrint(&buf, "{s}, {s} \u{b7} {s}", .{ c.author, Blame.ago(&ago_buf, state_files.unixNow(ed) - c.time), c.summary }) catch return,
     };
     const end_col = dcol(bytes, bytes.len, ed.options.tab_width) + 4;
     if (end_col < win_left or end_col >= winEnd(l)) return;
@@ -1000,21 +1018,21 @@ fn faded(c: rl.Color, alpha: f32) rl.Color {
 fn posRow(ed: *Editor, pos: usize) ?struct { row: usize, col: usize } {
     const t = ed.text();
     const line = t.lineOf(pos);
-    const col = ed.visualCol(line, pos - t.lineStart(line));
-    if (!ed.layered()) {
+    const col = row_model.visualCol(ed, line, pos - t.lineStart(line));
+    if (!row_model.layered(ed)) {
         unwrappedWindow(ed);
-        return .{ .row = ed.screenRow(line) orelse return null, .col = col };
+        return .{ .row = row_model.screenRow(ed, line) orelse return null, .col = col };
     }
     var seg_buf: [Editor.max_segments]Editor.Seg = undefined;
-    const vis = ed.visibleLine(line);
-    const segs = ed.segments(vis, &seg_buf);
-    const k = if (vis == line) Editor.segmentIndex(segs, col) else 0;
-    if (ed.wraps()) {
+    const vis = folding.visibleLine(ed, line);
+    const segs = row_model.segments(ed, vis, &seg_buf);
+    const k = if (vis == line) row_model.segmentIndex(segs, col) else 0;
+    if (inlay.wraps(ed)) {
         win_left = segs[k].start;
         win_right = segs[k].end;
         win_indent = segs[k].indent;
     } else unwrappedWindow(ed);
-    const row = ed.rowOnScreen(.{ .line = vis, .sub = @intCast(ed.lensRows(vis) + k) }) orelse return null;
+    const row = row_model.rowOnScreen(ed, .{ .line = vis, .sub = @intCast(row_model.lensRows(ed, vis) + k) }) orelse return null;
     return .{ .row = row, .col = col };
 }
 
@@ -1138,15 +1156,15 @@ fn projectPath(ed: *Editor, buf: []u8) []const u8 {
 fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (ed.macro_register) |r| try w.print("recording @{c}   ", .{r});
     if (ed.cursors.items.len > 0) try w.print("{d} cursors   ", .{ed.cursors.items.len + 1});
-    const typed = ed.showcmdKeys();
+    const typed = code_motion.showcmdKeys(ed);
     try keys.formatSequenceDisplay(typed, w);
     if (typed.len > 0) try w.writeAll("-   ");
-    if (ed.buffers.items.len > 1 and ed.cmd_float == null) try w.print("[{d}/{d}]  ", .{ ed.bufferIndex(ed.buffer) + 1, ed.buffers.items.len });
+    if (ed.buffers.items.len > 1 and ed.cmd_float == null) try w.print("[{d}/{d}]  ", .{ formatting.bufferIndex(ed, ed.buffer) + 1, ed.buffers.items.len });
 
     const line = ed.cursorLine();
     const total = ed.text().lineCount();
     if (ed.ghost) |g| {
-        const h = ed.ghostHunk(g.line);
+        const h = row_model.ghostHunk(ed, g.line);
         if (h) |hh| try w.print("HEAD:{d}  ", .{hh.old_start + g.k + 1});
     }
     try w.print("{d}:{d}  ", .{ line + 1, ed.cursorCol() + 1 });
@@ -1192,7 +1210,7 @@ fn drawSearchMatches(ed: *Editor, font: *const Font, theme: *const Theme, l: Lay
 /// Search match backgrounds in `bytes` (a text or ghost line); the match
 /// starting at `cursor_col` is brighter.
 fn drawMatchesIn(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, bytes: []const u8, cursor_col: ?usize, y: f32) void {
-    const pattern = ed.searchPattern() orelse return;
+    const pattern = row_search.searchPattern(ed) orelse return;
     if (pattern.needle.len == 0) return;
     const tab = ed.options.tab_width;
     var i: usize = 0;
@@ -1247,7 +1265,7 @@ const max_ligature_line = 1024;
 /// one with the cursor in it is drawn as its characters (as kitty's
 /// `disable_ligatures cursor`), and so is one whose cells don't sit side by
 /// side (a tab, an inlay hint or a suggestion inside it).
-fn drawnLigatures(font: *const Font, bytes: []const u8, hints: []const Editor.LineHint, ghost_at: usize, ghost_cells: usize, cursor_off: ?usize, out: *[max_ligature_line]u16) ?[]const u16 {
+fn drawnLigatures(font: *const Font, bytes: []const u8, hints: []const inlay.LineHint, ghost_at: usize, ghost_cells: usize, cursor_off: ?usize, out: *[max_ligature_line]u16) ?[]const u16 {
     const shaped = font.ligatures(bytes) orelse return null;
     if (shaped.len > out.len) return null;
     const ligs = out[0..shaped.len];
@@ -1268,7 +1286,7 @@ fn drawnLigatures(font: *const Font, bytes: []const u8, hints: []const Editor.Li
             if (cp == null) break;
             continue;
         }
-        const shift = (if (off >= ghost_at) ghost_cells else 0) + Editor.hintShift(hints, off);
+        const shift = (if (off >= ghost_at) ghost_cells else 0) + inlay.hintShift(hints, off);
         if (run_start == null) {
             run_start = i;
             run_shift = shift;
@@ -1289,7 +1307,7 @@ fn drawDiagnostics(ed: *Editor, font: *const Font, theme: *const Theme, l: Layou
     const bytes = t.lineSlice(line);
     const tab = ed.options.tab_width;
     var on_buf: [16]*const Lsp.Diagnostic = undefined;
-    for (ed.diagnosticsOn(line, null, &on_buf)) |d| {
+    for (row_model.diagnosticsOn(ed, line, null, &on_buf)) |d| {
         const end_byte = if (d.end_line == d.line) @max(d.end_col, d.col + 1) else bytes.len;
         const c0 = dcol(bytes, @min(d.col, bytes.len), tab);
         const c1 = @min(@max(dcolEnd(bytes, @min(end_byte, bytes.len), tab), c0 + 1), winEnd(l));
@@ -1302,13 +1320,13 @@ fn drawDiagnostics(ed: *Editor, font: *const Font, theme: *const Theme, l: Layou
     // under it, for what doesn't fit).
     if (!last_piece) return;
     var seg_buf: [Editor.max_segments]Editor.Seg = undefined;
-    const d = ed.diagText(line, ed.segments(line, &seg_buf)) orelse return;
+    const d = row_model.diagText(ed, line, row_model.segments(ed, line, &seg_buf)) orelse return;
     drawDiagPiece(font, theme, l, d, 0, y);
 }
 
 /// Piece `k` of a diagnostic message: 0 after the line's text, then a row
 /// each under it.
-fn drawDiagPiece(font: *const Font, theme: *const Theme, l: Layout, d: Editor.DiagText, k: usize, y: f32) void {
+fn drawDiagPiece(font: *const Font, theme: *const Theme, l: Layout, d: row_model.DiagText, k: usize, y: f32) void {
     const piece = d.pieces[k];
     if (piece.len == 0) return;
     const col = if (k == 0) d.first_col else d.col;
@@ -1379,14 +1397,14 @@ fn drawDiagHover(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout)
     if (ed.hover != null) return;
     var found: [4]*const Lsp.Diagnostic = undefined;
     // The mouse's, else the text cursor's (in a box under or over it).
-    var diags = ed.hoveredDiagnostics(&found);
+    var diags = borders.hoveredDiagnostics(ed, &found);
     var x0: f32 = 0;
     var y0: f32 = 0;
     if (diags.len > 0) {
         x0 = l.text_x + @as(f32, @floatFromInt(ed.mouse_hover.?.col)) * font.cell_w;
         y0 = @as(f32, @floatFromInt(ed.mouse_hover.?.row)) * font.cell_h;
     } else {
-        diags = ed.cursorDiagnostics(&found);
+        diags = resting.cursorDiagnostics(ed, &found);
         if (diags.len == 0) return;
         const at = cellPos(ed, font, l, ed.view.cursor) orelse return;
         x0 = at.x;
@@ -1402,7 +1420,7 @@ fn drawDiagHover(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout)
         var rest = std.mem.trim(u8, d.message, " \t\r\n");
         var first = true;
         while (rest.len > 0 and n < pieces.len) {
-            const p = Editor.wrapPiece(rest, max_cols - 2);
+            const p = row_model.wrapPiece(rest, max_cols - 2);
             pieces[n] = .{ .text = p[0], .diag = di, .first = first };
             width = @max(width, cells(p[0]));
             n += 1;
@@ -1462,7 +1480,7 @@ fn drawSignature(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout)
 }
 
 fn drawCompletion(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
-    const c = ed.completionShown() orelse return;
+    const c = completion_ops.completionShown(ed) orelse return;
     const at = cellPos(ed, font, l, c.word_start) orelse return;
     const max_rows = 10;
     const rows = @min(c.shown.items.len, max_rows);
@@ -1541,10 +1559,10 @@ fn drawGhostRow(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
     _ = font.drawText("-", sign_x, y, theme.ghost_fg);
     if (ed.search_highlight) {
         const on_it: ?usize = if (ed.ghost) |g| (if (g.line == line and g.k == k) g.col else null) else null;
-        drawMatchesIn(ed, font, theme, l, ed.ghostText(line, k), on_it, y);
+        drawMatchesIn(ed, font, theme, l, row_model.ghostText(ed, line, k), on_it, y);
     }
     rect(0, y, 3, font.cell_h, theme.diff_delete);
-    const text = ed.ghostText(line, k);
+    const text = row_model.ghostText(ed, line, k);
     var it = Font.Utf8Lossy{ .bytes = text };
     var col: usize = 0;
     const left = ed.view.left;
@@ -1559,8 +1577,8 @@ fn drawGhostRow(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
 }
 
 fn drawGhostCursor(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, g: Editor.GhostCursor) void {
-    const row = ed.rowOnScreen(.{ .line = g.line, .ghost = g.k }) orelse return;
-    const text = ed.ghostText(g.line, g.k);
+    const row = row_model.rowOnScreen(ed, .{ .line = g.line, .ghost = g.k }) orelse return;
+    const text = row_model.ghostText(ed, g.line, g.k);
     const col = motions.displayCol(text, @min(g.col, text.len), ed.options.tab_width);
     if (col < ed.view.left or col >= ed.view.left + l.cols) return;
     const x = l.text_x + @as(f32, @floatFromInt(col - ed.view.left)) * font.cell_w;
@@ -1646,7 +1664,7 @@ test "terminal mode: a popup over the cursor hides the terminal's cursor" {
 /// highlighted, with a line under them.
 fn drawContext(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
     var buf: [3]usize = undefined;
-    const lines = ed.contextLines(&buf);
+    const lines = code_motion.contextLines(ed, &buf);
     if (lines.len == 0) return;
     const t = ed.text();
     const syntax = ed.buffer.syntax;
@@ -1722,8 +1740,8 @@ test "terminal mode: a long diagnostic wraps under its line; resting the mouse o
     try std.testing.expect(grid.cells[15].ul != null);
     try std.testing.expect(grid.cells[14].ul == null);
     // The mouse on the `a`, a moment: the whole message in a box.
-    ed.mouseHover(.{ 0, 10 });
-    ed.now = ed.timeAfter(500);
+    resting.mouseHover(&ed, .{ 0, 10 });
+    ed.now = notifications.timeAfter(&ed, 500);
     l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
     draw(&ed, &font, theme, l);
     try std.testing.expect(std.mem.indexOf(u8, row(&grid, 1, &buf), "expected type 'u8', found") != null);
@@ -1760,15 +1778,15 @@ test "terminal mode: the cursor resting on a diagnostic pops it up" {
     var l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
     draw(&ed, &font, theme, l);
     try std.testing.expect(!has(&grid, "unused local")); // not at once
-    try std.testing.expect(ed.wantsFrames()); // but a frame will come
-    ed.now = ed.timeAfter(500);
+    try std.testing.expect(notifications.wantsFrames(&ed)); // but a frame will come
+    ed.now = notifications.timeAfter(&ed, 500);
     l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
     draw(&ed, &font, theme, l);
     try std.testing.expect(has(&grid, "unused local"));
     // Off the range: gone.
     ed.setCursor(0);
     ed.tick();
-    ed.now = ed.timeAfter(500);
+    ed.now = notifications.timeAfter(&ed, 500);
     l = prepare(&ed, &font, 50 * Grid.cell_w, 12 * Grid.cell_h);
     draw(&ed, &font, theme, l);
     try std.testing.expect(!has(&grid, "unused local"));
@@ -1795,8 +1813,8 @@ test "terminal mode: the mouse resting on a diagnostic pops it up" {
     const cell = hoverCell(&ed, &font, (5 + 6 + 0.5) * Grid.cell_w, 0.5 * Grid.cell_h).?;
     try std.testing.expectEqual([2]usize{ 0, 6 }, cell);
     try std.testing.expectEqual(null, hoverCell(&ed, &font, 2 * Grid.cell_w, 0.5 * Grid.cell_h)); // the gutter
-    ed.mouseHover(cell);
-    ed.now = ed.timeAfter(500);
+    resting.mouseHover(&ed, cell);
+    ed.now = notifications.timeAfter(&ed, 500);
     draw(&ed, &font, theme, l);
     var found = false;
     for (0..grid.rows) |r| {
@@ -1824,7 +1842,7 @@ test "ligatures: drawn but for the one with the cursor in it, or one spread apar
     try std.testing.expect(ligs[2] == 0 and ligs[3] == 0);
     try std.testing.expect(ligs[7] != 0 and ligs[8] != 0);
     // An inlay hint between `!` and `=`: drawn as its characters.
-    const hints = [_]Editor.LineHint{.{ .off = 8, .text = ": T" }};
+    const hints = [_]inlay.LineHint{.{ .off = 8, .text = ": T" }};
     ligs = drawnLigatures(&font, line, &hints, none, 0, null, &buf).?;
     try std.testing.expect(ligs[2] != 0 and ligs[7] == 0 and ligs[8] == 0);
     // Plain text has none.

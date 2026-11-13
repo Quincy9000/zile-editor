@@ -18,6 +18,14 @@ const gfx = @import("../ui/gfx.zig");
 const Grid = @import("Grid.zig");
 const input = @import("input.zig");
 const keys = @import("../input/keys.zig");
+const state_files = @import("../editor/state_files.zig");
+const notifications = @import("../editor/notifications.zig");
+const window_ops = @import("../editor/window_ops.zig");
+const run_popup = @import("../editor/run_popup.zig");
+const borders = @import("../editor/borders.zig");
+const resting = @import("../editor/resting.zig");
+const row_model = @import("../editor/row_model.zig");
+const prompts = @import("../editor/prompts.zig");
 
 pub const Options = struct {
     /// Scripted keys (`<Wait>` separated) and a text snapshot of the screen
@@ -148,7 +156,7 @@ pub fn run(gpa: Allocator, io: Io, ed: *Editor, opts: Options) !void {
             .{ .fd = wake_fds[0], .events = std.c.POLL.IN, .revents = 0 },
         };
         // Sooner when something on screen is due to change by itself.
-        const timeout: c_int = if (pending.items.len > 0) 25 else if (!script_done) 60 else if (ed.wantsFrames()) 40 else 250;
+        const timeout: c_int = if (pending.items.len > 0) 25 else if (!script_done) 60 else if (notifications.wantsFrames(ed)) 40 else 250;
         const ready = std.c.poll(&fds, fds.len, timeout);
         if (fds[1].revents != 0) {
             var drain: [64]u8 = undefined;
@@ -176,7 +184,7 @@ fn handleInput(ed: *Editor, font: *const Font, pending: *std.ArrayList(u8), idle
                     .key => |k| ed.handleKey(k),
                     .paste => |text| paste(ed, text),
                     .mouse => |m| mouse(ed, font, m),
-                    .focus => |in| if (!in) ed.focusLost(),
+                    .focus => |in| if (!in) state_files.focusLost(ed),
                 }
             },
         }
@@ -187,11 +195,11 @@ fn handleInput(ed: *Editor, font: *const Font, pending: *std.ArrayList(u8), idle
 /// A paste goes where typing would: the terminal popup, a prompt or picker
 /// query, insert mode; in normal mode it's put after the cursor.
 fn paste(ed: *Editor, text: []const u8) void {
-    if (ed.popupTerminal()) |t| return t.paste(text);
-    if (ed.activeInput()) |inp| {
+    if (run_popup.popupTerminal(ed)) |t| return t.paste(text);
+    if (prompts.activeInput(ed)) |inp| {
         var it = std.unicode.Utf8View.initUnchecked(text).iterator();
         while (it.nextCodepoint()) |cp| if (cp != '\n' and cp != '\r') inp.insert(ed.gpa, cp) catch return;
-        ed.inputChanged() catch {};
+        prompts.inputChanged(ed) catch {};
         return;
     }
     if (ed.mode == .insert) {
@@ -209,9 +217,9 @@ fn seconds(ed: *const Editor) f64 {
 
 /// The pointer shape last asked of the terminal (OSC 22; terminals without
 /// it ignore it).
-var pointer_shown: Editor.Pointer = .normal;
+var pointer_shown: borders.Pointer = .normal;
 
-fn showPointer(shape: Editor.Pointer) void {
+fn showPointer(shape: borders.Pointer) void {
     if (shape == pointer_shown) return;
     pointer_shown = shape;
     writeAll(switch (shape) {
@@ -224,24 +232,24 @@ fn showPointer(shape: Editor.Pointer) void {
 fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
     const x = (@as(f32, @floatFromInt(m.col)) + 0.5) * Grid.cell_w;
     const y = (@as(f32, @floatFromInt(m.row)) + 0.5) * Grid.cell_h;
-    // Window borders (`Editor.borderPress` and co.): the cells either side
+    // Window borders (`borders.borderPress` and co.): the cells either side
     // of one take it.
     const slop = Grid.cell_w * 0.6;
     const busy = switch (m.kind) {
-        .drag => ed.borderDrag(x, y),
-        .release => ed.borderRelease(),
-        .press => ed.borderPress(x, y, slop),
+        .drag => borders.borderDrag(ed, x, y),
+        .release => borders.borderRelease(ed),
+        .press => borders.borderPress(ed, x, y, slop),
         else => false,
     };
-    showPointer(ed.pointerAt(x, y, slop));
+    showPointer(borders.pointerAt(ed, x, y, slop));
     if (busy) return;
     // The pointer resting on a diagnostic pops it up (as the cursor does).
     if (m.kind == .move) {
-        ed.mouseHover(render.hoverCell(ed, font, x, y));
+        resting.mouseHover(ed, render.hoverCell(ed, font, x, y));
         return;
     }
-    ed.mouseHover(null);
-    if (ed.popupTerminal()) |t| {
+    resting.mouseHover(ed, null);
+    if (run_popup.popupTerminal(ed)) |t| {
         switch (m.kind) {
             .wheel_up => t.scroll(-3),
             .wheel_down => t.scroll(3),
@@ -252,7 +260,7 @@ fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
     if (ed.picker != null or ed.cmd_float != null) return;
     const w = ed.windows.at(x, y) orelse return;
     if (w.term) |t| {
-        ed.focusWindow(w);
+        window_ops.focusWindow(ed, w);
         switch (m.kind) {
             .wheel_up => t.scroll(-3),
             .wheel_down => t.scroll(3),
@@ -262,20 +270,20 @@ fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
     }
     switch (m.kind) {
         .wheel_up, .wheel_down => {
-            ed.focusWindow(w);
+            window_ops.focusWindow(ed, w);
             ed.scrollLines(if (m.kind == .wheel_up) -3 else 3);
         },
         .press => {
-            ed.focusWindow(w);
+            window_ops.focusWindow(ed, w);
             const l = render.windowLayout(ed, font, w);
             const now = seconds(ed);
-            if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| ed.mousePress(cell.row, cell.col, clicks.count(cell.row, cell.col, now));
+            if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| row_model.mousePress(ed, cell.row, cell.col, clicks.count(cell.row, cell.col, now));
         },
         .drag => {
             const l = render.windowLayout(ed, font, ed.window);
-            if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| ed.mouseDrag(cell.row, cell.col);
+            if (l.cellAt(font, x - l.x0, y - l.y0)) |cell| row_model.mouseDrag(ed, cell.row, cell.col);
         },
-        .release => ed.mouseRelease(),
+        .release => row_model.mouseRelease(ed),
         .move => {},
     }
 }

@@ -10,6 +10,9 @@ const motions = @import("core/motions.zig");
 const textobjects = @import("core/textobjects.zig");
 const Registers = @import("Registers.zig");
 const textops = @import("textops.zig");
+const jumplist = @import("editor/jumplist.zig");
+const indenting = @import("editor/indenting.zig");
+const row_model = @import("editor/row_model.zig");
 
 pub const Range = textobjects.Range;
 
@@ -59,7 +62,7 @@ pub fn lastLine(t: *const Text, r: Range) usize {
 
 pub fn apply(ed: *Editor, op: Operator, range: Range, register: ?u8) !void {
     // Linewise operators on a closed fold act on the whole fold.
-    const r = ed.extendToFolds(range);
+    const r = row_model.extendToFolds(ed, range);
     // Nothing to act on (e.g. `x` on an empty line): leave the registers alone.
     if (!r.linewise and r.start == r.end) {
         if (op == .change) {
@@ -151,9 +154,9 @@ fn shiftLines(ed: *Editor, r: Range, right: bool) !void {
     const t = ed.text();
     const first = t.lineOf(r.start);
     const last = t.lineOf(r.end);
-    const width = ed.indentWidth();
+    const width = indenting.indentWidth(ed);
     var unit_buf: [16]u8 = undefined;
-    const unit = ed.indentUnit(&unit_buf);
+    const unit = indenting.indentUnit(ed, &unit_buf);
     // Bottom-up, so earlier line positions stay valid.
     var line = last + 1;
     while (line > first) {

@@ -12,13 +12,17 @@ const Io = std.Io;
 const Editor = @import("Editor.zig");
 const Buffer = @import("core/Buffer.zig");
 const Windows = @import("Windows.zig");
+const state_files = @import("editor/state_files.zig");
+const formatting = @import("editor/formatting.zig");
+const window_ops = @import("editor/window_ops.zig");
+const project_ops = @import("editor/project_ops.zig");
 
 /// Where `root`'s session is kept. Caller frees. Null when there is no state
 /// directory.
 pub fn pathFor(ed: *Editor, root: []const u8) ?[]u8 {
     var name: [64]u8 = undefined;
     const n = std.fmt.bufPrint(&name, "sessions/{x:0>16}", .{std.hash.Wyhash.hash(0, root)}) catch return null;
-    return ed.statePath(n);
+    return state_files.statePath(ed, n);
 }
 
 pub fn exists(ed: *Editor, root: []const u8) bool {
@@ -36,7 +40,7 @@ fn inRoot(abs: []const u8, root: []const u8) bool {
 /// nothing to save, nothing written).
 pub fn save(ed: *Editor) !usize {
     const gpa = ed.gpa;
-    const root = ed.projectRoot();
+    const root = project_ops.projectRoot(ed);
     const path = pathFor(ed, root) orelse return 0;
     defer gpa.free(path);
 
@@ -52,7 +56,7 @@ pub fn save(ed: *Editor) !usize {
         defer gpa.free(abs);
         if (!inRoot(abs, root)) continue;
         const top = if (b == ed.buffer) ed.view.top else b.saved.top;
-        try out.print(gpa, "buffer {d} {d} {s}\n", .{ ed.cursorOf(b), top, abs });
+        try out.print(gpa, "buffer {d} {d} {s}\n", .{ formatting.cursorOf(ed, b), top, abs });
         try saved.append(gpa, b);
     }
     if (saved.items.len == 0) return 0;
@@ -72,8 +76,8 @@ pub fn save(ed: *Editor) !usize {
 fn writeNode(ed: *Editor, n: *const Windows.Node, saved: []const *Buffer, out: *std.ArrayList(u8)) !void {
     switch (n.kind) {
         .window => |w| {
-            const v = ed.windowView(w);
-            const index: isize = if (std.mem.indexOfScalar(*Buffer, saved, ed.windowBuffer(w))) |i| @intCast(i) else -1;
+            const v = window_ops.windowView(ed, w);
+            const index: isize = if (std.mem.indexOfScalar(*Buffer, saved, window_ops.windowBuffer(ed, w))) |i| @intCast(i) else -1;
             try out.print(ed.gpa, "leaf {d} {d} {d} {d}\n", .{ index, v.cursor, v.top, @intFromBool(w == ed.window) });
         },
         .split => |s| {
@@ -147,12 +151,12 @@ pub fn restore(ed: *Editor, root: []const u8) !usize {
     if (opened == 0) return 0;
 
     if (nodes.items.len > 1) {
-        ed.focusEditorWindow();
-        try ed.onlyWindow();
+        window_ops.focusEditorWindow(ed);
+        try window_ops.onlyWindow(ed);
         var i: usize = 0;
         var focus: ?*Windows.Window = null;
         build(ed, nodes.items, &i, buffers.items, &focus) catch {};
-        if (focus) |w| ed.focusWindow(w);
+        if (focus) |w| window_ops.focusWindow(ed, w);
     } else if (current) |c| {
         if (c < buffers.items.len) if (buffers.items[c]) |b| ed.switchTo(b);
     }
@@ -182,15 +186,15 @@ fn build(ed: *Editor, nodes: []const Node, i: *usize, buffers: []const ?*Buffer,
         },
         .split => |s| {
             const old = ed.window;
-            try ed.splitWindow(if (s.axis == .horizontal) .right else .down);
+            try window_ops.splitWindow(ed, if (s.axis == .horizontal) .right else .down);
             const new = ed.window;
             if (new.node.parent) |p| switch (p.kind) {
                 .split => |*sp| sp.ratio = s.ratio,
                 .window => {},
             };
-            ed.focusWindow(old);
+            window_ops.focusWindow(ed, old);
             try build(ed, nodes, i, buffers, focus);
-            ed.focusWindow(new);
+            window_ops.focusWindow(ed, new);
             try build(ed, nodes, i, buffers, focus);
         },
     }

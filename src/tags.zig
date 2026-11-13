@@ -13,6 +13,8 @@ const std = @import("std");
 const ts = @import("tree_sitter");
 const Editor = @import("Editor.zig");
 const Text = @import("core/Text.zig");
+const jumplist = @import("editor/jumplist.zig");
+const indenting = @import("editor/indenting.zig");
 
 pub const Kind = enum { none, html, jsx };
 
@@ -286,7 +288,7 @@ pub fn splitTags(ed: *Editor) !bool {
     const indent = line[0 .. std.mem.indexOfNone(u8, line, " \t") orelse line.len];
     var buf: [512]u8 = undefined;
     var unit_buf: [16]u8 = undefined;
-    const unit = ed.indentUnit(&unit_buf);
+    const unit = indenting.indentUnit(ed, &unit_buf);
     const text = std.fmt.bufPrint(&buf, "\n{s}{s}\n{s}", .{ indent, unit, indent }) catch return false;
     try ed.insertAt(pos, text);
     ed.setCursor(pos + 1 + indent.len + unit.len);

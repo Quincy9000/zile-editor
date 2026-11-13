@@ -13,6 +13,8 @@ const comment = @import("core/comment.zig");
 const operators = @import("operators.zig");
 const ts = @import("tree_sitter");
 const config = @import("config/config.zig");
+const jumplist = @import("editor/jumplist.zig");
+const indenting = @import("editor/indenting.zig");
 
 const Range = textobjects.Range;
 
@@ -365,7 +367,7 @@ pub fn splitJoin(ed: *Editor) !void {
         const line = t.lineOf(open);
         const indent = t.slice(t.lineStart(line), motions.firstNonBlank(t, line));
         var unit_buf: [16]u8 = undefined;
-        const unit = ed.indentUnit(&unit_buf);
+        const unit = indenting.indentUnit(ed, &unit_buf);
         const trailing = allowsTrailingComma(ed.buffer.path);
         for (parts.items, 0..) |p, i| {
             try out.append(gpa, '\n');

@@ -16,6 +16,12 @@ const Debugger = @import("Debugger.zig");
 const RunMemory = @import("terminal/RunMemory.zig");
 const sources = @import("picker/sources.zig");
 const config = @import("config/config.zig");
+const formatting = @import("editor/formatting.zig");
+const notifications = @import("editor/notifications.zig");
+const project_ops = @import("editor/project_ops.zig");
+const picker_ops = @import("editor/picker_ops.zig");
+const picker_query = @import("editor/picker_query.zig");
+const run_popup = @import("editor/run_popup.zig");
 
 /// A breakpoint: an absolute path and a 0-based line.
 pub const Breakpoint = struct { path: []u8, line: u32 };
@@ -164,7 +170,7 @@ pub fn deinit(ed: *Editor) void {
 /// Breakpoints (switched on) in the project the runner's commands are for.
 pub fn hasBreakpoints(ed: *Editor) bool {
     if (!ed.dbg.breakpoints_on or ed.dbg.breakpoints.items.len == 0) return false;
-    const key = ed.runKey() catch return false;
+    const key = run_popup.runKey(ed) catch return false;
     defer ed.gpa.free(key);
     for (ed.dbg.breakpoints.items) |b| {
         if (std.mem.startsWith(u8, b.path, key) and b.path.len > key.len and b.path[key.len] == '/') return true;
@@ -175,7 +181,7 @@ pub fn hasBreakpoints(ed: *Editor) bool {
 /// `R` in the Debug picker: the runner's command under gdb (the runner
 /// opens if there is none yet).
 pub fn again(ed: *Editor) !void {
-    const cmd = ed.loadRunnerCommand() orelse return ed.runPrompt(true);
+    const cmd = run_popup.loadRunnerCommand(ed) orelse return run_popup.runPrompt(ed, true);
     defer ed.gpa.free(cmd);
     try debug(ed, cmd);
 }
@@ -184,8 +190,8 @@ pub fn again(ed: *Editor) !void {
 pub fn fromRunner(ed: *Editor, command: []const u8) !void {
     const cmd = std.mem.trim(u8, command, " \t");
     if (cmd.len == 0) return;
-    if (ed.runMemoryPath()) |path| {
-        const key = try ed.runKey();
+    if (run_popup.runMemoryPath(ed)) |path| {
+        const key = try run_popup.runKey(ed);
         defer ed.gpa.free(key);
         RunMemory.save(ed.gpa, ed.io, path, key, cmd);
     }
@@ -202,7 +208,7 @@ pub fn debug(ed: *Editor, cmd: []const u8) !void {
         return start(ed, mine);
     }
     if (!sources.onPath(ed.io, "gdb")) return ed.setMessage(.err, "gdb isn't installed", .{});
-    try ed.editCommand(cmd, .debug, cmd);
+    try run_popup.editCommand(ed, cmd, .debug, cmd);
     const release = switch (try Debugger.plan(ed.gpa, cmd)) {
         .plan => |p| blk: {
             defer p.deinit(ed.gpa);
@@ -218,7 +224,7 @@ pub fn debug(ed: *Editor, cmd: []const u8) !void {
 /// What runner command `from` debugs as, if it was debugged this session.
 /// Caller frees.
 fn commandFor(ed: *Editor, from: []const u8) !?[]u8 {
-    const key = try ed.runKey();
+    const key = try run_popup.runKey(ed);
     defer ed.gpa.free(key);
     for (ed.dbg.commands.items) |d| {
         if (std.mem.eql(u8, d.project, key) and std.mem.eql(u8, d.from, from)) return try ed.gpa.dupe(u8, d.cmd);
@@ -229,7 +235,7 @@ fn commandFor(ed: *Editor, from: []const u8) !?[]u8 {
 /// Enter in the command editor: `cmd` is what `from` debugs as; debug it.
 /// Which program it starts is asked again if need be.
 pub fn edited(ed: *Editor, from: []const u8, cmd: []const u8) !void {
-    const key = try ed.runKey();
+    const key = try run_popup.runKey(ed);
     var key_owned = true;
     defer if (key_owned) ed.gpa.free(key);
     var i: usize = 0;
@@ -255,7 +261,7 @@ pub fn edited(ed: *Editor, from: []const u8, cmd: []const u8) !void {
 pub const CommandRow = struct { cmd: []u8, from: []u8, edited: bool };
 
 pub fn commandRow(ed: *Editor) !?CommandRow {
-    const key = try ed.runKey();
+    const key = try run_popup.runKey(ed);
     defer ed.gpa.free(key);
     var i = ed.dbg.commands.items.len;
     while (i > 0) {
@@ -266,14 +272,14 @@ pub fn commandRow(ed: *Editor) !?CommandRow {
         errdefer ed.gpa.free(c);
         return .{ .cmd = c, .from = try ed.gpa.dupe(u8, d.from), .edited = true };
     }
-    const cmd = ed.loadRunnerCommand() orelse return null;
+    const cmd = run_popup.loadRunnerCommand(ed) orelse return null;
     errdefer ed.gpa.free(cmd);
     return .{ .cmd = cmd, .from = try ed.gpa.dupe(u8, cmd), .edited = false };
 }
 
 /// Enter on the command row: debug it (the first time, after a look).
 pub fn acceptCommandRow(ed: *Editor) !void {
-    const row = try commandRow(ed) orelse return ed.runPrompt(true);
+    const row = try commandRow(ed) orelse return run_popup.runPrompt(ed, true);
     defer ed.gpa.free(row.cmd);
     defer ed.gpa.free(row.from);
     if (row.edited) return start(ed, row.cmd);
@@ -282,10 +288,10 @@ pub fn acceptCommandRow(ed: *Editor) !void {
 
 /// `e` in the Debug picker: the debugger's command, in the command editor.
 pub fn editCommandRow(ed: *Editor) !void {
-    const row = try commandRow(ed) orelse return ed.runPrompt(true);
+    const row = try commandRow(ed) orelse return run_popup.runPrompt(ed, true);
     defer ed.gpa.free(row.cmd);
     defer ed.gpa.free(row.from);
-    try ed.editCommand(row.cmd, .debug, row.from);
+    try run_popup.editCommand(ed, row.cmd, .debug, row.from);
 }
 
 /// Debugs `cmd`: a build-and-run command (`zig build run`, `cargo run`) is
@@ -322,7 +328,7 @@ fn setCommand(ed: *Editor, cmd: []const u8, by_program: bool) !void {
 /// The debugged command runs where a runner command would, from the file
 /// you're in now (not where a stop takes you later).
 fn setRoot(ed: *Editor) !void {
-    const folder = try ed.commandFolder();
+    const folder = try run_popup.commandFolder(ed);
     if (ed.dbg.root) |old| ed.gpa.free(old);
     ed.dbg.root = folder;
 }
@@ -334,7 +340,7 @@ fn runPlan(ed: *Editor, plan: Debugger.Plan) !void {
     defer if (owned) plan.deinit(ed.gpa);
     if (plan.build) |build| {
         // startRun drops any plan waiting, so this one goes in after it.
-        try ed.startRun(build);
+        try run_popup.startRun(ed, build);
         ed.dbg.plan = plan;
         owned = false;
         // `r` in its popup (a build that failed, say) is the debug again.
@@ -350,8 +356,8 @@ fn runPlan(ed: *Editor, plan: Debugger.Plan) !void {
 /// with no folder stays one to find on PATH, unless that file is there).
 fn inProject(ed: *Editor, plan: *Debugger.Plan) !void {
     if (std.fs.path.isAbsolute(plan.program)) return;
-    const full = try std.fs.path.resolve(ed.gpa, &.{ ed.dbg.root orelse ed.projectRoot(), plan.program });
-    if (std.mem.indexOfScalar(u8, plan.program, '/') == null and !ed.fileExists(full)) {
+    const full = try std.fs.path.resolve(ed.gpa, &.{ ed.dbg.root orelse project_ops.projectRoot(ed), plan.program });
+    if (std.mem.indexOfScalar(u8, plan.program, '/') == null and !formatting.fileExists(ed, full)) {
         ed.gpa.free(full);
         return;
     }
@@ -402,7 +408,7 @@ pub fn pickProgram(ed: *Editor, row: []const u8) !void {
 /// The program this project's build command debugs, this session (none or
 /// one). Caller frees each and the slice.
 pub fn pickedPrograms(ed: *Editor) ![][]u8 {
-    const key = try ed.runKey();
+    const key = try run_popup.runKey(ed);
     defer ed.gpa.free(key);
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -417,11 +423,11 @@ pub fn pickedPrograms(ed: *Editor) ![][]u8 {
 
 /// That program, if it is still there (caller frees).
 fn rememberedProgram(ed: *Editor) !?[]u8 {
-    const key = try ed.runKey();
+    const key = try run_popup.runKey(ed);
     defer ed.gpa.free(key);
     for (ed.dbg.programs.items) |d| {
         if (!std.mem.eql(u8, d.project, key)) continue;
-        if (ed.fileExists(d.text)) return try ed.gpa.dupe(u8, d.text);
+        if (formatting.fileExists(ed, d.text)) return try ed.gpa.dupe(u8, d.text);
         break;
     }
     forgetProgram(ed);
@@ -431,7 +437,7 @@ fn rememberedProgram(ed: *Editor) !?[]u8 {
 /// `abs` is what this project's build command debugs (for this session).
 fn rememberProgram(ed: *Editor, abs: []const u8) !void {
     forgetProgram(ed);
-    const key = try ed.runKey();
+    const key = try run_popup.runKey(ed);
     errdefer ed.gpa.free(key);
     const t = try ed.gpa.dupe(u8, abs);
     errdefer ed.gpa.free(t);
@@ -440,7 +446,7 @@ fn rememberProgram(ed: *Editor, abs: []const u8) !void {
 
 /// Forgets it: the next debug of the build command looks again.
 pub fn forgetProgram(ed: *Editor) void {
-    const key = ed.runKey() catch return;
+    const key = run_popup.runKey(ed) catch return;
     defer ed.gpa.free(key);
     var i: usize = 0;
     while (i < ed.dbg.programs.items.len) {
@@ -517,7 +523,7 @@ fn searchDone(ed: *Editor, s: *Debugger.Search) !void {
 
 /// Starts gdb on the planned program, its terminal the run popup.
 pub fn launch(ed: *Editor, plan: Debugger.Plan) !void {
-    const folder = if (ed.dbg.root) |r| try ed.gpa.dupe(u8, r) else try ed.commandFolder();
+    const folder = if (ed.dbg.root) |r| try ed.gpa.dupe(u8, r) else try run_popup.commandFolder(ed);
     var folder_owned = true;
     defer if (folder_owned) ed.gpa.free(folder);
     const program = try programPath(ed, plan, folder) orelse {
@@ -527,7 +533,7 @@ pub fn launch(ed: *Editor, plan: Debugger.Plan) !void {
     defer ed.gpa.free(program);
     // The program's terminal: one with nothing in it until gdb starts the
     // program there (Ctrl-C in the popup pauses it instead).
-    const t = try ed.spawnTerminalIn(&.{}, folder);
+    const t = try run_popup.spawnTerminalIn(ed, &.{}, folder);
     errdefer t.destroy();
     var tty_buf: [128]u8 = undefined;
     const tty = t.pty.deviceName(&tty_buf);
@@ -587,7 +593,7 @@ fn programPath(ed: *Editor, plan: Debugger.Plan, folder: []const u8) !?[]u8 {
     if (plan.newest_in) return null;
     if (std.fs.path.isAbsolute(plan.program) or std.mem.indexOfScalar(u8, plan.program, '/') != null) {
         const full = try std.fs.path.resolve(ed.gpa, &.{ folder, plan.program });
-        if (ed.fileExists(full)) return full;
+        if (formatting.fileExists(ed, full)) return full;
         ed.gpa.free(full);
         return null;
     }
@@ -636,13 +642,13 @@ pub fn tick(ed: *Editor) void {
     const up = d.poll();
     if (up.note) if (d.takeNote()) |n| {
         defer ed.gpa.free(n);
-        ed.notify(.err, "gdb: {s}", .{std.mem.sliceTo(n, '\n')});
+        notifications.notify(ed, .err, "gdb: {s}", .{std.mem.sliceTo(n, '\n')});
     };
     if (up.ended) {
         const code = d.exit_code;
         end(ed);
         ed.dbg.outcome = if (code) |c| .{ .exited = c } else .ended;
-        if (ed.picker) |p| if (p.kind == .debug) ed.closePicker();
+        if (ed.picker) |p| if (p.kind == .debug) picker_query.closePicker(ed);
         if (ed.run) |t| if (ed.run_debug) {
             var buf: [160]u8 = undefined;
             const ok = code != null and code.? == 0;
@@ -673,7 +679,7 @@ fn showStop(ed: *Editor) void {
     var pick: ?usize = null;
     for (d.frames.items, 0..) |f, i| {
         const path = f.path orelse continue;
-        if (!ed.fileExists(path)) continue;
+        if (!formatting.fileExists(ed, path)) continue;
         if (pick == null) pick = i;
         if (std.mem.startsWith(u8, path, root) and path.len > root.len and path[root.len] == '/') {
             pick = i;
@@ -691,7 +697,7 @@ fn showStop(ed: *Editor) void {
     if (pick) |i| {
         const f = d.frames.items[i];
         ed.moveTo(f.path.?, f.line, 0) catch {};
-        ed.centerCursor();
+        picker_ops.centerCursor(ed);
     }
     ed.setMessage(level, "stopped ({s}) in {s}", .{ d.reason, where });
     if (ed.picker) |p| {
@@ -711,7 +717,7 @@ pub fn step(ed: *Editor, how: Debugger.Step) !void {
     try d.step(how);
     // Continuing shows the program until it stops again.
     if (how == .cont) {
-        ed.closePicker();
+        picker_query.closePicker(ed);
         ed.popup = .run;
     }
 }
@@ -740,7 +746,7 @@ pub fn showFrame(ed: *Editor, i: usize) !void {
     const f = d.frames.items[i];
     const path = f.path orelse return ed.setMessage(.info, "{s}: no source (a library without debug info)", .{f.name});
     try ed.jumpTo(path, f.line, 0);
-    ed.centerCursor();
+    picker_ops.centerCursor(ed);
 }
 
 /// `b`: a breakpoint on the cursor's line, or off if there is one.

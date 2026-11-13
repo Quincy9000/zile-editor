@@ -12,6 +12,9 @@ const Editor = @import("../Editor.zig");
 const Buffer = @import("../core/Buffer.zig");
 const WsServer = @import("WsServer.zig");
 const Terminal = @import("../terminal/Terminal.zig");
+const file_ops = @import("../editor/file_ops.zig");
+const project_ops = @import("../editor/project_ops.zig");
+const claude_panel = @import("../editor/claude_panel.zig");
 
 const Claude = @This();
 
@@ -257,7 +260,7 @@ fn callTool(c: *Claude, ed: *Editor, conn: u32, id_json: []const u8, name: []con
         const tab = str(field(args, "tab_name")) orelse path;
         // A new proposal under the same tab name replaces the old one.
         c.closeDiffByTab(ed, tab, true);
-        const buffer = try ed.openProposal(path, contents);
+        const buffer = try claude_panel.openProposal(ed, path, contents);
         try c.diffs.append(c.gpa, .{
             .conn = conn,
             .id = try c.gpa.dupe(u8, id_json),
@@ -268,43 +271,43 @@ fn callTool(c: *Claude, ed: *Editor, conn: u32, id_json: []const u8, name: []con
         // No reply yet: Claude waits for accept / reject.
     } else if (std.mem.eql(u8, name, "close_tab")) {
         if (str(field(args, "tab_name"))) |tab| c.closeDiffByTab(ed, tab, true);
-        ed.checkDiskChanges();
+        claude_panel.checkDiskChanges(ed);
         c.replyTexts(conn, id_json, &.{"TAB_CLOSED"});
     } else if (std.mem.eql(u8, name, "closeAllDiffTabs")) {
         const n = c.diffs.items.len;
         while (c.diffs.items.len > 0) c.closeDiff(ed, c.diffs.items.len - 1, true);
-        ed.checkDiskChanges();
+        claude_panel.checkDiskChanges(ed);
         var buf: [48]u8 = undefined;
         c.replyTexts(conn, id_json, &.{std.fmt.bufPrint(&buf, "CLOSED_{d}_DIFF_TABS", .{n}) catch "CLOSED_DIFF_TABS"});
     } else if (std.mem.eql(u8, name, "openFile")) {
         const path = str(field(args, "filePath")) orelse return c.replyError(conn, id_json, -32602, "missing filePath");
-        try ed.openFromClaude(path, str(field(args, "startText")));
+        try claude_panel.openFromClaude(ed, path, str(field(args, "startText")));
         var buf: [1024]u8 = undefined;
         c.replyTexts(conn, id_json, &.{std.fmt.bufPrint(&buf, "Opened file: {s}", .{path}) catch "Opened file"});
     } else if (std.mem.eql(u8, name, "getDiagnostics")) {
-        const json = try ed.diagnosticsJson(c.gpa, str(field(args, "uri")));
+        const json = try claude_panel.diagnosticsJson(ed, c.gpa, str(field(args, "uri")));
         defer c.gpa.free(json);
         c.replyTexts(conn, id_json, &.{json});
     } else if (std.mem.eql(u8, name, "getCurrentSelection") or std.mem.eql(u8, name, "getLatestSelection")) {
         const sel = c.last_selection.items;
         c.replyTexts(conn, id_json, &.{if (sel.len > 0) sel else "{\"success\":false,\"message\":\"No active editor\"}"});
     } else if (std.mem.eql(u8, name, "getOpenEditors")) {
-        const json = try ed.openEditorsJson(c.gpa);
+        const json = try claude_panel.openEditorsJson(ed, c.gpa);
         defer c.gpa.free(json);
         c.replyTexts(conn, id_json, &.{json});
     } else if (std.mem.eql(u8, name, "getWorkspaceFolders")) {
         var folders: std.ArrayList(struct { name: []const u8, path: []const u8 }) = .empty;
         defer folders.deinit(c.gpa);
         for (ed.projects.items) |p| try folders.append(c.gpa, .{ .name = p.name(), .path = p.root });
-        c.replyJson(conn, id_json, .{ .success = true, .folders = folders.items, .rootPath = ed.projectRoot() });
+        c.replyJson(conn, id_json, .{ .success = true, .folders = folders.items, .rootPath = project_ops.projectRoot(ed) });
     } else if (std.mem.eql(u8, name, "checkDocumentDirty")) {
         const path = str(field(args, "filePath")) orelse return c.replyError(conn, id_json, -32602, "missing filePath");
-        const b = ed.bufferForPath(path);
+        const b = claude_panel.bufferForPath(ed, path);
         c.replyJson(conn, id_json, .{ .success = b != null, .filePath = path, .isDirty = if (b) |x| x.modified else false, .isUntitled = false });
     } else if (std.mem.eql(u8, name, "saveDocument")) {
         const path = str(field(args, "filePath")) orelse return c.replyError(conn, id_json, -32602, "missing filePath");
-        const b = ed.bufferForPath(path) orelse return c.replyJson(conn, id_json, .{ .success = false, .message = "not open" });
-        ed.saveBufferNow(b);
+        const b = claude_panel.bufferForPath(ed, path) orelse return c.replyJson(conn, id_json, .{ .success = false, .message = "not open" });
+        file_ops.saveBufferNow(ed, b);
         c.replyJson(conn, id_json, .{ .success = true, .filePath = path, .saved = true });
     } else {
         var buf: [128]u8 = undefined;
@@ -343,7 +346,7 @@ pub fn resolve(c: *Claude, ed: *Editor, i: usize, accept: bool) void {
 fn closeDiff(c: *Claude, ed: *Editor, i: usize, reject_pending: bool) void {
     const d = c.diffs.orderedRemove(i);
     if (reject_pending) c.replyTexts(d.conn, d.id, &.{"DIFF_REJECTED"});
-    ed.closeProposal(d.buffer, d.path);
+    claude_panel.closeProposal(ed, d.buffer, d.path);
     c.freeDiff(d);
 }
 
@@ -370,7 +373,7 @@ fn connectionClosed(c: *Claude, ed: *Editor, conn: u32) void {
 /// Sends `selection_changed` when the file, selection or cursor changed.
 fn shareSelection(c: *Claude, ed: *Editor) void {
     if (!c.ready) return;
-    const json = ed.selectionJson(c.gpa) orelse return;
+    const json = claude_panel.selectionJson(ed, c.gpa) orelse return;
     defer c.gpa.free(json);
     if (std.mem.eql(u8, json, c.last_selection.items)) return;
     c.last_selection.clearRetainingCapacity();

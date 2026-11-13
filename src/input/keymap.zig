@@ -492,7 +492,10 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ PA, "<C-c>", "picker_close" },
     .{ PA, "<CR>", "picker_accept" },
     .{ PA, "<C-CR>", "picker_accept_alt" },
-    .{ PA, "<Tab>", "picker_open_menu" },
+    // <Tab> goes through the scopes; the menu of everything a row can do
+    // (the keys are in the picker's bottom bar) is on <S-Tab>.
+    .{ PA, "<Tab>", "picker_scope" },
+    .{ PA, "<S-Tab>", "picker_open_menu" },
     .{ PA, "<C-q>", "picker_to_quickfix" },
     .{ PA, "<C-r>", "picker_replace" },
     .{ PA, "<C-t>", "picker_scope" },

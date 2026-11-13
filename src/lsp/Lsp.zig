@@ -16,6 +16,19 @@ const Text = @import("../core/Text.zig");
 const Lsp = @This();
 const balance = @import("balance.zig");
 const config = @import("../config/config.zig");
+const state_files = @import("../editor/state_files.zig");
+const formatting = @import("../editor/formatting.zig");
+const file_ops = @import("../editor/file_ops.zig");
+const notifications = @import("../editor/notifications.zig");
+const inlay = @import("../editor/inlay.zig");
+const jumplist = @import("../editor/jumplist.zig");
+const indenting = @import("../editor/indenting.zig");
+const row_model = @import("../editor/row_model.zig");
+const prompts = @import("../editor/prompts.zig");
+const signature_help = @import("../editor/signature_help.zig");
+const lsp_actions = @import("../editor/lsp_actions.zig");
+const completion_ops = @import("../editor/completion_ops.zig");
+const lsp_ops = @import("../editor/lsp_ops.zig");
 
 gpa: Allocator,
 client: *Client,
@@ -645,7 +658,7 @@ pub fn requestCodeActions(l: *Lsp, ed: *Editor, first: usize, last: usize) !void
     const Diag = struct { range: Range, severity: u8, message: []const u8 };
     var diags: std.ArrayList(Diag) = .empty;
     defer diags.deinit(l.gpa);
-    for (ed.diagnostics(ed.buffer)) |d| {
+    for (lsp_ops.diagnostics(ed, ed.buffer)) |d| {
         if (d.end_line < first or d.line > last) continue;
         try diags.append(l.gpa, .{
             .range = .{ .start = .{ .line = d.line, .character = d.col }, .end = .{ .line = d.end_line, .character = d.end_col } },
@@ -704,7 +717,7 @@ fn finishCodeAction(l: *Lsp, ed: *Editor, action: std.json.Value) !void {
             edits.deinit(l.gpa);
         }
         try l.collectWorkspaceEdit(ed, edit, &edits);
-        try ed.applyEdits(edits.items);
+        try prompts.applyEdits(ed, edits.items);
     }
     const command = if (str(field(action, "command")) != null) action else field(action, "command") orelse return;
     const name = str(field(command, "command")) orelse return;
@@ -764,7 +777,7 @@ pub fn requestRename(l: *Lsp, ed: *Editor, pos: usize, new_name: []const u8) !vo
 pub fn requestFormat(l: *Lsp, ed: *Editor, range: ?[2]usize, then_save: bool) !void {
     const doc = l.docs.get(ed.buffer) orelse return error.NotOpen;
     try l.sync(ed);
-    const options = .{ .tabSize = ed.indentWidth(), .insertSpaces = !ed.usesTabs() };
+    const options = .{ .tabSize = indenting.indentWidth(ed), .insertSpaces = !indenting.usesTabs(ed) };
     const id = if (range != null and l.can_format_range)
         try l.client.request("textDocument/rangeFormatting", .{
             .textDocument = .{ .uri = doc.uri },
@@ -822,7 +835,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             const message = str(field(params, "message")) orelse return;
             // 1 = error, 2 = warning, 3 = info, 4 = log.
             const level = if (field(params, "type")) |t| (if (t == .integer) t.integer else 3) else 3;
-            if (level <= 3) ed.notify(if (level == 1) .err else .info, "{s}: {s}", .{ l.server().name, std.mem.sliceTo(message, '\n') });
+            if (level <= 3) notifications.notify(ed, if (level == 1) .err else .info, "{s}: {s}", .{ l.server().name, std.mem.sliceTo(message, '\n') });
         }
         return;
     }
@@ -835,7 +848,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
         if (req == .completion) ed.completion_pending = false;
         // A save waiting on this goes on without it.
         if (req == .save_action or req == .save_action_resolve) {
-            ed.saveChainNext();
+            file_ops.saveChainNext(ed);
             return;
         }
         // A failed hint request isn't repeated until the text changes.
@@ -846,7 +859,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
         }
         if (req != .completion) ed.setMessage(.err, "lsp: {s}", .{str(field(e, "message")) orelse "request failed"});
         // Formatting before a save failed: save anyway.
-        if (req == .format and req.format.then_save) ed.saveBufferNow(req.format.buffer);
+        if (req == .format and req.format.then_save) file_ops.saveBufferNow(ed, req.format.buffer);
         return;
     }
     switch (req) {
@@ -902,7 +915,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                 .implementation => "implementations",
                 else => "references",
             };
-            try ed.showLocations(locs.items, what);
+            try lsp_ops.showLocations(ed, locs.items, what);
         },
         .inlay_hints => |ih| {
             var hints: std.ArrayList(Buffer.Hint) = .empty;
@@ -911,18 +924,18 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                 hints.deinit(l.gpa);
             }
             try parseInlayHints(l.gpa, &ih.buffer.text, result, &hints);
-            try ed.takeInlayHints(ih.buffer, &hints, ih.first, ih.last, ih.version);
+            try inlay.takeInlayHints(ed, ih.buffer, &hints, ih.first, ih.last, ih.version);
         },
         .code_actions => {
-            ed.clearCodeActions();
+            lsp_actions.clearCodeActions(ed);
             if (result == .array) for (result.array.items) |action| {
                 const title = str(field(action, "title")) orelse continue;
                 // Kept as the server wrote it, to hand back when picked.
                 const json = try std.json.Stringify.valueAlloc(l.gpa, action, .{});
                 errdefer l.gpa.free(json);
-                try ed.addCodeAction(title, str(field(action, "kind")) orelse "", json);
+                try lsp_actions.addCodeAction(ed, title, str(field(action, "kind")) orelse "", json);
             };
-            try ed.showCodeActions();
+            try lsp_actions.showCodeActions(ed);
         },
         .code_action_resolve => try l.finishCodeAction(ed, result),
         .save_action => {
@@ -935,11 +948,11 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                 }
                 l.finishCodeAction(ed, a) catch {};
             }
-            ed.saveChainNext();
+            file_ops.saveChainNext(ed);
         },
         .code_lens => |cl| {
             cl.buffer.lens_pending = false;
-            if (!ed.bufferAlive(cl.buffer) or cl.version != cl.buffer.edit_version) return;
+            if (!state_files.bufferAlive(ed, cl.buffer) or cl.version != cl.buffer.edit_version) return;
             // The new set replaces the old, but a lens still to be resolved
             // keeps its old title meanwhile: rows don't vanish and come back
             // (everything below would jump) on every refresh.
@@ -954,7 +967,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                 const line = int(field(field(field(lens, "range"), "start"), "line")) orelse continue;
                 if (line < 0) continue;
                 if (str(field(field(lens, "command"), "title"))) |title| {
-                    try ed.addLens(cl.buffer, @intCast(line), title);
+                    try row_model.addLens(ed, cl.buffer, @intCast(line), title);
                 } else if (l.can_resolve_lens) {
                     const rid = try l.client.request("codeLens/resolve", lens);
                     try l.pending.put(l.gpa, rid, .{ .code_lens_resolve = .{ .buffer = cl.buffer, .version = cl.version, .line = @intCast(line) } });
@@ -964,18 +977,18 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             ed.wake_fn();
         },
         .code_lens_resolve => |cl| {
-            if (!ed.bufferAlive(cl.buffer) or cl.version != cl.buffer.edit_version) return;
+            if (!state_files.bufferAlive(ed, cl.buffer) or cl.version != cl.buffer.edit_version) return;
             const title = str(field(field(result, "command"), "title")) orelse return;
-            try ed.addLens(cl.buffer, cl.line, title);
+            try row_model.addLens(ed, cl.buffer, cl.line, title);
             ed.wake_fn();
         },
         .save_action_resolve => {
             l.finishCodeAction(ed, result) catch {};
-            ed.saveChainNext();
+            file_ops.saveChainNext(ed);
         },
         .execute_command => {},
         .workspace_symbols => {
-            ed.clearWorkspaceSymbols();
+            lsp_actions.clearWorkspaceSymbols(ed);
             if (result == .array) for (result.array.items) |sym| {
                 const name = str(field(sym, "name")) orelse continue;
                 const loc = field(sym, "location") orelse continue;
@@ -986,7 +999,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                 const path = try ed.relativePath(abs);
                 defer l.gpa.free(path);
                 const kind: usize = @intCast(int(field(sym, "kind")) orelse 0);
-                try ed.addWorkspaceSymbol(
+                try lsp_actions.addWorkspaceSymbol(ed,
                     name,
                     if (kind < symbol_kinds.len) symbol_kinds[kind] else "",
                     path,
@@ -994,14 +1007,14 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                     @intCast(int(field(from, "character")) orelse 0),
                 );
             };
-            try ed.workspaceSymbolsArrived();
+            try lsp_actions.workspaceSymbolsArrived(ed);
         },
         .hover => {
             const text = hoverText(result) orelse return ed.setMessage(.info, "no hover information", .{});
-            try ed.showHover(text);
+            try lsp_actions.showHover(ed, text);
         },
-        .completion => |cp| try ed.showCompletion(cp.buffer, cp.word_start, result),
-        .signature => |b| try ed.showSignature(b, result),
+        .completion => |cp| try completion_ops.showCompletion(ed, cp.buffer, cp.word_start, result),
+        .signature => |b| try signature_help.showSignature(ed, b, result),
         .format => |f| {
             var edits: std.ArrayList(TextEdit) = .empty;
             defer {
@@ -1012,7 +1025,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                 edits.deinit(l.gpa);
             }
             if (l.docs.get(f.buffer)) |doc| try l.collectTextEdits(ed, doc.uri, result, &edits);
-            try ed.applyFormatEdits(f.buffer, edits.items, f.then_save);
+            try formatting.applyFormatEdits(ed, f.buffer, edits.items, f.then_save);
         },
         .symbols => {
             var list: std.ArrayList(Symbol) = .empty;
@@ -1022,7 +1035,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             }
             try l.collectSymbols(result, "", &list);
             defer list.deinit(l.gpa); // the names now belong to the editor
-            try ed.setSymbols(list.items);
+            try lsp_ops.setSymbols(ed, list.items);
         },
         .rename => {
             var edits: std.ArrayList(TextEdit) = .empty;
@@ -1034,7 +1047,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
                 edits.deinit(l.gpa);
             }
             try l.collectWorkspaceEdit(ed, result, &edits);
-            try ed.applyEdits(edits.items);
+            try prompts.applyEdits(ed, edits.items);
         },
     }
 }
@@ -1052,7 +1065,7 @@ fn answerServerRequest(l: *Lsp, ed: *Editor, id: std.json.Value, method: []const
             edits.deinit(l.gpa);
         }
         if (field(params orelse .null, "edit")) |edit| try l.collectWorkspaceEdit(ed, edit, &edits);
-        try ed.applyEdits(edits.items);
+        try prompts.applyEdits(ed, edits.items);
         return l.client.respond(id, .{ .applied = true });
     }
     if (std.mem.eql(u8, method, "workspace/codeLens/refresh")) {
@@ -1149,7 +1162,7 @@ fn onProgress(l: *Lsp, ed: *Editor, params: std.json.Value) !void {
     }
     const title: []const u8 = l.progress_titles.get(key) orelse "";
     if (std.mem.eql(u8, kind, "end")) {
-        ed.progress(key, false, "{s}: {s} {s}", .{ name, title, if (message.len > 0) message else "done" });
+        notifications.progress(ed, key, false, "{s}: {s} {s}", .{ name, title, if (message.len > 0) message else "done" });
         if (l.progress_titles.fetchRemove(key)) |old| l.gpa.free(old.value);
         return;
     }
@@ -1159,8 +1172,8 @@ fn onProgress(l: *Lsp, ed: *Editor, params: std.json.Value) !void {
         else => null,
     } else null;
     if (percent) |p| {
-        ed.progress(key, true, "{s}: {s} {s} {d}%", .{ name, title, message, p });
-    } else ed.progress(key, true, "{s}: {s} {s}", .{ name, title, message });
+        notifications.progress(ed, key, true, "{s}: {s} {s} {d}%", .{ name, title, message, p });
+    } else notifications.progress(ed, key, true, "{s}: {s} {s}", .{ name, title, message });
 }
 
 fn onDiagnostics(l: *Lsp, ed: *Editor, params: std.json.Value) !void {
