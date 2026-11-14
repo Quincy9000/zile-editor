@@ -14,6 +14,7 @@ const render = @import("render.zig");
 const gfx = @import("gfx.zig");
 const icons = @import("icons.zig");
 const Replace = @import("../Replace.zig");
+const LineInput = @import("../input/LineInput.zig");
 const ResultGrid = @import("../ResultGrid.zig");
 
 const rect = render.rect;
@@ -436,15 +437,30 @@ pub fn drawPromptBox(font: *const Font, theme: *const Theme, l: render.Layout, t
 }
 
 // ---------------------------------------------------------------------------
-// Search and replace across the project (`<C-r>` in the grep picker)
+// Find and replace across the project (`SPC c`; `<C-r>` in the grep picker)
 
-/// The replace prompt: "Replace <needle> with › <replacement>" over the
-/// lines with matches, grouped by file, each as it is (matches in red) and
-/// as it will be (replacements in green). Skipped lines are dimmed.
-pub fn drawReplace(r: *Replace, font: *const Font, theme: *const Theme, l: render.Layout, replacement: []const u8) void {
+/// One field of the form: its name, and its text with the cursor when it
+/// is the one typed into.
+fn drawField(font: *const Font, theme: *const Theme, name: []const u8, input: *const LineInput, focused: bool, x0: f32, y: f32, color: rl.Color) void {
+    var x = font.drawText(name, x0, y, if (focused) theme.mode_picker else theme.status_dim);
+    x = font.drawText(" › ", x, y, theme.status_dim);
+    const text = input.items();
+    const at = @min(input.cursor, text.len);
+    x = font.drawText(text[0..at], x, y, color);
+    _ = font.drawText(text[at..], x, y, color);
+    if (!focused) return;
+    if (gfx.grid == null) rect(x, y + 2, 2, font.cell_h - 4, theme.cursor);
+    gfx.cursor(x, y, .bar);
+}
+
+/// The replace form: what to find and what to put there, over the lines
+/// with matches, grouped by file, each as it is (matches in red) and as it
+/// will be (replacements in green). Skipped lines are dimmed. Below: the
+/// options (and, with regex on, what a regex can say), then the keys.
+pub fn drawReplace(r: *Replace, font: *const Font, theme: *const Theme, l: render.Layout, replacement: *const LineInput) void {
     const cw = font.cell_w;
     const ch = font.cell_h;
-    const d = dock(font, l, listRows(font, l));
+    const d = dock(font, l, listRows(font, l) + 2);
     const box_cols = d.cols;
     const box_rows = d.rows;
     const bx = d.bx;
@@ -453,29 +469,55 @@ pub fn drawReplace(r: *Replace, font: *const Font, theme: *const Theme, l: rende
     const bh = d.bh;
     drawPanel(theme, d);
 
-    // Replace "needle" with › replacement            12 in 4 files
-    var x = font.drawText("Replace ", bx + cw, by, theme.mode_picker);
-    x = font.drawText(r.needle, x, by, theme.diff_delete);
-    x = font.drawText(" with › ", x, by, theme.status_dim);
-    x = font.drawText(replacement, x, by, theme.diff_add);
-    if (gfx.grid == null) rect(x, by + 2, 2, ch - 4, theme.cursor);
-    gfx.cursor(x, by, .bar);
+    // Find    › needle                                  12 in 4 files
+    // Replace › replacement
+    drawField(font, theme, "Find   ", &r.find, r.field == .find, bx + cw, by, theme.diff_delete);
+    drawField(font, theme, "Replace", replacement, r.field == .with, bx + cw, by + ch, theme.diff_add);
     var buf: [64]u8 = undefined;
-    const done = r.isDone();
-    const c: @TypeOf(r.counts()) = if (done) r.counts() else .{ .matches = 0, .files = 0 };
-    const count = if (!done) "searching…" else if (r.failed) "rg failed" else std.fmt.bufPrint(&buf, "{d} in {d} file{s}{s}", .{
-        c.matches, c.files, if (c.files == 1) "" else "s", if (r.truncated) " (first 10000)" else "",
+    const rows = r.matches();
+    const c = r.counts();
+    const count = if (r.busy()) "searching…" else if (r.failed()) "rg failed" else if (r.find.items().len == 0) "" else std.fmt.bufPrint(&buf, "{d} in {d} file{s}{s}", .{
+        c.matches, c.files, if (c.files == 1) "" else "s", if (r.truncated()) " (first 10000)" else "",
     }) catch "";
     _ = font.drawText(count, bx + @as(f32, @floatFromInt(box_cols -| (cells(count) + 1))) * cw, by, theme.status_dim);
-    rect(bx, by + ch, bw, 1, theme.popup_border);
+    rect(bx, by + 2 * ch, bw, 1, theme.popup_border);
 
-    const hint = "↑↓ move · Tab skip line · S-Tab skip file · Enter replace · Esc back";
-    _ = font.drawText(hint, bx + cw, by + bh - ch, theme.status_dim);
-    const visible = box_rows -| 3; // query, list, hint
-    if (!done) return;
-    const rows = r.matches.items;
+    // The options, and the keys.
+    const max_cells = box_cols -| 2;
+    {
+        const y = by + bh - 2 * ch;
+        var x = font.drawText("C-r regex ", bx + cw, y, theme.status_dim);
+        x = font.drawText(if (r.options.regex) "on" else "off", x, y, if (r.options.regex) theme.diff_add else theme.status_dim);
+        x = font.drawText(" · C-b whole word ", x, y, theme.status_dim);
+        x = font.drawText(if (r.options.word) "on" else "off", x, y, if (r.options.word) theme.diff_add else theme.status_dim);
+        const used: usize = @intFromFloat((x - bx) / cw);
+        const help = if (r.options.regex)
+            "· . any character · \\w+ a word · \\d+ a number · \\s a space · (…) a group, $1 in the replacement · a|b either · ^ $ the line's ends · \\. a real dot"
+        else
+            "· the text exactly as typed (a capital makes it case-sensitive)";
+        drawMarked(font, help, &.{}, x + cw, y, max_cells -| (used + 1), theme.status_dim, theme.status_dim);
+    }
+    const hint = if (r.field == .find)
+        "Tab the replacement · Enter the replacement · ↑↓ move · C-x skip line · C-f skip file · Esc close"
+    else
+        "Tab what to find · Enter replace all · ↑↓ move · C-x skip line · C-f skip file · Esc close";
+    drawMarked(font, hint, &.{}, bx + cw, by + bh - ch, max_cells, theme.status_dim, theme.status_dim);
+
+    const visible = box_rows -| 5; // the fields, the list, options, keys
+    const list_y = by + 2 * ch;
     if (rows.len == 0) {
-        _ = font.drawText(if (r.failed) "rg could not search here" else "no matches", bx + cw, by + ch, theme.status_dim);
+        var eb: [256]u8 = undefined;
+        const said = if (r.find.items().len == 0)
+            "type what to find"
+        else if (r.busy())
+            ""
+        else if (r.complaintOf()) |e|
+            std.fmt.bufPrint(&eb, "rg can't read that{s}: {s}", .{ if (r.options.regex) " regex yet" else "", e }) catch e
+        else if (r.failed())
+            "rg could not search here"
+        else
+            "no matches";
+        drawMarked(font, said, &.{}, bx + cw, list_y, max_cells, theme.status_dim, theme.status_dim);
         return;
     }
 
@@ -483,7 +525,7 @@ pub fn drawReplace(r: *Replace, font: *const Font, theme: *const Theme, l: rende
     if (r.selected < r.top) r.top = r.selected;
     while (r.top < r.selected and replaceRows(r, r.top, r.selected) > visible) r.top += 1;
 
-    var y = by + ch;
+    var y = list_y;
     const y_end = y + @as(f32, @floatFromInt(visible)) * ch;
     const text_cols = box_cols -| 9;
     var i = r.top;
@@ -509,13 +551,8 @@ pub fn drawReplace(r: *Replace, font: *const Font, theme: *const Theme, l: rende
         }
         // As it is: each match marked.
         var spans: [32][2]usize = undefined;
-        var n: usize = 0;
-        for (m.cols) |col| {
-            if (n == spans.len) break;
-            if (!r.matchesAt(m.text, col)) continue;
-            spans[n] = .{ col, col + r.needle.len };
-            n += 1;
-        }
+        const n = @min(m.subs.len, spans.len);
+        for (m.subs[0..n], spans[0..n]) |sub, *sp| sp.* = .{ sub.start, sub.end };
         drawMarked(font, m.text, spans[0..n], tx, y, text_cols, theme.fg, theme.diff_delete);
         y += ch;
         if (y >= y_end) break;
@@ -525,16 +562,16 @@ pub fn drawReplace(r: *Replace, font: *const Font, theme: *const Theme, l: rende
         var from: usize = 0;
         var k: usize = 0;
         var new_spans: [32][2]usize = undefined;
-        for (spans[0..n]) |sp| {
-            const before = m.text[from..sp[0]];
-            if (len + before.len + replacement.len > line_buf.len) break;
+        for (m.subs[0..n]) |sub| {
+            const before = m.text[from..sub.start];
+            if (len + before.len + sub.with.len > line_buf.len) break;
             @memcpy(line_buf[len..][0..before.len], before);
             len += before.len;
-            @memcpy(line_buf[len..][0..replacement.len], replacement);
-            new_spans[k] = .{ len, len + replacement.len };
+            @memcpy(line_buf[len..][0..sub.with.len], sub.with);
+            new_spans[k] = .{ len, len + sub.with.len };
             k += 1;
-            len += replacement.len;
-            from = sp[1];
+            len += sub.with.len;
+            from = sub.end;
         }
         const rest = m.text[@min(from, m.text.len)..];
         const take = @min(rest.len, line_buf.len - len);
@@ -548,7 +585,7 @@ pub fn drawReplace(r: *Replace, font: *const Font, theme: *const Theme, l: rende
 /// Screen rows the list takes from line `from` through line `to`.
 fn replaceRows(r: *const Replace, from: usize, to: usize) usize {
     var n: usize = 0;
-    const rows = r.matches.items;
+    const rows = r.matches();
     for (from..to + 1) |i| {
         if (i == from or !std.mem.eql(u8, rows[i - 1].path, rows[i].path)) n += 1;
         n += if (rows[i].skip) 1 else 2;

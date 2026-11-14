@@ -171,7 +171,7 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     if (ed.grid) |*g| picker_view.drawGrid(g, font, theme, l);
     if (ed.search_prompt) |*sp| if (sp.kind.boxed()) {
         if (sp.kind == .replace) {
-            if (ed.replace) |r| picker_view.drawReplace(r, font, theme, l, sp.input.items());
+            if (ed.replace) |r| picker_view.drawReplace(r, font, theme, l, &sp.input);
         } else picker_view.drawPromptBox(font, theme, l, sp.kind.title(), sp.input.items());
     };
 }

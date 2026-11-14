@@ -249,8 +249,8 @@ pub fn startSelectIn(ed: *Editor) void {
 /// `c` changes them all and <Esc> leaves plain cursors.
 pub fn cursorsFromPrompt(ed: *Editor) !void {
     const sp = ed.search_prompt orelse return;
-    // In the replace prompt, <Tab> skips a line instead.
-    if (sp.kind == .replace) if (ed.replace) |r| return r.toggle();
+    // In the replace form, <Tab> goes to the other field instead.
+    if (sp.kind == .replace) return @import("replacing.zig").otherField(ed);
     if (sp.kind != .search and sp.kind != .snipe and sp.kind != .select_in) return;
     const needle = try ed.gpa.dupe(u8, sp.input.items());
     defer ed.gpa.free(needle);

@@ -278,14 +278,18 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ S, "<CR>", "search_accept" },
     .{ S, "<Esc>", "search_cancel" },
     .{ S, "<C-g>", "search_cancel" },
-    // The replace prompt's list (no-ops in a search).
+    // The replace form (no-ops in a search); `<Tab>` there is the other field.
     .{ S, "<Down>", "replace_next" },
     .{ S, "<C-n>", "replace_next" },
     .{ S, "<C-j>", "replace_next" },
     .{ S, "<Up>", "replace_previous" },
     .{ S, "<C-p>", "replace_previous" },
     .{ S, "<C-k>", "replace_previous" },
-    .{ S, "<S-Tab>", "replace_skip_file" },
+    .{ S, "<S-Tab>", "replace_other_field" },
+    .{ S, "<C-x>", "replace_skip_line" },
+    .{ S, "<C-f>", "replace_skip_file" },
+    .{ S, "<C-r>", "replace_regex" },
+    .{ S, "<C-b>", "replace_word" },
 
     .{ NV, "<C-d>", "half_page_down" },
     .{ NV, "<C-u>", "half_page_up" },

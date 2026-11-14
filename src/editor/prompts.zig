@@ -28,7 +28,11 @@ const PromptKind = Editor.PromptKind;
 pub fn activeInput(ed: *Editor) ?*LineInput {
     return switch (ed.mode) {
         .picker => if (ed.picker) |p| &p.query else null,
-        .search => if (ed.search_prompt) |*sp| &sp.input else null,
+        .search => if (ed.search_prompt) |*sp| blk: {
+            // The replace form's other field: what to find.
+            if (sp.kind == .replace) if (ed.replace) |r| if (r.field == .find) break :blk &r.find;
+            break :blk &sp.input;
+        } else null,
         else => null,
     };
 }
@@ -141,6 +145,7 @@ pub fn offsetOf(ed: *Editor, line: usize, col: usize) usize {
 pub fn searchIncremental(ed: *Editor) !void {
     const sp = &(ed.search_prompt orelse return);
     ed.snipe_label_count = 0;
+    if (sp.kind == .replace) return replacing.changed(ed);
     if (sp.kind.boxed()) return;
     if (sp.kind == .select_in) {
         // Only shows the matches (the cursors come on <CR> / <Tab>).

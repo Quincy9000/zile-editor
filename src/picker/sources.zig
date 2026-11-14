@@ -382,6 +382,7 @@ const Leader = Menu("Leader", &.{
     .{ .key = ' ', .label = "Files", .command = "find_file" },
     .{ .key = 'b', .label = "Buffers", .command = "switch_buffer" },
     .{ .key = '/', .label = "Search the project (grep, C-r replace)", .command = "search_project" },
+    .{ .key = 'c', .label = "Change across the project (find and replace, regex)", .command = "replace_project" },
     .{ .key = '.', .label = "Explore this folder", .command = "browse_files" },
     .{ .key = 'f', .label = "Find: every other picker", .command = "all_pickers" },
     .{ .key = 'l', .label = "Code", .command = "code_menu" },

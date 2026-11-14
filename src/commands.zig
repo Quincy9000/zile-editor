@@ -465,6 +465,11 @@ const base = [_]Command{
     .{ .name = "picker_replace", .doc = "Grep picker: replace the matches across the project", .run = replaceCmd(.start), .once = true, .hidden = true },
     .{ .name = "replace_next", .doc = "Replace: next line", .run = replaceCmd(.next), .once = true, .hidden = true },
     .{ .name = "replace_previous", .doc = "Replace: previous line", .run = replaceCmd(.previous), .once = true, .hidden = true },
+    .{ .name = "replace_project", .doc = "Find and replace across the project", .run = replaceCmd(.project), .once = true },
+    .{ .name = "replace_skip_line", .doc = "Replace: skip (or take back) the line", .run = replaceCmd(.skip_line), .once = true, .hidden = true },
+    .{ .name = "replace_other_field", .doc = "Replace: the other field", .run = replaceCmd(.other_field), .once = true, .hidden = true },
+    .{ .name = "replace_regex", .doc = "Replace: regex on / off", .run = replaceCmd(.regex), .once = true, .hidden = true },
+    .{ .name = "replace_word", .doc = "Replace: whole words only, on / off", .run = replaceCmd(.word), .once = true, .hidden = true },
     .{ .name = "replace_skip_file", .doc = "Replace: skip (or take back) the whole file", .run = replaceCmd(.skip_file), .once = true, .hidden = true },
     .{ .name = "picker_accept", .doc = "Open the selection", .run = pickerAccept, .hidden = true },
     .{ .name = "picker_preview_down", .doc = "Picker: scroll the preview down", .run = previewScroll(3), .hidden = true },
@@ -1621,17 +1626,22 @@ fn pickerScope(c: Context) !void {
     try picker_query.pickerNextScope(c.ed);
 }
 
-fn replaceCmd(comptime action: enum { start, next, previous, skip_file }) Handler {
+fn replaceCmd(comptime action: enum { start, project, next, previous, skip_line, skip_file, other_field, regex, word }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             if (action == .start) return replacing.startReplace(ed);
+            if (action == .project) return replacing.replaceProject(ed);
             const r = ed.replace orelse return;
             switch (action) {
-                .start => unreachable,
+                .start, .project => unreachable,
                 .next => r.move(1),
                 .previous => r.move(-1),
+                .skip_line => r.toggle(),
                 .skip_file => r.toggleFile(),
+                .other_field => replacing.otherField(ed),
+                .regex => try replacing.toggleOption(ed, .regex),
+                .word => try replacing.toggleOption(ed, .word),
             }
         }
     }.run;

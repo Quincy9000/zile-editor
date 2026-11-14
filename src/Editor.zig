@@ -471,7 +471,8 @@ pub const PromptKind = enum {
     browse_new_file,
     browse_rename,
     browse_move,
-    /// `<C-r>` in the grep picker: the replacement for every match.
+    /// `SPC c`, `<C-r>` in the grep picker: the replacement for every match
+    /// (what to find is the form's other field, `Replace.find`).
     replace,
 
     /// One-line prompts shown in a centered box (not incremental searches).
@@ -814,9 +815,11 @@ queue: std.ArrayList(KeyEvent) = .empty,
 
 /// The `/` or `?` prompt while it is open.
 search_prompt: ?SearchPrompt = null,
-/// Search and replace across the project (`<C-r>` in the grep picker),
-/// while its prompt is open.
+/// Find and replace across the project (`SPC c`; `<C-r>` in the grep
+/// picker), while its form is open.
 replace: ?*Replace = null,
+/// Regex and whole-word, as last set in the form (for this run of zile).
+replace_options: Replace.Options = .{},
 /// The folder it searches (not owned), for going back to the grep picker.
 replace_root: []const u8 = ".",
 last_search: std.ArrayList(u8) = .empty,
@@ -1152,6 +1155,7 @@ pub fn tick(ed: *Editor) void {
     state_files.keepUndoHistories(ed);
     state_files.tickZigChecks(ed);
     file_ops.tickSaveChain(ed);
+    if (ed.replace) |r| r.poll();
     sql_ops.tickSqlSchema(ed);
     sql_ops.tickSqlResults(ed);
     row_model.tickCodeLens(ed);

@@ -5,6 +5,7 @@ const testing = std.testing;
 const Io = std.Io;
 const claude_panel = @import("../editor/claude_panel.zig");
 const prompts = @import("../editor/prompts.zig");
+const project_ops = @import("../editor/project_ops.zig");
 const Editor = @import("../Editor.zig");
 const Mode = Editor.Mode;
 const PromptKind = Editor.PromptKind;
@@ -32,11 +33,14 @@ test "replace across the project: from the grep picker, skipping a line and a fi
     const r = ed.replace.?;
     r.wait();
     // Lowercase: any case (smart case), so `Foo` too. Lines: a 1, a 3, b 1, b 2, c 1.
-    try testing.expectEqual(5, r.matches.items.len);
+    try testing.expectEqual(5, r.matches().len);
     try testing.expectEqual(6, r.counts().matches);
+    // The query is what to find; the replacement is typed.
+    try testing.expectEqual(.with, r.field);
     try ed.feed("bar");
+    r.wait();
     // Skip `const Foo` (b.zig's second line), then all of c.zig.
-    try ed.feed("<Down><Down><Down><Tab><S-Tab>");
+    try ed.feed("<Down><Down><Down><C-x><C-f>");
     try testing.expectEqual(4, r.counts().matches);
     try ed.feed("<CR>");
     try testing.expectEqual(null, ed.replace);
@@ -80,6 +84,56 @@ test "replace: Esc goes back to the grep picker with the search" {
     try testing.expectEqual(null, ed.replace);
     try testing.expectEqual(null, ed.search_prompt);
     try testing.expectEqualStrings("needle", ed.picker.?.query.items());
+}
+
+test "replace: SPC c, a regex with a group, whole words, Tab between the fields" {
+    if (!@import("../picker/sources.zig").haveRg(testing.io)) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "get(a, b) + forget(c, d)\ncost $5 (x)\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try project_ops.workIn(&ed, dir);
+    try ed.feed("<Space>c");
+    try testing.expectEqual(PromptKind.replace, ed.search_prompt.?.kind);
+    const r = ed.replace.?;
+    try testing.expectEqual(.find, r.field);
+
+    // Plain text: `(x)` and `$5` mean themselves, on both sides.
+    try ed.feed("(x)<CR>");
+    try testing.expectEqual(.with, r.field);
+    try ed.feed("$1");
+    r.wait();
+    try testing.expectEqual(1, r.counts().matches);
+    try testing.expectEqualStrings("$1", r.matches()[0].subs[0].with);
+
+    // A regex, whole words: `get(a, b)` but not `forget(c, d)`; the groups swapped.
+    try ed.feed("<C-u><Tab><C-u><C-r><C-b>get\\((\\w+), (\\w+)\\)<Tab>put($2, $1)");
+    try testing.expect(r.options.regex and r.options.word);
+    r.wait();
+    try testing.expectEqual(1, r.counts().matches);
+    try testing.expectEqualStrings("put(b, a)", r.matches()[0].subs[0].with);
+    // Half a regex: rg says what is wrong, and nothing is replaced.
+    try ed.feed("<Tab>(");
+    r.wait();
+    try testing.expectEqual(0, r.counts().matches);
+    try testing.expect(r.complaintOf() != null);
+    try ed.feed("<BS><Tab><CR>");
+    try testing.expectEqual(null, ed.replace);
+    const path = try std.fs.path.join(gpa, &.{ dir, "a.txt" });
+    defer gpa.free(path);
+    const a = claude_panel.bufferForPath(&ed, path).?;
+    try testing.expectEqualStrings("put(b, a) + forget(c, d)\ncost $5 (x)", a.text.slice(0, a.text.len()));
+    // The options are as they were left, the next time.
+    try ed.feed("<Space>c");
+    try testing.expect(ed.replace.?.options.regex);
+    try ed.feed("<Esc>");
+    try testing.expectEqual(null, ed.replace);
+    try testing.expectEqual(null, ed.picker);
 }
 
 test ". and , continue a snipe too" {
