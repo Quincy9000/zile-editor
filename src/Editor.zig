@@ -9,7 +9,7 @@ const Buffer = @import("core/Buffer.zig");
 const Text = @import("core/Text.zig");
 const motions = @import("core/motions.zig");
 const keys = @import("input/keys.zig");
-const KeyEvent = keys.KeyEvent;
+pub const KeyEvent = keys.KeyEvent;
 const km = @import("input/keymap.zig");
 const commands = @import("commands.zig");
 const Picker = @import("picker/Picker.zig");
@@ -22,6 +22,7 @@ const Git = @import("git/Git.zig");
 const GitJob = @import("git/Job.zig");
 const Lsp = @import("lsp/Lsp.zig");
 const Replace = @import("Replace.zig");
+const Chat = @import("ai/Chat.zig");
 const sources = @import("picker/sources.zig");
 const Completion = @import("lsp/Completion.zig");
 const lsp_docs = @import("lsp/docs.zig");
@@ -86,6 +87,9 @@ pub const folding = @import("editor/folding.zig");
 pub const code_motion = @import("editor/code_motion.zig");
 pub const row_search = @import("editor/row_search.zig");
 pub const replacing = @import("editor/replacing.zig");
+pub const claude_chat = @import("editor/claude_chat.zig");
+pub const side_float = @import("editor/side_float.zig");
+pub const pads = @import("editor/pads.zig");
 pub const prompts = @import("editor/prompts.zig");
 pub const git_ops = @import("editor/git_ops.zig");
 pub const signature_help = @import("editor/signature_help.zig");
@@ -301,7 +305,7 @@ pub const WorkspaceSymbol = struct {
 
 /// `run`: it runs. `runner`: it runs as a runner command (remembered).
 /// `debug`: it runs under gdb, and is what its runner command debugs as.
-pub const CommandPurpose = enum { run, runner, debug };
+pub const CommandPurpose = enum { run, runner, debug, claude };
 
 /// A quickfix entry: a place (0-based line/col) and what's there.
 pub const QuickfixItem = struct {
@@ -463,14 +467,14 @@ pub const PromptKind = enum {
     copy_file,
     /// `SPC ;`: any one-off shell command.
     run_command,
-    /// `SPC a i`: an instruction for Claude about the selection.
-    ask_claude,
     /// The file browser's own operations (`o` `n` `r` `m` in its list): a
     /// name for a new folder or file, a new name, a new place.
     browse_new_folder,
     browse_new_file,
     browse_rename,
     browse_move,
+    /// `n` in the scratch pads: a new pad's name.
+    new_pad,
     /// `SPC c`, `<C-r>` in the grep picker: the replacement for every match
     /// (what to find is the form's other field, `Replace.find`).
     replace,
@@ -485,6 +489,7 @@ pub const PromptKind = enum {
             .search, .snipe, .select_in => "",
             .rename => "Rename symbol",
             .replace => "Replace",
+            .new_pad => "New scratch pad (its name)",
             .git_commit => "Commit message (commits all changes)",
             .git_remote => "Remote URL (origin)",
             .new_file => "New file (path)",
@@ -492,7 +497,6 @@ pub const PromptKind = enum {
             .rename_file => "Rename / move file to",
             .copy_file => "Copy file to",
             .run_command => "Run command",
-            .ask_claude => "Ask Claude (about the selection)",
             .browse_new_folder => "New folder (name)",
             .browse_new_file => "New file (name)",
             .browse_rename => "Rename to",
@@ -907,7 +911,22 @@ last_term_esc: Io.Timestamp = .zero,
 shells: std.ArrayList(*Terminal) = .empty,
 /// When open buffers were last checked for changes on disk.
 last_disk_check: Io.Timestamp = .zero,
-/// What `SPC a i` asks about: a file and its selected lines.
+/// Claude Code drawn by zile (`SPC a a`): the CLI without its interface
+/// (it keeps the conversation), and the panel that shows it.
+chat: ?*Chat = null,
+chat_panel: claude_chat.Panel = .{},
+/// The scratch pads (`SPC t s`): their panel, and the pads there are.
+pad_panel: claude_chat.Panel = .{},
+pad_list: pads.List = .{},
+/// The text side of a bottom panel gone into with Tab (`side_float.zig`):
+/// a window outside the splits (owned), and the window to go back to.
+side_window: ?*Windows.Window = null,
+side_return: ?*Windows.Window = null,
+/// Its buffer is its own (a copy of a row), freed with it.
+side_owned: bool = false,
+/// The question the notification is up for (a hash of its id; 0: none).
+chat_asked: u64 = 0,
+/// What `SPC a i` was opened on: a file and its selected lines (0-based).
 claude_ask: ?struct { path: []u8, lines: ?[2]usize } = null,
 /// Tests never ask a model (they mustn't depend on one running).
 ai_offline: bool = @import("builtin").is_test,
@@ -1042,6 +1061,9 @@ pub fn deinit(ed: *Editor) void {
     for (ed.shells.items) |t| t.destroy();
     ed.shells.deinit(ed.gpa);
     if (ed.claude_ask) |a| ed.gpa.free(a.path);
+    side_float.close(ed);
+    ed.pad_list.deinit(ed.gpa);
+    if (ed.chat) |c| c.destroy();
     if (ed.browse_target) |p| ed.gpa.free(p);
     if (ed.browse_clip) |p| ed.gpa.free(p);
     for (ed.buffers.items) |b| {
@@ -1156,6 +1178,8 @@ pub fn tick(ed: *Editor) void {
     state_files.tickZigChecks(ed);
     file_ops.tickSaveChain(ed);
     if (ed.replace) |r| r.poll();
+    claude_chat.tick(ed);
+    pads.tick(ed);
     sql_ops.tickSqlSchema(ed);
     sql_ops.tickSqlResults(ed);
     row_model.tickCodeLens(ed);
@@ -1211,6 +1235,9 @@ pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
     if (run_popup.popupKey(ed, ev)) return;
     if (sql_ops.gridKey(ed, ev)) return;
     if (run_popup.cmdFloatKey(ed, ev)) return;
+    if (side_float.key(ed, ev)) return;
+    if (claude_chat.key(ed, ev)) return;
+    if (pads.key(ed, ev)) return;
     if (ed.macro_register != null) ed.macro_keys.append(ed.gpa, ev) catch {};
     ed.processKey(ev);
     // Macro playback and `.` queue keys; a runaway macro (one that calls
@@ -1278,7 +1305,7 @@ pub fn queueNotation(ed: *Editor, notation: []const u8, count: usize) !void {
     try ed.queue.insertSlice(ed.gpa, 0, parsed.items);
 }
 
-fn processKey(ed: *Editor, ev: KeyEvent) void {
+pub fn processKey(ed: *Editor, ev: KeyEvent) void {
     // Ghost rows must reflect the latest edits (macros and `.` replay many
     // keys between frames). Cheap when nothing changed.
     git_ops.updateGit(ed);
@@ -1445,6 +1472,10 @@ pub fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
             ed.pending_len = 0;
             ed.count = 0;
             ed.register = null;
+            if (ed.buffer.read_only and cmd.repeat) {
+                ed.resetCommand();
+                return ed.setMessage(.info, "this is read-only: y copies{s}", .{""});
+            }
             if (ed.ghost != null and !cmd.ghost) {
                 // Ghost lines are read-only; other commands act on the text.
                 if (cmd.repeat or ed.mode == .operator) {
@@ -1720,39 +1751,9 @@ pub fn selectLastChange(ed: *Editor) void {
     ed.view.want_col = null;
 }
 
-/// `SPC t s`: the scratch pad (one markdown file for every project) in a
-/// window at the bottom, or that window closed (saved) if it is open.
-pub fn toggleScratch(ed: *Editor) !void {
-    const path = ed.scratchPath() orelse return ed.setMessage(.err, "nowhere to keep the scratch pad", .{});
-    defer ed.gpa.free(path);
-    for (ed.window_list.items) |w| {
-        const b = window_ops.windowBuffer(ed, w);
-        const bp = b.path orelse continue;
-        const abs = ed.absolutePath(bp) catch continue;
-        defer ed.gpa.free(abs);
-        if (!std.mem.eql(u8, abs, path)) continue;
-        if (b.modified) _ = b.save(ed.gpa, ed.io) catch {};
-        window_ops.focusWindow(ed, w);
-        if (ed.window_list.items.len > 1) window_ops.closeWindow(ed);
-        return;
-    }
-    if (std.fs.path.dirname(path)) |d| Io.Dir.cwd().createDirPath(ed.io, d) catch {};
-    try window_ops.splitWindow(ed, .down);
-    Windows.resize(ed.window, .vertical, -0.25);
-    try ed.openFile(path);
-}
-
-/// Where the scratch pad is kept (`$XDG_DATA_HOME/zile/scratch.md`; in
-/// tests, the state folder). Caller frees.
-pub fn scratchPath(ed: *Editor) ?[]u8 {
-    if (ed.state_dir) |d| return std.fs.path.join(ed.gpa, &.{ d, "scratch.md" }) catch null;
-    if (@import("builtin").is_test) return null;
-    return config.dir(ed.gpa, .data, "scratch.md");
-}
-
 /// Inserts at `pos`, recording it for undo. Leaves the cursor alone.
 pub fn insertAt(ed: *Editor, pos: usize, bytes: []const u8) !void {
-    if (bytes.len == 0) return;
+    if (bytes.len == 0 or ed.buffer.read_only) return;
     tags.beforeEdit(ed, pos, pos, bytes.len);
     ed.noteChange(pos, pos, bytes.len);
     try ed.buffer.history.recordInsert(ed.gpa, pos, bytes, ed.view.cursor);
@@ -1784,7 +1785,7 @@ pub fn deleteRange(ed: *Editor, start: usize, end: usize) !void {
 /// Deletes `[start, end)`, recording it for undo. The cursor keeps its
 /// position relative to the text around it.
 pub fn deleteRangeKeepCursor(ed: *Editor, start: usize, end: usize) !void {
-    if (start >= end) return;
+    if (start >= end or ed.buffer.read_only) return;
     tags.beforeEdit(ed, start, end, 0);
     ed.noteChange(start, end, 0);
     const t = ed.text();
@@ -1901,6 +1902,12 @@ pub fn openArg(ed: *Editor, path: []const u8) void {
 
 pub fn switchTo(ed: *Editor, b: *Buffer) void {
     if (b == ed.buffer) return;
+    // A panel's text side shows its own buffer only: another is for the
+    // window it was gone into from.
+    if (side_float.focused(ed)) {
+        side_float.close(ed);
+        if (b == ed.buffer) return;
+    }
     ed.buffer.saved = .{ .cursor = ed.view.cursor, .top = ed.view.top, .left = ed.view.left };
     state_files.leaveBuffer(ed, ed.buffer);
     ed.use_counter += 1;
@@ -1928,6 +1935,7 @@ fn activate(ed: *Editor, b: *Buffer) void {
 /// Closes `b`. Refuses (with a message) if it has unsaved changes. Closing the
 /// last buffer leaves an empty scratch buffer.
 pub fn killBuffer(ed: *Editor, b: *Buffer) !void {
+    if (ed.side_window) |f| if (f.buffer == b or (f == ed.window and ed.buffer == b)) side_float.close(ed);
     if (b.modified) {
         ed.setMessage(.err, "\"{s}\" has unsaved changes: SPC s to save it first", .{b.displayName()});
         return;
@@ -1969,6 +1977,9 @@ pub fn openPicker(ed: *Editor, kind: Picker.Kind, query: []const u8) !void {
     // From visual mode (`SPC` on a selection): a menu row acts on it.
     ed.picker_visual = if (ed.mode == .visual) .{ .line = ed.visual_line } else null;
     picker_query.closePicker(ed);
+    // The bottom panels are where a picker goes: it takes their place.
+    claude_chat.hide(ed);
+    pads.hide(ed);
     ed.picker_root = ed.next_picker_root orelse project_ops.projectRoot(ed);
     ed.next_picker_root = null;
     if (kind == .themes) ed.theme_before = ed.theme_index;

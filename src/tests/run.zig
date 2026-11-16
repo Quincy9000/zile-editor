@@ -221,9 +221,33 @@ test "terminal window: Esc Esc is normal mode, SPC commands work, i types again"
     try ed.feed("<cmd:window_left>"); // SPC commands work from here
     try testing.expectEqual(code_window, ed.window);
     try testing.expectEqual(2, ed.window_list.items.len);
-    try ed.feed("<C-\\>"); // and to the terminal again
+    try ed.feed("<C-\\>"); // and to the terminal again, typing
     try testing.expectEqual(term_window, ed.window);
-    try ed.feed("i"); // typing into the program again
+    try testing.expect(!term_window.term_normal);
+    try ed.feed("<C-\\>"); // one key back to the code
+    try testing.expectEqual(code_window, ed.window);
+    try testing.expectEqual(Mode.normal, ed.mode);
+    try ed.feed("<C-\\><Esc><Esc>"); // from its normal mode, Esc is the way out too
+    try testing.expect(term_window.term_normal);
+    try ed.feed("<Esc>");
+    try testing.expectEqual(code_window, ed.window);
+    // The leader menu over the terminal has the keys while it is open: Esc
+    // closes it, and nothing more.
+    try ed.feed("<C-\\><Esc><Esc><Space>");
+    try testing.expect(ed.picker != null);
+    try ed.feed("<Esc>");
+    try testing.expectEqual(null, ed.picker);
+    try testing.expectEqual(term_window, ed.window);
+    try testing.expect(term_window.term_normal);
+    try ed.feed("<Space>");
+    try ed.feed("j"); // moves in the menu, not the terminal's scrollback
+    try testing.expect(ed.picker != null);
+    try ed.feed("<Esc>");
+    try testing.expectEqual(null, ed.picker);
+    try ed.feed("<C-w>"); // Ctrl-w: back to the code
+    try testing.expectEqual(code_window, ed.window);
+    try ed.feed("<C-\\>");
+    try testing.expectEqual(term_window, ed.window);
     try testing.expect(!term_window.term_normal);
     var got = false;
     for (0..200) |_| {

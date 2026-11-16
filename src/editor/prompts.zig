@@ -338,10 +338,10 @@ pub fn acceptSearch(ed: *Editor) !void {
         .git_remote => return git_ops.finishGitRemote(ed),
         .new_file, .save_as, .rename_file, .copy_file => |k| return file_ops.finishFilePrompt(ed, k),
         .run_command => |k| return run_popup.finishRunPrompt(ed, k),
-        .ask_claude => return claude_panel.finishAskClaude(ed),
         .browse_new_folder, .browse_new_file, .browse_rename, .browse_move => |k| return browser.finishBrowsePrompt(ed, k),
         .select_in => return multicursor.cursorsFromPrompt(ed),
         .replace => return replacing.finishReplace(ed),
+        .new_pad => return @import("pads.zig").finishNew(ed),
         .search, .snipe => {},
     }
     if (sp.input.items().len > 0) {

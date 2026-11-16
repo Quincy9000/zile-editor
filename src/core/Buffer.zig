@@ -30,6 +30,9 @@ syntax: ?Syntax = null,
 project: ?*const Project = null,
 /// A name for buffers without a file (owned), e.g. a proposed edit.
 label: ?[]u8 = null,
+/// Not to be changed by the user (Claude's conversation): commands that
+/// edit are refused, yanking and moving work.
+read_only: bool = false,
 /// Its lines are never wrapped, whatever the option says (a table: rows
 /// that are cut into pieces can't be read down a column).
 no_wrap: bool = false,

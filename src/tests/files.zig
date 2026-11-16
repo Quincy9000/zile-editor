@@ -599,7 +599,7 @@ test "buffer picker: x closes the selected buffer in place; pickers take a visua
     defer ed.deinit();
     try ed.openFile("src/pairs.zig");
     try ed.openFile("src/format.zig");
-    try ed.feed("<Space>b<Esc>");
+    try ed.feed("<Space>b");
     settlePicker(&ed);
     try testing.expectEqualStrings("src/pairs.zig", ed.picker.?.itemAt(0).?.text);
     try ed.feed("x");

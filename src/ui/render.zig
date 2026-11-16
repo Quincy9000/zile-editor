@@ -27,6 +27,7 @@ const window_ops = @import("../editor/window_ops.zig");
 const project_ops = @import("../editor/project_ops.zig");
 const inlay = @import("../editor/inlay.zig");
 const quickfix_list = @import("../editor/quickfix_list.zig");
+const claude_panel = @import("../editor/claude_panel.zig");
 const run_popup = @import("../editor/run_popup.zig");
 const borders = @import("../editor/borders.zig");
 const resting = @import("../editor/resting.zig");
@@ -98,6 +99,15 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
             f.view.cols = fl.cols;
         }
     }
+    if (ed.side_window) |f| {
+        // Over the text side of the panel it belongs to.
+        if (picker_view.paneGeometry(font, screen, panelBottom(ed, screen))) |g| f.rect = g.text;
+        const fl = sideLayout(ed, font, f);
+        if (f == ed.window) ed.setViewSize(fl.rows, fl.cols) else {
+            f.view.rows = fl.rows;
+            f.view.cols = fl.cols;
+        }
+    }
     for (ed.window_list.items) |w| {
         if (w.term) |t| {
             // Its screen: the window less a header row and a cell of padding.
@@ -106,7 +116,7 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
             t.resize(cols, rows, @intFromFloat(font.cell_w), @intFromFloat(font.cell_h));
         }
         const wl = windowLayout(ed, font, w);
-        if (w == ed.window and ed.cmd_float == null) {
+        if (w == ed.window) {
             ed.setViewSize(wl.rows, wl.cols);
         } else {
             w.view.rows = wl.rows;
@@ -152,9 +162,18 @@ pub fn windowLayout(ed: *Editor, font: *const Font, w: *Editor.Windows.Window) L
 pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
     gfx.clear(theme.bg);
     for (ed.window_list.items) |w| drawWindow(ed, font, theme, w);
+    // Claude's conversation: above the box to tell it something, if open.
+    if (ed.chat_panel.shown) picker_view.drawChat(ed, font, theme, l, panelBottom(ed, l));
+    if (ed.pad_panel.shown) picker_view.drawPads(ed, font, theme, l, panelBottom(ed, l));
+    if (ed.side_window) |f| drawSideWindow(ed, font, theme, f);
     if (ed.cmd_float) |f| drawCmdFloat(ed, font, theme, f, l);
     // Popups at the focused window's cursor.
-    const fl = if (ed.cmd_float != null and ed.window == ed.cmd_float.?) floatLayout(ed, font, ed.window) else windowLayout(ed, font, ed.window);
+    const fl = if (ed.cmd_float != null and ed.window == ed.cmd_float.?)
+        floatLayout(ed, font, ed.window)
+    else if (ed.side_window != null and ed.window == ed.side_window.?)
+        sideLayout(ed, font, ed.window)
+    else
+        windowLayout(ed, font, ed.window);
     gfx.pushOffset(fl.x0, fl.y0);
     drawHover(ed, font, theme, fl);
     drawDiagHover(ed, font, theme, fl);
@@ -208,9 +227,51 @@ fn shortPath(ed: *Editor, path: []const u8) []const u8 {
 fn cmdFloatRect(ed: *Editor, font: *const Font, screen: Layout) Editor.Windows.Rect {
     const lines = window_ops.windowBuffer(ed, ed.cmd_float.?).text.lineCount();
     const rows: f32 = @floatFromInt(std.math.clamp(lines + 1, 3, 16));
+    // Telling Claude: docked along the bottom like a picker, the code in
+    // view above it.
+    if (ed.cmd_purpose == .claude) {
+        const dock_h = @min((rows + 1) * font.cell_h, @max(screen.status_y - font.cell_h, font.cell_h * 2));
+        return .{ .x = 0, .y = screen.status_y - dock_h, .w = screen.width, .h = dock_h };
+    }
     const w = @max(@min(@floor(screen.width * 0.7 / font.cell_w), 120), 30) * font.cell_w;
     const h = (rows + 1) * font.cell_h; // + the title row
     return .{ .x = @floor((screen.width - w) / 2), .y = @floor(@max(screen.status_y / 3 - h / 2, font.cell_h)), .w = w, .h = h };
+}
+
+/// Where the bottom panels end: above the box to tell Claude something
+/// while that is open, else above the status line.
+fn panelBottom(ed: *const Editor, screen: Layout) f32 {
+    return if (ed.cmd_float != null and ed.cmd_purpose == .claude) ed.cmd_float.?.rect.y else screen.status_y;
+}
+
+/// A panel's text side as a window (`side_float`): all of its rectangle.
+fn sideLayout(ed: *Editor, font: *const Font, f: *Editor.Windows.Window) Layout {
+    const lines = window_ops.windowBuffer(ed, f).text.lineCount();
+    const gutter_cols = @max(std.math.log10_int(lines) + 1, 2) + 2;
+    const text_x = @as(f32, @floatFromInt(gutter_cols)) * font.cell_w;
+    return .{
+        .gutter_cols = gutter_cols,
+        .text_x = text_x,
+        .rows = @max(@as(usize, @intFromFloat(f.rect.h / font.cell_h)), 1),
+        .cols = @max(@as(usize, @intFromFloat(@max(f.rect.w - text_x, 0) / font.cell_w)), 1),
+        .status_y = f.rect.h,
+        .width = f.rect.w,
+        .x0 = f.rect.x,
+        .y0 = f.rect.y,
+    };
+}
+
+fn drawSideWindow(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.Windows.Window) void {
+    const r = f.rect;
+    rect(r.x, r.y, r.w, r.h, theme.bg);
+    const fl = sideLayout(ed, font, f);
+    gfx.beginClip(r.x, r.y, r.w, r.h);
+    defer gfx.endClip();
+    const peek: ?Editor.Peek = if (f == ed.window) null else ed.peekWindow(f);
+    defer if (peek) |p| ed.unpeekWindow(p);
+    gfx.pushOffset(fl.x0, fl.y0);
+    defer gfx.popOffset();
+    drawText(ed, font, theme, fl, f == ed.window);
 }
 
 fn floatLayout(ed: *Editor, font: *const Font, f: *Editor.Windows.Window) Layout {
@@ -233,13 +294,19 @@ fn floatLayout(ed: *Editor, font: *const Font, f: *Editor.Windows.Window) Layout
 /// The command editor: title, then the buffer drawn like any window.
 fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.Windows.Window, screen: Layout) void {
     const r = f.rect;
-    rect(0, 0, screen.width, screen.status_y, theme.backdrop);
+    const claude = ed.cmd_purpose == .claude;
+    // (The docked box leaves the code as it is.)
+    if (!claude) rect(0, 0, screen.width, screen.status_y, theme.backdrop);
     rect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, theme.popup_border);
     rect(r.x, r.y, r.w, r.h, theme.bg);
     rect(r.x, r.y, r.w, font.cell_h, theme.status_bg);
     const debug = ed.cmd_purpose == .debug;
-    _ = font.drawText(if (debug) "Debug command (this session)" else "Run command", r.x + font.cell_w, r.y, theme.mode_picker);
-    const hint = if (ed.mode == .normal)
+    var title_buf: [160]u8 = undefined;
+    const title: []const u8 = if (claude) claude_panel.tellTitle(ed, &title_buf) else if (debug) "Debug command (this session)" else "Run command";
+    _ = font.drawText(title, r.x + font.cell_w, r.y, theme.mode_picker);
+    const hint = if (claude)
+        (if (ed.mode == .normal) "Enter sends   Esc closes" else "Enter sends   S-Enter new line   Esc normal")
+    else if (ed.mode == .normal)
         (if (debug) "Enter debugs   Esc cancels" else "Enter runs   Esc cancels")
     else if (debug) "Esc, then Enter debugs" else "Esc, then Enter runs";
     _ = font.drawText(hint, r.x + r.w - @as(f32, @floatFromInt(cells(hint) + 1)) * font.cell_w, r.y, theme.status_dim);
@@ -384,13 +451,13 @@ fn drawTermWindow(ed: *Editor, font: *const Font, theme: *const Theme, w: *Edito
     if (is_claude) {
         const c = ed.claude.?;
         const status: []const u8 = if (c.ready) "connected" else "connecting…";
-        const hint = if (!focused) "" else if (w.term_normal) "   NORMAL (i types)" else "   Esc Esc: normal";
-        var buf: [64]u8 = undefined;
+        const hint = if (!focused) "" else if (w.term_normal) "   NORMAL · i types · Esc code" else "   C-w code · Esc Esc scroll";
+        var buf: [96]u8 = undefined;
         const right = std.fmt.bufPrint(&buf, "{s}{s}", .{ status, hint }) catch status;
         _ = font.drawText(right, r.x + r.w - @as(f32, @floatFromInt(cells(right) + 1)) * font.cell_w, r.y, if (c.ready) theme.diff_add else theme.status_dim);
     }
     if (!is_claude and focused) {
-        const hint: []const u8 = if (w.term_normal) "NORMAL (i types)" else "Esc Esc: normal";
+        const hint: []const u8 = if (w.term_normal) "NORMAL · i types · Esc code" else "C-\\ code · Esc Esc scroll";
         _ = font.drawText(hint, r.x + r.w - @as(f32, @floatFromInt(cells(hint) + 1)) * font.cell_w, r.y, theme.status_dim);
     }
     if (r.x > 0) rect(r.x, r.y, 1, r.h, theme.popup_border);
@@ -1096,9 +1163,8 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
             .rename => .{ " RENAME ", theme.mode_insert },
             .replace => .{ " REPLACE ", theme.mode_insert },
             .git_commit, .git_remote => .{ " GIT ", theme.mode_insert },
-            .new_file, .save_as, .rename_file, .copy_file => .{ " FILE ", theme.mode_insert },
+            .new_file, .save_as, .rename_file, .copy_file, .new_pad => .{ " FILE ", theme.mode_insert },
             .run_command => .{ " RUN ", theme.mode_insert },
-            .ask_claude => .{ " CLAUDE ", theme.mode_insert },
             .browse_new_folder, .browse_new_file, .browse_rename, .browse_move => .{ " FILE ", theme.mode_insert },
         },
     };
@@ -1847,4 +1913,78 @@ test "ligatures: drawn but for the one with the cursor in it, or one spread apar
     try std.testing.expect(ligs[2] != 0 and ligs[7] == 0 and ligs[8] == 0);
     // Plain text has none.
     try std.testing.expectEqual(null, drawnLigatures(&font, "plain text", &.{}, none, 0, null, &buf));
+}
+
+test "terminal mode: Claude's conversation in a panel along the bottom, the box under it" {
+    const Grid = @import("../tui/Grid.zig");
+    const Chat = @import("../ai/Chat.zig");
+    const claude_chat = @import("../editor/claude_chat.zig");
+    const gpa = std.testing.allocator;
+    var ed = try Editor.init(gpa, std.testing.io);
+    defer ed.deinit();
+    try ed.text().insert(gpa, 0, "code\n");
+    ed.chat = try Chat.create(gpa, std.testing.io, ".", Editor.noWake);
+    ed.chat.?.offline = true;
+    try claude_chat.tell(&ed, "fix it");
+    try ed.chat.?.event("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"On it.\\nA second line of the answer.\"}}}");
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 80, 30);
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    const theme = Theme.get(ed.theme_index);
+    const Rows = struct {
+        fn find(g: *const Grid, a: std.mem.Allocator, needle: []const u8) !?usize {
+            for (0..g.rows) |r| {
+                var line: std.ArrayList(u8) = .empty;
+                defer line.deinit(a);
+                for (g.cells[r * g.cols ..][0..g.cols]) |cell| {
+                    var b: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(if (cell.cp == 0) ' ' else cell.cp, &b) catch continue;
+                    try line.appendSlice(a, b[0..n]);
+                }
+                if (std.mem.indexOf(u8, line.items, needle) != null) return r;
+            }
+            return null;
+        }
+    };
+    // Shown, the code keeping the keyboard: the code on top, the panel below.
+    for (0..2) |_| {
+        ed.tick();
+        const l = prepare(&ed, &font, 80 * Grid.cell_w, 30 * Grid.cell_h);
+        draw(&ed, &font, theme, l);
+    }
+    try std.testing.expectEqual(0, (try Rows.find(&grid, gpa, "code")).?);
+    const title = (try Rows.find(&grid, gpa, "Claude · working")).?;
+    try std.testing.expect(title > 10);
+    // A row each on the left; the whole of the selected (the last) on the right.
+    const you = (try Rows.find(&grid, gpa, "› fix it")).?;
+    try std.testing.expectEqual(title + 1, you);
+    // (Its text starts level with the first row; its own row is the second.)
+    try std.testing.expectEqual(you, (try Rows.find(&grid, gpa, "On it.")).?);
+    try std.testing.expectEqual(you + 1, (try Rows.find(&grid, gpa, "A second line of the answer.")).?);
+    // Gone into the text (Tab): a window over that side, the cursor in it.
+    try claude_chat.toggle(&ed);
+    try ed.feed("<Tab>j");
+    for (0..2) |_| {
+        const l = prepare(&ed, &font, 80 * Grid.cell_w, 30 * Grid.cell_h);
+        draw(&ed, &font, theme, l);
+    }
+    const second = (try Rows.find(&grid, gpa, "A second line of the answer.")).?;
+    try std.testing.expectEqual(you + 1, second);
+    try std.testing.expectEqual(second, grid.cursor.?.row);
+    try std.testing.expect(grid.cursor.?.col > 28); // past the rows
+    try ed.feed("<Tab>");
+    ed.chat_panel.focus = false;
+    // The box open under it: the conversation moves up.
+    try @import("../editor/claude_panel.zig").claudeAskPrompt(&ed);
+    for (0..2) |_| {
+        const l = prepare(&ed, &font, 80 * Grid.cell_w, 30 * Grid.cell_h);
+        draw(&ed, &font, theme, l);
+    }
+    const box = (try Rows.find(&grid, gpa, "Tell Claude")).?;
+    const title2 = (try Rows.find(&grid, gpa, "Claude · working")).?;
+    try std.testing.expect(title2 < title and box > title2);
+    try std.testing.expect((try Rows.find(&grid, gpa, "A second line of the answer.")).? < box);
 }

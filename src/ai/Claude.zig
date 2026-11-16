@@ -45,6 +45,15 @@ diffs: std.ArrayList(Diff) = .empty,
 ready: bool = false,
 /// `at_mentioned` notifications waiting for a client (JSON, owned).
 queued: std.ArrayList([]u8) = .empty,
+/// Something to tell Claude (`SPC a i`), until it is in its prompt (owned).
+say_text: ?[]u8 = null,
+/// Not before this: the prompt of a CLI just started has to be there.
+say_after: Io.Timestamp = .zero,
+/// Waiting for the CLI to connect (or `say_after`, if it never does).
+say_connecting: bool = false,
+/// The text is in the prompt; Enter follows at this time (a paste and its
+/// Enter in one go would be one paste).
+say_enter: ?Io.Timestamp = null,
 /// The last `selection_changed` sent (JSON, owned), to send only changes.
 last_selection: std.ArrayList(u8) = .empty,
 
@@ -73,6 +82,7 @@ pub fn destroy(c: *Claude) void {
     for (c.queued.items) |q| c.gpa.free(q);
     c.queued.deinit(c.gpa);
     c.last_selection.deinit(c.gpa);
+    if (c.say_text) |s| c.gpa.free(s);
     c.gpa.destroy(c);
 }
 
@@ -157,6 +167,57 @@ pub fn tick(c: *Claude, ed: *Editor) void {
     }
     while (c.server.pollClosed()) |conn| c.connectionClosed(ed, conn);
     c.shareSelection(ed);
+    c.tickSay(ed);
+}
+
+/// Types `text` into Claude's prompt and sends it, as soon as the CLI in
+/// the panel can take it. More than one waiting go as one message.
+pub fn say(c: *Claude, ed: *Editor, text: []const u8) !void {
+    const now = Io.Timestamp.now(ed.io, .awake);
+    if (c.say_text) |old| {
+        const both = try std.fmt.allocPrint(c.gpa, "{s}\n{s}", .{ old, text });
+        c.gpa.free(old);
+        c.say_text = both;
+    } else {
+        c.say_text = try c.gpa.dupe(u8, text);
+        c.say_connecting = !c.ready;
+        const wait: i96 = if (c.ready) 0 else 15 * std.time.ns_per_s;
+        c.say_after = .{ .nanoseconds = now.nanoseconds + wait };
+    }
+    ed.wake_fn();
+}
+
+/// Something is on its way to Claude's prompt: frames have to come.
+pub fn saying(c: *const Claude) bool {
+    return c.say_text != null or c.say_enter != null;
+}
+
+fn tickSay(c: *Claude, ed: *Editor) void {
+    if (!c.saying()) return;
+    const t = c.term orelse {
+        if (c.say_text) |s| c.gpa.free(s);
+        c.say_text = null;
+        c.say_enter = null;
+        return;
+    };
+    const now = Io.Timestamp.now(ed.io, .awake);
+    if (c.say_enter) |at| {
+        if (now.nanoseconds < at.nanoseconds) return;
+        c.say_enter = null;
+        t.sendKey(.{ .key = .{ .special = .enter }, .mods = .{} });
+        return;
+    }
+    if (c.say_connecting and c.ready) {
+        // Connected: its prompt is drawn a moment later.
+        c.say_connecting = false;
+        c.say_after = .{ .nanoseconds = now.nanoseconds + 700 * std.time.ns_per_ms };
+    }
+    if (now.nanoseconds < c.say_after.nanoseconds) return;
+    const text = c.say_text.?;
+    c.say_text = null;
+    defer c.gpa.free(text);
+    t.paste(text);
+    c.say_enter = .{ .nanoseconds = now.nanoseconds + 150 * std.time.ns_per_ms };
 }
 
 fn handle(c: *Claude, ed: *Editor, conn: u32, text: []const u8) !void {

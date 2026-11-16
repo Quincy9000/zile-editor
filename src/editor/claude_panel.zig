@@ -20,6 +20,8 @@ const Editor = @import("../Editor.zig");
 const row_model = @import("row_model.zig");
 const code_motion = @import("code_motion.zig");
 const prompts = @import("prompts.zig");
+const run_popup = @import("run_popup.zig");
+const claude_chat = @import("claude_chat.zig");
 const git_ops = @import("git_ops.zig");
 const lsp_ops = @import("lsp_ops.zig");
 const diagnostics = lsp_ops.diagnostics;
@@ -285,31 +287,82 @@ pub fn claudeTarget(ed: *Editor) !?ClaudeTarget {
     return .{ .path = abs, .lines = lines };
 }
 
-/// `SPC a i`: asks for an instruction to send along with the selection.
+/// `SPC a i`: a floating vim buffer for something to tell Claude, without
+/// going to its panel. Enter sends it and closes the box (the cursor stays
+/// in the code); Esc is normal mode, and there closes it. Opened on a
+/// selection, the message starts with those lines (`@path#L3-9`).
 pub fn claudeAskPrompt(ed: *Editor) !void {
-    const target = try claudeTarget(ed) orelse return;
+    if (ed.cmd_float != null) return;
     if (ed.claude_ask) |a| ed.gpa.free(a.path);
-    ed.claude_ask = .{ .path = target.path, .lines = target.lines };
-    prompts.startSearch(ed, true, .ask_claude);
+    ed.claude_ask = null;
+    if (ed.mode == .visual) {
+        if (ed.window.term == null) if (ed.buffer.path) |path| {
+            const t = ed.text();
+            const lines: [2]usize = .{ t.lineOf(@min(ed.view.anchor, ed.view.cursor)), t.lineOf(@max(ed.view.anchor, ed.view.cursor)) };
+            ed.claude_ask = .{ .path = try ed.absolutePath(path), .lines = lines };
+        };
+        code_motion.exitVisual(ed);
+    }
+    try run_popup.editCommand(ed, "", .claude, null);
 }
 
-pub fn finishAskClaude(ed: *Editor) !void {
-    const raw = try git_ops.takePromptText(ed) orelse return;
-    defer ed.gpa.free(raw);
-    const ask = ed.claude_ask orelse return;
+/// The box, started with `text` (a slash command taken from the picker),
+/// to go on typing after it.
+pub fn claudeAskWith(ed: *Editor, text: []const u8) !void {
+    if (ed.cmd_float != null) run_popup.closeCommandEditor(ed);
+    if (ed.claude_ask) |a| ed.gpa.free(a.path);
     ed.claude_ask = null;
-    defer ed.gpa.free(ask.path);
-    const instruction = std.mem.trim(u8, raw, " \t");
+    try run_popup.editCommand(ed, text, .claude, null);
+    ed.setMode(.insert);
+    ed.setCursor(ed.text().len());
+}
+
+/// The box's title: what it is, and the lines it was opened on.
+pub fn tellTitle(ed: *const Editor, buf: []u8) []const u8 {
+    const ask = ed.claude_ask orelse return "Tell Claude";
+    const lines = ask.lines orelse return "Tell Claude";
+    const name = std.fs.path.basename(ask.path);
+    return (if (lines[0] == lines[1])
+        std.fmt.bufPrint(buf, "Tell Claude about {s}:{d}", .{ name, lines[0] + 1 })
+    else
+        std.fmt.bufPrint(buf, "Tell Claude about {s}:{d}-{d}", .{ name, lines[0] + 1, lines[1] + 1 })) catch "Tell Claude";
+}
+
+/// What is typed into Claude's prompt for `text`: after the lines the box
+/// was opened on, as Claude writes them itself (`@src/a.zig#L3-9`, the path
+/// from the folder Claude runs in). Caller frees.
+pub fn tellMessage(ed: *Editor, text: []const u8) ![]u8 {
+    const ask = ed.claude_ask orelse return ed.gpa.dupe(u8, text);
+    const lines = ask.lines orelse return ed.gpa.dupe(u8, text);
+    const root = project_ops.projectRoot(ed);
+    const path = if (ask.path.len > root.len + 1 and std.mem.startsWith(u8, ask.path, root) and ask.path[root.len] == '/') ask.path[root.len + 1 ..] else ask.path;
+    if (lines[0] == lines[1]) return std.fmt.allocPrint(ed.gpa, "@{s}#L{d} {s}", .{ path, lines[0] + 1, text });
+    return std.fmt.allocPrint(ed.gpa, "@{s}#L{d}-{d} {s}", .{ path, lines[0] + 1, lines[1] + 1, text });
+}
+
+/// Enter in the box: `text` goes to Claude and is sent. The panel is shown
+/// (started, if need be) but the window the box was opened from keeps the
+/// keyboard.
+pub fn tellClaude(ed: *Editor, text: []const u8) !void {
+    const message = try tellMessage(ed, text);
+    defer ed.gpa.free(message);
+    if (ed.claude_ask) |a| ed.gpa.free(a.path);
+    ed.claude_ask = null;
+    // Claude's own terminal, if that is what is on screen; else the
+    // conversation zile draws.
+    const term_shown = if (ed.claude) |c| (if (c.term) |t| window_ops.windowShowing(ed, t) != null else false) else false;
+    if (!term_shown) return claude_chat.tell(ed, message);
+    const back = ed.window;
     try showClaude(ed);
-    const c = ed.claude.?;
-    c.mention(ask.path, ask.lines);
-    // Typed into Claude's prompt, after the mention; <CR> in the panel sends it.
-    if (instruction.len > 0) if (c.term) |t| t.paste(instruction);
+    for (ed.window_list.items) |w| if (w == back) window_ops.focusWindow(ed, back);
+    try ed.claude.?.say(ed, message);
 }
 
 /// `SPC a y` / `SPC a n`: accepts or rejects the proposal shown (or shows
 /// the first one waiting, if another buffer is shown).
 pub fn claudeResolve(ed: *Editor, accept: bool) void {
+    // A tool of the conversation's waiting for permission comes first.
+    if (claude_chat.answer(ed, accept)) return;
     const c = ed.claude orelse return ed.setMessage(.info, "no proposed changes", .{});
     if (c.diffFor(ed.buffer)) |i| return c.resolve(ed, i, accept);
     if (c.diffs.items.len == 0) return ed.setMessage(.info, "no proposed changes", .{});

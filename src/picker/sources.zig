@@ -37,6 +37,8 @@ const inlay = @import("../editor/inlay.zig");
 const jumplist = @import("../editor/jumplist.zig");
 const browser = @import("../editor/browser.zig");
 const picker_ops = @import("../editor/picker_ops.zig");
+const claude_chat = @import("../editor/claude_chat.zig");
+const Chat = @import("../ai/Chat.zig");
 const picker_query = @import("../editor/picker_query.zig");
 const quickfix_list = @import("../editor/quickfix_list.zig");
 const run_popup = @import("../editor/run_popup.zig");
@@ -44,7 +46,7 @@ const prompts = @import("../editor/prompts.zig");
 const git_ops = @import("../editor/git_ops.zig");
 const lsp_actions = @import("../editor/lsp_actions.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, files_global, debug, stored_data };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_ask, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, files_global, debug, stored_data };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -91,6 +93,12 @@ fn Impl(comptime kind: Kind) type {
         .leader => Leader,
         .leader_projects => ProjectsMenu,
         .leader_claude => ClaudeMenu,
+        .claude_ask => ClaudeAsk,
+        .claude_commands => ClaudeList(.commands),
+        .claude_models => ClaudeList(.models),
+        .claude_modes => ClaudeList(.modes),
+        .claude_efforts => ClaudeList(.efforts),
+        .claude_usage => ClaudeList(.usage),
         .leader_quit => QuitMenu,
         .files_global => GlobalFiles,
         .debug => Debug,
@@ -394,6 +402,8 @@ const Leader = Menu("Leader", &.{
     .{ .key = 't', .label = "Toggles", .command = "pick_toggles" },
     .{ .key = 'p', .label = "Projects (and their sessions)", .command = "switch_project" },
     .{ .key = 'a', .label = "Claude", .command = "claude_menu" },
+    .{ .key = 'n', .label = "Notes: the scratch pads", .command = "toggle_scratch" },
+    .{ .key = 'x', .label = "Errors and warnings in the project", .command = "list_diagnostics" },
     .{ .key = '\'', .label = "Resume the last picker", .command = "resume_picker" },
     .{ .key = ',', .label = "Last jump (again: back)", .command = "jump_toggle" },
     .{ .key = 's', .label = "Save", .command = "save_file" },
@@ -410,11 +420,19 @@ const ProjectsMenu = Menu("Projects", &.{
 
 /// `SPC a`.
 const ClaudeMenu = Menu("Claude", &.{
-    .{ .key = 'a', .label = "Claude panel", .command = "claude_panel" },
+    .{ .key = 'a', .label = "Claude (the conversation, drawn here)", .command = "claude_chat" },
+    .{ .key = '/', .label = "Slash commands", .command = "claude_commands" },
+    .{ .key = 'm', .label = "Model", .command = "claude_model" },
+    .{ .key = 'e', .label = "Effort (how hard it thinks)", .command = "claude_effort" },
+    .{ .key = 'p', .label = "Permission mode (ask first, accept edits, plan)", .command = "claude_mode" },
+    .{ .key = 'u', .label = "Usage (your limits, the context)", .command = "claude_usage" },
+    .{ .key = 'x', .label = "Stop what Claude is doing", .command = "claude_stop" },
+    .{ .key = 'c', .label = "A new conversation", .command = "claude_new" },
+    .{ .key = 't', .label = "Claude's own terminal", .command = "claude_panel" },
     .{ .key = 's', .label = "Send the file / selection", .command = "claude_send" },
-    .{ .key = 'i', .label = "Ask about it...", .command = "claude_ask" },
-    .{ .key = 'y', .label = "Accept the proposal", .command = "claude_accept" },
-    .{ .key = 'n', .label = "Reject the proposal", .command = "claude_reject" },
+    .{ .key = 'i', .label = "Tell Claude... (a box: Enter sends, you stay in the code)", .command = "claude_ask" },
+    .{ .key = 'y', .label = "Yes: allow the tool / accept the proposal", .command = "claude_accept" },
+    .{ .key = 'n', .label = "No: refuse the tool / reject the proposal", .command = "claude_reject" },
 });
 
 /// `SPC Q`.
@@ -724,6 +742,135 @@ const Toggles = struct {
         if (item.id >= commands.all.len) return;
         const c = &commands.all[item.id];
         try out.text.print(ed.gpa, "{s}\n\n(command: {s})", .{ c.doc, c.name });
+    }
+};
+
+/// `SPC a /`, `m`, `e`, `p`, `u`: what the CLI says it has (its slash
+/// commands, its models, the model's effort levels), the permission modes,
+/// and how much is used, each a list to pick from (usage: to look at).
+fn ClaudeList(comptime which: claude_chat.Menu) type {
+    return struct {
+        pub const title = switch (which) {
+            .commands => "Claude: slash commands",
+            .models => "Claude: model",
+            .modes => "Claude: permission mode",
+            .efforts => "Claude: effort",
+            .usage => "Claude: usage",
+        };
+        pub const prefix: ?u8 = null;
+        pub const start_mode: StartMode = if (which == .commands) .insert else .normal;
+
+        const Row = struct { text: []const u8, detail: []const u8 = "", current: bool = false };
+
+        /// The rows, in `a`.
+        fn rows(ed: *Editor, a: std.mem.Allocator) ![]const Row {
+            const c = ed.chat orelse return &.{};
+            var list: std.ArrayList(Row) = .empty;
+            switch (which) {
+                .commands => for (c.commands) |r| try list.append(a, .{ .text = try std.fmt.allocPrint(a, "/{s}", .{r.name}), .detail = r.description }),
+                .models => for (c.models) |r| try list.append(a, .{
+                    .text = if (r.title.len > 0) r.title else r.name,
+                    .detail = r.description,
+                    .current = if (c.want_model) |m| std.mem.eql(u8, m, r.name) else false,
+                }),
+                .modes => for (Chat.modes) |r| try list.append(a, .{ .text = r.title, .detail = r.description, .current = std.mem.eql(u8, c.mode, r.name) }),
+                .efforts => for (c.efforts()) |level| try list.append(a, .{ .text = level, .current = std.mem.eql(u8, c.effort, level) }),
+                .usage => {
+                    const u = c.usage;
+                    var tb: [64]u8 = undefined;
+                    if (u.five_hour) |pct| try list.append(a, .{
+                        .text = try std.fmt.allocPrint(a, "5-hour limit    {d:.0}% used", .{pct}),
+                        .detail = try a.dupe(u8, claude_chat.until(ed, u.five_hour_resets, &tb)),
+                    });
+                    if (u.week) |pct| try list.append(a, .{
+                        .text = try std.fmt.allocPrint(a, "Weekly limit    {d:.0}% used", .{pct}),
+                        .detail = try a.dupe(u8, claude_chat.until(ed, u.week_resets, &tb)),
+                    });
+                    if (u.context_max > 0) try list.append(a, .{
+                        .text = try std.fmt.allocPrint(a, "Context         {d}% full", .{u.context_tokens * 100 / u.context_max}),
+                        .detail = try std.fmt.allocPrint(a, "{d}k of {d}k tokens", .{ u.context_tokens / 1000, u.context_max / 1000 }),
+                    });
+                    try list.append(a, .{
+                        .text = try std.fmt.allocPrint(a, "This conversation  ${d:.2}", .{c.cost}),
+                        .detail = if (c.model.len > 0) try std.fmt.allocPrint(a, "{s}{s}{s}", .{ c.model, if (c.effort.len > 0) ", effort " else "", c.effort }) else "",
+                    });
+                },
+            }
+            return list.items;
+        }
+
+        pub fn fill(ed: *Editor, items: *Items) !void {
+            var arena: std.heap.ArenaAllocator = .init(ed.gpa);
+            defer arena.deinit();
+            for (try rows(ed, arena.allocator()), 0..) |r, i| {
+                // The one in use is marked.
+                var db: [220]u8 = undefined;
+                const short = r.detail[0..@min(r.detail.len, 180)];
+                const detail = if (r.current) std.fmt.bufPrint(&db, "● {s}", .{short}) catch short else short;
+                try items.append(.{ .text = r.text, .detail = detail, .id = @intCast(i) });
+            }
+        }
+
+        pub fn accept(ed: *Editor, item: Item) !void {
+            try claude_chat.menuPick(ed, which, item.id);
+        }
+
+        pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+            var arena: std.heap.ArenaAllocator = .init(ed.gpa);
+            defer arena.deinit();
+            const all = try rows(ed, arena.allocator());
+            if (item.id >= all.len) return;
+            try out.text.print(ed.gpa, "{s}\n\n{s}", .{ all[item.id].text, all[item.id].detail });
+        }
+    };
+}
+
+/// `SPC a y` while Claude waits for an answer: what a tool that wants
+/// permission may do, or the options of a question of Claude's own. The
+/// preview says what is being asked.
+const ClaudeAsk = struct {
+    pub const title = "Claude asks";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const c = ed.chat orelse return;
+        const a = c.asking() orelse return;
+        if (a.question) {
+            var arena: std.heap.ArenaAllocator = .init(ed.gpa);
+            defer arena.deinit();
+            const q = c.question(arena.allocator()) orelse return;
+            for (q.options, 0..) |o, i| try items.append(.{ .text = o.label, .detail = o.description, .id = @intCast(i) });
+            return;
+        }
+        for (claude_chat.permission_rows, 0..) |row, i| {
+            if (i == 1 and a.suggestions == null) continue;
+            try items.append(.{ .text = row, .detail = a.tool, .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        try claude_chat.pick(ed, item.id);
+    }
+
+    pub fn preview(ed: *Editor, _: *const Item, out: *Preview) !void {
+        const c = ed.chat orelse return;
+        const a = c.asking() orelse return;
+        var arena: std.heap.ArenaAllocator = .init(ed.gpa);
+        defer arena.deinit();
+        if (c.question(arena.allocator())) |q| {
+            try out.text.print(ed.gpa, "{s}\n", .{q.text});
+            for (q.options) |o| try out.text.print(ed.gpa, "\n{s}\n    {s}\n", .{ o.label, o.description });
+            return;
+        }
+        try out.text.print(ed.gpa, "Claude asks to use {s}:\n\n", .{a.tool});
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), a.input, .{}) catch return;
+        if (v != .object) return;
+        var it = v.object.iterator();
+        while (it.next()) |e| switch (e.value_ptr.*) {
+            .string => |s| try out.text.print(ed.gpa, "{s}:\n{s}\n\n", .{ e.key_ptr.*, s }),
+            else => {},
+        };
     }
 };
 
@@ -1841,7 +1988,7 @@ const GlobalFiles = struct {
 const Buffers = struct {
     pub const title = "Buffers";
     pub const prefix: ?u8 = null;
-    pub const start_mode: StartMode = .insert;
+    pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         try OpenRows.fill(ed, items, false);
@@ -1960,6 +2107,31 @@ const OpenRows = struct {
         }
     }
 
+    /// `X`: every buffer closed, but those with unsaved changes (an empty
+    /// one is left when all have gone).
+    fn closeAll(ed: *Editor, _: ?Item) anyerror!void {
+        var closed: usize = 0;
+        var kept: usize = 0;
+        // (Closing the last one leaves a new empty buffer: once round only.)
+        var i = ed.buffers.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (i >= ed.buffers.items.len) continue;
+            const b = ed.buffers.items[i];
+            if (b.modified) {
+                kept += 1;
+                continue;
+            }
+            if (b.path == null and b.label == null and b.text.len() == 0) continue; // already the empty one
+            try ed.killBuffer(b);
+            closed += 1;
+        }
+        if (kept > 0)
+            ed.setMessage(.info, "closed {d}; {d} with unsaved changes kept (S saves all)", .{ closed, kept })
+        else
+            ed.setMessage(.info, "closed {d} buffer{s}", .{ closed, if (closed == 1) "" else "s" });
+    }
+
     fn save(ed: *Editor, item: ?Item) anyerror!void {
         const b = bufferOf(ed, item) orelse return ed.setMessage(.info, "not open: nothing to save", .{});
         if (b.path == null) return ed.setMessage(.err, "no file name: save it as (w)", .{});
@@ -1992,6 +2164,7 @@ const OpenRows = struct {
         .{ .label = "revert from disk", .key = 'R', .run = onBuffer("revert_buffer") },
         .{ .label = "delete the file...", .key = 'D', .run = onBuffer("delete_file") },
         .{ .label = "close the others", .key = 'o', .stay = true, .any = true, .run = closeOthers },
+        .{ .label = "close all", .key = 'X', .stay = true, .any = true, .run = closeAll },
         .{ .label = "copy path", .key = 'y', .stay = true, .run = copyPath(false) },
         .{ .label = "copy absolute path", .key = 'Y', .stay = true, .run = copyPath(true) },
     };
@@ -2252,6 +2425,15 @@ const Diagnostics = struct {
                     const first_line = std.mem.sliceTo(d.message, '\n');
                     try items.append(.{ .text = first_line, .detail = where, .id = @intFromEnum(d.severity) });
                 }
+            }
+        }
+        // And what zile's own compile check of a Zig file found (the errors
+        // the language server doesn't see): they show in the file too.
+        for (ed.check_results.items) |r| {
+            const path = r.buffer.path orelse continue;
+            for (r.diags) |d| {
+                const where = std.fmt.bufPrint(&detail, "{s}:{d}:{d}", .{ path, d.line + 1, d.col + 1 }) catch continue;
+                try items.append(.{ .text = std.mem.sliceTo(d.message, '\n'), .detail = where, .id = @intFromEnum(d.severity) });
             }
         }
     }

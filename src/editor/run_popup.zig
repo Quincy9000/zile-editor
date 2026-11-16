@@ -17,6 +17,8 @@ const Debugger = @import("../Debugger.zig");
 const debugging = @import("../debugging.zig");
 const run_errors_mod = @import("../terminal/errors.zig");
 const formatting = @import("formatting.zig");
+const completion_ops = @import("completion_ops.zig");
+const claude_panel = @import("claude_panel.zig");
 const window_ops = @import("window_ops.zig");
 const project_ops = @import("project_ops.zig");
 const inlay = @import("inlay.zig");
@@ -140,6 +142,8 @@ pub fn termNormalKey(ed: *Editor, t: *Terminal, ev: KeyEvent) bool {
             else => {},
         },
         .special => |sp| switch (sp) {
+            // Out of the terminal altogether: back to the code.
+            .escape => leaveTerminal(ed),
             .enter => ed.window.term_normal = false,
             .down => t.scroll(1),
             .up => t.scroll(-1),
@@ -147,6 +151,20 @@ pub fn termNormalKey(ed: *Editor, t: *Terminal, ev: KeyEvent) bool {
         },
     }
     return true;
+}
+
+/// From a terminal window to the code window last used, leaving the
+/// terminal open and typing again when it is come back to. With no code
+/// window to go to (the shell took the only one), its normal mode.
+pub fn leaveTerminal(ed: *Editor) void {
+    const w = ed.window;
+    window_ops.focusEditorWindow(ed);
+    w.term_normal = ed.window == w;
+    ed.mode = .normal;
+}
+
+fn isCtrlW(ev: KeyEvent) bool {
+    return ev.mods.ctrl and !ev.mods.alt and !ev.mods.shift and ev.key == .codepoint and ev.key.codepoint == 'w';
 }
 
 pub fn isCtrlBackslash(ev: KeyEvent) bool {
@@ -157,16 +175,31 @@ pub fn isCtrlBackslash(ev: KeyEvent) bool {
 /// true when the key was used.
 pub fn popupKey(ed: *Editor, ev: KeyEvent) bool {
     if (ed.popup == null) {
-        // A terminal window (the Claude panel) has the keyboard.
-        if (ed.window.term) |t| {
+        // A terminal window (the Claude panel) has the keyboard, unless a
+        // picker or a prompt opened over it (the leader menu from its normal
+        // mode): their keys are theirs.
+        const over = ed.picker != null or ed.search_prompt != null or ed.cmd_float != null;
+        if (ed.window.term) |t| if (!over) {
             // Normal mode: SPC and what follows go to the keymap; i/a type
-            // again, j/k and Ctrl-d/u scroll, other keys do nothing.
-            if (ed.window.term_normal) return ed.pending_len == 0 and termNormalKey(ed, t, ev);
-            // Ctrl-\: back to the code, the panel staying open. Ctrl-C: close
+            // again, j/k and Ctrl-d/u scroll, Esc, Ctrl-w and Ctrl-\ go back
+            // to the code, other keys do nothing.
+            if (ed.window.term_normal) {
+                if (isCtrlBackslash(ev) or isCtrlW(ev)) {
+                    leaveTerminal(ed);
+                    return true;
+                }
+                return ed.pending_len == 0 and termNormalKey(ed, t, ev);
+            }
+            // Ctrl-w in the Claude panel (Ctrl-\ in any terminal window): back
+            // to the code, the panel staying open. (Claude still deletes a
+            // word with Ctrl-Backspace or Alt-Backspace.) Esc Esc: its
+            // normal mode (scrolling, SPC commands). Ctrl-C: close
             // the panel (it keeps running; SPC a a brings it back). Claude
             // interrupts with Esc; Ctrl-Shift-C sends it a real Ctrl-C.
             const ctrl_c = ev.mods.ctrl and !ev.mods.alt and ev.key == .codepoint and (ev.key.codepoint == 'c' or ev.key.codepoint == 'C');
-            if (isCtrlBackslash(ev) or doubleEsc(ed, t, ev)) {
+            if (isCtrlBackslash(ev) or (isCtrlW(ev) and window_ops.isClaudeTerm(ed, t))) {
+                leaveTerminal(ed);
+            } else if (doubleEsc(ed, t, ev)) {
                 ed.window.term_normal = true;
                 ed.mode = .normal;
             } else if (ctrl_c and !ev.mods.shift and window_ops.isClaudeTerm(ed, t)) {
@@ -175,11 +208,12 @@ pub fn popupKey(ed: *Editor, ev: KeyEvent) bool {
                 t.sendKey(.{ .key = .{ .codepoint = 'c' }, .mods = .{ .ctrl = true } });
             } else termKey(ed, t, ev);
             return true;
-        }
+        };
         if (isCtrlBackslash(ev) and ed.mode == .normal) {
             // To the terminal window if there is one, else the shell popup.
             for (ed.window_list.items) |w| if (w.term != null) {
                 window_ops.focusWindow(ed, w);
+                w.term_normal = false; // typing, as it was left
                 return true;
             };
             toggleShell(ed) catch |err| ed.setMessage(.err, "could not start the shell: {s}", .{@errorName(err)});
@@ -307,7 +341,31 @@ pub fn closeCommandEditor(ed: *Editor) void {
 
 /// In the command editor's normal mode: <CR> runs, <Esc> cancels.
 pub fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
-    if (ed.cmd_float == null or ed.window != ed.cmd_float.? or ed.mode != .normal or !ed.isIdle()) return false;
+    if (ed.cmd_float == null or ed.window != ed.cmd_float.?) return false;
+    // Telling Claude: Enter sends while typing too (Shift- or Alt-Enter is
+    // a new line; Enter still takes a completion that is showing).
+    // A `/` first in the box: Claude's slash commands, to pick from.
+    if (ed.cmd_purpose == .claude and ed.mode == .insert and ed.pending_len == 0 and ed.text().len() == 0 and
+        ev.key == .codepoint and ev.key.codepoint == '/' and !ev.mods.ctrl and !ev.mods.alt)
+    {
+        const claude_chat = @import("claude_chat.zig");
+        const known = if (ed.chat) |c| c.commands.len > 0 else false;
+        if (known) {
+            closeCommandEditor(ed);
+            claude_chat.menu(ed, .commands) catch {};
+            return true;
+        }
+    }
+    if (ed.cmd_purpose == .claude and ed.mode == .insert and ed.pending_len == 0 and
+        ev.key == .special and ev.key.special == .enter and !ev.mods.ctrl)
+    {
+        if (ev.mods.shift or ev.mods.alt) {
+            ed.processKey(.{ .key = ev.key, .mods = .{} });
+            return true;
+        }
+        if (completion_ops.completionShown(ed) != null) return false;
+        ed.setMode(.normal);
+    } else if (ed.mode != .normal or !ed.isIdle()) return false;
     if (ed.cursors.items.len > 0) return false; // <Esc> first drops extra cursors
     if (ev.mods.any() or ev.key != .special) return false;
     switch (ev.key.special) {
@@ -323,6 +381,7 @@ pub fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
             if (cmd.len == 0) return true;
             const one_line = std.mem.indexOfScalar(u8, cmd, '\n') == null;
             (switch (purpose) {
+                .claude => claude_panel.tellClaude(ed, cmd),
                 .run => startRun(ed, cmd),
                 // The history is a line per command.
                 .runner => if (one_line) runFromRunner(ed, cmd) else startRun(ed, cmd),

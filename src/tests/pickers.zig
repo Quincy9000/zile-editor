@@ -119,12 +119,12 @@ test "pickers as menus: buffers' actions, the S-Tab menu, toggles, row keys" {
     var ed = try testEditor("main");
     defer ed.deinit();
     // Buffers: n makes one, x closes it, the list stays open and shows it.
-    try ed.feed("<Space>b<Esc>n");
+    try ed.feed("<Space>bn");
     try testing.expectEqual(null, ed.picker);
     try testing.expectEqual(2, ed.buffers.items.len);
     try ed.feed("<Space>b");
     settlePicker(&ed);
-    try ed.feed("<C-x>"); // while typing: Ctrl-x closes the selected one
+    try ed.feed("<C-x>"); // Ctrl-x closes the selected one (as while typing)
     settlePicker(&ed);
     try testing.expectEqual(1, ed.buffers.items.len);
     try testing.expect(ed.picker != null);
@@ -408,4 +408,53 @@ test "pickers: Tab goes through the scopes, as Ctrl-t does" {
     try testing.expect(second != first);
     try ed.feed("<C-t>");
     try testing.expect(ed.picker.?.kind != second);
+}
+
+test "buffers: X closes them all, but those with unsaved changes" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("src/pairs.zig");
+    try ed.openFile("src/format.zig");
+    try ed.feed("<cmd:new_buffer>iunsaved<Esc>");
+    try testing.expectEqual(3, ed.buffers.items.len);
+    try ed.feed("<Space>b");
+    settlePicker(&ed);
+    try ed.feed("X");
+    settlePicker(&ed);
+    try testing.expectEqual(1, ed.buffers.items.len); // the unsaved one stays
+    try testing.expect(ed.buffers.items[0].modified);
+    try testing.expect(ed.picker != null);
+    // With nothing unsaved, an empty buffer is what is left.
+    ed.buffers.items[0].modified = false;
+    try ed.feed("X");
+    settlePicker(&ed);
+    try testing.expectEqual(1, ed.buffers.items.len);
+    try testing.expectEqual(0, ed.buffers.items[0].text.len());
+    try testing.expectEqual(null, ed.buffers.items[0].path);
+}
+
+test "SPC x is the project's errors and warnings" {
+    var ed = try testEditor("code");
+    defer ed.deinit();
+    try ed.feed("<Space>x");
+    try testing.expectEqual(.diagnostics, ed.picker.?.kind);
+    try ed.feed("<Esc>");
+    if (ed.picker != null) try ed.feed("<Esc>");
+    try testing.expectEqual(null, ed.picker);
+}
+
+test "the errors list has what zile's own Zig check found, not only the server's" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("src/pairs.zig");
+    const Diagnostic = @import("../lsp/Lsp.zig").Diagnostic;
+    const diags = try ed.gpa.alloc(Diagnostic, 2);
+    diags[0] = .{ .line = 2, .col = 4, .end_line = 2, .end_col = 5, .severity = .err, .message = try ed.gpa.dupe(u8, "expected type 'u8'") };
+    diags[1] = .{ .line = 9, .col = 0, .end_line = 9, .end_col = 3, .severity = .err, .message = try ed.gpa.dupe(u8, "unused local constant") };
+    try ed.check_results.append(ed.gpa, .{ .buffer = ed.buffer, .diags = diags, .libc = false });
+    try ed.feed("<Space>x");
+    settlePicker(&ed);
+    try testing.expectEqual(2, ed.picker.?.rowCount());
+    try testing.expectEqualStrings("src/pairs.zig:10:1", ed.picker.?.itemAt(1).?.detail);
+    try ed.feed("<Esc>");
 }

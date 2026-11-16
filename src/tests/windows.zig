@@ -27,23 +27,64 @@ test "SPC q: closes the window, then buffers, then the editor" {
     try testing.expect(ed.should_quit);
 }
 
-test "scratch pad: SPC t s opens it below, again closes it (saved)" {
+test "scratch pads: SPC t s lists them; Tab writes in one (saved), n makes another, x x deletes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    try tmp.dir.createDirPath(testing.io, "scratch");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "scratch/todo.md", .data = "buy milk\n" });
     var ed = try testEditor("code");
     defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
     ed.state_dir = dir;
+    const p = &ed.pad_panel;
     try ed.feed("<cmd:toggle_scratch>");
-    try testing.expectEqual(2, ed.window_list.items.len);
+    try testing.expect(p.shown and p.focus);
+    try testing.expectEqual(1, ed.window_list.items.len); // a panel, not a split
+    // The first pad (there is always one), then the others by name.
+    try testing.expectEqual(2, ed.pad_list.pads.items.len);
+    try testing.expectEqualStrings("scratch", ed.pad_list.pads.items[0].name);
+    try testing.expectEqualStrings("todo", ed.pad_list.pads.items[1].name);
+    // The selected one's text is what shows.
+    try ed.feed("j");
+    ed.tick();
+    try testing.expectEqualStrings("buy milk\n", ed.pad_list.text.items);
+    // Tab: into the file itself; Tab back saves it.
+    try ed.feed("k<Tab>");
+    try testing.expect(Editor.side_float.focused(&ed));
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "scratch.md"));
-    try ed.feed("inote<Esc><cmd:toggle_scratch>");
-    try testing.expectEqual(1, ed.window_list.items.len);
+    try ed.feed("inote<Esc><Tab>");
+    try testing.expectEqual(null, ed.side_window);
+    try testing.expect(p.shown and p.focus);
     try expectText(&ed, "code");
     const saved = try tmp.dir.readFileAlloc(testing.io, "scratch.md", testing.allocator, .limited(1024));
     defer testing.allocator.free(saved);
     try testing.expectEqualStrings("note\n", saved);
+    ed.tick();
+    try testing.expectEqualStrings("note", std.mem.trimEnd(u8, ed.pad_list.text.items, "\n"));
+    // n: a new pad, gone into to write.
+    try ed.feed("nideas<CR>");
+    try testing.expectEqual(3, ed.pad_list.pads.items.len);
+    try testing.expectEqualStrings("ideas", ed.pad_list.pads.items[p.sel].name);
+    try testing.expectEqual(Editor.Mode.insert, ed.mode);
+    try ed.feed("a zig thing<Esc><Esc>");
+    const ideas = try tmp.dir.readFileAlloc(testing.io, "scratch/ideas.md", testing.allocator, .limited(1024));
+    defer testing.allocator.free(ideas);
+    try testing.expectEqualStrings("a zig thing\n", ideas);
+    // y copies the pad; x asks, x again deletes.
+    ed.tick();
+    try ed.feed("y");
+    try testing.expectEqualStrings("a zig thing", std.mem.trimEnd(u8, ed.registers.get(null).?.text, "\n"));
+    try ed.feed("x");
+    try testing.expectEqual(3, ed.pad_list.pads.items.len);
+    try ed.feed("x");
+    try testing.expectEqual(2, ed.pad_list.pads.items.len);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "scratch/ideas.md", .{}));
+    // Esc hides the panel; the code is as it was.
+    try ed.feed("<Esc>");
+    try testing.expect(!p.shown);
+    try expectText(&ed, "code");
 }
 
 test "SPC Q s saves every modified buffer, then quits; SPC q checks all buffers" {
@@ -266,4 +307,18 @@ test "QQ quits without asking, even with unsaved changes; Qq still records" {
     try testing.expect(!ed.should_quit);
     try ed.feed("QQ");
     try testing.expect(ed.should_quit);
+}
+
+test "SPC n is the scratch pads" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    var ed = try testEditor("code");
+    defer ed.deinit();
+    ed.state_dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    try ed.feed("<Space>n");
+    try testing.expectEqual(null, ed.picker);
+    try testing.expect(ed.pad_panel.shown and ed.pad_panel.focus);
+    try ed.feed("q");
+    try testing.expect(!ed.pad_panel.shown);
 }

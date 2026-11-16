@@ -45,6 +45,7 @@ const folding = @import("editor/folding.zig");
 const code_motion = @import("editor/code_motion.zig");
 const row_search = @import("editor/row_search.zig");
 const replacing = @import("editor/replacing.zig");
+const claude_chat = @import("editor/claude_chat.zig");
 const prompts = @import("editor/prompts.zig");
 const git_ops = @import("editor/git_ops.zig");
 const snippet_ops = @import("editor/snippet_ops.zig");
@@ -228,7 +229,7 @@ const base = [_]Command{
     .{ .name = "redo", .doc = "Redo", .run = redo , .once = true },
     .{ .name = "append_semicolon", .doc = "Add ; at the end of the line", .run = appendSemicolon },
     .{ .name = "select_last_change", .doc = "Select the last change or yank", .run = selectLastChange, .once = true },
-    .{ .name = "toggle_scratch", .doc = "Scratch pad", .run = toggleScratch, .once = true },
+    .{ .name = "toggle_scratch", .doc = "Scratch pads (notes)", .run = toggleScratch, .once = true },
     .{ .name = "repeat_change", .doc = "Repeat last change", .run = repeatChange , .once = true },
     .{ .name = "record_macro", .doc = "Record macro (Q again to stop; QQ quits without saving)", .run = recordMacro, .takes_char = true, .once = true },
     .{ .name = "play_macro", .doc = "Play macro (@@ for the last one)", .run = playMacro, .takes_char = true , .once = true },
@@ -326,9 +327,17 @@ const base = [_]Command{
     .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) , .jump = true },
     .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) , .jump = true },
     .{ .name = "switch_project", .doc = "Switch project", .run = openPicker(.projects), .once = true },
-    .{ .name = "claude_panel", .doc = "Claude Code panel", .run = claudeCmd(.panel), .once = true, .needs = "claude" },
+    .{ .name = "claude_chat", .doc = "Claude: the conversation (drawn by zile)", .run = claudeCmd(.chat), .once = true, .needs = "claude" },
+    .{ .name = "claude_commands", .doc = "Claude: its slash commands", .run = claudeCmd(.commands), .once = true, .needs = "claude" },
+    .{ .name = "claude_model", .doc = "Claude: the model that answers", .run = claudeCmd(.model), .once = true, .needs = "claude" },
+    .{ .name = "claude_mode", .doc = "Claude: how much it may do without asking", .run = claudeCmd(.mode), .once = true, .needs = "claude" },
+    .{ .name = "claude_effort", .doc = "Claude: how hard it thinks (effort)", .run = claudeCmd(.effort), .once = true, .needs = "claude" },
+    .{ .name = "claude_usage", .doc = "Claude: how much of your limits is used", .run = claudeCmd(.usage), .once = true, .needs = "claude" },
+    .{ .name = "claude_stop", .doc = "Claude: stop what it is doing", .run = claudeCmd(.stop), .once = true },
+    .{ .name = "claude_new", .doc = "Claude: a new conversation", .run = claudeCmd(.new), .once = true, .needs = "claude" },
+    .{ .name = "claude_panel", .doc = "Claude Code's own terminal", .run = claudeCmd(.panel), .once = true, .needs = "claude" },
     .{ .name = "claude_send", .doc = "Send selection/file to Claude", .run = claudeCmd(.send), .once = true, .needs = "claude" },
-    .{ .name = "claude_ask", .doc = "Ask Claude about the selection", .run = claudeCmd(.ask), .once = true, .needs = "claude" },
+    .{ .name = "claude_ask", .doc = "Tell Claude something (a box; Enter sends)", .run = claudeCmd(.ask), .once = true, .needs = "claude" },
     .{ .name = "claude_accept", .doc = "Accept Claude's change", .run = claudeCmd(.accept), .once = true },
     .{ .name = "claude_reject", .doc = "Reject Claude's change", .run = claudeCmd(.reject), .once = true },
     .{ .name = "terminal_window", .doc = "Terminal here (in this window)", .run = termCmd(.window), .once = true },
@@ -2132,12 +2141,20 @@ fn surroundStep(comptime step: enum { add, delete, change_from, change_to, visua
     }.run;
 }
 
-fn claudeCmd(comptime action: enum { panel, send, ask, accept, reject }) Handler {
+fn claudeCmd(comptime action: enum { chat, commands, model, mode, effort, usage, stop, new, panel, send, ask, accept, reject }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
                 .panel => claude_panel.toggleClaude(ed) catch |err| ed.setMessage(.err, "could not start Claude Code: {s}", .{@errorName(err)}),
+                .chat => try claude_chat.toggle(ed),
+                .commands => try claude_chat.menu(ed, .commands),
+                .model => try claude_chat.menu(ed, .models),
+                .mode => try claude_chat.menu(ed, .modes),
+                .effort => try claude_chat.menu(ed, .efforts),
+                .usage => try claude_chat.menu(ed, .usage),
+                .stop => claude_chat.stop(ed),
+                .new => try claude_chat.startOver(ed),
                 .send => try claude_panel.claudeMention(ed),
                 .ask => try claude_panel.claudeAskPrompt(ed),
                 .accept => claude_panel.claudeResolve(ed, true),
@@ -2620,7 +2637,7 @@ fn selectLastChange(c: Context) !void {
 }
 
 fn toggleScratch(c: Context) !void {
-    try c.ed.toggleScratch();
+    try @import("editor/pads.zig").toggle(c.ed);
 }
 
 fn gotoSymbol(c: Context) !void {

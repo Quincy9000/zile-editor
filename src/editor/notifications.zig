@@ -61,6 +61,8 @@ pub fn wantsFrames(ed: *const Editor) bool {
     for (ed.window_list.items) |w| if (w != ed.window and (w.view.scroll_offset != 0 or w.view.scroll_frac != 0)) return true;
     for (ed.toasts.items) |t| if (!t.busy) return true;
     if (ed.yank_flash != null) return true;
+    // Text on its way to Claude's prompt (its Enter follows a moment later).
+    if (ed.claude) |c| if (c.saying()) return true;
     // Hints waiting out their debounce: a frame has to come to ask for them.
     if (inlay.inlayHintsDue(ed)) return true;
     // A guide is waiting out its delay, or growing: frames have to come.

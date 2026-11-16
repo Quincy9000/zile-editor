@@ -767,3 +767,303 @@ test "terminal mode: the results grid's cell is the cursor (no terminal cursor o
     } else return error.TestUnexpectedResult;
     try std.testing.expect(std.meta.eql(grid.cells[at].fg, theme.cursor_text));
 }
+
+// ---------------------------------------------------------------------------
+// Claude's conversation (`SPC a a`)
+
+const Chat = @import("../ai/Chat.zig");
+
+/// Lines of `text` as they fit in `width` cells: broken at a space where
+/// there is one in the last third, else mid-word.
+const Wrap = struct {
+    text: []const u8,
+    width: usize,
+    i: usize = 0,
+    done: bool = false,
+
+    fn next(w: *Wrap) ?[]const u8 {
+        if (w.done) return null;
+        const rest = w.text[w.i..];
+        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const line = rest[0 .. nl orelse rest.len];
+        // The bytes that fit.
+        var cells_n: usize = 0;
+        var end: usize = 0;
+        var last_space: ?usize = null;
+        var it = Font.Utf8Lossy{ .bytes = line };
+        while (true) {
+            const at = it.i;
+            const cp = it.next() orelse {
+                end = line.len;
+                break;
+            };
+            const wide: usize = if (cp == '\t') 4 else 1;
+            if (cells_n + wide > w.width and at > 0) {
+                end = at;
+                if (last_space) |sp| if (sp * 3 >= at * 2) {
+                    end = sp + 1;
+                };
+                break;
+            }
+            if (cp == ' ') last_space = at;
+            cells_n += wide;
+        }
+        if (end == line.len) {
+            if (nl) |n| w.i += n + 1 else w.done = true;
+        } else w.i += end;
+        return line[0..end];
+    }
+};
+
+/// One line of text at (`x`, `y`), indentation kept, tabs as four cells.
+fn drawPlain(font: *const Font, line: []const u8, x: f32, y: f32, max_cells: usize, color: rl.Color) void {
+    var it = Font.Utf8Lossy{ .bytes = line };
+    var col: usize = 0;
+    while (it.next()) |cp| {
+        if (col >= max_cells) break;
+        if (cp == '\t') {
+            col += 4;
+            continue;
+        }
+        if (cp != ' ' and cp != '\r') font.drawCodepoint(cp, x + @as(f32, @floatFromInt(col)) * font.cell_w, y, color);
+        col += 1;
+    }
+}
+
+/// Where a two-sided bottom panel goes: docked above `bottom`, a title
+/// row, then rows on the left and text on the right.
+pub const PaneGeometry = struct {
+    by: f32,
+    bh: f32,
+    /// Rows of the panel, the title's included.
+    rows: usize,
+    total_cols: usize,
+    list_cols: usize,
+    /// The text side (where `side_float` puts its window).
+    text: Editor.Windows.Rect,
+};
+
+pub fn paneGeometry(font: *const Font, l: render.Layout, bottom: f32) ?PaneGeometry {
+    const cw = font.cell_w;
+    const ch = font.cell_h;
+    const total_cols: usize = @intFromFloat(l.width / cw);
+    const above: usize = @intFromFloat(@max(bottom, 0) / ch);
+    const rows = @min(listRows(font, l) + 2, above -| 2);
+    if (rows < 3 or total_cols < 20) return null;
+    const bh = @as(f32, @floatFromInt(rows)) * ch;
+    const by = bottom - bh;
+    const list_cols = std.math.clamp(total_cols * 35 / 100, 16, 48);
+    const tx = @as(f32, @floatFromInt(list_cols)) * cw + 1;
+    return .{
+        .by = by,
+        .bh = bh,
+        .rows = rows,
+        .total_cols = total_cols,
+        .list_cols = list_cols,
+        .text = .{ .x = tx, .y = by + ch, .w = @max(l.width - tx, 0), .h = bh - ch },
+    };
+}
+
+/// A row of a panel's list.
+pub const PaneRow = struct { mark: []const u8 = "  ", text: []const u8, color: rl.Color };
+
+/// What a two-sided panel shows this frame.
+pub const PaneSpec = struct {
+    title: []const u8,
+    /// After the title, dimmer (in `about_color`).
+    about: []const u8 = "",
+    about_color: rl.Color,
+    /// The keys, at the title's right when there is room.
+    hint: []const u8,
+    /// How many rows, and what to say when there are none.
+    count: usize,
+    empty: []const u8,
+    /// The whole of the selected row, for the text side.
+    text: []const u8,
+    /// Its lines are program text (a `+` or `-` first is a diff's), not prose.
+    plain: bool = false,
+    color: rl.Color,
+};
+
+/// A two-sided panel: `rows(ctx, i)` on the left, one line each, the
+/// selected one's `text` wrapped on the right (its end while `p.tail`).
+/// While `side_float` shows a buffer over the text side, that side is its.
+fn drawPanes(ed: *Editor, font: *const Font, theme: *const Theme, l: render.Layout, bottom: f32, p: *Editor.claude_chat.Panel, spec: PaneSpec, ctx: anytype) void {
+    const g = paneGeometry(font, l, bottom) orelse return;
+    const cw = font.cell_w;
+    const ch = font.cell_h;
+    const by = g.by;
+    rect(0, by, l.width, g.bh, theme.popup_bg);
+    rect(0, by, l.width, 1, theme.popup_border);
+
+    var x = font.drawText(spec.title, cw, by, if (p.focus) theme.mode_picker else theme.status_dim);
+    x = font.drawText(spec.about, x, by, spec.about_color);
+    const used: usize = @intFromFloat(x / cw);
+    if (used + cells(spec.hint) + 3 <= g.total_cols) _ = font.drawText(spec.hint, l.width - @as(f32, @floatFromInt(cells(spec.hint) + 1)) * cw, by, theme.status_dim);
+
+    const body = g.rows - 1;
+    const body_y = by + ch;
+    if (spec.count == 0) {
+        _ = font.drawText(spec.empty, cw, body_y, theme.status_dim);
+        return;
+    }
+    p.sel = @min(p.sel, spec.count - 1);
+
+    // The rows: the selection kept in sight.
+    const in_text = ed.side_window != null;
+    if (p.sel < p.top) p.top = p.sel;
+    if (p.sel >= p.top + body) p.top = p.sel + 1 - body;
+    if (p.top + body > spec.count) p.top = spec.count -| body;
+    for (0..body) |r| {
+        const i = p.top + r;
+        if (i >= spec.count) break;
+        const row: PaneRow = ctx.row(theme, i);
+        const y = body_y + @as(f32, @floatFromInt(r)) * ch;
+        if (i == p.sel) {
+            rect(0, y, @as(f32, @floatFromInt(g.list_cols)) * cw, ch, theme.selection_bg);
+            if (p.focus and !in_text) rect(0, y, 2, ch, theme.cursor);
+        }
+        const tx = font.drawText(row.mark, cw, y, row.color);
+        drawPlain(font, row.text, tx, y, g.list_cols -| 4, row.color);
+    }
+    rect(g.text.x - 1, body_y, 1, g.bh - ch, theme.popup_border);
+    if (in_text) return;
+
+    // The whole of the selected row.
+    const text_cols = g.total_cols -| (g.list_cols + 3);
+    if (text_cols < 8) return;
+    var total: usize = 0;
+    var count = Wrap{ .text = spec.text, .width = text_cols };
+    while (count.next()) |_| total += 1;
+    p.lines = total;
+    p.page = body;
+    const first = if (p.tail) total -| body else @min(p.scroll, total -| body);
+    if (!p.tail) p.scroll = first;
+    const tx = g.text.x + 2 * cw;
+    var w = Wrap{ .text = spec.text, .width = text_cols };
+    var n: usize = 0;
+    var in_code = false;
+    while (w.next()) |line| : (n += 1) {
+        const fence = std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "```");
+        if (fence) in_code = !in_code;
+        if (n < first) continue;
+        if (n >= first + body) break;
+        const color = if (fence)
+            theme.status_dim
+        else if ((in_code or spec.plain) and line.len > 0 and line[0] == '+')
+            theme.diff_add
+        else if (in_code and line.len > 0 and line[0] == '-' or spec.plain and line.len > 1 and line[0] == '-' and line[1] != ' ')
+            theme.diff_delete
+        else if (!in_code and std.mem.startsWith(u8, line, "#"))
+            theme.whichkey_group
+        else if (in_code)
+            theme.status_fg
+        else
+            spec.color;
+        drawPlain(font, line, tx, body_y + @as(f32, @floatFromInt(n - first)) * ch, text_cols, color);
+    }
+    // More above or below what shows.
+    if (total > body) {
+        var pb: [32]u8 = undefined;
+        const where = std.fmt.bufPrint(&pb, "{d}-{d}/{d}", .{ first + 1, @min(first + body, total), total }) catch "";
+        _ = font.drawText(where, l.width - @as(f32, @floatFromInt(cells(where) + 1)) * cw, by + g.bh - ch, theme.status_dim);
+    }
+}
+
+/// Claude's conversation, docked above `bottom`: a title row (what Claude
+/// is doing, the keys), then the rows on the left, one line each (what you
+/// said, what Claude said, a tool, a question), and on the right the whole
+/// of the selected one. While it follows, that is the end of what is being
+/// written.
+pub fn drawChat(ed: *Editor, font: *const Font, theme: *const Theme, l: render.Layout, bottom: f32) void {
+    const c = ed.chat orelse return;
+    const p = &ed.chat_panel;
+    var buf: [160]u8 = undefined;
+    const state = c.stateText();
+    // Claude · the model · plan · working…
+    var w: std.Io.Writer = .fixed(&buf);
+    if (c.model.len > 0) w.print(" · {s}", .{c.model[0..@min(c.model.len, 28)]}) catch {};
+    if (c.effort.len > 0) w.print(" {s}", .{c.effort[0..@min(c.effort.len, 8)]}) catch {};
+    if (c.usage.five_hour) |pct| w.print(" · 5h {d:.0}%", .{pct}) catch {};
+    if (c.mode.len > 0 and !std.mem.eql(u8, c.mode, "default")) w.print(" · {s}", .{c.mode[0..@min(c.mode.len, 20)]}) catch {};
+    if (state.len > 0) w.print(" · {s}", .{state}) catch {} else if (c.cost > 0) w.print(" · ${d:.2}", .{c.cost}) catch {};
+    const about = w.buffered();
+    const asking = c.asking() != null;
+    const hint: []const u8 = if (ed.side_window != null)
+        "vim's keys: y copies   Tab / Esc back to the rows"
+    else if (p.focus)
+        (if (asking) "Enter answers   Tab into the text   y copies   i tell Claude   Esc / q hide" else "j/k rows   Tab text   y copy   i tell   / commands   m model   e effort   u usage   C-c stop   Esc hide")
+    else if (asking) "SPC a y answers   Esc hides" else "SPC a a here   SPC a i tell Claude   Esc hides";
+    const entries = c.entries.items;
+    const sel: ?*const Chat.Entry = if (entries.len > 0) &entries[@min(p.sel, entries.len - 1)] else null;
+    const Rows = struct {
+        entries: []const Chat.Entry,
+        pub fn row(r: @This(), th: *const Theme, i: usize) PaneRow {
+            const e = &r.entries[i];
+            const mark: []const u8, const color = switch (e.kind) {
+                .you => .{ "› ", th.mode_picker },
+                .claude => .{ "  ", th.fg },
+                .tool => .{ "· ", th.status_dim },
+                .ask => .{ "? ", th.diff_add },
+                .note => .{ "  ", th.status_dim },
+            };
+            return .{ .mark = mark, .text = Chat.rowLine(e), .color = color };
+        }
+    };
+    drawPanes(ed, font, theme, l, bottom, p, .{
+        .title = "Claude",
+        .about = about,
+        .about_color = if (c.state == .asking) theme.diff_add else theme.status_dim,
+        .hint = hint,
+        .count = entries.len,
+        .empty = "nothing said yet: SPC a i tells Claude something",
+        .text = if (sel) |e| e.text.items else "",
+        // A tool's row is its input and what came back; an ask's, the edit.
+        .plain = if (sel) |e| e.kind == .tool or e.kind == .ask else false,
+        .color = if (sel) |e| (if (e.kind == .you) theme.mode_picker else theme.fg) else theme.fg,
+    }, Rows{ .entries = entries });
+}
+
+/// The scratch pads (`SPC n`): their names on the left, the selected
+/// one's text on the right.
+pub fn drawPads(ed: *Editor, font: *const Font, theme: *const Theme, l: render.Layout, bottom: f32) void {
+    const p = &ed.pad_panel;
+    const list = ed.pad_list.pads.items;
+    var buf: [48]u8 = undefined;
+    const about = std.fmt.bufPrint(&buf, " · {d}", .{list.len}) catch "";
+    const hint: []const u8 = if (ed.side_window != null)
+        "vim's keys   Tab / Esc back to the pads (saved)"
+    else if (p.focus)
+        "j/k pads   Tab / i write in it   n new   x delete   y copy   o in a window   Esc / q hide"
+    else
+        "SPC n here   Esc hides";
+    const Rows = struct {
+        pads: []const Editor.pads.Pad,
+        pub fn row(r: @This(), th: *const Theme, i: usize) PaneRow {
+            return .{ .text = r.pads[i].name, .color = th.fg };
+        }
+    };
+    drawPanes(ed, font, theme, l, bottom, p, .{
+        .title = "Scratch pads",
+        .about = about,
+        .about_color = theme.status_dim,
+        .hint = hint,
+        .count = list.len,
+        .empty = "no pads",
+        .text = ed.pad_list.text.items,
+        .color = theme.fg,
+    }, Rows{ .pads = list });
+}
+
+test "text wrapped to a width: at spaces, mid-word when it must" {
+    var w = Wrap{ .text = "one two three four\n\n  abcdefghijklmnop", .width = 10 };
+    try std.testing.expectEqualStrings("one two ", w.next().?);
+    try std.testing.expectEqualStrings("three four", w.next().?);
+    try std.testing.expectEqualStrings("", w.next().?);
+    try std.testing.expectEqualStrings("  abcdefgh", w.next().?);
+    try std.testing.expectEqualStrings("ijklmnop", w.next().?);
+    try std.testing.expectEqual(null, w.next());
+    var empty = Wrap{ .text = "", .width = 10 };
+    try std.testing.expectEqualStrings("", empty.next().?);
+    try std.testing.expectEqual(null, empty.next());
+}

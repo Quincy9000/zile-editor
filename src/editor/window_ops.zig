@@ -111,6 +111,8 @@ pub fn codeWindowCount(ed: *const Editor) usize {
 }
 
 pub fn closeWindow(ed: *Editor) void {
+    // A panel's text side isn't one of the splits: closing it leaves it.
+    if (@import("side_float.zig").focused(ed)) return @import("side_float.zig").close(ed);
     const closing = ed.window;
     const shell = closing.term;
     // Never leave only a terminal panel on screen.

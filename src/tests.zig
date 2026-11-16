@@ -33,6 +33,7 @@ comptime {
     _ = @import("sql.zig");
     _ = @import("ZigCheck.zig");
     _ = @import("Replace.zig");
+    _ = @import("ai/Chat.zig");
     _ = @import("core/case.zig");
     _ = @import("core/hex.zig");
     _ = @import("lsp/Snippet.zig");
