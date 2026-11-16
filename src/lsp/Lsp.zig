@@ -1013,7 +1013,7 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             const text = hoverText(result) orelse return ed.setMessage(.info, "no hover information", .{});
             try lsp_actions.showHover(ed, text);
         },
-        .completion => |cp| try completion_ops.showCompletion(ed, cp.buffer, cp.word_start, result),
+        .completion => |cp| try completion_ops.showServerCompletion(ed, cp.buffer, cp.word_start, result),
         .signature => |b| try signature_help.showSignature(ed, b, result),
         .format => |f| {
             var edits: std.ArrayList(TextEdit) = .empty;

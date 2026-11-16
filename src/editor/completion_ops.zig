@@ -70,6 +70,22 @@ pub fn requestCompletion(ed: *Editor) !void {
 }
 
 /// A completion reply arrived: show it if the cursor is still on that word.
+/// A server's answer. Where the Postgres server has nothing after `name.`
+/// (it doesn't complete in `order by`, `group by` or a function's
+/// arguments), the columns of the table that name means come from the
+/// schema zile loaded itself.
+pub fn showServerCompletion(ed: *Editor, b: *Buffer, word_start: usize, result: std.json.Value) !void {
+    const items = if (result == .object) result.object.get("items") orelse result else result;
+    const empty = items != .array or items.array.items.len == 0;
+    if (empty and b == ed.buffer and sql_ops.isSql(ed) and ed.mode == .insert and
+        word_start > 0 and word_start <= ed.view.cursor and ed.text().byteAt(word_start - 1) == '.')
+    {
+        ed.completion_pending = false;
+        return sql_ops.sqlCompletion(ed, word_start);
+    }
+    return showCompletion(ed, b, word_start, result);
+}
+
 pub fn showCompletion(ed: *Editor, b: *Buffer, word_start: usize, result: std.json.Value) !void {
     ed.completion_pending = false;
     if (b != ed.buffer or ed.mode != .insert or ed.view.cursor < word_start) return;

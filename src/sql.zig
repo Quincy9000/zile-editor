@@ -351,7 +351,9 @@ test "parseCsv: quoted cells hold commas, quotes and lines" {
 // Completion: the database's tables and columns (as vim-dadbod-completion)
 
 /// A table and its columns.
-pub const Table = struct { name: []const u8, columns: []const []const u8 };
+/// A table and its columns. `schema`: the Postgres schema it is in (""
+/// where there are none: sqlite).
+pub const Table = struct { schema: []const u8 = "", name: []const u8, columns: []const []const u8 };
 
 /// The tables and columns of a database, loaded in the background (psql /
 /// sqlite3, no shell), with everything in its arena.
@@ -400,7 +402,7 @@ pub const Schema = struct {
             return;
         };
         const argv: []const []const u8 = switch (c.client) {
-            .psql => &.{ "psql", c.target, "-X", "-At", "-F", "\t", "-c", "select table_name, column_name from information_schema.columns where table_schema not in ('pg_catalog', 'information_schema') order by table_name, ordinal_position" },
+            .psql => &.{ "psql", c.target, "-X", "-At", "-F", "\t", "-c", "select table_schema || '.' || table_name, column_name from information_schema.columns where table_schema not in ('pg_catalog', 'information_schema') order by (table_schema <> 'public'), table_schema, table_name, ordinal_position" },
             .sqlite3 => &.{ "sqlite3", "-separator", "\t", c.target, "select m.name, p.name from sqlite_master m join pragma_table_info(m.name) p where m.type in ('table', 'view') order by m.name, p.cid" },
         };
         const r = std.process.run(a, s.io, .{ .argv = argv }) catch {
@@ -415,7 +417,8 @@ pub const Schema = struct {
     }
 };
 
-/// "table\tcolumn" lines (grouped by table) into tables.
+/// "table\tcolumn" lines (grouped by table) into tables; the table as
+/// `schema.table` where there are schemas.
 pub fn parseColumns(a: Allocator, out: []const u8) ![]Table {
     var tables: std.ArrayList(Table) = .empty;
     var cols: std.ArrayList([]const u8) = .empty;
@@ -426,13 +429,35 @@ pub fn parseColumns(a: Allocator, out: []const u8) ![]Table {
         const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
         const t = line[0..tab];
         if (current == null or !std.mem.eql(u8, current.?, t)) {
-            if (current) |name| try tables.append(a, .{ .name = name, .columns = try cols.toOwnedSlice(a) });
+            if (current) |name| try tables.append(a, splitName(name, try cols.toOwnedSlice(a)));
             current = t;
         }
         try cols.append(a, line[tab + 1 ..]);
     }
-    if (current) |name| try tables.append(a, .{ .name = name, .columns = try cols.toOwnedSlice(a) });
+    if (current) |name| try tables.append(a, splitName(name, try cols.toOwnedSlice(a)));
     return tables.toOwnedSlice(a);
+}
+
+fn splitName(name: []const u8, columns: []const []const u8) Table {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return .{ .name = name, .columns = columns };
+    return .{ .schema = name[0..dot], .name = name[dot + 1 ..], .columns = columns };
+}
+
+/// The table `name` means, written `table` or `schema.table` (quoted or
+/// not). Without a schema: the first of that name (`public`'s is first).
+fn tableNamed(schema: []const Table, name: []const u8) ?Table {
+    var in: []const u8 = "";
+    var bare = name;
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |d| {
+        in = std.mem.trim(u8, name[0..d], "\"");
+        bare = name[d + 1 ..];
+    }
+    bare = std.mem.trim(u8, bare, "\"");
+    for (schema) |t| {
+        if (!std.ascii.eqlIgnoreCase(t.name, bare)) continue;
+        if (in.len == 0 or t.schema.len == 0 or std.ascii.eqlIgnoreCase(t.schema, in)) return t;
+    }
+    return null;
 }
 
 const keywords = [_][]const u8{
@@ -447,7 +472,6 @@ const keywords = [_][]const u8{
 /// The table a name before a `.` means in `statement`: a table of that
 /// name, or one given that alias (`from users u`, `join orders as o`).
 pub fn tableFor(schema: []const Table, statement: []const u8, name: []const u8) ?Table {
-    for (schema) |t| if (std.ascii.eqlIgnoreCase(t.name, name)) return t;
     var words: [512][]const u8 = undefined;
     var n: usize = 0;
     var it = std.mem.tokenizeAny(u8, statement, " \t\r\n,();");
@@ -460,15 +484,14 @@ pub fn tableFor(schema: []const Table, statement: []const u8, name: []const u8) 
         const after_table = std.ascii.eqlIgnoreCase(w, "from") or std.ascii.eqlIgnoreCase(w, "join") or
             std.ascii.eqlIgnoreCase(w, "update") or std.ascii.eqlIgnoreCase(w, "into");
         if (!after_table or i + 1 >= n) continue;
-        const table = words[i + 1];
+        const written = words[i + 1];
         var j = i + 2;
         if (j < n and std.ascii.eqlIgnoreCase(words[j], "as")) j += 1;
         if (j >= n or !std.ascii.eqlIgnoreCase(words[j], name)) continue;
-        // `schema.table` names the table after the dot.
-        const bare = if (std.mem.lastIndexOfScalar(u8, table, '.')) |d| table[d + 1 ..] else table;
-        for (schema) |t| if (std.ascii.eqlIgnoreCase(t.name, bare)) return t;
+        if (tableNamed(schema, written)) |t| return t;
     }
-    return null;
+    // Not an alias: the table itself (`users.`), then.
+    return tableNamed(schema, name);
 }
 
 /// Completion items (as LSP JSON) at a word starting at `word_start` in
@@ -507,6 +530,13 @@ test "tables, aliases and completion items" {
     const tables = try parseColumns(arena.allocator(), "orders\tid\norders\ttotal\nusers\tid\nusers\tname\n");
     try testing.expectEqual(2, tables.len);
     try testing.expectEqualStrings("total", tables[0].columns[1]);
+    // The same table name in two schemas: each keeps its own columns.
+    const two = try parseColumns(arena.allocator(), "public.items\tid\nportal.items\tid\nportal.items\tamount\n");
+    try testing.expectEqual(2, two.len);
+    try testing.expectEqualStrings("portal", two[1].schema);
+    const q = "select sum(r.amount) from portal.items r join items i on i.id = r.id group by r.";
+    try testing.expectEqual(2, tableFor(two, q, "r").?.columns.len);
+    try testing.expectEqual(1, tableFor(two, q, "i").?.columns.len);
     const sql = "select u.name, o. from users u join public.orders as o on o.id = u.id";
     try testing.expectEqualStrings("users", tableFor(tables, sql, "u").?.name);
     try testing.expectEqualStrings("orders", tableFor(tables, sql, "o").?.name);

@@ -6,6 +6,7 @@ const Io = std.Io;
 const run_popup = @import("../editor/run_popup.zig");
 const sql_ops = @import("../editor/sql_ops.zig");
 const completion_ops = @import("../editor/completion_ops.zig");
+const after_typing = @import("../editor/after_typing.zig");
 const Editor = @import("../Editor.zig");
 const support = @import("support.zig");
 const testEditor = support.testEditor;
@@ -127,4 +128,15 @@ test "SQL completion: tables and columns from the database, after an alias its c
     try ed.feed("<Esc>o");
     try ed.feed("ord");
     try testing.expectEqualStrings("orders", completion_ops.completionShown(&ed).?.current().?.label);
+    // A server with nothing to say after `o.` (the Postgres one, in an
+    // `order by`): the table's columns all the same. Elsewhere its empty
+    // answer stands.
+    try ed.feed("<Esc>ccselect 1 from orders o order by o.");
+    after_typing.closeCompletion(&ed);
+    const nothing = try std.json.parseFromSlice(std.json.Value, gpa, "{\"isIncomplete\":false,\"items\":[]}", .{});
+    defer nothing.deinit();
+    try completion_ops.showServerCompletion(&ed, ed.buffer, ed.view.cursor, nothing.value);
+    const cols = completion_ops.completionShown(&ed).?;
+    try testing.expectEqualStrings("id", cols.items[cols.shown.items[0]].label);
+    try testing.expectEqualStrings("total", cols.items[cols.shown.items[1]].label);
 }
