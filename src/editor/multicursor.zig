@@ -10,6 +10,7 @@ const textobjects = @import("../core/textobjects.zig");
 const Editor = @import("../Editor.zig");
 const row_model = @import("row_model.zig");
 const code_motion = @import("code_motion.zig");
+const block_visual = @import("block_visual.zig");
 const prompts = @import("prompts.zig");
 const Cursor = Editor.Cursor;
 
@@ -207,6 +208,7 @@ pub fn cursorAtMatch(ed: *Editor, how: enum { next, previous, skip, all }) !void
 /// non-blank) or end of every selected line. `insert` starts typing there.
 pub fn cursorsOnLines(ed: *Editor, at_end: bool, insert: bool) !void {
     if (ed.mode != .visual) return;
+    if (block_visual.active(ed)) return block_visual.insert(ed, at_end, insert);
     const t = ed.text();
     const first = t.lineOf(@min(ed.view.anchor, ed.view.cursor));
     const last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));

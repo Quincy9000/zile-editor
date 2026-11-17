@@ -46,7 +46,7 @@ const prompts = @import("../editor/prompts.zig");
 const git_ops = @import("../editor/git_ops.zig");
 const lsp_actions = @import("../editor/lsp_actions.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_ask, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, files_global, debug, stored_data };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_ask, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, claude_sessions, files_global, debug, stored_data };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -99,6 +99,7 @@ fn Impl(comptime kind: Kind) type {
         .claude_modes => ClaudeList(.modes),
         .claude_efforts => ClaudeList(.efforts),
         .claude_usage => ClaudeList(.usage),
+        .claude_sessions => ClaudeList(.sessions),
         .leader_quit => QuitMenu,
         .files_global => GlobalFiles,
         .debug => Debug,
@@ -426,6 +427,8 @@ const ClaudeMenu = Menu("Claude", &.{
     .{ .key = 'e', .label = "Effort (how hard it thinks)", .command = "claude_effort" },
     .{ .key = 'p', .label = "Permission mode (ask first, accept edits, plan)", .command = "claude_mode" },
     .{ .key = 'u', .label = "Usage (your limits, the context)", .command = "claude_usage" },
+    .{ .key = 'w', .label = "Rewrite the selection in place...", .command = "claude_rewrite" },
+    .{ .key = 'r', .label = "Resume a conversation of before", .command = "claude_resume" },
     .{ .key = 'x', .label = "Stop what Claude is doing", .command = "claude_stop" },
     .{ .key = 'c', .label = "A new conversation", .command = "claude_new" },
     .{ .key = 't', .label = "Claude's own terminal", .command = "claude_panel" },
@@ -756,9 +759,10 @@ fn ClaudeList(comptime which: claude_chat.Menu) type {
             .modes => "Claude: permission mode",
             .efforts => "Claude: effort",
             .usage => "Claude: usage",
+            .sessions => "Claude: conversations",
         };
         pub const prefix: ?u8 = null;
-        pub const start_mode: StartMode = if (which == .commands) .insert else .normal;
+        pub const start_mode: StartMode = if (which == .commands or which == .sessions) .insert else .normal;
 
         const Row = struct { text: []const u8, detail: []const u8 = "", current: bool = false };
 
@@ -775,6 +779,10 @@ fn ClaudeList(comptime which: claude_chat.Menu) type {
                 }),
                 .modes => for (Chat.modes) |r| try list.append(a, .{ .text = r.title, .detail = r.description, .current = std.mem.eql(u8, c.mode, r.name) }),
                 .efforts => for (c.efforts()) |level| try list.append(a, .{ .text = level, .current = std.mem.eql(u8, c.effort, level) }),
+                .sessions => for (c.listed) |sn| {
+                    var tb: [32]u8 = undefined;
+                    try list.append(a, .{ .text = sn.first, .detail = try a.dupe(u8, claude_chat.ago(ed, sn.modified, &tb)), .current = if (c.session) |id| std.mem.eql(u8, id, sn.id) else false });
+                },
                 .usage => {
                     const u = c.usage;
                     var tb: [64]u8 = undefined;

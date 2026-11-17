@@ -356,7 +356,7 @@ pub fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
             return true;
         }
     }
-    if (ed.cmd_purpose == .claude and ed.mode == .insert and ed.pending_len == 0 and
+    if ((ed.cmd_purpose == .claude or ed.cmd_purpose == .claude_inline) and ed.mode == .insert and ed.pending_len == 0 and
         ev.key == .special and ev.key.special == .enter and !ev.mods.ctrl)
     {
         if (ev.mods.shift or ev.mods.alt) {
@@ -382,6 +382,7 @@ pub fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
             const one_line = std.mem.indexOfScalar(u8, cmd, '\n') == null;
             (switch (purpose) {
                 .claude => claude_panel.tellClaude(ed, cmd),
+                .claude_inline => @import("claude_inline.zig").start(ed, cmd),
                 .run => startRun(ed, cmd),
                 // The history is a line per command.
                 .runner => if (one_line) runFromRunner(ed, cmd) else startRun(ed, cmd),

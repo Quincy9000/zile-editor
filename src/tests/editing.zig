@@ -490,3 +490,97 @@ test "o, O and Enter on a blank line indent like the code around it" {
     try top.feed("ggox<Esc>");
     try expectText(&top, "\n    x\n\n    a;");
 }
+
+test "Ctrl-a / Ctrl-x change the number at or after the cursor" {
+    var ed = try testEditor("a 9 b -3 c 007");
+    defer ed.deinit();
+    try ed.feed("<C-a>");
+    try expectText(&ed, "a 10 b -3 c 007");
+    try ed.feed("5<C-x>");
+    try expectText(&ed, "a 5 b -3 c 007");
+    try ed.feed("w<C-a>");
+    try expectText(&ed, "a 5 b -2 c 007");
+    try ed.feed("3<C-a>");
+    try expectText(&ed, "a 5 b 1 c 007");
+    try ed.feed("$<C-a>");
+    try expectText(&ed, "a 5 b 1 c 008");
+    try ed.feed("u");
+    try expectText(&ed, "a 5 b 1 c 007");
+}
+
+test "block visual: delete, yank and paste a rectangle" {
+    var ed = try testEditor("abcd\nefgh\nijkl");
+    defer ed.deinit();
+    try ed.feed("l<C-v>jld");
+    try expectText(&ed, "ad\neh\nijkl");
+    try ed.feed("$p");
+    try expectText(&ed, "adbc\nehfg\nijkl");
+    try ed.feed("gg0<C-v>jy");
+    try expectText(&ed, "adbc\nehfg\nijkl");
+    try ed.feed("G$p");
+    try expectText(&ed, "adbc\nehfg\nijkla\n    e");
+}
+
+test "block visual: I, A and c type on every line of the block" {
+    var ed = try testEditor("abcd\nefgh\nij\nklmn");
+    defer ed.deinit();
+    try ed.feed("l<C-v>jjIX<Esc>");
+    try expectText(&ed, "aXbcd\neXfgh\niXj\nklmn");
+    ed.deinit();
+    ed = try testEditor("abcd\ne\nijkl");
+    try ed.feed("l<C-v>jjlAX<Esc>");
+    try expectText(&ed, "abcXd\ne  X\nijkXl");
+    ed.deinit();
+    ed = try testEditor("abcd\nefgh");
+    try ed.feed("l<C-v>jlcZ<Esc>");
+    try expectText(&ed, "aZd\neZh");
+    try ed.feed("u");
+    try expectText(&ed, "abcd\nefgh");
+}
+
+test "block visual: case operators and leaving with v / Esc" {
+    var ed = try testEditor("abcd\nefgh");
+    defer ed.deinit();
+    try ed.feed("l<C-v>jlU");
+    try expectText(&ed, "aBCd\neFGh");
+    try ed.feed("l<C-v><Esc>");
+    try testing.expectEqual(.normal, ed.mode);
+    try ed.feed("<C-v>jv");
+    try testing.expect(!ed.visual_block);
+    try testing.expectEqual(.visual, ed.mode);
+}
+
+test "block visual: the block keeps its shape through short lines and blank space" {
+    var ed = try testEditor("abcdef\nab\nabcdef");
+    defer ed.deinit();
+    try ed.feed("3l<C-v>jjd");
+    try expectText(&ed, "abcef\nab\nabcef");
+    ed.deinit();
+    ed = try testEditor("abcdef\nab\nabcdef");
+    try ed.feed("3l<C-v>jllhd");
+    try expectText(&ed, "abcf\nab\nabcdef");
+    ed.deinit();
+    ed = try testEditor("abcdef\nab\nabcdef");
+    try ed.feed("l<C-v>j$d");
+    try expectText(&ed, "a\na\nabcdef");
+}
+
+test "block visual: o and O change corners, r fills the selection" {
+    var ed = try testEditor("abcd\nefgh\nijkl");
+    defer ed.deinit();
+    try ed.feed("l<C-v>jlOd");
+    try expectText(&ed, "ad\neh\nijkl");
+    ed.deinit();
+    // o keeps the blank-space column with its corner: the block stays cols 1..2 over lines 0..2
+    ed = try testEditor("abcdef\nabcdef\nab");
+    try ed.feed("l<C-v>jjllod");
+    try expectText(&ed, "aef\naef\na");
+    ed.deinit();
+    ed = try testEditor("abcd\nefgh\nijkl");
+    try ed.feed("l<C-v>jlrx");
+    try expectText(&ed, "axxd\nexxh\nijkl");
+    ed.deinit();
+    ed = try testEditor("abcd\nefgh");
+    try ed.feed("lvlrx");
+    try expectText(&ed, "axxd\nefgh");
+}

@@ -472,6 +472,12 @@ const keywords = [_][]const u8{
 /// The table a name before a `.` means in `statement`: a table of that
 /// name, or one given that alias (`from users u`, `join orders as o`).
 pub fn tableFor(schema: []const Table, statement: []const u8, name: []const u8) ?Table {
+    return source(null, schema, statement, name) catch null;
+}
+
+/// `tableFor`, and with `a`, what a `with` names too (`with big as (select
+/// id, total from …) select b. from big b`): its select list's names.
+fn source(a: ?Allocator, schema: []const Table, statement: []const u8, name: []const u8) !?Table {
     var words: [512][]const u8 = undefined;
     var n: usize = 0;
     var it = std.mem.tokenizeAny(u8, statement, " \t\r\n,();");
@@ -481,17 +487,200 @@ pub fn tableFor(schema: []const Table, statement: []const u8, name: []const u8) 
         n += 1;
     }
     for (words[0..n], 0..) |w, i| {
-        const after_table = std.ascii.eqlIgnoreCase(w, "from") or std.ascii.eqlIgnoreCase(w, "join") or
-            std.ascii.eqlIgnoreCase(w, "update") or std.ascii.eqlIgnoreCase(w, "into");
-        if (!after_table or i + 1 >= n) continue;
+        if (!namesTable(w) or i + 1 >= n) continue;
         const written = words[i + 1];
         var j = i + 2;
         if (j < n and std.ascii.eqlIgnoreCase(words[j], "as")) j += 1;
         if (j >= n or !std.ascii.eqlIgnoreCase(words[j], name)) continue;
-        if (tableNamed(schema, written)) |t| return t;
+        if (try named(a, schema, statement, written)) |t| return t;
     }
     // Not an alias: the table itself (`users.`), then.
-    return tableNamed(schema, name);
+    return named(a, schema, statement, name);
+}
+
+/// The word after this one is a table's name.
+fn namesTable(w: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(w, "from") or std.ascii.eqlIgnoreCase(w, "join") or
+        std.ascii.eqlIgnoreCase(w, "update") or std.ascii.eqlIgnoreCase(w, "into");
+}
+
+/// A table of the database, or (with `a`) one the statement's `with` makes.
+fn named(a: ?Allocator, schema: []const Table, statement: []const u8, written: []const u8) !?Table {
+    if (tableNamed(schema, written)) |t| return t;
+    const arena = a orelse return null;
+    const columns = try withColumns(arena, statement, written) orelse return null;
+    return .{ .name = written, .columns = columns };
+}
+
+fn isNameByte(b: u8) bool {
+    return std.ascii.isAlphanumeric(b) or b == '_';
+}
+
+/// Where `needle` is in `hay` as a whole word, in either case, from `from`.
+fn findWord(hay: []const u8, needle: []const u8, from: usize) ?usize {
+    if (needle.len == 0 or hay.len < needle.len) return null;
+    var i = from;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (!std.ascii.eqlIgnoreCase(hay[i..][0..needle.len], needle)) continue;
+        if (i > 0 and isNameByte(hay[i - 1])) continue;
+        if (i + needle.len < hay.len and isNameByte(hay[i + needle.len])) continue;
+        return i;
+    }
+    return null;
+}
+
+/// The end of the parenthesis opened at `open` (the index of its `)`),
+/// quotes skipped.
+fn closing(text: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var quote: u8 = 0;
+    var i = open;
+    while (i < text.len) : (i += 1) {
+        const b = text[i];
+        if (quote != 0) {
+            if (b == quote) quote = 0;
+            continue;
+        }
+        switch (b) {
+            '\'', '"' => quote = b,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The columns of `name` if the statement's `with` makes it (`name as (select
+/// …)`): what its select list calls them. A `*` in the list is left out.
+fn withColumns(a: Allocator, statement: []const u8, name: []const u8) !?[]const []const u8 {
+    var from: usize = 0;
+    while (findWord(statement, name, from)) |at| : (from = at + 1) {
+        var i = at + name.len;
+        while (i < statement.len and std.ascii.isWhitespace(statement[i])) i += 1;
+        if (i + 2 > statement.len or !std.ascii.eqlIgnoreCase(statement[i..][0..2], "as")) continue;
+        i += 2;
+        // (`as materialized (`, `as not materialized (`.)
+        const open = std.mem.indexOfScalarPos(u8, statement, i, '(') orelse continue;
+        if (std.mem.indexOfAny(u8, statement[i..open], ",;") != null) continue;
+        const body = statement[open + 1 .. closing(statement, open) orelse statement.len];
+        return try selectNames(a, body);
+    }
+    return null;
+}
+
+/// The names of a select's columns: `select a, t.b, count(*) as n from …`
+/// gives a, b, n.
+fn selectNames(a: Allocator, select: []const u8) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    const start = (findWord(select, "select", 0) orelse return names.items) + "select".len;
+    // The list: up to the `from` outside any parenthesis; its commas likewise.
+    var depth: usize = 0;
+    var quote: u8 = 0;
+    var item = start;
+    var i = start;
+    while (i <= select.len) : (i += 1) {
+        const end = i == select.len;
+        const b = if (end) ',' else select[i];
+        if (!end and quote != 0) {
+            if (b == quote) quote = 0;
+            continue;
+        }
+        const at_from = !end and depth == 0 and findWord(select, "from", i) == i;
+        if (!end and !at_from) switch (b) {
+            '\'' => quote = b,
+            '(' => depth += 1,
+            ')' => depth -|= 1,
+            else => {},
+        };
+        if (end or at_from or (b == ',' and depth == 0)) {
+            const one = std.mem.trim(u8, select[item..i], " \t\r\n");
+            item = i + 1;
+            // Its name: the last word (after `as`, or of `t.column`).
+            var e = one.len;
+            while (e > 0 and one[e - 1] == '"') e -= 1;
+            var st = e;
+            while (st > 0 and isNameByte(one[st - 1])) st -= 1;
+            if (st < e and !std.ascii.isDigit(one[st])) try names.append(a, one[st..e]);
+            if (at_from) break;
+        }
+    }
+    return names.items;
+}
+
+/// Where columns are what comes next: in `order by`, `group by`, `having`
+/// and `returning`, and between the parentheses of `insert into t (`
+/// (`table`: that t).
+const Clause = union(enum) { other, columns, insert: []const u8 };
+
+/// The clause `before` (a statement up to the cursor's word) ends in.
+fn clauseAt(before: []const u8) Clause {
+    const boundaries = [_][]const u8{ "select", "from", "where", "join", "on", "by", "having", "returning", "limit", "offset", "set", "values", "into", "union", "with", "using", "over", "when", "then", "else" };
+    var last: []const u8 = "";
+    var into_at: usize = 0;
+    var into_table: []const u8 = "";
+    var it = std.mem.tokenizeAny(u8, before, " \t\r\n,();=<>");
+    while (it.next()) |w| {
+        if (std.ascii.eqlIgnoreCase(last, "into") and into_table.len == 0) into_table = w;
+        for (boundaries) |k| if (std.ascii.eqlIgnoreCase(w, k)) {
+            last = k;
+            if (std.mem.eql(u8, k, "into")) {
+                into_at = it.index;
+                into_table = "";
+            }
+        };
+    }
+    if (std.mem.eql(u8, last, "by") or std.mem.eql(u8, last, "having") or std.mem.eql(u8, last, "returning")) return .columns;
+    if (std.mem.eql(u8, last, "into") and into_table.len > 0) {
+        const rest = before[into_at..];
+        if (std.mem.count(u8, rest, "(") > std.mem.count(u8, rest, ")")) return .{ .insert = into_table };
+    }
+    return .other;
+}
+
+/// Completion items (as LSP JSON) for where the Postgres server has none:
+/// after `name.` the columns of what that names (a table, an alias, what a
+/// `with` makes); in `order by`, `group by`, `having` and `returning` the
+/// columns of the statement's tables; in `insert into t (` those of t.
+/// Elsewhere none. Caller frees.
+pub fn fallbackJson(gpa: Allocator, schema: []const Table, text: []const u8, word_start: usize) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Item = struct { label: []const u8, detail: []const u8, kind: u8 = 5 };
+    var items: std.ArrayList(Item) = .empty;
+    const statement = statementAt(text, word_start);
+    if (word_start > 0 and text[word_start - 1] == '.') {
+        var s = word_start - 1;
+        while (s > 0 and isNameByte(text[s - 1])) s -= 1;
+        if (try source(a, schema, statement, text[s .. word_start - 1])) |t| {
+            for (t.columns) |col| try items.append(a, .{ .label = col, .detail = t.name });
+        }
+    } else {
+        // The statement up to the word being typed.
+        const offset = @intFromPtr(statement.ptr) -| @intFromPtr(text.ptr);
+        const before = statement[0..@min(word_start -| offset, statement.len)];
+        switch (clauseAt(before)) {
+            .other => {},
+            .insert => |table| if (try named(a, schema, statement, table)) |t| {
+                for (t.columns) |col| try items.append(a, .{ .label = col, .detail = t.name });
+            },
+            .columns => {
+                var it = std.mem.tokenizeAny(u8, statement, " \t\r\n,();");
+                var after_table = false;
+                while (it.next()) |w| {
+                    if (after_table) if (try named(a, schema, statement, w)) |t| {
+                        for (t.columns) |col| try items.append(a, .{ .label = col, .detail = t.name });
+                    };
+                    after_table = namesTable(w);
+                }
+            },
+        }
+    }
+    return std.json.Stringify.valueAlloc(gpa, .{ .items = items.items }, .{});
 }
 
 /// Completion items (as LSP JSON) at a word starting at `word_start` in
@@ -528,6 +717,7 @@ test "tables, aliases and completion items" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const tables = try parseColumns(arena.allocator(), "orders\tid\norders\ttotal\nusers\tid\nusers\tname\n");
+    const tables_email = try parseColumns(arena.allocator(), "orders\tid\norders\ttotal\nusers\tid\nusers\temail\n");
     try testing.expectEqual(2, tables.len);
     try testing.expectEqualStrings("total", tables[0].columns[1]);
     // The same table name in two schemas: each keeps its own columns.
@@ -537,6 +727,47 @@ test "tables, aliases and completion items" {
     const q = "select sum(r.amount) from portal.items r join items i on i.id = r.id group by r.";
     try testing.expectEqual(2, tableFor(two, q, "r").?.columns.len);
     try testing.expectEqual(1, tableFor(two, q, "i").?.columns.len);
+    // What a `with` makes, and where columns come next.
+    const cte = "with big as (select id, o.total, count(*) as n, upper(name) shout from orders o), x as (select 1) select b. from big b order by ";
+    {
+        const dot = std.mem.indexOf(u8, cte, "b. ").? + 2;
+        const json = try fallbackJson(testing.allocator, tables, cte, dot);
+        defer testing.allocator.free(json);
+        try testing.expect(std.mem.indexOf(u8, json, "\"label\":\"id\"") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "\"label\":\"total\"") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "\"label\":\"n\"") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "\"label\":\"shout\"") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "\"label\":\"name\"") == null);
+        // `order by`: the columns of what the statement reads (the `with`'s).
+        const by = try fallbackJson(testing.allocator, tables, cte, cte.len);
+        defer testing.allocator.free(by);
+        try testing.expect(std.mem.indexOf(u8, by, "\"label\":\"shout\"") != null);
+    }
+    inline for (.{
+        .{ "select count(*) from users u group by ", true, "email" },
+        .{ "select * from users having ", true, "email" },
+        .{ "update users set name = 'x' returning ", true, "email" },
+        .{ "insert into orders (", true, "total" },
+        .{ "insert into orders (id, ", true, "total" },
+        .{ "select * from users u join orders o on o.id = u.id order by u.id, ", true, "total" },
+        // Not where columns come next: nothing of ours.
+        .{ "select * from users limit ", false, "email" },
+        .{ "insert into orders (id) values (", false, "total" },
+        .{ "select * from users where ", false, "email" },
+        .{ "select * from nothing_known order by ", false, "email" },
+    }) |case| {
+        const json = try fallbackJson(testing.allocator, tables_email, case[0], case[0].len);
+        defer testing.allocator.free(json);
+        const needle = "\"label\":\"" ++ case[2] ++ "\"";
+        testing.expectEqual(case[1], std.mem.indexOf(u8, json, needle) != null) catch |err| {
+            std.debug.print("case: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+    // (Only the table inserted into.)
+    const ins = try fallbackJson(testing.allocator, tables_email, "insert into orders (", "insert into orders (".len);
+    defer testing.allocator.free(ins);
+    try testing.expect(std.mem.indexOf(u8, ins, "\"label\":\"email\"") == null);
     const sql = "select u.name, o. from users u join public.orders as o on o.id = u.id";
     try testing.expectEqualStrings("users", tableFor(tables, sql, "u").?.name);
     try testing.expectEqualStrings("orders", tableFor(tables, sql, "o").?.name);

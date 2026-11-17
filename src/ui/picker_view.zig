@@ -992,7 +992,7 @@ pub fn drawChat(ed: *Editor, font: *const Font, theme: *const Theme, l: render.L
     const hint: []const u8 = if (ed.side_window != null)
         "vim's keys: y copies   Tab / Esc back to the rows"
     else if (p.focus)
-        (if (asking) "Enter answers   Tab into the text   y copies   i tell Claude   Esc / q hide" else "j/k rows   Tab text   y copy   i tell   / commands   m model   e effort   u usage   C-c stop   Esc hide")
+        (if (asking) "Enter answers   Tab into the text   y copies   i tell Claude   Esc / q hide" else "j/k rows   Tab text   y copy   i tell   / commands   m model   e effort   u usage   r resume   C-c stop   Esc hide")
     else if (asking) "SPC a y answers   Esc hides" else "SPC a a here   SPC a i tell Claude   Esc hides";
     const entries = c.entries.items;
     const sel: ?*const Chat.Entry = if (entries.len > 0) &entries[@min(p.sel, entries.len - 1)] else null;

@@ -86,6 +86,21 @@ test "replace: Esc goes back to the grep picker with the search" {
     try testing.expectEqualStrings("needle", ed.picker.?.query.items());
 }
 
+test "replace: not across a compiler's cache" {
+    if (!@import("../picker/sources.zig").haveRg(testing.io)) return error.SkipZigTest;
+    const home = std.mem.span(std.c.getenv("HOME") orelse return error.SkipZigTest);
+    if (std.c.getenv("XDG_CACHE_HOME") != null) return error.SkipZigTest;
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "{s}/.cache/zig/p/some-package", .{home});
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try project_ops.workIn(&ed, dir);
+    try ed.feed("<Space>c");
+    try testing.expectEqual(null, ed.replace);
+    try testing.expectEqual(null, ed.search_prompt);
+}
+
 test "replace: SPC c, a regex with a group, whole words, Tab between the fields" {
     if (!@import("../picker/sources.zig").haveRg(testing.io)) return error.SkipZigTest;
     const gpa = testing.allocator;

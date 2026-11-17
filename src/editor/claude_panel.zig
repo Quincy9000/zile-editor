@@ -344,14 +344,20 @@ pub fn tellMessage(ed: *Editor, text: []const u8) ![]u8 {
 /// (started, if need be) but the window the box was opened from keeps the
 /// keyboard.
 pub fn tellClaude(ed: *Editor, text: []const u8) !void {
-    const message = try tellMessage(ed, text);
-    defer ed.gpa.free(message);
-    if (ed.claude_ask) |a| ed.gpa.free(a.path);
-    ed.claude_ask = null;
+    defer {
+        if (ed.claude_ask) |a| ed.gpa.free(a.path);
+        ed.claude_ask = null;
+    }
     // Claude's own terminal, if that is what is on screen; else the
     // conversation zile draws.
     const term_shown = if (ed.claude) |c| (if (c.term) |t| window_ops.windowShowing(ed, t) != null else false) else false;
-    if (!term_shown) return claude_chat.tell(ed, message);
+    if (!term_shown) {
+        // (What is said as typed; the lines go with it, their text too.)
+        const about: ?claude_chat.About = if (ed.claude_ask) |a| (if (a.lines) |l| .{ .path = a.path, .lines = l } else null) else null;
+        return claude_chat.tell(ed, text, about);
+    }
+    const message = try tellMessage(ed, text);
+    defer ed.gpa.free(message);
     const back = ed.window;
     try showClaude(ed);
     for (ed.window_list.items) |w| if (w == back) window_ops.focusWindow(ed, back);
@@ -361,6 +367,8 @@ pub fn tellClaude(ed: *Editor, text: []const u8) !void {
 /// `SPC a y` / `SPC a n`: accepts or rejects the proposal shown (or shows
 /// the first one waiting, if another buffer is shown).
 pub fn claudeResolve(ed: *Editor, accept: bool) void {
+    // A rewrite of a selection that is showing comes first.
+    if (@import("claude_inline.zig").resolve(ed, accept)) return;
     // A tool of the conversation's waiting for permission comes first.
     if (claude_chat.answer(ed, accept)) return;
     const c = ed.claude orelse return ed.setMessage(.info, "no proposed changes", .{});

@@ -15,6 +15,8 @@ const Editor = @import("../Editor.zig");
 const project_ops = @import("project_ops.zig");
 const notifications = @import("notifications.zig");
 const side_float = @import("side_float.zig");
+const state_files = @import("state_files.zig");
+const Claude = @import("../ai/Claude.zig");
 
 /// The panel: what it shows of the conversation.
 pub const Panel = struct {
@@ -57,11 +59,155 @@ fn chat(ed: *Editor) !*Chat {
     return ed.chat.?;
 }
 
+/// The CLI, started if it wasn't (nothing is said to Claude by that): its
+/// slash commands and models are known a moment later. It is told how to
+/// reach zile's own server (`ai/Claude.zig`), which it can ask for the
+/// diagnostics of the files that are open.
+fn awake(ed: *Editor) !*Chat {
+    const c = try chat(ed);
+    if (!c.offline and c.mcp_config == null) connect: {
+        if (ed.claude == null) ed.claude = Claude.start(ed) catch break :connect;
+        const file = ed.claude.?.mcpConfigFile() orelse break :connect;
+        c.mcp_config = ed.gpa.dupe(u8, file) catch break :connect;
+        c.mcp_allowed = "mcp__ide__getDiagnostics";
+    }
+    c.wake_up();
+    return c;
+}
+
+/// What something said to Claude is about: lines selected in a file.
+pub const About = struct { path: []const u8, lines: [2]usize };
+
+/// What Claude is told along with what is said, as its editor extensions
+/// tell it: the lines selected (with their text), else the file in the
+/// code window and where the cursor is. Caller frees.
+fn context(ed: *Editor, about: ?About) !?[]u8 {
+    if (about) |a| {
+        const b = @import("claude_panel.zig").bufferForPath(ed, a.path) orelse return null;
+        const t = &b.text;
+        const last = @min(a.lines[1], t.lineCount() -| 1, a.lines[0] + 400);
+        if (a.lines[0] > last) return null;
+        return try std.fmt.allocPrint(ed.gpa, "<ide_selection>The user selected the lines {d} to {d} from {s}:\n{s}\n\nThis may or may not be related to the current task.</ide_selection>", .{
+            a.lines[0] + 1, last + 1, a.path, t.slice(t.lineStart(a.lines[0]), t.lineEnd(last)),
+        });
+    }
+    if (ed.window.term != null or ed.buffer.read_only) return null;
+    const path = ed.buffer.path orelse return null;
+    const abs = try ed.absolutePath(path);
+    defer ed.gpa.free(abs);
+    return try std.fmt.allocPrint(ed.gpa, "<ide_opened_file>The user opened the file {s} in the IDE (the cursor is on line {d}). This may or may not be related to the current task.</ide_opened_file>", .{ abs, ed.cursorLine() + 1 });
+}
+
+/// An edit Claude asks to make, shown in the code window as a diff
+/// (`claude_panel.openProposal`) to look at, change, and accept or refuse.
+pub const Proposal = struct {
+    /// The request it is for (owned).
+    ask: []u8,
+    buffer: *Buffer,
+    /// The file (absolute, owned), as it is on disk (owned), and the
+    /// proposal as it was shown (owned), to know if it was changed here.
+    path: []u8,
+    base: []u8,
+    shown: []u8,
+
+    fn deinit(p: Proposal, gpa: std.mem.Allocator) void {
+        gpa.free(p.ask);
+        gpa.free(p.path);
+        gpa.free(p.base);
+        gpa.free(p.shown);
+    }
+};
+
+/// The file a tool waiting for permission would write, and what would be
+/// in it (in `a`): Write's content; Edit's replacement made in the file as
+/// it is on disk. Null for other tools, or an edit that doesn't fit.
+fn editOf(ed: *Editor, a: std.mem.Allocator, ask: Chat.Ask) ?struct { path: []const u8, base: []const u8, contents: []const u8 } {
+    const write = std.mem.eql(u8, ask.tool, "Write");
+    if (!write and !std.mem.eql(u8, ask.tool, "Edit")) return null;
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, ask.input, .{}) catch return null;
+    if (v != .object) return null;
+    const str = struct {
+        fn get(o: std.json.Value, name: []const u8) ?[]const u8 {
+            const f = o.object.get(name) orelse return null;
+            return if (f == .string) f.string else null;
+        }
+    }.get;
+    const path = str(v, "file_path") orelse return null;
+    if (!std.fs.path.isAbsolute(path)) return null;
+    const base = Io.Dir.cwd().readFileAlloc(ed.io, path, a, .limited(16 << 20)) catch "";
+    if (write) return .{ .path = path, .base = base, .contents = str(v, "content") orelse return null };
+    const old = str(v, "old_string") orelse return null;
+    const new = str(v, "new_string") orelse return null;
+    if (old.len == 0 or std.mem.indexOf(u8, base, old) == null) return null;
+    const all = if (v.object.get("replace_all")) |r| r == .bool and r.bool else false;
+    const contents = if (all) std.mem.replaceOwned(u8, a, base, old, new) catch return null else blk: {
+        const at = std.mem.indexOf(u8, base, old).?;
+        break :blk std.mem.concat(a, u8, &.{ base[0..at], new, base[at + old.len ..] }) catch return null;
+    };
+    return .{ .path = path, .base = base, .contents = contents };
+}
+
+/// The proposal that is showing for the tool waiting now, if any.
+fn proposal(ed: *Editor) ?*Proposal {
+    const p = &(ed.chat_proposal orelse return null);
+    const c = ed.chat orelse return null;
+    const a = c.asking() orelse return null;
+    if (!std.mem.eql(u8, p.ask, a.id) or !state_files.bufferAlive(ed, p.buffer)) return null;
+    return p;
+}
+
+fn dropProposal(ed: *Editor) void {
+    const p = ed.chat_proposal orelse return;
+    ed.chat_proposal = null;
+    if (state_files.bufferAlive(ed, p.buffer)) @import("claude_panel.zig").closeProposal(ed, p.buffer, p.path);
+    p.deinit(ed.gpa);
+}
+
+/// Shows the edit the waiting tool would make, as a diff in the code
+/// window. False if it isn't an edit that can be shown.
+fn showEdit(ed: *Editor, ask: Chat.Ask) !bool {
+    var arena: std.heap.ArenaAllocator = .init(ed.gpa);
+    defer arena.deinit();
+    const e = editOf(ed, arena.allocator(), ask) orelse return false;
+    dropProposal(ed);
+    hide(ed);
+    const b = try @import("claude_panel.zig").openProposal(ed, e.path, e.contents);
+    var p: Proposal = .{ .ask = &.{}, .buffer = b, .path = &.{}, .base = &.{}, .shown = &.{} };
+    errdefer p.deinit(ed.gpa);
+    p.ask = try ed.gpa.dupe(u8, ask.id);
+    p.path = try ed.gpa.dupe(u8, e.path);
+    p.base = try ed.gpa.dupe(u8, e.base);
+    p.shown = try ed.gpa.dupe(u8, b.text.slice(0, b.text.len()));
+    ed.chat_proposal = p;
+    return true;
+}
+
+/// `SPC a y` / `SPC a n` on the edit that is showing: allowed (as it is
+/// in the editor now, if it was changed there) or refused.
+fn finishEdit(ed: *Editor, c: *Chat, accept: bool) !void {
+    const p = ed.chat_proposal.?;
+    defer dropProposal(ed);
+    if (!accept) return c.answer(.refuse);
+    const t = &p.buffer.text;
+    const now = t.slice(0, t.len());
+    if (std.mem.eql(u8, now, p.shown)) return c.answer(.allow);
+    // Changed here: the whole file as it should be (an Edit replacing all
+    // of what is there; a Write, where there is nothing yet).
+    const text = try std.mem.concat(ed.gpa, u8, &.{ now, if (p.buffer.final_newline and now.len > 0) "\n" else "" });
+    defer ed.gpa.free(text);
+    const input = if (p.base.len > 0 and std.mem.eql(u8, c.asking().?.tool, "Edit"))
+        try std.json.Stringify.valueAlloc(ed.gpa, .{ .file_path = p.path, .old_string = p.base, .new_string = text }, .{})
+    else if (std.mem.eql(u8, c.asking().?.tool, "Write"))
+        try std.json.Stringify.valueAlloc(ed.gpa, .{ .file_path = p.path, .content = text }, .{})
+    else
+        return c.answer(.allow);
+    defer ed.gpa.free(input);
+    try c.answerWith(input);
+}
+
 /// Puts the panel on screen. The code keeps the keyboard unless `focus`.
 pub fn show(ed: *Editor, focus: bool) !void {
-    // The CLI is started with the panel (nothing is said yet): its slash
-    // commands and models are known by the time they are asked for.
-    (try chat(ed)).wake_up();
+    _ = try awake(ed);
     // One panel along the bottom at a time.
     @import("pads.zig").hide(ed);
     ed.chat_panel.shown = true;
@@ -83,12 +229,15 @@ pub fn toggle(ed: *Editor) !void {
 }
 
 /// Says `text` to Claude; the conversation is shown, the keyboard stays.
-pub fn tell(ed: *Editor, text: []const u8) !void {
+/// `about`: the lines it was said about, if any were selected.
+pub fn tell(ed: *Editor, text: []const u8, about: ?About) !void {
     const c = try chat(ed);
+    const told = context(ed, about) catch null;
+    defer if (told) |t| ed.gpa.free(t);
     try show(ed, false);
     // What is said, and the answer to it, are what to look at.
     ed.chat_panel.follow = true;
-    try c.send(text);
+    try c.send(text, told);
     tick(ed);
 }
 
@@ -97,7 +246,15 @@ pub fn tell(ed: *Editor, text: []const u8) !void {
 /// in. `SPC a n` refuses at once. False if nothing is waiting.
 pub fn answer(ed: *Editor, yes: bool) bool {
     const c = ed.chat orelse return false;
-    if (c.asking() == null) return false;
+    const a = c.asking() orelse return false;
+    // An edit: the first `SPC a y` shows it in the code window (to change
+    // it there if need be), the second accepts it.
+    if (proposal(ed) != null) {
+        finishEdit(ed, c, yes) catch {};
+        tick(ed);
+        return true;
+    }
+    if (yes and (showEdit(ed, a) catch false)) return true;
     if (yes) {
         // The picker takes the panel's place; it comes back with the answer.
         ed.chat_panel.back = if (ed.chat_panel.shown) (if (ed.chat_panel.focus) .focused else .shown) else .no;
@@ -144,30 +301,35 @@ pub fn pick(ed: *Editor, row: usize) !void {
 }
 
 /// What `SPC a /`, `SPC a m` and `SPC a p` pick from.
-pub const Menu = enum { commands, models, modes, efforts, usage };
+pub const Menu = enum { commands, models, modes, efforts, usage, sessions };
 
 /// `SPC a /` (`/` in the panel, or first in the box): Claude's slash
 /// commands; the one taken starts the box (`/review `). `SPC a m` (`m`):
 /// the models to choose from. `SPC a p` (`p`): how much Claude may do
 /// without asking. The lists are the CLI's own.
 pub fn menu(ed: *Editor, which: Menu) !void {
-    const c = try chat(ed);
-    c.wake_up();
+    const c = try awake(ed);
     c.poll();
     // (The limits as they are now, for the next look.)
     if (which == .usage) c.refresh();
+    if (which == .sessions) {
+        c.listSessions();
+        if (c.listed.len == 0) return ed.setMessage(.info, "no conversations with Claude in this project yet", .{});
+    }
     const empty = switch (which) {
         .commands => c.commands.len == 0,
         .models => c.models.len == 0,
         .modes => false,
         .efforts => c.efforts().len == 0,
         .usage => !c.usage.known,
+        .sessions => false,
     };
     if (empty) return ed.setMessage(.info, "Claude is starting: its {s} here in a moment", .{switch (which) {
         .commands => "commands are",
         .models, .modes => "models are",
         .efforts => "effort levels are",
         .usage => "usage is",
+        .sessions => "conversations are",
     }});
     try ed.openPicker(switch (which) {
         .commands => .claude_commands,
@@ -175,6 +337,7 @@ pub fn menu(ed: *Editor, which: Menu) !void {
         .modes => .claude_modes,
         .efforts => .claude_efforts,
         .usage => .claude_usage,
+        .sessions => .claude_sessions,
     }, "");
 }
 
@@ -207,7 +370,28 @@ pub fn menuPick(ed: *Editor, which: Menu, row: usize) !void {
         },
         // Only to look at.
         .usage => {},
+        .sessions => {
+            if (row >= c.listed.len) return;
+            try c.resumeSession(c.listed[row].id, c.listed[row].path);
+            ed.chat_panel.follow = true;
+            try show(ed, true);
+            tick(ed);
+            ed.setMessage(.info, "back in that conversation: what you say next carries on with it", .{});
+        },
     }
+}
+
+/// "3h ago": how long since `at` (seconds since 1970).
+pub fn ago(ed: *const Editor, at: i64, buf: []u8) []const u8 {
+    const since = @max(Io.Timestamp.now(ed.io, .real).toSeconds() - at, 0);
+    return (if (since >= 2 * 86400)
+        std.fmt.bufPrint(buf, "{d} days ago", .{@divFloor(since, 86400)})
+    else if (since >= 3600)
+        std.fmt.bufPrint(buf, "{d}h ago", .{@divFloor(since, 3600)})
+    else if (since >= 60)
+        std.fmt.bufPrint(buf, "{d}m ago", .{@divFloor(since, 60)})
+    else
+        std.fmt.bufPrint(buf, "just now", .{})) catch "";
 }
 
 /// "in 2h 14m" until `at` (seconds since 1970), from now.
@@ -271,6 +455,8 @@ pub fn tick(ed: *Editor) void {
         }
         ed.wake_fn();
     }
+    // An edit that was showing, and isn't asked about any more.
+    if (ed.chat_proposal != null and proposal(ed) == null) dropProposal(ed);
     // A notification for as long as Claude waits for an answer.
     const waiting: u64 = if (c.asking()) |a| std.hash.Wyhash.hash(0, a.id) | 1 else 0;
     if (waiting != ed.chat_asked) {
@@ -278,6 +464,8 @@ pub fn tick(ed: *Editor) void {
         if (c.asking()) |a| {
             if (a.question)
                 notifications.progress(ed, ask_toast, true, "Claude has a question: SPC a y to answer", .{})
+            else if (std.mem.eql(u8, a.tool, "Edit") or std.mem.eql(u8, a.tool, "Write"))
+                notifications.progress(ed, ask_toast, true, "Claude asks to change a file: SPC a y shows it (SPC a n refuses)", .{})
             else
                 notifications.progress(ed, ask_toast, true, "Claude asks to use {s}: SPC a y to answer (SPC a n refuses)", .{a.tool});
         } else notifications.progress(ed, ask_toast, false, "Claude has its answer", .{});
@@ -411,6 +599,7 @@ pub fn key(ed: *Editor, ev: Editor.KeyEvent) bool {
             'p' => menu(ed, .modes) catch {},
             'e' => menu(ed, .efforts) catch {},
             'u' => menu(ed, .usage) catch {},
+            'r' => menu(ed, .sessions) catch {},
             ' ' => {
                 p.focus = false;
                 return false;

@@ -43,6 +43,7 @@ const multicursor = @import("editor/multicursor.zig");
 const row_model = @import("editor/row_model.zig");
 const folding = @import("editor/folding.zig");
 const code_motion = @import("editor/code_motion.zig");
+const block_visual = @import("editor/block_visual.zig");
 const row_search = @import("editor/row_search.zig");
 const replacing = @import("editor/replacing.zig");
 const claude_chat = @import("editor/claude_chat.zig");
@@ -102,8 +103,8 @@ pub const all = base ++ text_object_commands;
 
 const base = [_]Command{
     // Motions: normal and visual mode, and as an operator's range.
-    .{ .name = "move_left", .doc = "Left", .run = ghostCol(.left, motion(left, .exclusive, .reset)), .ghost = true },
-    .{ .name = "move_right", .doc = "Right", .run = ghostCol(.right, motion(right, .exclusive, .reset)), .ghost = true },
+    .{ .name = "move_left", .doc = "Left", .run = blockSideways(false, ghostCol(.left, motion(left, .exclusive, .reset))), .ghost = true },
+    .{ .name = "move_right", .doc = "Right", .run = blockSideways(true, ghostCol(.right, motion(right, .exclusive, .reset))), .ghost = true },
     .{ .name = "move_down", .doc = "Down", .run = verticalRow(1), .ghost = true },
     .{ .name = "move_up", .doc = "Up", .run = verticalRow(-1), .ghost = true },
     .{ .name = "word_forward", .doc = "Next word", .run = wordMotion(.forward, false), .ghost = true },
@@ -224,6 +225,8 @@ const base = [_]Command{
     .{ .name = "shift_text_left", .doc = "Move line/selection left", .run = moveCmd(.left) },
     .{ .name = "shift_text_right", .doc = "Move line/selection right", .run = moveCmd(.right) },
     .{ .name = "join_lines", .doc = "Join lines", .run = joinLines, .repeat = true },
+    .{ .name = "number_increment", .doc = "Add to the number at or after the cursor", .run = numberStep(1), .repeat = true },
+    .{ .name = "number_decrement", .doc = "Subtract from the number at or after the cursor", .run = numberStep(-1), .repeat = true },
     .{ .name = "toggle_case_char", .doc = "Toggle case of character", .run = toggleCaseChar, .repeat = true },
     .{ .name = "undo", .doc = "Undo", .run = undo , .once = true },
     .{ .name = "redo", .doc = "Redo", .run = redo , .once = true },
@@ -236,6 +239,9 @@ const base = [_]Command{
 
     // Visual mode
     .{ .name = "visual_mode", .doc = "Visual mode", .run = visualMode(false), .ghost = true },
+    .{ .name = "visual_swap_sides", .doc = "Other corner on the same line (block: the other side)", .run = visualSwapSides },
+    .{ .name = "visual_replace_char", .doc = "Replace every character of the selection", .run = visualReplaceChar, .takes_char = true },
+    .{ .name = "visual_block_mode", .doc = "Visual block mode (columns)", .run = visualBlockMode },
     .{ .name = "visual_line_mode", .doc = "Visual line mode", .run = visualMode(true), .ghost = true },
     .{ .name = "visual_swap_ends", .doc = "Other end of selection", .run = visualSwap },
     .{ .name = "exit_visual", .doc = "Leave visual mode", .run = exitVisual, .hidden = true, .ghost = true },
@@ -333,6 +339,8 @@ const base = [_]Command{
     .{ .name = "claude_mode", .doc = "Claude: how much it may do without asking", .run = claudeCmd(.mode), .once = true, .needs = "claude" },
     .{ .name = "claude_effort", .doc = "Claude: how hard it thinks (effort)", .run = claudeCmd(.effort), .once = true, .needs = "claude" },
     .{ .name = "claude_usage", .doc = "Claude: how much of your limits is used", .run = claudeCmd(.usage), .once = true, .needs = "claude" },
+    .{ .name = "claude_resume", .doc = "Claude: go back to a conversation of before", .run = claudeCmd(.resume_), .once = true, .needs = "claude" },
+    .{ .name = "claude_rewrite", .doc = "Claude: rewrite the selection in place", .run = claudeCmd(.rewrite), .once = true, .needs = "claude" },
     .{ .name = "claude_stop", .doc = "Claude: stop what it is doing", .run = claudeCmd(.stop), .once = true },
     .{ .name = "claude_new", .doc = "Claude: a new conversation", .run = claudeCmd(.new), .once = true, .needs = "claude" },
     .{ .name = "claude_panel", .doc = "Claude Code's own terminal", .run = claudeCmd(.panel), .once = true, .needs = "claude" },
@@ -1360,6 +1368,7 @@ fn operator(comptime op: Operator) Handler {
             const ed = c.ed;
             switch (ed.mode) {
                 .visual => {
+                    if (block_visual.active(ed)) return block_visual.apply(ed, op, c.register);
                     const r = code_motion.visualRange(ed);
                     code_motion.exitVisual(ed);
                     try operators.apply(ed, op, r, c.register);
@@ -1581,14 +1590,20 @@ fn pasteMode(comptime before: bool, comptime inline_: bool) Handler {
             const text = try ed.gpa.dupe(u8, if (inline_) inlineText(v.text) else v.text);
             defer ed.gpa.free(text);
             if (text.len == 0) return;
-            const value: @TypeOf(v) = .{ .text = text, .linewise = v.linewise and !inline_ };
+            const value: @TypeOf(v) = .{ .text = text, .linewise = v.linewise and !inline_, .block = v.block and !inline_ };
             if (ed.mode == .visual) {
+                if (block_visual.active(ed)) {
+                    try block_visual.apply(ed, .delete, '_');
+                    if (value.block) return block_visual.paste(ed, value.text, v.block_width, c.count, true);
+                    return operators.paste(ed, value, c.count, true, true);
+                }
                 // Replace the selection, keeping the pasted text in the register.
                 const r = code_motion.visualRange(ed);
                 code_motion.exitVisual(ed);
                 try operators.apply(ed, .delete, r, '_');
                 return operators.paste(ed, value, c.count, true, true);
             }
+            if (value.block) return block_visual.paste(ed, value.text, v.block_width, c.count, before);
             try operators.paste(ed, value, c.count, before, !before);
         }
     }.run;
@@ -1796,6 +1811,45 @@ fn toggleCaseChar(c: Context) !void {
     ed.setCursor(to);
 }
 
+/// `<C-a>` / `<C-x>`: the decimal number under the cursor, else the first one
+/// after it on the line, changed by the count. A `-` right before it is its
+/// sign; leading zeros keep the width. The cursor ends on the last digit.
+fn numberStep(comptime sign: i8) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const t = ed.text();
+            const line = ed.cursorLine();
+            const ls = t.lineStart(line);
+            const le = t.lineEnd(line);
+            var p = ed.view.cursor;
+            while (p > ls and std.ascii.isDigit(t.byteAt(p - 1))) p -= 1;
+            while (p < le and !std.ascii.isDigit(t.byteAt(p))) p += 1;
+            if (p >= le) return fail(ed);
+            var e = p;
+            while (e < le and std.ascii.isDigit(t.byteAt(e))) e += 1;
+            const negative = p > ls and t.byteAt(p - 1) == '-';
+            const start = if (negative) p - 1 else p;
+            const digits = t.slice(p, e);
+            const mag = std.fmt.parseInt(i64, digits, 10) catch return fail(ed);
+            var value: i64 = if (negative) -mag else mag;
+            const step = std.math.mul(i64, @intCast(c.count), sign) catch return fail(ed);
+            value = std.math.add(i64, value, step) catch return fail(ed);
+            var buf: [32]u8 = undefined;
+            const abs = std.fmt.bufPrint(&buf, "{d}", .{@abs(value)}) catch return fail(ed);
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(ed.gpa);
+            if (value < 0) try out.append(ed.gpa, '-');
+            if (digits.len > 1 and digits[0] == '0')
+                for (0..digits.len -| abs.len) |_| try out.append(ed.gpa, '0');
+            try out.appendSlice(ed.gpa, abs);
+            try ed.deleteRange(start, e);
+            try ed.insertAt(start, out.items);
+            ed.setCursor(start + out.items.len - 1);
+        }
+    }.run;
+}
+
 fn undo(c: Context) !void {
     try code_motion.undo(c.ed, c.count);
 }
@@ -1845,6 +1899,12 @@ fn visualMode(comptime line: bool) Handler {
                 return;
             }
             if (ed.mode != .visual) return ed.enterVisual(line);
+            // From a block: `v` / `V` make it charwise / linewise.
+            if (ed.visual_block) {
+                ed.visual_block = false;
+                ed.visual_line = line;
+                return;
+            }
             // `v` again in charwise visual: line mode, over every line the
             // selection touches.
             if (!line and !ed.visual_line) {
@@ -1857,7 +1917,45 @@ fn visualMode(comptime line: bool) Handler {
     }.run;
 }
 
+/// `h` / `l`, but in a block they go on into blank space past a line's end.
+fn blockSideways(comptime right_: bool, comptime inner: Handler) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            if (block_visual.horizontal(c.ed, right_, c.count)) return;
+            try inner(c);
+        }
+    }.run;
+}
+
+/// `<C-v>`: a rectangle of columns; again leaves visual mode.
+fn visualBlockMode(c: Context) !void {
+    const ed = c.ed;
+    if (ed.ghost != null) return;
+    if (ed.mode != .visual) {
+        ed.enterVisual(false);
+        ed.visual_block = true;
+        ed.view.want_col = null;
+        return;
+    }
+    if (ed.visual_block) return code_motion.exitVisual(ed);
+    ed.visual_line = false;
+    ed.visual_block = true;
+    ed.view.want_col = null;
+}
+
+/// `O` in a block: the other corner on the same line.
+fn visualSwapSides(c: Context) !void {
+    if (block_visual.active(c.ed)) return block_visual.swapSides(c.ed);
+    try visualSwap(c);
+}
+
+/// `r{char}` on a selection.
+fn visualReplaceChar(c: Context) !void {
+    if (c.ed.mode == .visual and c.ed.ghost == null) try block_visual.replaceSelection(c.ed, c.char);
+}
+
 fn visualSwap(c: Context) !void {
+    if (block_visual.active(c.ed)) return block_visual.swapEnds(c.ed);
     const v = &c.ed.view;
     std.mem.swap(usize, &v.anchor, &v.cursor);
     v.want_col = null;
@@ -2141,7 +2239,7 @@ fn surroundStep(comptime step: enum { add, delete, change_from, change_to, visua
     }.run;
 }
 
-fn claudeCmd(comptime action: enum { chat, commands, model, mode, effort, usage, stop, new, panel, send, ask, accept, reject }) Handler {
+fn claudeCmd(comptime action: enum { chat, commands, model, mode, effort, usage, resume_, rewrite, stop, new, panel, send, ask, accept, reject }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
@@ -2153,6 +2251,8 @@ fn claudeCmd(comptime action: enum { chat, commands, model, mode, effort, usage,
                 .mode => try claude_chat.menu(ed, .modes),
                 .effort => try claude_chat.menu(ed, .efforts),
                 .usage => try claude_chat.menu(ed, .usage),
+                .resume_ => try claude_chat.menu(ed, .sessions),
+                .rewrite => try @import("editor/claude_inline.zig").prompt(ed),
                 .stop => claude_chat.stop(ed),
                 .new => try claude_chat.startOver(ed),
                 .send => try claude_panel.claudeMention(ed),

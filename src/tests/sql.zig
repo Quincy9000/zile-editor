@@ -139,4 +139,22 @@ test "SQL completion: tables and columns from the database, after an alias its c
     const cols = completion_ops.completionShown(&ed).?;
     try testing.expectEqualStrings("id", cols.items[cols.shown.items[0]].label);
     try testing.expectEqualStrings("total", cols.items[cols.shown.items[1]].label);
+    // In `order by` with no name before it: the columns of the statement's tables.
+    try ed.feed("<Esc>ccselect 1 from orders o order by ");
+    after_typing.closeCompletion(&ed);
+    try completion_ops.showServerCompletion(&ed, ed.buffer, ed.view.cursor, nothing.value);
+    const by = completion_ops.completionShown(&ed).?;
+    try testing.expectEqualStrings("id", by.items[by.shown.items[0]].label);
+    try testing.expectEqualStrings("total", by.items[by.shown.items[1]].label);
+    // Not in a comment, nor where columns aren't what comes next.
+    try ed.feed("<Esc>cc-- order by ");
+    after_typing.closeCompletion(&ed);
+    try completion_ops.showServerCompletion(&ed, ed.buffer, ed.view.cursor, nothing.value);
+    // (Only the file's own words, as anywhere.)
+    if (completion_ops.completionShown(&ed)) |c2| for (c2.shown.items) |i| try testing.expect(c2.items[i].from_buffer);
+    try ed.feed("<Esc>ccselect 1 from orders limit ");
+    after_typing.closeCompletion(&ed);
+    try completion_ops.showServerCompletion(&ed, ed.buffer, ed.view.cursor, nothing.value);
+    // (Only the file's own words, as anywhere.)
+    if (completion_ops.completionShown(&ed)) |c2| for (c2.shown.items) |i| try testing.expect(c2.items[i].from_buffer);
 }

@@ -39,6 +39,9 @@ pub fn replaceProject(ed: *Editor) !void {
 }
 
 fn open(ed: *Editor, find: []const u8, root: []const u8, from_grep: bool) !void {
+    // Only our own files: not the packages and generated sources a compiler
+    // keeps in its cache, where a jump to a definition may have left us.
+    if (project_ops.isCache(root)) return ed.setMessage(.err, "not replacing in {s}: that is a cache, not your project", .{root});
     const r = try Replace.create(ed.gpa, ed.io, root, ed.wake_fn);
     errdefer r.destroy();
     r.options = ed.replace_options;

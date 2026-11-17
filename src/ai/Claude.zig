@@ -36,6 +36,8 @@ io: Io,
 server: *WsServer,
 token: [32]u8,
 lock_path: ?[]u8 = null,
+/// `mcpConfigFile`'s file (owned; deleted with us).
+mcp_path: ?[]u8 = null,
 /// The workspace folders last written to the lock file (their count).
 lock_projects: usize = 0,
 /// The panel's terminal running `claude` (owned; null until opened).
@@ -75,6 +77,10 @@ pub fn destroy(c: *Claude) void {
         Io.Dir.cwd().deleteFile(c.io, p) catch {};
         c.gpa.free(p);
     }
+    if (c.mcp_path) |p| {
+        Io.Dir.cwd().deleteFile(c.io, p) catch {};
+        c.gpa.free(p);
+    }
     if (c.term) |t| t.destroy();
     c.server.destroy();
     for (c.diffs.items) |d| c.freeDiff(d);
@@ -106,6 +112,34 @@ fn lockDir(gpa: Allocator) ?[]u8 {
     }
     const home = std.mem.span(std.c.getenv("HOME") orelse return null);
     return std.fs.path.join(gpa, &.{ home, ".claude", "ide" }) catch null;
+}
+
+/// A file saying how to reach this server as an MCP server (what
+/// `claude --mcp-config` takes), for the CLI zile runs without its
+/// interface: beside the lock file, where only you can read it (the token
+/// stays out of the process list). Written once; null if it can't be.
+pub fn mcpConfigFile(c: *Claude) ?[]const u8 {
+    if (c.mcp_path) |p| return p;
+    const dir = lockDir(c.gpa) orelse return null;
+    defer c.gpa.free(dir);
+    Io.Dir.cwd().createDirPath(c.io, dir) catch return null;
+    const path = std.fmt.allocPrint(c.gpa, "{s}/{d}.mcp.json", .{ dir, c.port() }) catch return null;
+    const json = std.fmt.allocPrint(c.gpa, "{{\"mcpServers\":{{\"ide\":{{\"type\":\"ws\",\"url\":\"ws://127.0.0.1:{d}\",\"headers\":{{\"X-Claude-Code-Ide-Authorization\":\"{s}\"}}}}}}}}", .{ c.port(), &c.token }) catch {
+        c.gpa.free(path);
+        return null;
+    };
+    defer c.gpa.free(json);
+    const file = Io.Dir.cwd().createFile(c.io, path, .{ .permissions = .fromMode(0o600) }) catch {
+        c.gpa.free(path);
+        return null;
+    };
+    defer file.close(c.io);
+    file.writeStreamingAll(c.io, json) catch {
+        c.gpa.free(path);
+        return null;
+    };
+    c.mcp_path = path;
+    return path;
 }
 
 /// (Re)writes `<port>.lock` with the projects open (the CLI connects when

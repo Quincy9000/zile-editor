@@ -156,7 +156,9 @@ const Job = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         // --no-messages: not the files it can't read (a regex it can't read
         // is still reported).
-        try argv.appendSlice(a, &.{ "rg", "--json", "--no-require-git", "--no-messages", "--smart-case" });
+        // --no-hidden: never in dot files and folders (`.zig-cache`, `.git`),
+        // even when the user's own rg config searches them.
+        try argv.appendSlice(a, &.{ "rg", "--json", "--no-require-git", "--no-messages", "--smart-case", "--no-hidden" });
         if (!j.options.regex) try argv.append(a, "--fixed-strings");
         if (j.options.word) try argv.append(a, "--word-regexp");
         try argv.append(a, try std.fmt.allocPrint(a, "--regexp={s}", .{j.find}));

@@ -20,6 +20,10 @@ const Registers = @This();
 pub const Value = struct {
     text: []const u8,
     linewise: bool,
+    /// The rows of a block selection (`<C-v>`), one per line.
+    block: bool = false,
+    /// How wide the block was, short rows included.
+    block_width: usize = 0,
 };
 
 /// Platform clipboard access (main thread only). Absent in tests.
@@ -49,6 +53,10 @@ clipboard: ?Clipboard = null,
 /// The text we last put on the clipboard, to recognize it when reading back.
 clip_last: std.ArrayList(u8) = .empty,
 clip_linewise: bool = false,
+/// The text of the last block yank: a register holding exactly this (even
+/// by way of the clipboard) pastes as a block.
+block_last: std.ArrayList(u8) = .empty,
+block_width: usize = 0,
 
 pub fn init(gpa: Allocator) Registers {
     return .{ .gpa = gpa };
@@ -57,6 +65,7 @@ pub fn init(gpa: Allocator) Registers {
 pub fn deinit(r: *Registers) void {
     for (&r.slots) |*s| s.text.deinit(r.gpa);
     r.clip_last.deinit(r.gpa);
+    r.block_last.deinit(r.gpa);
     r.* = undefined;
 }
 
@@ -132,6 +141,13 @@ pub fn setNamed(r: *Registers, name: u8, text: []const u8) Allocator.Error!void 
     try r.set(slot, text, false);
 }
 
+/// Marks `text` as a block yank (see `block_last`).
+pub fn noteBlock(r: *Registers, text: []const u8, width: usize) Allocator.Error!void {
+    r.block_width = width;
+    r.block_last.clearRetainingCapacity();
+    try r.block_last.appendSlice(r.gpa, text);
+}
+
 /// Reads a register for pasting. Valid until the next register write.
 pub fn get(r: *Registers, name: ?u8) ?Value {
     const n = name orelse '"';
@@ -142,7 +158,8 @@ pub fn get(r: *Registers, name: ?u8) ?Value {
     };
     const s = &r.slots[slot];
     if (s.text.items.len == 0) return null;
-    return .{ .text = s.text.items, .linewise = s.linewise };
+    const block = !s.linewise and std.mem.indexOfScalar(u8, s.text.items, '\n') != null and std.mem.eql(u8, s.text.items, r.block_last.items);
+    return .{ .text = s.text.items, .linewise = s.linewise, .block = block, .block_width = if (block) r.block_width else 0 };
 }
 
 fn setClipboard(r: *Registers, text: []const u8, linewise: bool) void {

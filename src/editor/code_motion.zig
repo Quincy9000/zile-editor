@@ -208,6 +208,7 @@ pub fn contextLines(ed: *Editor, out: []usize) []usize {
 
 pub fn exitVisual(ed: *Editor) void {
     ed.mode = .normal;
+    ed.visual_block = false;
     if (ed.ghost) |*g| g.anchor = null;
     ed.placeCursor(ed.view.cursor);
 }

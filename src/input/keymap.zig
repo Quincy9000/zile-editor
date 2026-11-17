@@ -372,6 +372,8 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ N, "r", "replace_char" },
     .{ NV, "J", "join_lines" },
     .{ N, "~", "toggle_case_char" },
+    .{ N, "<C-a>", "number_increment" },
+    .{ N, "<C-x>", "number_decrement" },
     .{ N, "u", "undo" },
     .{ N, "<C-r>", "redo" },
     .{ N, "U", "redo" },
@@ -388,7 +390,10 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     // Visual mode
     .{ NV, "v", "visual_mode" },
     .{ NV, "V", "visual_line_mode" },
+    .{ NV, "<C-v>", "visual_block_mode" },
     .{ V, "o", "visual_swap_ends" },
+    .{ V, "O", "visual_swap_sides" },
+    .{ V, "r", "visual_replace_char" },
     .{ V, "<Esc>", "exit_visual" },
 
     // Leader menus (Doom Emacs layout). The first binding of a command is the

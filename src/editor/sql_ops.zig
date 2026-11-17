@@ -28,6 +28,26 @@ pub fn sqlCompletion(ed: *Editor, start: usize) void {
     completion_ops.showCompletion(ed, ed.buffer, start, parsed.value) catch {};
 }
 
+/// Where the Postgres server answered with nothing: zile's own columns, if
+/// this is a place for them (after `name.`; in `order by`, `group by`,
+/// `having`, `returning`; in `insert into t (`). False if it has none
+/// either, or this is a comment.
+pub fn sqlFallback(ed: *Editor, start: usize) bool {
+    const t = ed.text();
+    const tables: []const sql.Table = if (ed.sql_schema) |sc| (if (sc.done.load(.acquire)) sc.tables else &.{}) else &.{};
+    if (tables.len == 0) return false;
+    const line_start = t.lineStart(t.lineOf(start));
+    if (std.mem.indexOf(u8, t.slice(line_start, start), "--") != null) return false;
+    const json = sql.fallbackJson(ed.gpa, tables, t.slice(0, t.len()), start) catch return false;
+    defer ed.gpa.free(json);
+    var parsed = std.json.parseFromSlice(std.json.Value, ed.gpa, json, .{}) catch return false;
+    defer parsed.deinit();
+    const items = parsed.value.object.get("items") orelse return false;
+    if (items != .array or items.array.items.len == 0) return false;
+    completion_ops.showCompletion(ed, ed.buffer, start, parsed.value) catch return false;
+    return true;
+}
+
 /// A statement's results arrived: its rows in the results picker; an error
 /// in a box at the cursor (it points into the statement there).
 pub fn tickSqlResults(ed: *Editor) void {

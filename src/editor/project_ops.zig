@@ -43,6 +43,34 @@ pub fn projectRoot(ed: *const Editor) []const u8 {
     return if (project(ed)) |p| p.root else ed.cwd;
 }
 
+/// Whether `path` is `dir` or somewhere inside it.
+fn within(path: []const u8, dir: []const u8) bool {
+    const d = std.mem.trimEnd(u8, dir, "/");
+    if (d.len == 0 or !std.mem.startsWith(u8, path, d)) return false;
+    return path.len == d.len or path[d.len] == '/';
+}
+
+/// Whether `root` is a cache rather than someone's work: under
+/// `$XDG_CACHE_HOME` (`~/.cache`), where compilers keep the packages they
+/// fetched and what they generated. A jump to a definition lands there, and
+/// nothing project-wide should be written there.
+pub fn isCache(root: []const u8) bool {
+    if (std.c.getenv("XDG_CACHE_HOME")) |e| {
+        const base = std.mem.span(e);
+        if (base.len > 0) return within(root, base);
+    }
+    const home = std.mem.trimEnd(u8, std.mem.span(std.c.getenv("HOME") orelse return false), "/");
+    if (home.len == 0 or !within(root, home)) return false;
+    return within(root[home.len..], "/.cache");
+}
+
+test "a cache is not a project to write across" {
+    try std.testing.expect(within("/a/b/c", "/a/b"));
+    try std.testing.expect(within("/a/b", "/a/b/"));
+    try std.testing.expect(!within("/a/bc", "/a/b"));
+    try std.testing.expect(!within("/a", "/a/b"));
+}
+
 /// `c` in Files ("work here", a cd): `dir` is where Files, search, the
 /// runner and the terminal work from now on.
 pub fn workIn(ed: *Editor, dir: []const u8) !void {

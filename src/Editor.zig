@@ -89,6 +89,7 @@ pub const row_search = @import("editor/row_search.zig");
 pub const replacing = @import("editor/replacing.zig");
 pub const claude_chat = @import("editor/claude_chat.zig");
 pub const side_float = @import("editor/side_float.zig");
+pub const claude_inline = @import("editor/claude_inline.zig");
 pub const pads = @import("editor/pads.zig");
 pub const prompts = @import("editor/prompts.zig");
 pub const git_ops = @import("editor/git_ops.zig");
@@ -305,7 +306,7 @@ pub const WorkspaceSymbol = struct {
 
 /// `run`: it runs. `runner`: it runs as a runner command (remembered).
 /// `debug`: it runs under gdb, and is what its runner command debugs as.
-pub const CommandPurpose = enum { run, runner, debug, claude };
+pub const CommandPurpose = enum { run, runner, debug, claude, claude_inline };
 
 /// A quickfix entry: a place (0-based line/col) and what's there.
 pub const QuickfixItem = struct {
@@ -787,6 +788,10 @@ surround_from: u21 = 0,
 op: ?PendingOp = null,
 /// Visual mode selects whole lines (`V`).
 visual_line: bool = false,
+/// Visual mode selects a rectangle of columns (`<C-v>`).
+visual_block: bool = false,
+/// The block's anchor column when it is past the end of its line.
+block_anchor_col: ?usize = null,
 /// Where the cursor was when visual mode began: a yank goes back there.
 visual_origin: usize = 0,
 /// `Alt-u` grew the selection from these (`Alt-i` goes back), while the
@@ -915,6 +920,10 @@ last_disk_check: Io.Timestamp = .zero,
 /// (it keeps the conversation), and the panel that shows it.
 chat: ?*Chat = null,
 chat_panel: claude_chat.Panel = .{},
+/// A selection Claude is rewriting in place (`SPC a w`).
+inline_edit: claude_inline.State = .{},
+/// An edit Claude asks to make, showing in the code window.
+chat_proposal: ?claude_chat.Proposal = null,
 /// The scratch pads (`SPC t s`): their panel, and the pads there are.
 pad_panel: claude_chat.Panel = .{},
 pad_list: pads.List = .{},
@@ -1062,6 +1071,13 @@ pub fn deinit(ed: *Editor) void {
     ed.shells.deinit(ed.gpa);
     if (ed.claude_ask) |a| ed.gpa.free(a.path);
     side_float.close(ed);
+    ed.inline_edit.deinit(ed.gpa);
+    if (ed.chat_proposal) |p| {
+        ed.gpa.free(p.ask);
+        ed.gpa.free(p.path);
+        ed.gpa.free(p.base);
+        ed.gpa.free(p.shown);
+    }
     ed.pad_list.deinit(ed.gpa);
     if (ed.chat) |c| c.destroy();
     if (ed.browse_target) |p| ed.gpa.free(p);
@@ -1179,6 +1195,7 @@ pub fn tick(ed: *Editor) void {
     file_ops.tickSaveChain(ed);
     if (ed.replace) |r| r.poll();
     claude_chat.tick(ed);
+    claude_inline.tick(ed);
     pads.tick(ed);
     sql_ops.tickSqlSchema(ed);
     sql_ops.tickSqlResults(ed);
@@ -1588,6 +1605,8 @@ pub fn pendingOperator(ed: *const Editor) ?operators.Operator {
 pub fn enterVisual(ed: *Editor, line: bool) void {
     ed.mode = .visual;
     ed.visual_line = line;
+    ed.visual_block = false;
+    ed.block_anchor_col = null;
     ed.view.anchor = ed.view.cursor;
     ed.visual_origin = ed.view.cursor;
 }

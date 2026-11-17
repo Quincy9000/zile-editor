@@ -279,7 +279,7 @@ test "Claude drawn by zile: a row for each thing said, a picker to answer what i
     try c.event("{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}");
     ed.tick();
     try testing.expectEqualStrings("Claude is done: All fixed.", ed.toasts.items[ed.toasts.items.len - 1].text());
-    try c.say("more"); // (and on with the conversation)
+    try c.say("more", null); // (and on with the conversation)
 
     // SPC a a goes into the panel: j / k are its rows, y copies the one selected.
     try claude_chat.toggle(&ed);
@@ -419,4 +419,155 @@ test "Claude's slash commands and models: the CLI's own lists, in pickers" {
     support.settlePicker(&ed);
     try ed.feed("jj<CR>");
     try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"subtype\":\"set_permission_mode\",\"mode\":\"plan\"") != null);
+}
+
+test "Claude is told what the editor shows; an edit it asks for is looked at in the code window" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "const a = 1;\nconst b = 2;\nconst c = 3;\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const file = try std.fmt.allocPrint(gpa, "{s}/a.zig", .{base});
+    defer gpa.free(file);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.openFile(file);
+    ed.chat = try Chat.create(ed.gpa, ed.io, ".", noWake);
+    const c = ed.chat.?;
+    c.offline = true;
+
+    // Nothing selected: the file in the window, and the cursor's line.
+    try ed.feed("j");
+    try claude_panel.claudeAskPrompt(&ed);
+    try ed.feed("what is this<CR>");
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "<ide_opened_file>The user opened the file ") != null);
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "a.zig in the IDE (the cursor is on line 2)") != null);
+    try testing.expectEqualStrings("what is this", c.entries.items[0].text.items);
+    // A selection: its lines, with their text.
+    try ed.feed("<Esc>ggVj");
+    try claude_panel.claudeAskPrompt(&ed);
+    try ed.feed("why<CR>");
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "<ide_selection>The user selected the lines 1 to 2 from ") != null);
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "const a = 1;\\nconst b = 2;") != null);
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "const c = 3;") == null);
+    try testing.expectEqualStrings("why", c.entries.items[1].text.items);
+
+    // Claude asks to edit the file: SPC a y shows the edit as a diff in the
+    // code window; again accepts it as it was asked.
+    const ask = try std.fmt.allocPrint(gpa, "{{\"type\":\"control_request\",\"request_id\":\"r-1\",\"request\":{{\"subtype\":\"can_use_tool\",\"tool_name\":\"Edit\",\"input\":{{\"file_path\":\"{s}\",\"old_string\":\"b = 2\",\"new_string\":\"b = 20\"}}}}}}", .{file});
+    defer gpa.free(ask);
+    try c.event(ask);
+    ed.tick();
+    claude_panel.claudeResolve(&ed, true);
+    try testing.expectEqual(null, ed.picker);
+    try testing.expect(ed.chat_proposal != null);
+    try expectText(&ed, "const a = 1;\nconst b = 20;\nconst c = 3;");
+    claude_panel.claudeResolve(&ed, true);
+    try testing.expectEqual(null, ed.chat_proposal);
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"behavior\":\"allow\",\"updatedInput\":{\"file_path\":") != null);
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"old_string\":\"b = 2\",\"new_string\":\"b = 20\"") != null);
+    try expectText(&ed, "const a = 1;\nconst b = 2;\nconst c = 3;"); // the file again (Claude writes it)
+
+    // Changed in the editor before it is accepted: that is what Claude writes.
+    const ask2 = try std.mem.replaceOwned(u8, gpa, ask, "r-1", "r-2");
+    defer gpa.free(ask2);
+    try c.event(ask2);
+    ed.tick();
+    claude_panel.claudeResolve(&ed, true);
+    try ed.feed("0fbcwbee<Esc>"); // (the cursor is on the first change)
+    try expectText(&ed, "const a = 1;\nconst bee = 20;\nconst c = 3;");
+    claude_panel.claudeResolve(&ed, true);
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"old_string\":\"const a = 1;\\nconst b = 2;\\nconst c = 3;\\n\",\"new_string\":\"const a = 1;\\nconst bee = 20;\\nconst c = 3;\\n\"") != null);
+
+    // Refused: SPC a n, whether it is showing or not.
+    const ask3 = try std.mem.replaceOwned(u8, gpa, ask, "r-1", "r-3");
+    defer gpa.free(ask3);
+    try c.event(ask3);
+    ed.tick();
+    claude_panel.claudeResolve(&ed, true);
+    try testing.expect(ed.chat_proposal != null);
+    claude_panel.claudeResolve(&ed, false);
+    try testing.expectEqual(null, ed.chat_proposal);
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"behavior\":\"deny\"") != null);
+    try expectText(&ed, "const a = 1;\nconst b = 2;\nconst c = 3;");
+}
+
+test "SPC a w: a selection rewritten by Claude in place, as a diff to take or drop" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const claude_inline = Editor.claude_inline;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "const a = 1;\nvar b = 2;\nvar c = 3;\nconst d = 4;\n" });
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const file = try std.fmt.allocPrint(gpa, "{s}/a.zig", .{base});
+    defer gpa.free(file);
+
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    try ed.openFile(file);
+    const target = ed.buffer;
+
+    // The lines selected are what Claude is given, with what is around them.
+    try ed.feed("jVj");
+    try claude_inline.prompt(&ed);
+    try testing.expect(ed.cmd_float != null);
+    var title: [64]u8 = undefined;
+    try testing.expectEqualStrings("Rewrite a.zig:2-3 with Claude", claude_inline.title(&ed, &title));
+    const q = try claude_inline.question(&ed, target, .{ 1, 2 }, "make them const");
+    defer gpa.free(q);
+    try testing.expect(std.mem.indexOf(u8, q, "Instruction: make them const") != null);
+    try testing.expect(std.mem.indexOf(u8, q, "<before>\nconst a = 1;\n</before>\n<selected>\nvar b = 2;\nvar c = 3;\n</selected>\n<after>\nconst d = 4;\n</after>") != null);
+    try ed.feed("make them const<CR>");
+    try testing.expectEqual(null, ed.cmd_float);
+
+    // What it wrote (a fence around it is taken off) shows as a diff.
+    try claude_inline.finish(&ed, "```zig\nconst b = 2;\nconst c = 3;\n```\n");
+    try testing.expect(ed.inline_edit.proposal != null);
+    try expectText(&ed, "const a = 1;\nconst b = 2;\nconst c = 3;\nconst d = 4;");
+    try testing.expectEqualStrings("const a = 1;\nvar b = 2;\nvar c = 3;\nconst d = 4;", target.text.slice(0, target.text.len()));
+    // Changed in the diff, then taken: the file's buffer has it, as one undo step.
+    try ed.feed("0fbcwbee<Esc>");
+    claude_panel.claudeResolve(&ed, true);
+    try testing.expectEqual(null, ed.inline_edit.proposal);
+    try testing.expectEqual(target, ed.buffer);
+    try expectText(&ed, "const a = 1;\nconst bee = 2;\nconst c = 3;\nconst d = 4;");
+    try testing.expect(target.modified);
+    try ed.feed("u");
+    try expectText(&ed, "const a = 1;\nvar b = 2;\nvar c = 3;\nconst d = 4;");
+
+    // Dropped: nothing changes.
+    try ed.feed("ggV");
+    try claude_inline.prompt(&ed);
+    try ed.feed("anything<CR>");
+    try claude_inline.finish(&ed, "const a = 100;");
+    try expectText(&ed, "const a = 100;\nvar b = 2;\nvar c = 3;\nconst d = 4;");
+    claude_panel.claudeResolve(&ed, false);
+    try testing.expectEqual(target, ed.buffer);
+    try expectText(&ed, "const a = 1;\nvar b = 2;\nvar c = 3;\nconst d = 4;");
+
+    // The text changed while Claude wrote: what it wrote is dropped.
+    try claude_inline.prompt(&ed);
+    try ed.feed("x<CR>");
+    try ed.feed("ggx");
+    try claude_inline.finish(&ed, "nope");
+    try testing.expectEqual(null, ed.inline_edit.proposal);
+    try expectText(&ed, "onst a = 1;\nvar b = 2;\nvar c = 3;\nconst d = 4;");
+
+    // The first line keeps the selection's indentation, whatever came back.
+    try ed.feed("ggI    <Esc>");
+    try testing.expect(std.mem.startsWith(u8, ed.text().slice(0, ed.text().len()), "    onst a = 1;\n"));
+    try claude_inline.prompt(&ed);
+    try ed.feed("const<CR>");
+    try claude_inline.finish(&ed, "  const a = 1;");
+    try testing.expect(std.mem.startsWith(u8, ed.text().slice(0, ed.text().len()), "    const a = 1;\nvar b = 2;"));
+    claude_panel.claudeResolve(&ed, false);
+    try testing.expectEqualStrings("a\n  b", claude_inline.clean("\n```\na\n  b\n```\n"));
+    try testing.expectEqualStrings("  a", claude_inline.clean("  a\n"));
 }

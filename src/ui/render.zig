@@ -34,6 +34,7 @@ const resting = @import("../editor/resting.zig");
 const row_model = @import("../editor/row_model.zig");
 const folding = @import("../editor/folding.zig");
 const code_motion = @import("../editor/code_motion.zig");
+const block_visual = @import("../editor/block_visual.zig");
 const row_search = @import("../editor/row_search.zig");
 const prompts = @import("../editor/prompts.zig");
 const ai_ghost = @import("../editor/ai_ghost.zig");
@@ -229,7 +230,7 @@ fn cmdFloatRect(ed: *Editor, font: *const Font, screen: Layout) Editor.Windows.R
     const rows: f32 = @floatFromInt(std.math.clamp(lines + 1, 3, 16));
     // Telling Claude: docked along the bottom like a picker, the code in
     // view above it.
-    if (ed.cmd_purpose == .claude) {
+    if (ed.cmd_purpose == .claude or ed.cmd_purpose == .claude_inline) {
         const dock_h = @min((rows + 1) * font.cell_h, @max(screen.status_y - font.cell_h, font.cell_h * 2));
         return .{ .x = 0, .y = screen.status_y - dock_h, .w = screen.width, .h = dock_h };
     }
@@ -294,7 +295,8 @@ fn floatLayout(ed: *Editor, font: *const Font, f: *Editor.Windows.Window) Layout
 /// The command editor: title, then the buffer drawn like any window.
 fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.Windows.Window, screen: Layout) void {
     const r = f.rect;
-    const claude = ed.cmd_purpose == .claude;
+    const rewrite = ed.cmd_purpose == .claude_inline;
+    const claude = ed.cmd_purpose == .claude or rewrite;
     // (The docked box leaves the code as it is.)
     if (!claude) rect(0, 0, screen.width, screen.status_y, theme.backdrop);
     rect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, theme.popup_border);
@@ -302,7 +304,7 @@ fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.
     rect(r.x, r.y, r.w, font.cell_h, theme.status_bg);
     const debug = ed.cmd_purpose == .debug;
     var title_buf: [160]u8 = undefined;
-    const title: []const u8 = if (claude) claude_panel.tellTitle(ed, &title_buf) else if (debug) "Debug command (this session)" else "Run command";
+    const title: []const u8 = if (rewrite) Editor.claude_inline.title(ed, &title_buf) else if (claude) claude_panel.tellTitle(ed, &title_buf) else if (debug) "Debug command (this session)" else "Run command";
     _ = font.drawText(title, r.x + font.cell_w, r.y, theme.mode_picker);
     const hint = if (claude)
         (if (ed.mode == .normal) "Enter sends   Esc closes" else "Enter sends   S-Enter new line   Esc normal")
@@ -547,7 +549,8 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
     defer line_hints = &.{};
     unwrappedWindow(ed);
     defer unwrappedWindow(ed);
-    const selection: ?operators.Range = if (ed.mode == .visual) code_motion.visualRange(ed) else null;
+    const block: ?block_visual.Block = if (block_visual.active(ed)) block_visual.bounds(ed) else null;
+    const selection: ?operators.Range = if (ed.mode == .visual and block == null) code_motion.visualRange(ed) else null;
     const syntax: ?*const Syntax = if (ed.buffer.syntax) |*s| s else null;
     const t = ed.text();
     const v = &ed.view;
@@ -663,6 +666,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         // Where the debugger stopped: the line tinted.
         if (marks.here) rect(0, y, l.width, font.cell_h, withAlpha(theme.diag_warning, 40));
         if (selection) |sel| drawSelection(ed, font, theme, l, sel, line, y);
+        if (block) |b| if (line >= b.first and line <= b.last) drawBlockRow(ed, font, theme, l, b, line, y);
         if (selection != null) for (ed.cursors.items) |c| {
             drawSelection(ed, font, theme, l, code_motion.selectionRange(ed, c.anchor, c.pos), line, y);
         };
@@ -1106,7 +1110,7 @@ fn posRow(ed: *Editor, pos: usize) ?struct { row: usize, col: usize } {
 fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, pos: usize, color: rl.Color) void {
     const at = posRow(ed, pos) orelse return;
     const row = at.row;
-    const col = at.col;
+    const col = at.col + if (pos == ed.view.cursor) block_visual.cursorShift(ed) else 0;
     // At the end of a wrapped row the cursor sits at its last cell.
     if (col < win_left or col > winEnd(l) or (col == winEnd(l) and win_right == std.math.maxInt(usize))) return;
     const x = colX(font, l, @min(col, winEnd(l)));
@@ -1131,7 +1135,7 @@ fn drawCursorAt(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
             rect(x, y, font.cell_w, font.cell_h, color);
             // Redraw the character under the block in the contrasting color.
             const t = ed.text();
-            if (pos < t.lineEnd(t.lineOf(pos))) {
+            if (pos < t.lineEnd(t.lineOf(pos)) and col == at.col) {
                 var it = Font.Utf8Lossy{ .bytes = t.slice(pos, @min(pos + 4, t.len())) };
                 if (it.next()) |cp| {
                     if (cp != '\t' and cp != ' ') font.drawCodepoint(cp, x, y, theme.cursor_text);
@@ -1154,7 +1158,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
         .insert => .{ " INSERT ", theme.mode_insert },
         .picker => .{ " PICKER ", theme.mode_picker },
         .picker_normal => .{ " PICKER ", theme.mode_normal },
-        .visual => if (ed.visual_line) .{ " V-LINE ", theme.mode_visual } else .{ " VISUAL ", theme.mode_visual },
+        .visual => if (ed.visual_block) .{ " V-BLOCK ", theme.mode_visual } else if (ed.visual_line) .{ " V-LINE ", theme.mode_visual } else .{ " VISUAL ", theme.mode_visual },
         .operator => .{ " NORMAL ", theme.mode_normal },
         .search => switch (if (ed.search_prompt) |sp| sp.kind else .search) {
             .search => .{ " SEARCH ", theme.mode_visual },
@@ -1240,6 +1244,19 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// Highlights the part of `line` inside the visual selection.
 fn drawSelection(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, sel: operators.Range, line: usize, y: f32) void {
     drawRange(ed, font, l, sel, line, y, theme.selection_bg);
+}
+
+/// The block's columns on `line`, past the end of a short line too: the
+/// rectangle keeps its shape (`$` blocks stop at each line's end).
+fn drawBlockRow(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, b: block_visual.Block, line: usize, y: f32) void {
+    const bytes = ed.text().lineSlice(line);
+    const end_of_line = dcol(bytes, bytes.len, ed.options.tab_width) + 1;
+    const c1 = if (b.right == std.math.maxInt(usize)) end_of_line else b.right;
+    if (c1 <= b.left) return;
+    const end = @min(c1, winEnd(l));
+    const start = @max(b.left, win_left);
+    if (end <= start) return;
+    rect(colX(font, l, start), y, @as(f32, @floatFromInt(end - start)) * font.cell_w, font.cell_h, theme.selection_bg);
 }
 
 /// Colors the part of `line` inside `sel`.
@@ -1925,7 +1942,7 @@ test "terminal mode: Claude's conversation in a panel along the bottom, the box 
     try ed.text().insert(gpa, 0, "code\n");
     ed.chat = try Chat.create(gpa, std.testing.io, ".", Editor.noWake);
     ed.chat.?.offline = true;
-    try claude_chat.tell(&ed, "fix it");
+    try claude_chat.tell(&ed, "fix it", null);
     try ed.chat.?.event("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"On it.\\nA second line of the answer.\"}}}");
     var grid: Grid = .{};
     defer grid.deinit(gpa);

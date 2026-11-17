@@ -138,6 +138,14 @@ want_effort: ?[]u8 = null,
 /// (owned).
 want_model: ?[]u8 = null,
 want_mode: ?[]u8 = null,
+/// The conversations of before, as last listed (in `listing`).
+listing: std.heap.ArenaAllocator,
+listed: []const Session = &.{},
+/// An MCP server for the CLI to connect to when it starts (zile's own:
+/// the diagnostics of the files that are open), as `--mcp-config` takes it
+/// (JSON, owned), and the tools of it that need no asking.
+mcp_config: ?[]u8 = null,
+mcp_allowed: []const u8 = "",
 /// The last thing written to the CLI (owned): for the tests.
 last_sent: std.ArrayList(u8) = .empty,
 next_request: usize = 1,
@@ -147,7 +155,7 @@ offline: bool = false,
 pub fn create(gpa: Allocator, io: Io, root: []const u8, wake: *const fn () void) !*Chat {
     const c = try gpa.create(Chat);
     errdefer gpa.destroy(c);
-    c.* = .{ .gpa = gpa, .io = io, .wake = wake, .root = try gpa.dupe(u8, root), .info = .init(gpa) };
+    c.* = .{ .gpa = gpa, .io = io, .wake = wake, .root = try gpa.dupe(u8, root), .info = .init(gpa), .listing = .init(gpa) };
     return c;
 }
 
@@ -160,7 +168,9 @@ pub fn destroy(c: *Chat) void {
     if (c.session) |s| c.gpa.free(s);
     c.last_sent.deinit(c.gpa);
     c.answers.deinit(c.gpa);
+    if (c.mcp_config) |m| c.gpa.free(m);
     c.info.deinit();
+    c.listing.deinit();
     c.gpa.free(c.model);
     c.gpa.free(c.mode);
     c.gpa.free(c.effort);
@@ -235,6 +245,156 @@ fn stopProcess(c: *Chat) void {
     c.closed = false;
 }
 
+/// A conversation of before, as the CLI keeps it.
+pub const Session = struct {
+    /// What `--resume` takes, and its file (in the list's arena).
+    id: []const u8,
+    path: []const u8,
+    /// What was said first, on one line.
+    first: []const u8,
+    /// When it was last added to (seconds since 1970).
+    modified: i64,
+};
+
+/// Where the CLI keeps the conversations had in `root`
+/// (`<its folder>/projects/<root, every other character a ->/`). Caller frees.
+pub fn sessionsDir(gpa: Allocator, root: []const u8) ?[]u8 {
+    const slug = gpa.dupe(u8, root) catch return null;
+    defer gpa.free(slug);
+    for (slug) |*b| if (!std.ascii.isAlphanumeric(b.*)) {
+        b.* = '-';
+    };
+    if (std.c.getenv("CLAUDE_CONFIG_DIR")) |d| if (std.mem.span(d).len > 0) return std.fs.path.join(gpa, &.{ std.mem.span(d), "projects", slug }) catch null;
+    const home = std.mem.span(std.c.getenv("HOME") orelse return null);
+    return std.fs.path.join(gpa, &.{ home, ".claude", "projects", slug }) catch null;
+}
+
+/// The conversations had in `root`, the latest first (in `a`): those of
+/// the CLI's own interface too.
+pub fn sessions(a: Allocator, io: Io, root: []const u8) ![]Session {
+    const max = 100;
+    var list: std.ArrayList(Session) = .empty;
+    const dir_path = sessionsDir(a, root) orelse return list.items;
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return list.items;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        try list.append(a, .{
+            .id = try a.dupe(u8, entry.name[0 .. entry.name.len - ".jsonl".len]),
+            .path = try std.fs.path.join(a, &.{ dir_path, entry.name }),
+            .first = "",
+            .modified = st.mtime.toSeconds(),
+        });
+    }
+    std.mem.sort(Session, list.items, {}, struct {
+        fn later(_: void, x: Session, y: Session) bool {
+            return x.modified > y.modified;
+        }
+    }.later);
+    if (list.items.len > max) list.items.len = max;
+    // What each began with: in the start of its file.
+    var kept: usize = 0;
+    for (list.items) |sn| {
+        var file = Io.Dir.cwd().openFile(io, sn.path, .{}) catch continue;
+        defer file.close(io);
+        const head = try a.alloc(u8, 256 * 1024);
+        const n = file.readPositionalAll(io, head, 0) catch continue;
+        var one = sn;
+        one.first = try firstSaid(a, head[0..n]) orelse continue; // (nothing said: not a conversation)
+        list.items[kept] = one;
+        kept += 1;
+    }
+    return list.items[0..kept];
+}
+
+/// What the user said in a line of a session's file (in `a`): the text of
+/// a `user` line that isn't a tool's result, a subagent's, or something the
+/// CLI or the editor put there (`<ide_selection>…`, `<command-name>…`).
+fn saidIn(a: Allocator, v: std.json.Value) ?[]const u8 {
+    if (!std.mem.eql(u8, string(v, "type") orelse return null, "user")) return null;
+    if (member(v, "isSidechain")) |sc| if (sc == .bool and sc.bool) return null;
+    if (member(v, "isMeta")) |meta| if (meta == .bool and meta.bool) return null;
+    const content = member(member(v, "message") orelse return null, "content") orelse return null;
+    var out: std.ArrayList(u8) = .empty;
+    switch (content) {
+        .string => |text| out.appendSlice(a, text) catch return null,
+        .array => |parts| for (parts.items) |part| {
+            if (!std.mem.eql(u8, string(part, "type") orelse "", "text")) continue;
+            const text = std.mem.trim(u8, string(part, "text") orelse "", " \t\r\n");
+            if (text.len == 0 or text[0] == '<') continue;
+            if (out.items.len > 0) out.append(a, '\n') catch return null;
+            out.appendSlice(a, text) catch return null;
+        },
+        else => return null,
+    }
+    const said = std.mem.trim(u8, out.items, " \t\r\n");
+    return if (said.len == 0 or said[0] == '<') null else said;
+}
+
+fn firstSaid(a: Allocator, head: []const u8) !?[]const u8 {
+    var lines = std.mem.splitScalar(u8, head, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, a, line, .{}) catch continue;
+        if (saidIn(a, v)) |said| return try a.dupe(u8, oneLine(said));
+    }
+    return null;
+}
+
+/// Looks again for the conversations had in this folder (`listed`).
+pub fn listSessions(c: *Chat) void {
+    c.listed = &.{};
+    _ = c.listing.reset(.free_all);
+    c.listed = sessions(c.listing.allocator(), c.io, c.root) catch &.{};
+}
+
+/// Goes back to a conversation of before: its rows are shown again (from
+/// its file) and the next message carries on with it.
+pub fn resumeSession(c: *Chat, id: []const u8, path: []const u8) !void {
+    c.reset();
+    for (c.entries.items) |*e| c.freeEntry(e);
+    c.entries.clearRetainingCapacity();
+    c.session = try c.gpa.dupe(u8, id);
+    const text = Io.Dir.cwd().readFileAlloc(c.io, path, c.gpa, .limited(64 << 20)) catch return;
+    defer c.gpa.free(text);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| if (line.len > 0) c.replay(line) catch {};
+    c.version += 1;
+}
+
+/// A line of a session's file, as a row: what was said, what Claude said,
+/// the tools it used and what they gave back.
+fn replay(c: *Chat, line: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(c.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, line, .{}) catch return;
+    const kind = string(v, "type") orelse return;
+    if (member(v, "isSidechain")) |sc| if (sc == .bool and sc.bool) return;
+    const content = member(member(v, "message") orelse return, "content") orelse return;
+    if (std.mem.eql(u8, kind, "user")) {
+        if (saidIn(a, v)) |said| _ = try c.add(.you, "", said, "");
+        if (content == .array) for (content.array.items) |part| {
+            if (!std.mem.eql(u8, string(part, "type") orelse "", "tool_result")) continue;
+            const failed = if (member(part, "is_error")) |e| e == .bool and e.bool else false;
+            try c.toolResult(string(part, "tool_use_id") orelse "", member(part, "content") orelse .null, failed);
+        };
+    } else if (std.mem.eql(u8, kind, "assistant")) {
+        if (content != .array) return;
+        for (content.array.items) |part| {
+            const what = string(part, "type") orelse "";
+            if (std.mem.eql(u8, what, "text")) {
+                const text = std.mem.trim(u8, string(part, "text") orelse "", " \t\r\n");
+                if (text.len > 0) _ = try c.add(.claude, "", text, "");
+            } else if (std.mem.eql(u8, what, "tool_use")) {
+                try c.toolRow(a, string(part, "name") orelse "tool", member(part, "input") orelse .null, string(part, "id") orelse "");
+            }
+        }
+    }
+}
+
 /// A new conversation: the CLI is stopped, and the next message starts one
 /// that remembers nothing.
 pub fn reset(c: *Chat) void {
@@ -259,6 +419,10 @@ fn startProcess(c: *Chat) !void {
     if (c.want_model) |m| try argv.appendSlice(c.gpa, &.{ "--model", m });
     if (c.want_mode) |m| try argv.appendSlice(c.gpa, &.{ "--permission-mode", m });
     if (c.want_effort) |m| try argv.appendSlice(c.gpa, &.{ "--effort", m });
+    if (c.mcp_config) |m| {
+        try argv.appendSlice(c.gpa, &.{ "--mcp-config", m });
+        if (c.mcp_allowed.len > 0) try argv.appendSlice(c.gpa, &.{ "--allowedTools", c.mcp_allowed });
+    }
     c.child = try std.process.spawn(c.io, .{ .argv = argv.items, .cwd = .{ .path = c.root }, .stdin = .pipe, .stdout = .pipe, .stderr = .ignore });
     errdefer {
         c.child.?.kill(c.io);
@@ -481,19 +645,22 @@ fn write(c: *Chat, line: []const u8) void {
 
 /// Says `text` to Claude (starting the CLI if it isn't running). It may be
 /// said while Claude is working: it is taken up when the turn allows.
-pub fn send(c: *Chat, text: []const u8) !void {
+pub fn send(c: *Chat, text: []const u8, context: ?[]const u8) !void {
     if (c.child == null and !c.offline) try c.startProcess();
-    try c.say(text);
+    try c.say(text, context);
 }
 
-/// `send`, without the CLI (the tests).
-pub fn say(c: *Chat, text: []const u8) !void {
+/// `send`, without the CLI (the tests). `context`: what the editor adds
+/// for Claude to know (the file that is open, the selection); it goes
+/// before `text` and isn't in the row.
+pub fn say(c: *Chat, text: []const u8, context: ?[]const u8) !void {
     c.endText();
     _ = try c.add(.you, "", std.mem.trim(u8, text, " \t\r\n"), "");
     const Part = struct { type: []const u8 = "text", text: []const u8 };
+    const parts = [_]Part{ .{ .text = context orelse "" }, .{ .text = text } };
     const json = try std.json.Stringify.valueAlloc(c.gpa, .{
         .type = "user",
-        .message = .{ .role = "user", .content = &[_]Part{.{ .text = text }} },
+        .message = .{ .role = "user", .content = parts[@intFromBool(context == null)..] },
     }, .{});
     defer c.gpa.free(json);
     c.state = .working;
@@ -533,6 +700,16 @@ pub fn answer(c: *Chat, reply: Reply) !void {
         .refuse => try c.mark(a.id, "✗", "refused"),
         else => try c.mark(a.id, "✓", if (always) "allowed, from now on" else "allowed"),
     }
+    try c.respond(body);
+}
+
+/// Allows the tool that is waiting, with `input` (JSON) instead of what it
+/// asked to do (an edit changed in the editor before it was accepted).
+pub fn answerWith(c: *Chat, input: []const u8) !void {
+    if (c.asks.items.len == 0) return;
+    const body = try std.fmt.allocPrint(c.gpa, "{{\"behavior\":\"allow\",\"updatedInput\":{s}}}", .{input});
+    defer c.gpa.free(body);
+    try c.mark(c.asks.items[0].id, "✓", "allowed, as changed in the editor");
     try c.respond(body);
 }
 
@@ -823,7 +1000,7 @@ test "the conversation as markdown: text as it is written, tools, what they gave
     const gpa = std.testing.allocator;
     const c = try create(gpa, std.testing.io, ".", noWake);
     defer c.destroy();
-    try c.say("run it");
+    try c.say("run it", null);
     try std.testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"text\":\"run it\"") != null);
     try std.testing.expectEqual(State.working, c.state);
     const events = [_][]const u8{
@@ -935,7 +1112,7 @@ test "with the real CLI (only when ZILE_CLAUDE_SMOKE is set: it costs a message)
     const dir = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
     const c = try create(gpa, std.testing.io, dir, noWake);
     defer c.destroy();
-    try c.send("Reply with just the word: pineapple");
+    try c.send("Reply with just the word: pineapple", null);
     for (0..600) |_| {
         c.poll();
         if (c.state == .idle) break;
@@ -1005,4 +1182,65 @@ test "effort and usage: the model's levels, what is in use, the limits and the c
     try c.event("{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"zile-3\",\"response\":{\"categories\":[],\"totalTokens\":14876,\"maxTokens\":1000000,\"percentage\":1}}}");
     try std.testing.expectEqual(14876, c.usage.context_tokens);
     try std.testing.expectEqual(1000000, c.usage.context_max);
+}
+
+test "what the editor adds goes before what is said, and not in the row" {
+    const gpa = std.testing.allocator;
+    const c = try create(gpa, std.testing.io, ".", noWake);
+    defer c.destroy();
+    try c.say("fix it", "<ide_opened_file>a.zig</ide_opened_file>");
+    try std.testing.expectEqualStrings("fix it", c.entries.items[0].text.items);
+    try std.testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"content\":[{\"type\":\"text\",\"text\":\"<ide_opened_file>a.zig</ide_opened_file>\"},{\"type\":\"text\",\"text\":\"fix it\"}]") != null);
+}
+
+test "conversations of before: listed by what began them, shown again when resumed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const cfg = try std.fmt.allocPrintSentinel(gpa, "{s}/cfg", .{base}, 0);
+    defer gpa.free(cfg);
+    const setenv = @extern(*const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) c_int, .{ .name = "setenv" });
+    _ = setenv("CLAUDE_CONFIG_DIR", cfg.ptr, 1);
+    const dir = sessionsDir(gpa, "/work/my.proj").?;
+    defer gpa.free(dir);
+    try std.testing.expect(std.mem.endsWith(u8, dir, "/cfg/projects/-work-my-proj"));
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const one = try std.fs.path.join(gpa, &.{ dir, "aaaa-1.jsonl" });
+    defer gpa.free(one);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = one, .data =
+        \\{"type":"session-owner","sessionId":"aaaa-1"}
+        \\{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"<ide_opened_file>a.zig</ide_opened_file>"},{"type":"text","text":"fix the parser\nplease"}]}}
+        \\{"type":"attachment","isSidechain":false}
+        \\{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"thinking","thinking":""},{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}
+        \\{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"a.zig"}]}}
+        \\{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"a subagent's"}]}}
+        \\{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"Done."}]}}
+        \\
+    });
+    // (A file with nothing said in it isn't listed.)
+    const empty = try std.fs.path.join(gpa, &.{ dir, "bbbb-2.jsonl" });
+    defer gpa.free(empty);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = empty, .data = "{\"type\":\"session-owner\"}\n" });
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const list = try sessions(arena.allocator(), io, "/work/my.proj");
+    try std.testing.expectEqual(1, list.len);
+    try std.testing.expectEqualStrings("aaaa-1", list[0].id);
+    try std.testing.expectEqualStrings("fix the parser", list[0].first);
+
+    const c = try create(gpa, io, "/work/my.proj", noWake);
+    defer c.destroy();
+    try c.say("something else", null);
+    try c.resumeSession(list[0].id, list[0].path);
+    try std.testing.expectEqualStrings("aaaa-1", c.session.?);
+    try std.testing.expectEqual(4, c.entries.items.len);
+    try std.testing.expectEqualStrings("fix the parser\nplease", c.entries.items[0].text.items);
+    try std.testing.expectEqualStrings("Looking.", c.entries.items[1].text.items);
+    try std.testing.expectEqualStrings("ls\n\na.zig", c.entries.items[2].text.items);
+    try std.testing.expectEqualStrings("Done.", c.entries.items[3].text.items);
+    try std.testing.expectEqual(State.idle, c.state);
 }
