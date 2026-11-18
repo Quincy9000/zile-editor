@@ -561,7 +561,20 @@ pub fn setMode(c: *Chat, value: []const u8) !void {
     const mine = try c.gpa.dupe(u8, value);
     if (c.want_mode) |old| c.gpa.free(old);
     c.want_mode = mine;
+    const changed = !c.modeInUse(value);
     try c.control("set_permission_mode", "mode", value);
+    // The CLI takes the mode for what comes next, and never looks again at
+    // what was already waiting for an answer: Claude would sit there under
+    // a mode that no longer asks. What waits is handed back to be done
+    // again, so the new mode's own rules decide (a question of Claude's is
+    // still yours to answer).
+    if (!changed) return;
+    while (c.asks.items.len > 0 and !c.asks.items[0].question) {
+        const body = try std.fmt.allocPrint(c.gpa, "{{\"behavior\":\"deny\",\"message\":\"Not refused: the permission mode changed to {s} while this was waiting for an answer. Make the same tool call again.\"}}", .{value});
+        defer c.gpa.free(body);
+        try c.mark(c.asks.items[0].id, "↻", "asked again, the mode changed");
+        try c.respond(body);
+    }
 }
 
 fn control(c: *Chat, subtype: []const u8, key: []const u8, value: []const u8) !void {
@@ -1004,8 +1017,9 @@ fn questionRow(c: *Chat, input: std.json.Value, id: []const u8) !void {
     for (all.array.items, 0..) |q, i| {
         if (i > 0) try e.text.appendSlice(c.gpa, "\n\n");
         try e.text.appendSlice(c.gpa, string(q, "question") orelse "");
-        if (member(q, "options")) |opts| if (opts == .array) for (opts.array.items) |o| {
-            try e.text.print(c.gpa, "\n- {s}: {s}", .{ oneLine(string(o, "label") orelse ""), oneLine(string(o, "description") orelse "") });
+        // Numbered: the panel's 1-9 pick one.
+        if (member(q, "options")) |opts| if (opts == .array) for (opts.array.items, 1..) |o, n| {
+            try e.text.print(c.gpa, "\n{d}. {s}: {s}", .{ n, oneLine(string(o, "label") orelse ""), oneLine(string(o, "description") orelse "") });
         };
     }
 }
@@ -1195,6 +1209,20 @@ test "what the CLI has: its slash commands and models; a model and a mode chosen
     try std.testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"subtype\":\"set_permission_mode\",\"mode\":\"plan\"") != null);
     try c.event("{\"type\":\"system\",\"subtype\":\"status\",\"status\":null,\"permissionMode\":\"plan\"}");
     try std.testing.expectEqualStrings("plan", c.mode);
+    // A tool that was waiting when the mode changes is handed back to be
+    // done again (the CLI never looks at it again by itself); a question
+    // of Claude's stays to be answered.
+    try c.event("{\"type\":\"control_request\",\"request_id\":\"r-9\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"input\":{\"command\":\"ls\"}}}");
+    try c.event("{\"type\":\"control_request\",\"request_id\":\"q-9\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Tea?\",\"options\":[]}]}}}");
+    try std.testing.expectEqual(.asking, c.state);
+    try c.setMode("plan"); // the same mode: nothing is answered
+    try std.testing.expectEqual(2, c.asks.items.len);
+    try c.setMode("auto");
+    try std.testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"request_id\":\"r-9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"behavior\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.last_sent.items, "Make the same tool call again") != null);
+    try std.testing.expectEqual(1, c.asks.items.len);
+    try std.testing.expect(c.asks.items[0].question);
 }
 
 test "effort and usage: the model's levels, what is in use, the limits and the context" {

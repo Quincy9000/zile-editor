@@ -102,6 +102,12 @@ pub fn build(b: *std.Build) void {
     const release_step = b.step("release", "Build an optimized zile into zig-out/release/zile");
     release_step.dependOn(&release.step);
 
+    // The default settings file, beside the program (share/zile/config.zon):
+    // what a new user's config.zon is copied from. A file, not in the binary.
+    const default_config = b.addInstallFile(b.path("config.zon"), "share/zile/config.zon");
+    b.getInstallStep().dependOn(&default_config.step);
+    release_step.dependOn(&default_config.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     // `zig build run -- file.zig` forwards everything after `--`.

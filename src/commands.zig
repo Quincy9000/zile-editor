@@ -466,6 +466,7 @@ const base = [_]Command{
     .{ .name = "frecent_files", .doc = "Frecent files (most used lately)", .run = openPicker(.frecent), .once = true },
     .{ .name = "search_todos", .doc = "Todo comments in project", .run = openPicker(.todos), .once = true },
     .{ .name = "pick_theme", .doc = "Colour scheme", .run = openPicker(.themes), .once = true },
+    .{ .name = "settings", .doc = "Settings: open config.zon (saving it applies it)", .run = openSettings, .once = true },
     .{ .name = "message_history", .doc = "Messages", .run = openPicker(.messages), .once = true },
     .{ .name = "start_screen", .doc = "Start screen", .run = openPicker(.start), .once = true },
     .{ .name = "save_session", .doc = "Save session", .run = sessionCmd(.save), .once = true },
@@ -854,6 +855,10 @@ fn gotoMark(comptime exact: bool) Handler {
 
 fn pickColor(c: Context) !void {
     color_wheel.openColorPicker(c.ed);
+}
+
+fn openSettings(c: Context) !void {
+    try @import("config/settings.zig").open(c.ed);
 }
 
 fn gitCompare(c: Context) !void {

@@ -249,30 +249,48 @@ test "Claude drawn by zile: a row for each thing said, a picker to answer what i
     try testing.expectEqual(1, p.sel);
     try testing.expect(p.tail);
 
-    // A tool wants permission: a notification, and SPC a y is the picker.
+    // A tool wants permission: a notification. It is answered in the panel
+    // (no picker takes its place): SPC a y allows what the panel shows.
     try c.event("{\"type\":\"control_request\",\"request_id\":\"r-1\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"input\":{\"command\":\"rm x\"}}}");
     ed.tick();
     try testing.expect(ed.toasts.items.len > 0 and ed.toasts.items[ed.toasts.items.len - 1].busy);
     try testing.expectEqual(2, p.sel); // the question is the row to look at
     claude_panel.claudeResolve(&ed, true);
-    try testing.expectEqual(.claude_ask, ed.picker.?.kind);
-    try testing.expect(!p.shown); // the picker instead of the panel, which comes back after
-    support.settlePicker(&ed);
-    try testing.expectEqual(2, ed.picker.?.rowCount()); // allow, refuse: nothing was suggested
-    try ed.feed("<CR>");
     try testing.expectEqual(null, ed.picker);
     try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"behavior\":\"allow\"") != null);
     try testing.expectEqualStrings("✓ Allow Bash? rm x", Chat.rowLine(&c.entries.items[2]));
     try testing.expect(p.shown and !p.focus);
 
-    // A question of Claude's own: its options are the picker's rows.
+    // The panel hidden: SPC a y brings it up on what is asked, and y there
+    // allows it (n refuses).
+    try c.event("{\"type\":\"control_request\",\"request_id\":\"r-2\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"input\":{\"command\":\"rm y\"}}}");
+    ed.tick();
+    claude_chat.hide(&ed);
+    claude_panel.claudeResolve(&ed, true);
+    try testing.expect(p.shown and p.focus);
+    try testing.expectEqual(3, p.sel);
+    try testing.expect(c.asking() != null); // not answered yet
+    try ed.feed("n");
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"behavior\":\"deny\"") != null);
+    try testing.expectEqual(null, c.asking());
+    try c.event("{\"type\":\"control_request\",\"request_id\":\"r-3\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"input\":{\"command\":\"rm z\"}}}");
+    ed.tick();
+    try ed.feed("y");
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"request_id\":\"r-3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"behavior\":\"allow\"") != null);
+    try testing.expect(p.shown and p.focus); // the panel stays
+
+    // A question of Claude's own: its answers are numbered in the panel.
     try c.event("{\"type\":\"control_request\",\"request_id\":\"q-1\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\",\"input\":{\"questions\":[{\"question\":\"Tea or coffee?\",\"options\":[{\"label\":\"Tea\",\"description\":\"leaves\"},{\"label\":\"Coffee\",\"description\":\"beans\"}]}]}}}");
     ed.tick();
+    try testing.expect(std.mem.indexOf(u8, c.entries.items[c.entries.items.len - 1].text.items, "\n2. Coffee: beans") != null);
+    try ed.feed("<C-w>"); // out of the panel
     claude_panel.claudeResolve(&ed, true);
-    support.settlePicker(&ed);
-    try ed.feed("j<CR>");
+    try testing.expect(p.focus and c.asking() != null);
+    try ed.feed("2");
     try testing.expectEqual(null, ed.picker);
     try testing.expect(std.mem.indexOf(u8, c.last_sent.items, "\"answers\":{\"Tea or coffee?\":\"Coffee\"}") != null);
+    try ed.feed("<C-w>");
 
     // Its turn over: a notification with the start of what it said.
     try c.event("{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"All fixed.\"}}}");

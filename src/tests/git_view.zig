@@ -137,6 +137,14 @@ test "SPC g: a row for each change with its diff; r restores one; C-t goes on to
     try testing.expectEqual(1, ed.window_list.items.len);
     try testing.expectEqual(buffers - 2, ed.buffers.items.len);
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "a.txt"));
+
+    // Enter on a changed file: at its first change, not where the cursor was.
+    try ed.feed("G<cmd:git_changed_files>");
+    support.settlePicker(&ed);
+    try testing.expect(std.mem.endsWith(u8, ed.picker.?.itemAt(0).?.text, "a.txt"));
+    try ed.feed("<CR>");
+    try testing.expectEqual(null, ed.picker);
+    try testing.expectEqual(1, ed.cursorLine());
 }
 
 test "side by side with HEAD: two windows that show the same rows; the left follows what is typed; again closes it" {

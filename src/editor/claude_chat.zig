@@ -253,63 +253,80 @@ pub fn tell(ed: *Editor, text: []const u8, about: ?About) !void {
     tick(ed);
 }
 
-/// `SPC a y` while Claude is waiting for an answer (a tool wants
-/// permission, or it has a question of its own): the picker to answer it
-/// in. `SPC a n` refuses at once. False if nothing is waiting.
+/// `SPC a y` / `SPC a n` while Claude is waiting for an answer (a tool
+/// wants permission, or it has a question of its own). It is answered in
+/// the panel, where what is asked is to be read: `SPC a y` allows what the
+/// panel shows, and brings the panel up first when it doesn't (or when the
+/// answer is one of several: a question). `SPC a n` refuses at once. An
+/// edit is looked at in the code window first. False if nothing is waiting.
 pub fn answer(ed: *Editor, yes: bool) bool {
     const c = ed.chat orelse return false;
     const a = c.asking() orelse return false;
+    const p = &ed.chat_panel;
     // An edit: the first `SPC a y` shows it in the code window (to change
-    // it there if need be), the second accepts it.
+    // it there if need be), the second accepts it; the panel comes back.
     if (proposal(ed) != null) {
+        const back = p.back;
         finishEdit(ed, c, yes) catch {};
         tick(ed);
+        if (back != .no) show(ed, back == .focused) catch {};
         return true;
     }
-    if (yes and (showEdit(ed, a) catch false)) return true;
-    if (yes) {
-        // The picker takes the panel's place; it comes back with the answer.
-        ed.chat_panel.back = if (ed.chat_panel.shown) (if (ed.chat_panel.focus) .focused else .shown) else .no;
-        ed.openPicker(.claude_ask, "") catch {};
+    if (!yes) {
+        reply(ed, .refuse);
         return true;
     }
-    c.answer(.refuse) catch {};
-    tick(ed);
+    const was: @TypeOf(p.back) = if (p.shown) (if (p.focus) .focused else .shown) else .no;
+    if (showEdit(ed, a) catch false) {
+        p.back = was;
+        return true;
+    }
+    if (a.question or !p.shown) face(ed, a) else reply(ed, .allow);
     return true;
 }
 
-/// Rows of the picker for a tool that wants permission.
-pub const permission_rows = [_][]const u8{ "Yes, allow it", "Yes, and don't ask again (as Claude suggests)", "No, refuse it" };
-
-/// A row of the answer picker was taken: an option of Claude's question
-/// (the next question comes up after it), or one of `permission_rows`.
-pub fn pick(ed: *Editor, row: usize) !void {
+/// Into the panel, on the row of what is asked, to answer it there.
+fn face(ed: *Editor, a: Chat.Ask) void {
+    show(ed, true) catch return;
     const c = ed.chat orelse return;
-    const a = c.asking() orelse return;
-    // The panel comes back as it was, unless the picker does (more to answer).
-    const back = ed.chat_panel.back;
-    var again = false;
-    defer if (!again and back != .no) show(ed, back == .focused) catch {};
+    for (c.entries.items, 0..) |*e, i| if (std.mem.eql(u8, e.id, a.id)) select(ed, i);
+    if (a.question)
+        ed.setMessage(.info, "Claude's question: the number of an answer picks it", .{})
+    else
+        ed.setMessage(.info, "Claude asks to use {s}: y allows, n refuses", .{a.tool});
+}
+
+fn reply(ed: *Editor, r: Chat.Reply) void {
+    const c = ed.chat orelse return;
+    c.answer(r) catch {};
+    tick(ed);
+}
+
+/// The panel's keys while Claude waits: `y` allows, `a` allows from now on
+/// (what the CLI suggests), `n` refuses; a question's answers are picked
+/// by their numbers. False for any other key.
+fn answerKey(ed: *Editor, cp: u21) bool {
+    const c = ed.chat orelse return false;
+    const a = c.asking() orelse return false;
     if (a.question) {
+        if (cp < '1' or cp > '9') return false;
         var arena: std.heap.ArenaAllocator = .init(ed.gpa);
         defer arena.deinit();
-        const q = c.question(arena.allocator()) orelse return;
-        if (row >= q.options.len) return;
-        const more = try c.choose(q.options[row].label);
+        const q = c.question(arena.allocator()) orelse return false;
+        if (cp - '1' >= q.options.len) return true;
+        _ = c.choose(q.options[cp - '1'].label) catch {};
         tick(ed);
-        again = more;
-        if (more) try ed.openPicker(.claude_ask, "");
-        return;
+        return true;
     }
-    try c.answer(switch (row) {
-        0 => .allow,
-        1 => .always,
-        else => .refuse,
-    });
-    tick(ed);
-    // The next tool that is waiting, if there is one.
-    again = c.asking() != null;
-    if (again) try ed.openPicker(.claude_ask, "");
+    switch (cp) {
+        // (An edit is in the panel's text as a diff; Enter has it in the
+        // code window, to change before it is accepted.)
+        'y' => reply(ed, .allow),
+        'a' => if (a.suggestions != null) reply(ed, .always) else ed.setMessage(.info, "nothing to allow from now on here: y allows it this once", .{}),
+        'n' => reply(ed, .refuse),
+        else => return false,
+    }
+    return true;
 }
 
 /// What `SPC a /`, `SPC a m` and `SPC a p` pick from.
@@ -608,7 +625,7 @@ pub fn key(ed: *Editor, ev: Editor.KeyEvent) bool {
             'n' => select(ed, p.sel + 1),
             'p' => select(ed, p.sel -| 1),
             else => {},
-        } else switch (cp) {
+        } else if (answerKey(ed, cp)) {} else switch (cp) {
             'j' => select(ed, p.sel + 1),
             'k' => select(ed, p.sel -| 1),
             'J' => scrollText(ed, 1),

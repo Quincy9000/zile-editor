@@ -47,7 +47,7 @@ const git_ops = @import("../editor/git_ops.zig");
 const git_view = @import("../editor/git_view.zig");
 const lsp_actions = @import("../editor/lsp_actions.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, git_hunks, git_log, git_commit_files, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_ask, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, claude_sessions, files_global, debug, stored_data };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, git_hunks, git_log, git_commit_files, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, claude_sessions, files_global, debug, stored_data };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -97,7 +97,6 @@ fn Impl(comptime kind: Kind) type {
         .leader => Leader,
         .leader_projects => ProjectsMenu,
         .leader_claude => ClaudeMenu,
-        .claude_ask => ClaudeAsk,
         .claude_commands => ClaudeList(.commands),
         .claude_models => ClaudeList(.models),
         .claude_modes => ClaudeList(.modes),
@@ -423,6 +422,7 @@ const Leader = Menu("Leader", &.{
     .{ .key = 'g', .label = "Git (changes; C-t: files, history, branches)", .command = "git_changes" },
     .{ .key = 'w', .label = "Windows", .command = "pick_windows" },
     .{ .key = 't', .label = "Toggles", .command = "pick_toggles" },
+    .{ .key = 'o', .label = "Options: your config.zon (saving it applies it)", .command = "settings" },
     .{ .key = 'p', .label = "Projects (and their sessions)", .command = "switch_project" },
     .{ .key = 'a', .label = "Claude", .command = "claude_menu" },
     .{ .key = 'n', .label = "Notes: the scratch pads", .command = "toggle_scratch" },
@@ -856,55 +856,6 @@ fn ClaudeList(comptime which: claude_chat.Menu) type {
         }
     };
 }
-
-/// `SPC a y` while Claude waits for an answer: what a tool that wants
-/// permission may do, or the options of a question of Claude's own. The
-/// preview says what is being asked.
-const ClaudeAsk = struct {
-    pub const title = "Claude asks";
-    pub const prefix: ?u8 = null;
-    pub const start_mode: StartMode = .normal;
-
-    pub fn fill(ed: *Editor, items: *Items) !void {
-        const c = ed.chat orelse return;
-        const a = c.asking() orelse return;
-        if (a.question) {
-            var arena: std.heap.ArenaAllocator = .init(ed.gpa);
-            defer arena.deinit();
-            const q = c.question(arena.allocator()) orelse return;
-            for (q.options, 0..) |o, i| try items.append(.{ .text = o.label, .detail = o.description, .id = @intCast(i) });
-            return;
-        }
-        for (claude_chat.permission_rows, 0..) |row, i| {
-            if (i == 1 and a.suggestions == null) continue;
-            try items.append(.{ .text = row, .detail = a.tool, .id = @intCast(i) });
-        }
-    }
-
-    pub fn accept(ed: *Editor, item: Item) !void {
-        try claude_chat.pick(ed, item.id);
-    }
-
-    pub fn preview(ed: *Editor, _: *const Item, out: *Preview) !void {
-        const c = ed.chat orelse return;
-        const a = c.asking() orelse return;
-        var arena: std.heap.ArenaAllocator = .init(ed.gpa);
-        defer arena.deinit();
-        if (c.question(arena.allocator())) |q| {
-            try out.text.print(ed.gpa, "{s}\n", .{q.text});
-            for (q.options) |o| try out.text.print(ed.gpa, "\n{s}\n    {s}\n", .{ o.label, o.description });
-            return;
-        }
-        try out.text.print(ed.gpa, "Claude asks to use {s}:\n\n", .{a.tool});
-        const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), a.input, .{}) catch return;
-        if (v != .object) return;
-        var it = v.object.iterator();
-        while (it.next()) |e| switch (e.value_ptr.*) {
-            .string => |s| try out.text.print(ed.gpa, "{s}:\n{s}\n\n", .{ e.key_ptr.*, s }),
-            else => {},
-        };
-    }
-};
 
 /// A place an item stands for (path owned by the caller, 0-based
 /// line/col), for sources whose items are places (`<C-q>` to quickfix).
@@ -3510,7 +3461,7 @@ const GitChanges = struct {
 
     pub fn accept(ed: *Editor, item: Item) !void {
         if (std.mem.eql(u8, item.detail, "deleted")) return ed.setMessage(.info, "{s} was deleted", .{item.text});
-        try ed.openFile(item.text);
+        try git_view.openAtFirstChange(ed, item.text);
     }
 
     /// What changed in the file (a new one: the file).

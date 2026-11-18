@@ -68,7 +68,8 @@ const codepoints = blk: {
     break :blk result;
 };
 
-/// Common monospace font locations, tried in order before asking fontconfig.
+/// Common monospace font locations, tried in order when fontconfig (which
+/// knows the system's own choice) isn't there to ask.
 const candidates = [_][]const u8{
     "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
@@ -123,19 +124,21 @@ pub fn deinit(f: *Font) void {
 }
 
 fn discover(gpa: Allocator, io: Io) Allocator.Error!?[:0]u8 {
+    fontconfig: {
+        const result = std.process.run(gpa, io, .{
+            .argv = &.{ "fc-match", "-f", "%{file}", "monospace" },
+        }) catch break :fontconfig;
+        defer gpa.free(result.stdout);
+        defer gpa.free(result.stderr);
+        const file = std.mem.trim(u8, result.stdout, " \n");
+        if (file.len > 0) return try gpa.dupeSentinel(u8, file, 0);
+    }
     for (candidates) |c| {
         if (Io.Dir.accessAbsolute(io, c, .{})) |_| {
             return try gpa.dupeSentinel(u8, c, 0);
         } else |_| {}
     }
-    const result = std.process.run(gpa, io, .{
-        .argv = &.{ "fc-match", "-f", "%{file}", "monospace" },
-    }) catch return null;
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
-    const file = std.mem.trim(u8, result.stdout, " \n");
-    if (file.len == 0) return null;
-    return try gpa.dupeSentinel(u8, file, 0);
+    return null;
 }
 
 /// Draws one codepoint with its cell's top-left at (x, y).

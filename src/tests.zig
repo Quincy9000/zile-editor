@@ -31,6 +31,7 @@ comptime {
     _ = @import("snippets.zig");
     _ = @import("config/toml.zig");
     _ = @import("config/config.zig");
+    _ = @import("config/settings.zig");
     _ = @import("sql.zig");
     _ = @import("git/patch.zig");
     _ = @import("editor/compare.zig");

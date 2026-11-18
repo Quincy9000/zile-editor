@@ -140,6 +140,17 @@ pub fn restoreFile(ed: *Editor, path: []const u8, status: []const u8) !void {
     ed.setMessage(.info, "{s} is as HEAD has it (u brings your changes back; not saved yet)", .{path});
 }
 
+/// Opens `path` at its first change from HEAD (a new file, which is all
+/// change: where its cursor was).
+pub fn openAtFirstChange(ed: *Editor, path: []const u8) !void {
+    try ed.openFile(path);
+    git_ops.updateGit(ed);
+    const g = ed.buffer.git orelse return;
+    if (g.hunks.items.len == 0) return;
+    const last = ed.buffer.text.lineCount() -| 1;
+    try ed.jumpTo(path, @min(g.hunks.items[0].new_start, last), 0);
+}
+
 /// `path` beside HEAD's version of it, at `line` (0-based).
 pub fn sideBySide(ed: *Editor, path: []const u8, line: usize) !void {
     compare.close(ed);

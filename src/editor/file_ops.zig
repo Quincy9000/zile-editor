@@ -209,4 +209,6 @@ pub fn saveBufferNow(ed: *Editor, b: *Buffer) void {
     };
     ed.setMessage(.info, "\"{s}\" {d}L, {d}B written", .{ b.displayName(), b.text.lineCount(), n });
     if (lsp_ops.lspFor(ed, b)) |l| l.didSave(b);
+    // The settings file: saved is applied.
+    if (b.path) |p| @import("../config/settings.zig").saved(ed, p);
 }

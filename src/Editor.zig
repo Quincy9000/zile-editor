@@ -184,9 +184,8 @@ pub const Options = struct {
     /// code (inlay hints).
     inlay_hints: bool = true,
     /// Folders searched (three levels deep) for projects to offer in
-    /// `SPC p p` besides the ones opened before. A setting once there is
-    /// config; nowhere in tests.
-    project_dirs: []const []const u8 = if (@import("builtin").is_test) &.{} else &.{"/mnt/code"},
+    /// `SPC p p` besides the ones opened before (`projects` in config.zon).
+    project_dirs: []const []const u8 = &.{},
 };
 
 pub const View = struct {

@@ -9,6 +9,7 @@ const render = @import("ui/render.zig");
 const keys = @import("input/keys.zig");
 const Tui = @import("tui/Tui.zig");
 const config = @import("config/config.zig");
+const settings = @import("config/settings.zig");
 const grammars = @import("config/grammars.zig");
 const state_files = @import("editor/state_files.zig");
 const notifications = @import("editor/notifications.zig");
@@ -24,8 +25,10 @@ const usage =
     \\usage: zile [options] [file]
     \\
     \\options:
-    \\  --font <path>       TTF/OTF font file (default: discovered monospace font)
-    \\  --font-size <px>    font size in pixels (default: 18)
+    \\  --font <path>       TTF/OTF font file (default: fontfamily in config.zon,
+    \\                      else the system's monospace font)
+    \\  --font-size <px>    font size in pixels (default: fontsize in config.zon,
+    \\                      else 18)
     \\  -t, --tui           draw in the terminal instead of a window (automatic
     \\                      when there is no display, e.g. over SSH)
     \\  -h, --help          show this help
@@ -44,8 +47,11 @@ const Args = struct {
     file: ?[]const u8 = null,
     tui: bool = false,
     font: ?[]const u8 = null,
-    font_size: i32 = 18,
+    /// `--font-size`; null: the settings', else `default_font_size`.
+    font_size: ?i32 = null,
 };
+
+const default_font_size = 18;
 
 fn parseArgs(init: std.process.Init) !Args {
     var out: Args = .{};
@@ -94,6 +100,8 @@ pub fn main(init: std.process.Init) !void {
     errdefer if (early) Tui.leaveEarly();
     // Languages from the config, before any file opens.
     const config_report = config.load(io);
+    // Your settings (config.zon).
+    const loaded = settings.read(io);
     const test_keys = init.environ_map.get("ZILE_TEST_KEYS");
     const test_screenshot = init.environ_map.get("ZILE_TEST_SCREENSHOT");
 
@@ -111,6 +119,8 @@ pub fn main(init: std.process.Init) !void {
         state_files.saveVisits(&ed);
     }
     for (config_report.problems) |p| notifications.notify(&ed, .err, "{s}", .{p});
+    for (loaded.problems) |p| notifications.notify(&ed, .err, "{s}", .{p});
+    for (settings.apply(&ed, &loaded.settings)) |p| notifications.notify(&ed, .err, "{s}", .{p});
     ed.theme_names = &Theme.names;
     state_files.loadTheme(&ed);
     if (args.file) |path| ed.openArg(path);
@@ -146,7 +156,15 @@ pub fn main(init: std.process.Init) !void {
     // (LSP, terminal) will call glfw.wake() when they have results.
     if (test_screenshot == null) rl.EnableEventWaiting();
 
-    var font = try Font.load(gpa, io, args.font, args.font_size);
+    // The font: the one asked for on the command line, else the settings',
+    // else the system's monospace font.
+    var font_problem: ?[]const u8 = null;
+    const font_file: ?[]u8 = if (args.font == null) (if (loaded.settings.fontfamily) |family| settings.fontFile(gpa, io, family, &font_problem) else null) else null;
+    defer if (font_file) |f| gpa.free(f);
+    if (font_problem) |p| notifications.notify(&ed, .err, "{s}", .{p});
+    const font_path: ?[]const u8 = args.font orelse font_file;
+    const font_size = std.math.clamp(args.font_size orelse loaded.settings.fontsize orelse default_font_size, min_font_size, max_font_size);
+    var font = try Font.load(gpa, io, font_path, font_size);
     defer font.deinit();
     // Without a Nerd Font the icons would be boxes.
     if (!font.has_icons) ed.options.icons = false;
@@ -182,7 +200,7 @@ pub fn main(init: std.process.Init) !void {
             ed.handleKey(ev);
         }
         ed.tick();
-        applyZoom(&ed, gpa, io, &font, args);
+        applyZoom(&ed, gpa, io, &font, font_path, font_size);
         if (theme != Theme.get(ed.theme_index)) {
             theme = Theme.get(ed.theme_index);
             syncTerminalColors(&ed, theme);
@@ -264,14 +282,14 @@ const min_font_size = 8;
 const max_font_size = 72;
 
 /// Reloads the font at the requested size (the glyph atlas is baked per size).
-fn applyZoom(ed: *Editor, gpa: std.mem.Allocator, io: std.Io, font: *Font, args: Args) void {
+fn applyZoom(ed: *Editor, gpa: std.mem.Allocator, io: std.Io, font: *Font, font_path: ?[]const u8, font_size: i32) void {
     if (ed.zoom_request == 0 and !ed.zoom_reset) return;
     const current: i32 = font.font.baseSize;
-    const size = if (ed.zoom_reset) args.font_size else std.math.clamp(current + 2 * ed.zoom_request, min_font_size, max_font_size);
+    const size = if (ed.zoom_reset) font_size else std.math.clamp(current + 2 * ed.zoom_request, min_font_size, max_font_size);
     ed.zoom_request = 0;
     ed.zoom_reset = false;
     if (size == current) return;
-    const fresh = Font.load(gpa, io, args.font, size) catch return;
+    const fresh = Font.load(gpa, io, font_path, size) catch return;
     font.deinit();
     font.* = fresh;
     ed.setMessage(.info, "text size {d}", .{size});

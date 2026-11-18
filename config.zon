@@ -1,0 +1,57 @@
+// zile's settings, each at its default: change what you like. Applied when
+// this file is saved (the font, and anything you remove, when zile next
+// starts). A setting that isn't here keeps its default.
+//
+// Ctrl-/ on a line comments it out, which puts that setting back to its
+// default; Ctrl-/ again brings the line back.
+.{
+    // The font: a family's name ("JetBrains Mono") or a font file's path.
+    // Without it, the system's monospace font.
+    //.fontfamily = "JetBrains Mono",
+    .fontsize = 18,
+
+    // Folders that SPC p p looks in for projects, as in .{ "~/code" }.
+    .projects = .{},
+
+    // Editing
+    .tabwidth = 4,
+    .expandtab = true,
+    .autopairs = true,
+    .autosave = true,
+    .formatonsave = true,
+    .trimonsave = false,
+
+    // What is drawn
+    .wrap = true,
+    .scrolloff = 0,
+    .relativenumbers = false,
+    .ligatures = true,
+    .icons = true,
+    .smoothscroll = true,
+    .cursorword = true,
+    .indentscope = true,
+    .trailingspace = true,
+    .highlightpatterns = true,
+    .stickycontext = true,
+
+    // Code: the language server, git, the debugger
+    .diagnostictext = false,
+    .inlayhints = true,
+    .codelens = true,
+    .ghostlines = true,
+    .gitblame = false,
+    .debugvalues = true,
+    .aicomplete = true,
+
+    // The Files picker's search of your home folder skips caches and
+    // build output.
+    .homefilter = true,
+
+    // Keys of your own: a key sequence, then a command's name (the command
+    // picker, SPC f c, shows every name).
+    //.keys = .{
+    //    .normal = .{ .{ "<Space>x", "git_changes" } },
+    //    .insert = .{},
+    //    .visual = .{},
+    //},
+}
