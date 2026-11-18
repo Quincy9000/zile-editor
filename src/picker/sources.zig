@@ -404,6 +404,8 @@ const Leader = Menu("Leader", &.{
     .{ .key = 'p', .label = "Projects (and their sessions)", .command = "switch_project" },
     .{ .key = 'a', .label = "Claude", .command = "claude_menu" },
     .{ .key = 'n', .label = "Notes: the scratch pads", .command = "toggle_scratch" },
+    .{ .key = 'm', .label = "Bookmarks (m and a key makes one)", .command = "pick_mark" },
+    .{ .key = 'j', .label = "Jumps (the places you jumped from)", .command = "jump_list" },
     .{ .key = 'x', .label = "Errors and warnings in the project", .command = "list_diagnostics" },
     .{ .key = '\'', .label = "Resume the last picker", .command = "resume_picker" },
     .{ .key = ',', .label = "Last jump (again: back)", .command = "jump_toggle" },
@@ -777,7 +779,7 @@ fn ClaudeList(comptime which: claude_chat.Menu) type {
                     .detail = r.description,
                     .current = if (c.want_model) |m| std.mem.eql(u8, m, r.name) else false,
                 }),
-                .modes => for (Chat.modes) |r| try list.append(a, .{ .text = r.title, .detail = r.description, .current = std.mem.eql(u8, c.mode, r.name) }),
+                .modes => for (c.modes) |name| try list.append(a, .{ .text = name, .current = c.modeInUse(name) }),
                 .efforts => for (c.efforts()) |level| try list.append(a, .{ .text = level, .current = std.mem.eql(u8, c.effort, level) }),
                 .sessions => for (c.listed) |sn| {
                     var tb: [32]u8 = undefined;
@@ -1541,10 +1543,13 @@ const Jumps = struct {
     pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
+        state_files.loadCurrentProjectPlaces(ed);
         var i = ed.jumps.items.len;
         while (i > 0) {
             i -= 1;
             const j = ed.jumps.items[i];
+            // Not where the cursor already is: the next place instead.
+            if (jumplist.isHere(ed, j)) continue;
             var buf: [512]u8 = undefined;
             const name = if (j.buffer) |b| b.displayName() else j.path orelse "?";
             if (j.buffer) |b| {
@@ -1560,7 +1565,7 @@ const Jumps = struct {
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
-        if (item.id < ed.jumps.items.len) try jumplist.goJump(ed, item.id);
+        try jumplist.pickJump(ed, item.id);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
@@ -2637,39 +2642,52 @@ const RegisterList = struct {
     }
 };
 
-/// `SPC f m`: the marks (`m{letter}`), this file's and the global ones.
+/// `SPC m`: the bookmarks (`m` and a key), of every file. Each row starts
+/// with its name, so typing it finds the row.
 const Marks = struct {
-    pub const title = "Marks";
+    pub const title = "Bookmarks";
     pub const prefix: ?u8 = null;
-    pub const start_mode: StartMode = .normal;
+    pub const start_mode: StartMode = .insert;
 
-    fn visible(ed: *Editor, m: Editor.Mark) bool {
-        return std.ascii.isUpper(m.name) or m.buffer == ed.buffer;
+    fn remove(ed: *Editor, item: ?Item) anyerror!void {
+        jumplist.removeMark(ed, (item orelse return).id);
     }
 
+    pub const item_actions = [_]Action{
+        .{ .label = "remove", .key = 'd', .stay = true, .run = remove },
+    };
+
     pub fn fill(ed: *Editor, items: *Items) !void {
+        state_files.loadCurrentProjectPlaces(ed);
         var buf: [512]u8 = undefined;
+        var row: std.ArrayList(u8) = .empty;
+        defer row.deinit(ed.gpa);
+        // The one longest left alone first (a jump to one puts it last).
         for (ed.marks.items, 0..) |m, i| {
-            if (!visible(ed, m)) continue;
             const name = if (m.buffer) |b| b.displayName() else m.path orelse "?";
+            var shown_buf: [4]u8 = undefined;
+            row.clearRetainingCapacity();
+            try row.print(ed.gpa, "{s}  ", .{m.shown(&shown_buf)});
             if (m.buffer) |b| {
                 const t = &b.text;
                 const line = t.lineOf(@min(m.pos, t.len()));
-                const detail = std.fmt.bufPrint(&buf, "{c}  {s}:{d}", .{ m.name, name, line + 1 }) catch name;
+                const detail = std.fmt.bufPrint(&buf, "{s}:{d}", .{ name, line + 1 }) catch name;
                 const text = std.mem.trim(u8, t.lineSlice(line), " \t");
-                try items.append(.{ .text = if (text.len > 0) text else "(blank line)", .detail = detail, .id = @intCast(i) });
+                try row.appendSlice(ed.gpa, if (text.len > 0) text else "(blank line)");
+                try items.append(.{ .text = row.items, .detail = detail, .id = @intCast(i) });
             } else {
-                const detail = std.fmt.bufPrint(&buf, "{c}  {s}", .{ m.name, name }) catch name;
-                try items.append(.{ .text = "(closed file)", .detail = detail, .id = @intCast(i) });
+                try row.appendSlice(ed.gpa, "(closed file)");
+                try items.append(.{ .text = row.items, .detail = name, .id = @intCast(i) });
             }
         }
-        if (items.count() == 0) ed.setMessage(.info, "no marks yet (m and a letter sets one)", .{});
+        if (items.count() == 0) ed.setMessage(.info, "no bookmarks yet (m and a key makes one)", .{});
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {
         if (item.id >= ed.marks.items.len) return;
         jumplist.pushJump(ed);
         try jumplist.goMark(ed, ed.marks.items[item.id], true);
+        jumplist.markVisited(ed, item.id);
     }
 
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {

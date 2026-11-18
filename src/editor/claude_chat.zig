@@ -46,6 +46,18 @@ pub const Panel = struct {
     /// doing then.
     version: usize = 0,
     state: Chat.State = .idle,
+    /// From the last draw: where the panel is, and where its text side
+    /// starts (for the mouse).
+    area: Editor.Windows.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    text_x: f32 = 0,
+
+    pub const Side = enum { rows, text };
+
+    /// The side of the panel the pointer is over, if it is over it.
+    pub fn under(p: *const Panel, x: f32, y: f32) ?Side {
+        if (!p.shown or y < p.area.y or y >= p.area.y + p.area.h or x < p.area.x or x >= p.area.x + p.area.w) return null;
+        return if (x >= p.text_x) .text else .rows;
+    }
 };
 
 /// The key of the notification shown while Claude waits for an answer.
@@ -312,6 +324,7 @@ pub fn menu(ed: *Editor, which: Menu) !void {
     c.poll();
     // (The limits as they are now, for the next look.)
     if (which == .usage) c.refresh();
+    if (which == .modes) c.loadModes();
     if (which == .sessions) {
         c.listSessions();
         if (c.listed.len == 0) return ed.setMessage(.info, "no conversations with Claude in this project yet", .{});
@@ -319,14 +332,15 @@ pub fn menu(ed: *Editor, which: Menu) !void {
     const empty = switch (which) {
         .commands => c.commands.len == 0,
         .models => c.models.len == 0,
-        .modes => false,
+        .modes => c.modes.len == 0,
         .efforts => c.efforts().len == 0,
         .usage => !c.usage.known,
         .sessions => false,
     };
     if (empty) return ed.setMessage(.info, "Claude is starting: its {s} here in a moment", .{switch (which) {
         .commands => "commands are",
-        .models, .modes => "models are",
+        .models => "models are",
+        .modes => "permission modes are",
         .efforts => "effort levels are",
         .usage => "usage is",
         .sessions => "conversations are",
@@ -358,9 +372,9 @@ pub fn menuPick(ed: *Editor, which: Menu, row: usize) !void {
             ed.setMessage(.info, "Claude answers with {s} from now on", .{if (m.title.len > 0) m.title else m.name});
         },
         .modes => {
-            if (row >= Chat.modes.len) return;
-            try c.setMode(Chat.modes[row].name);
-            ed.setMessage(.info, "Claude: {s} ({s})", .{ Chat.modes[row].title, Chat.modes[row].description });
+            if (row >= c.modes.len) return;
+            try c.setMode(c.modes[row]);
+            ed.setMessage(.info, "Claude's permission mode is {s} from now on", .{c.modes[row]});
         },
         .efforts => {
             const levels = c.efforts();
@@ -505,6 +519,22 @@ fn scrollText(ed: *Editor, delta: isize) void {
     const from: isize = @intCast(if (p.tail) last else @min(p.scroll, last));
     p.scroll = @intCast(std.math.clamp(from + delta, 0, @as(isize, @intCast(last))));
     p.tail = false;
+}
+
+/// The wheel over the panel: over the rows it goes through them, over the
+/// text it scrolls that (the copy opened by Tab, while it is open). True
+/// when the pointer was over the panel.
+pub fn wheel(ed: *Editor, x: f32, y: f32, lines: isize) bool {
+    const p = &ed.chat_panel;
+    const side = p.under(x, y) orelse return false;
+    if (lines == 0) return true;
+    if (ed.side_window) |f| {
+        if (ed.window == f) ed.scrollLines(lines);
+    } else switch (side) {
+        .rows => select(ed, if (lines > 0) p.sel + 1 else p.sel -| 1),
+        .text => scrollText(ed, lines),
+    }
+    return true;
 }
 
 /// Tab on a row: into its text, where it shows, with vim's keys (a

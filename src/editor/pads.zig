@@ -1,11 +1,14 @@
-//! The scratch pads (`SPC n`; also a row of the toggles, `SPC t`): markdown files of your own, one for each
-//! thing you are keeping notes on, kept for every project together. They
+//! The scratch pads (`SPC n`; also a row of the toggles, `SPC t`): files of your own, one for each
+//! thing you are keeping notes on, kept for every project together. A pad
+//! is markdown unless its name says what it is (`query.sql`, `try.zig`):
+//! then it is a file of that kind, with its language's colours, its
+//! language server and, for SQL, the database of the project you are in. They
 //! show in a panel docked along the bottom, as Claude's conversation does:
 //! their names on the left, the selected one's text on the right. Tab goes
 //! into the text (the file itself, with all of vim's keys; saved on the way
 //! back).
 //!
-//! The pads are the `.md` files of `scratch/` in zile's data folder, and
+//! The pads are the files of `scratch/` in zile's data folder, and
 //! `scratch.md` beside it (the one pad there was before there were more).
 
 const std = @import("std");
@@ -73,8 +76,8 @@ pub fn refresh(ed: *Editor) !void {
     var it = dir.iterate();
     const from = l.pads.items.len;
     while (it.next(ed.io) catch null) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".md")) continue;
-        const name = try ed.gpa.dupe(u8, entry.name[0 .. entry.name.len - 3]);
+        if (entry.kind != .file or entry.name[0] == '.') continue;
+        const name = try ed.gpa.dupe(u8, shownName(entry.name));
         errdefer ed.gpa.free(name);
         const path = try std.fs.path.join(ed.gpa, &.{ dir_path, entry.name });
         errdefer ed.gpa.free(path);
@@ -86,6 +89,33 @@ pub fn refresh(ed: *Editor) !void {
         }
     }.less);
     ed.pad_panel.sel = @min(ed.pad_panel.sel, l.pads.items.len - 1);
+}
+
+/// A pad's name for its file's: markdown is what a pad is unless it says
+/// otherwise, so `.md` isn't shown.
+fn shownName(file: []const u8) []const u8 {
+    return if (std.mem.endsWith(u8, file, ".md") and file.len > 3) file[0 .. file.len - 3] else file;
+}
+
+/// The file of the pad named `typed` (in `scratch/`; caller frees): the
+/// name as it is if it says what kind of file it is, else with `.md`. Null
+/// (with a message) if it can't be a pad's name.
+fn pathFor(ed: *Editor, typed: []const u8) !?[]u8 {
+    const name = std.mem.trim(u8, typed, " \t");
+    if (name.len == 0) {
+        ed.setMessage(.info, "cancelled: no name", .{});
+        return null;
+    }
+    if (std.mem.indexOfAny(u8, name, "/\\") != null or name[0] == '.') {
+        ed.setMessage(.err, "a pad's name is a file's name: no / in it, no . first", .{});
+        return null;
+    }
+    const dir_path = dataFile(ed, "scratch") orelse return null;
+    defer ed.gpa.free(dir_path);
+    try Io.Dir.cwd().createDirPath(ed.io, dir_path);
+    const file = if (std.fs.path.extension(name).len > 1) try ed.gpa.dupe(u8, name) else try std.fmt.allocPrint(ed.gpa, "{s}.md", .{name});
+    defer ed.gpa.free(file);
+    return try std.fs.path.join(ed.gpa, &.{ dir_path, file });
 }
 
 pub fn hide(ed: *Editor) void {
@@ -144,6 +174,20 @@ fn select(ed: *Editor, row: usize) void {
     ed.pad_list.deleting = null;
 }
 
+/// The wheel over the panel (as `claude_chat.wheel`).
+pub fn wheel(ed: *Editor, x: f32, y: f32, lines: isize) bool {
+    const p = &ed.pad_panel;
+    const side = p.under(x, y) orelse return false;
+    if (lines == 0) return true;
+    if (ed.side_window) |f| {
+        if (ed.window == f) ed.scrollLines(lines);
+    } else switch (side) {
+        .rows => select(ed, if (lines > 0) p.sel + 1 else p.sel -| 1),
+        .text => scrollText(ed, lines),
+    }
+    return true;
+}
+
 fn scrollText(ed: *Editor, delta: isize) void {
     const p = &ed.pad_panel;
     const last = p.lines -| p.page;
@@ -186,22 +230,51 @@ fn askNew(ed: *Editor) void {
 pub fn finishNew(ed: *Editor) !void {
     const raw = try git_ops.takePromptText(ed) orelse return;
     defer ed.gpa.free(raw);
-    var name = std.mem.trim(u8, raw, " \t");
-    if (std.mem.endsWith(u8, name, ".md")) name = name[0 .. name.len - 3];
-    if (name.len == 0) return ed.setMessage(.info, "cancelled: no name", .{});
-    if (std.mem.indexOfAny(u8, name, "/\\") != null or name[0] == '.') return ed.setMessage(.err, "a pad's name is a file's name: no / in it, no . first", .{});
-    const dir_path = dataFile(ed, "scratch") orelse return;
-    defer ed.gpa.free(dir_path);
-    try Io.Dir.cwd().createDirPath(ed.io, dir_path);
-    const file = try std.fmt.allocPrint(ed.gpa, "{s}.md", .{name});
-    defer ed.gpa.free(file);
-    const path = try std.fs.path.join(ed.gpa, &.{ dir_path, file });
+    const path = try pathFor(ed, raw) orelse return;
     defer ed.gpa.free(path);
     if (Io.Dir.cwd().statFile(ed.io, path, .{})) |_| {} else |_| try Io.Dir.cwd().writeFile(ed.io, .{ .sub_path = path, .data = "" });
     try refresh(ed);
     for (ed.pad_list.pads.items, 0..) |p, i| if (std.mem.eql(u8, p.path, path)) select(ed, i);
     try intoText(ed);
     if (ed.mode == .normal) ed.setMode(.insert);
+}
+
+/// `r`: asks for the pad's new name (the one it has, to change).
+fn askRename(ed: *Editor) void {
+    const pad = selected(ed) orelse return;
+    prompts.startSearch(ed, true, .rename_pad);
+    ed.search_prompt.?.input.set(ed.gpa, shownName(std.fs.path.basename(pad.path))) catch {};
+}
+
+/// The new name was typed: the pad's file is renamed, and is what the name
+/// says it is from now on (`notes` to `notes.sql`: a SQL file).
+pub fn finishRename(ed: *Editor) !void {
+    const raw = try git_ops.takePromptText(ed) orelse return;
+    defer ed.gpa.free(raw);
+    const pad = selected(ed) orelse return;
+    const path = try pathFor(ed, raw) orelse return;
+    defer ed.gpa.free(path);
+    if (std.mem.eql(u8, path, pad.path)) return ed.setMessage(.info, "that is already its name", .{});
+    if (Io.Dir.cwd().statFile(ed.io, path, .{})) |_| {
+        return ed.setMessage(.err, "there is a pad \"{s}\" already", .{shownName(std.fs.path.basename(path))});
+    } else |_| {}
+    // Its buffer, if it is open: written first, then it follows the file.
+    const open = claude_panel.bufferForPath(ed, pad.path);
+    if (open) |b| if (b.modified) {
+        _ = b.save(ed.gpa, ed.io) catch {};
+    };
+    if (Io.Dir.cwd().statFile(ed.io, pad.path, .{})) |_| {
+        Io.Dir.rename(Io.Dir.cwd(), pad.path, Io.Dir.cwd(), path, ed.io) catch |err|
+            return ed.setMessage(.err, "could not rename the pad: {s}", .{@errorName(err)});
+    } else |_| try Io.Dir.cwd().writeFile(ed.io, .{ .sub_path = path, .data = "" });
+    if (open) |b| {
+        const norm = try ed.normalizePath(path);
+        defer ed.gpa.free(norm);
+        try @import("file_ops.zig").setBufferPath(ed, b, norm);
+    }
+    ed.setMessage(.info, "the pad is \"{s}\" now", .{shownName(std.fs.path.basename(path))});
+    try refresh(ed);
+    for (ed.pad_list.pads.items, 0..) |q, i| if (std.mem.eql(u8, q.path, path)) select(ed, i);
 }
 
 /// `x`, twice: the pad's file is deleted (the first pad is only emptied:
@@ -270,6 +343,7 @@ pub fn key(ed: *Editor, ev: Editor.KeyEvent) bool {
                 ed.setMode(.insert);
             },
             'n' => askNew(ed),
+            'r' => askRename(ed),
             'x' => {
                 ed.pad_list.deleting = was_deleting;
                 delete(ed) catch {};

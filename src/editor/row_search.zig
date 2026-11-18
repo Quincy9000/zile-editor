@@ -183,7 +183,9 @@ pub fn finishSearchRow(ed: *Editor, rp: RowPos) !void {
 pub fn searchPattern(ed: *const Editor) ?search.Pattern {
     if (ed.search_prompt) |*sp| {
         if (sp.kind.boxed()) return null;
-        return search.Pattern.init(sp.input.items(), false);
+        var pattern = search.Pattern.init(sp.input.items(), false);
+        if (sp.regex) |*re| pattern.regex = re;
+        return pattern;
     }
     if (!ed.search_highlight or ed.last_search.items.len == 0) return null;
     return search.Pattern.init(ed.last_search.items, ed.last_search_whole_word);

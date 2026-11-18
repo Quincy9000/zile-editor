@@ -59,14 +59,6 @@ pub const Usage = struct {
     context_max: u64 = 0,
 };
 
-/// How much Claude may do without asking. The CLI takes these but doesn't
-/// list them (`claude --help`, `--permission-mode`).
-pub const modes = [_]Named{
-    .{ .name = "default", .title = "Ask first", .description = "tools that change things ask before they run" },
-    .{ .name = "acceptEdits", .title = "Accept edits", .description = "edits to files go ahead; commands still ask" },
-    .{ .name = "plan", .title = "Plan", .description = "Claude looks and plans, and changes nothing" },
-};
-
 /// A tool waiting for permission.
 pub const Ask = struct {
     /// The request's id (owned).
@@ -127,6 +119,10 @@ answered: usize = 0,
 info: std.heap.ArenaAllocator,
 commands: []const Named = &.{},
 models: []const Named = &.{},
+/// How much Claude may do without asking: the permission modes the CLI
+/// takes, as its own help lists them (`claude --help`, `--permission-mode`;
+/// nothing in the stream says). Owned; read when first wanted.
+modes: [][]u8 = &.{},
 /// The model answering and the permission mode, as the CLI last said
 /// (owned; empty until it has).
 model: []u8 = &.{},
@@ -171,6 +167,7 @@ pub fn destroy(c: *Chat) void {
     if (c.mcp_config) |m| c.gpa.free(m);
     c.info.deinit();
     c.listing.deinit();
+    c.freeModes();
     c.gpa.free(c.model);
     c.gpa.free(c.mode);
     c.gpa.free(c.effort);
@@ -510,6 +507,53 @@ pub fn setModel(c: *Chat, value: []const u8) !void {
     if (c.want_model) |old| c.gpa.free(old);
     c.want_model = mine;
     try c.control("set_model", "model", value);
+}
+
+fn freeModes(c: *Chat) void {
+    for (c.modes) |m| c.gpa.free(m);
+    c.gpa.free(c.modes);
+    c.modes = &.{};
+}
+
+/// Asks the CLI for its permission modes, once (its help: quick).
+pub fn loadModes(c: *Chat) void {
+    if (c.modes.len > 0 or c.offline) return;
+    const r = std.process.run(c.gpa, c.io, .{ .argv = &.{ "claude", "--help" }, .stdout_limit = .limited(1 << 20) }) catch return;
+    defer c.gpa.free(r.stdout);
+    defer c.gpa.free(r.stderr);
+    c.readModes(r.stdout) catch {};
+}
+
+/// Takes the modes from the CLI's help: the quoted choices of
+/// `--permission-mode`.
+pub fn readModes(c: *Chat, help: []const u8) !void {
+    const flag = std.mem.indexOf(u8, help, "--permission-mode") orelse return;
+    const open = std.mem.indexOfPos(u8, help, flag, "(choices:") orelse return;
+    const close = std.mem.indexOfScalarPos(u8, help, open, ')') orelse return;
+    var list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (list.items) |m| c.gpa.free(m);
+        list.deinit(c.gpa);
+    }
+    var it = std.mem.splitScalar(u8, help[open..close], '"');
+    _ = it.next();
+    // Every other piece is inside quotes.
+    while (it.next()) |name| : (_ = it.next()) {
+        if (name.len == 0) continue;
+        const mine = try c.gpa.dupe(u8, name);
+        errdefer c.gpa.free(mine);
+        try list.append(c.gpa, mine);
+    }
+    if (list.items.len == 0) return list.deinit(c.gpa);
+    c.freeModes();
+    c.modes = try list.toOwnedSlice(c.gpa);
+}
+
+/// Whether `name` is the mode in use. (The CLI calls the one that asks
+/// first `manual` in its help and `default` when it says which it is on.)
+pub fn modeInUse(c: *const Chat, name: []const u8) bool {
+    if (std.mem.eql(u8, c.mode, name)) return true;
+    return std.mem.eql(u8, c.mode, "default") and std.mem.eql(u8, name, "manual");
 }
 
 /// Changes how much Claude may do without asking (one of `modes`).
@@ -1243,4 +1287,22 @@ test "conversations of before: listed by what began them, shown again when resum
     try std.testing.expectEqualStrings("ls\n\na.zig", c.entries.items[2].text.items);
     try std.testing.expectEqualStrings("Done.", c.entries.items[3].text.items);
     try std.testing.expectEqual(State.idle, c.state);
+}
+
+test "the permission modes are the CLI's own: the choices in its help" {
+    const c = try create(std.testing.allocator, std.testing.io, ".", noWake);
+    defer c.destroy();
+    c.offline = true;
+    try c.readModes(
+        \\  --permission-mode <mode>              Permission mode to use for the session
+        \\                                        (choices: "acceptEdits", "auto",
+        \\                                        "manual", "plan")
+        \\  --permission-prompts <target>         Who answers (choices: "x")
+    );
+    try std.testing.expectEqual(4, c.modes.len);
+    try std.testing.expectEqualStrings("acceptEdits", c.modes[0]);
+    try std.testing.expectEqualStrings("auto", c.modes[1]);
+    try std.testing.expectEqualStrings("plan", c.modes[3]);
+    try c.event("{\"type\":\"system\",\"subtype\":\"status\",\"permissionMode\":\"default\"}");
+    try std.testing.expect(c.modeInUse("manual") and !c.modeInUse("auto"));
 }

@@ -17,6 +17,7 @@ const motions = @import("core/motions.zig");
 const textobjects = @import("core/textobjects.zig");
 const syntax_objects = @import("syntax/objects.zig");
 const operators = @import("operators.zig");
+const Registers = @import("Registers.zig");
 const pairs = @import("pairs.zig");
 const tags = @import("tags.zig");
 const Picker = @import("picker/Picker.zig");
@@ -97,6 +98,9 @@ pub const Command = struct {
     /// A program it runs: when that isn't installed, running the command
     /// just says so ("git isn't installed").
     needs: []const u8 = "",
+    /// With `takes_char`: asked in a box while the key is waited for (no
+    /// <CR>: the key pressed is the answer, <Esc> gives up).
+    char_prompt: []const u8 = "",
 };
 
 pub const all = base ++ text_object_commands;
@@ -136,7 +140,7 @@ const base = [_]Command{
     // Search
     .{ .name = "search_forward", .doc = "Search forward", .run = startSearch(true, .search) },
     .{ .name = "search_backward", .doc = "Search backward", .run = startSearch(false, .search) },
-    .{ .name = "cursors_in_selection", .doc = "Cursors on matches in the selection", .run = selectIn },
+    .{ .name = "cursors_in_selection", .doc = "Cursors on regex matches in the selection", .run = selectIn },
     .{ .name = "snipe", .doc = "Jump to text on screen", .run = startSearch(true, .snipe) },
     .{ .name = "search_word_forward", .doc = "Search word under cursor", .run = searchWord(true) , .jump = true },
     .{ .name = "search_word_backward", .doc = "Search word under cursor backward", .run = searchWord(false) , .jump = true },
@@ -217,6 +221,7 @@ const base = [_]Command{
     // Editing
     .{ .name = "paste_after", .doc = "Paste after", .run = pasteMode(false, false), .repeat = true },
     .{ .name = "paste_before", .doc = "Paste before", .run = pasteMode(true, false), .repeat = true },
+    .{ .name = "paste_clipboard", .doc = "Paste the system clipboard", .run = pasteClipboard, .repeat = true },
     .{ .name = "paste_inline_after", .doc = "Paste inline after (a yanked line without its newline)", .run = pasteMode(false, true), .repeat = true },
     .{ .name = "paste_inline_before", .doc = "Paste inline before (a yanked line without its newline)", .run = pasteMode(true, true), .repeat = true },
     .{ .name = "replace_char", .doc = "Replace character", .run = replaceChar, .repeat = true, .takes_char = true },
@@ -462,10 +467,10 @@ const base = [_]Command{
     .{ .name = "start_screen", .doc = "Start screen", .run = openPicker(.start), .once = true },
     .{ .name = "save_session", .doc = "Save session", .run = sessionCmd(.save), .once = true },
     .{ .name = "load_session", .doc = "Restore session", .run = sessionCmd(.load), .once = true },
-    .{ .name = "set_mark", .doc = "Set mark (a-z here, A-Z anywhere)", .run = setMark, .takes_char = true, .once = true },
-    .{ .name = "goto_mark_line", .doc = "To a mark's line", .run = gotoMark(false), .takes_char = true, .jump = true },
-    .{ .name = "goto_mark", .doc = "To a mark", .run = gotoMark(true), .takes_char = true, .jump = true },
-    .{ .name = "pick_mark", .doc = "Marks", .run = openPicker(.marks), .once = true },
+    .{ .name = "set_mark", .doc = "Bookmark this line under a key (again: remove it)", .run = setMark, .takes_char = true, .once = true, .char_prompt = "Bookmark: press a key to name it (Space: no name, Esc: cancel)" },
+    .{ .name = "goto_mark_line", .doc = "To a bookmark's line", .run = gotoMark(false), .takes_char = true, .jump = true },
+    .{ .name = "goto_mark", .doc = "To a bookmark", .run = gotoMark(true), .takes_char = true, .jump = true },
+    .{ .name = "pick_mark", .doc = "Bookmarks", .run = openPicker(.marks), .once = true },
     .{ .name = "pick_register", .doc = "Registers (Enter pastes)", .run = openPicker(.registers), .once = true },
     .{ .name = "undo_history", .doc = "Undo history", .run = openPicker(.undo), .once = true },
     .{ .name = "help_keys", .doc = "Keys and commands", .run = openPicker(.help), .once = true },
@@ -824,8 +829,11 @@ fn gotoMark(comptime exact: bool) Handler {
             const ed = c.ed;
             const m = jumplist.findMark(ed, c.char) orelse {
                 fail(ed);
-                return ed.setMessage(.info, "mark {u} is not set", .{c.char});
+                return ed.setMessage(.info, "no bookmark {u}", .{c.char});
             };
+            // A jump (not an operator's or a selection's motion) is a visit.
+            const index = @divExact(@intFromPtr(m) - @intFromPtr(ed.marks.items.ptr), @sizeOf(Editor.Mark));
+            defer if (c.ed.mode == .normal) jumplist.markVisited(ed, index);
             if (m.buffer != ed.buffer) {
                 if (ed.mode != .normal) return fail(ed);
                 try jumplist.goMark(ed, m.*, exact);
@@ -1607,6 +1615,37 @@ fn pasteMode(comptime before: bool, comptime inline_: bool) Handler {
             try operators.paste(ed, value, c.count, before, !before);
         }
     }.run;
+}
+
+/// Ctrl+Shift+V: the system clipboard, put where typing would go (a prompt
+/// or picker query, the text in insert mode), after the cursor in normal
+/// mode, over the selection in visual. No register is read or written: `p`
+/// keeps what it had.
+fn pasteClipboard(c: Context) anyerror!void {
+    const ed = c.ed;
+    const read: ?[]u8 = if (ed.paste_text != null) null else if (ed.registers.clipboard) |cb| cb.get(ed.gpa) else null;
+    defer if (read) |r| ed.gpa.free(r);
+    const text: []const u8 = ed.paste_text orelse read orelse return ed.setMessage(.info, "the clipboard is empty", .{});
+    if (text.len == 0) return;
+    if (prompts.activeInput(ed)) |inp| {
+        var it = std.unicode.Utf8View.initUnchecked(text).iterator();
+        while (it.nextCodepoint()) |cp| if (cp != '\n' and cp != '\r') try inp.insert(ed.gpa, cp);
+        return prompts.inputChanged(ed);
+    }
+    if (ed.mode == .insert) return ed.insertText(text);
+    const value: Registers.Value = .{ .text = text, .linewise = text[text.len - 1] == '\n' };
+    if (ed.mode == .visual) {
+        if (block_visual.active(ed)) {
+            try block_visual.apply(ed, .delete, '_');
+        } else {
+            const r = code_motion.visualRange(ed);
+            code_motion.exitVisual(ed);
+            try operators.apply(ed, .delete, r, '_');
+        }
+        return operators.paste(ed, value, c.count, true, true);
+    }
+    if (ed.mode != .normal) return;
+    try operators.paste(ed, value, c.count, false, true);
 }
 
 /// Text for an inline paste: no leading indent, no trailing newline.

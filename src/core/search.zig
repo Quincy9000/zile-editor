@@ -2,14 +2,17 @@
 //!
 //! Smart case: a needle with an uppercase letter is case-sensitive.
 //! `whole_word` (from `*`/`#`) requires word boundaries around the match.
-//! TODO: regex patterns.
+//! A pattern can carry a compiled regex instead (the select prompt, `s`).
 
 const std = @import("std");
+const Regex = @import("regex.zig");
 
 pub const Pattern = struct {
     needle: []const u8,
     case_sensitive: bool,
     whole_word: bool = false,
+    /// Matches this instead of `needle` (which stays the pattern's text).
+    regex: ?*const Regex = null,
 
     pub fn init(needle: []const u8, whole_word: bool) Pattern {
         var sensitive = false;
@@ -18,20 +21,28 @@ pub const Pattern = struct {
     }
 
     pub fn matchAt(p: Pattern, hay: []const u8, i: usize) bool {
+        return p.matchLen(hay, i) != null;
+    }
+
+    /// How many bytes the match starting at `i` covers, if there is one.
+    pub fn matchLen(p: Pattern, hay: []const u8, i: usize) ?usize {
         const n = p.needle;
-        if (n.len == 0 or i + n.len > hay.len) return false;
+        if (n.len == 0) return null;
+        if (p.regex) |re| return re.matchLenAt(hay, i);
+        if (i + n.len > hay.len) return null;
         const window = hay[i .. i + n.len];
         const eq = if (p.case_sensitive) std.mem.eql(u8, window, n) else std.ascii.eqlIgnoreCase(window, n);
-        if (!eq) return false;
-        if (!p.whole_word) return true;
+        if (!eq) return null;
+        if (!p.whole_word) return n.len;
         const before_ok = i == 0 or !isWord(hay[i - 1]);
         const after_ok = i + n.len == hay.len or !isWord(hay[i + n.len]);
-        return before_ok and after_ok;
+        return if (before_ok and after_ok) n.len else null;
     }
 
     /// First match starting at or after `from`.
     pub fn forward(p: Pattern, hay: []const u8, from: usize) ?usize {
         if (p.needle.len == 0) return null;
+        if (p.regex) |re| return (re.find(hay, from) orelse return null).start;
         var i = from;
         while (i + p.needle.len <= hay.len) : (i += 1) {
             if (p.matchAt(hay, i)) return i;

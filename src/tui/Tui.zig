@@ -22,6 +22,7 @@ const state_files = @import("../editor/state_files.zig");
 const notifications = @import("../editor/notifications.zig");
 const window_ops = @import("../editor/window_ops.zig");
 const run_popup = @import("../editor/run_popup.zig");
+const picker_ops = @import("../editor/picker_ops.zig");
 const borders = @import("../editor/borders.zig");
 const resting = @import("../editor/resting.zig");
 const row_model = @import("../editor/row_model.zig");
@@ -206,8 +207,10 @@ fn paste(ed: *Editor, text: []const u8) void {
         ed.insertText(text) catch {};
         return;
     }
-    ed.registers.store(null, .yank, text, false) catch return;
-    ed.feed("p") catch {};
+    // As Ctrl+Shift+V does in the window: the registers stay as they are.
+    ed.paste_text = text;
+    defer ed.paste_text = null;
+    ed.feed("<C-S-v>") catch {};
 }
 
 /// Seconds on the editor's clock (double clicks).
@@ -234,7 +237,7 @@ fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
     const y = (@as(f32, @floatFromInt(m.row)) + 0.5) * Grid.cell_h;
     // Window borders (`borders.borderPress` and co.): the cells either side
     // of one take it.
-    const slop = Grid.cell_w * 0.6;
+    const slop: Editor.Windows.Slop = .{ .x = Grid.cell_w * 0.6, .above = Grid.cell_h * 0.6, .below = 0 };
     const busy = switch (m.kind) {
         .drag => borders.borderDrag(ed, x, y),
         .release => borders.borderRelease(ed),
@@ -256,6 +259,10 @@ fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
             else => {},
         }
         return;
+    }
+    // A picker, or a bottom panel under the pointer, takes the wheel.
+    if (m.kind == .wheel_up or m.kind == .wheel_down) {
+        if (picker_ops.wheel(ed, x, y, if (m.kind == .wheel_up) -3 else 3)) return;
     }
     if (ed.picker != null or ed.cmd_float != null) return;
     const w = ed.windows.at(x, y) orelse return;

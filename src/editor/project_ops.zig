@@ -102,6 +102,7 @@ pub fn pickerPath(ed: *Editor, path: []const u8) ![]u8 {
 /// `SPC p p`).
 pub fn enterProject(ed: *Editor, p: ?*const Project) void {
     const proj = p orelse return;
+    state_files.loadProjectPlaces(ed, proj);
     if (ed.last_project == proj) return;
     ed.last_project = proj;
     rememberProject(ed, proj.root);

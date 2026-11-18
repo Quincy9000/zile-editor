@@ -16,6 +16,7 @@ const Picker = @import("picker/Picker.zig");
 const Registers = @import("Registers.zig");
 const LineInput = @import("input/LineInput.zig");
 const search = @import("core/search.zig");
+const Regex = @import("core/regex.zig");
 const Folds = @import("core/Folds.zig");
 const diff = @import("git/diff.zig");
 const Git = @import("git/Git.zig");
@@ -276,15 +277,26 @@ pub const Jump = struct {
     buffer: ?*Buffer,
     path: ?[]u8,
     pos: usize,
+    /// Its file's project: whose `.zilehistory` keeps it.
+    project: ?*const Project = null,
 };
 
 /// A mark (`m{letter}`): lower-case ones belong to their buffer, upper-case
 /// ones are global and remember their file. `path` is owned.
 pub const Mark = struct {
-    name: u8,
+    /// The key it was set under with `m` (0: Space, no name).
+    name: u21,
     buffer: ?*Buffer,
     path: ?[]u8,
     pos: usize,
+    /// Its file's project: whose `.zilehistory` keeps it.
+    project: ?*const Project = null,
+
+    /// Its name as text (a diamond without one).
+    pub fn shown(m: Mark, buf: *[4]u8) []const u8 {
+        const n = std.unicode.utf8Encode(if (m.name != 0) m.name else 0x25c6, buf) catch return "?";
+        return buf[0..n];
+    }
 };
 
 /// A code action offered by the language server (`SPC l a`). `title`,
@@ -438,6 +450,9 @@ pub const SearchPrompt = struct {
     /// `select_in`: the selection the matches are looked for in.
     within_start: usize = 0,
     within_end: usize = 0,
+    /// `select_in`: its text as a regex (null while it is not one, when the
+    /// text is looked for as it is).
+    regex: ?Regex = null,
 };
 
 /// A key shown after a snipe's match: pressing it jumps there.
@@ -476,6 +491,7 @@ pub const PromptKind = enum {
     browse_move,
     /// `n` in the scratch pads: a new pad's name.
     new_pad,
+    rename_pad,
     /// `SPC c`, `<C-r>` in the grep picker: the replacement for every match
     /// (what to find is the form's other field, `Replace.find`).
     replace,
@@ -490,7 +506,8 @@ pub const PromptKind = enum {
             .search, .snipe, .select_in => "",
             .rename => "Rename symbol",
             .replace => "Replace",
-            .new_pad => "New scratch pad (its name)",
+            .new_pad => "New scratch pad (its name; name.sql makes a SQL one)",
+            .rename_pad => "Rename the scratch pad",
             .git_commit => "Commit message (commits all changes)",
             .git_remote => "Remote URL (origin)",
             .new_file => "New file (path)",
@@ -714,7 +731,7 @@ jump_index: usize = 0,
 /// The language server's last answers for `SPC l a` and `SPC f w`.
 code_actions: std.ArrayList(CodeAction) = .empty,
 workspace_symbols: std.ArrayList(WorkspaceSymbol) = .empty,
-/// Marks (`m{letter}`, `'{letter}`, `SPC f m`).
+/// Bookmarks (`m{key}`, `'{key}`, `SPC m`).
 marks: std.ArrayList(Mark) = .empty,
 /// Surround in progress: the range `ys` will wrap, the pair `cs` replaces.
 surround_range: operators.Range = .{ .start = 0, .end = 0 },
@@ -831,6 +848,9 @@ replace: ?*Replace = null,
 replace_options: Replace.Options = .{},
 /// The folder it searches (not owned), for going back to the grep picker.
 replace_root: []const u8 = ".",
+/// Text the terminal pasted (bracketed paste), for `paste_clipboard` to put
+/// in place of the clipboard, which a terminal does not let us read.
+paste_text: ?[]const u8 = null,
 last_search: std.ArrayList(u8) = .empty,
 last_search_forward: bool = true,
 last_search_whole_word: bool = false,
@@ -1848,6 +1868,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
         ed.use_counter += 1;
         cur.last_used = ed.use_counter;
         git_ops.loadGitBase(ed, cur);
+        state_files.restorePlaces(ed, cur);
         ed.activate(cur);
         state_files.recordVisit(ed, cur);
         return;
@@ -1859,6 +1880,7 @@ pub fn openFile(ed: *Editor, path: []const u8) !void {
     b.* = loaded;
     try ed.buffers.append(ed.gpa, b);
     git_ops.loadGitBase(ed, b);
+    state_files.restorePlaces(ed, b);
     ed.switchTo(b);
 }
 
@@ -1966,6 +1988,9 @@ pub fn killBuffer(ed: *Editor, b: *Buffer) !void {
     };
     if (ed.buffers.items.len == 1) {
         const fresh = try Buffer.initEmpty(ed.gpa);
+        if (b.path) |bp| state_files.savePlaces(ed, bp, b.project);
+        inlay.forgetJumps(ed, b);
+        jumplist.forgetMarks(ed, b);
         b.deinit(ed.gpa);
         b.* = fresh;
         for (ed.window_list.items) |w| w.view = .{ .rows = w.view.rows, .cols = w.view.cols };
@@ -1973,6 +1998,7 @@ pub fn killBuffer(ed: *Editor, b: *Buffer) !void {
         return;
     }
     _ = ed.buffers.orderedRemove(formatting.bufferIndex(ed, b));
+    if (b.path) |bp| state_files.savePlaces(ed, bp, b.project);
     inlay.forgetJumps(ed, b);
     jumplist.forgetMarks(ed, b);
     var next = ed.buffers.items[0];

@@ -16,6 +16,7 @@ pub const Store = enum {
     visits,
     sessions,
     undo,
+    places,
     runner,
     projects,
     theme,
@@ -26,6 +27,7 @@ pub const Store = enum {
             .visits => "Recent files",
             .sessions => "Sessions",
             .undo => "Undo histories",
+            .places => "Bookmarks and jumps",
             .runner => "Runner commands",
             .projects => "Projects",
             .theme => "Theme",
@@ -39,6 +41,7 @@ pub const Store = enum {
             .visits => "visits",
             .sessions => "sessions",
             .undo => "undo",
+            .places => "places",
             .runner => "run-commands",
             .projects => "projects",
             .theme => "theme",
@@ -47,7 +50,7 @@ pub const Store = enum {
     }
 
     pub fn isFolder(s: Store) bool {
-        return s == .sessions or s == .undo or s == .logs;
+        return s == .sessions or s == .undo or s == .places or s == .logs;
     }
 
     /// What it holds.
@@ -56,6 +59,7 @@ pub const Store = enum {
             .visits => "Files you opened: how often, when, where the cursor was.",
             .sessions => "Per project: the open files, cursors, window splits.",
             .undo => "Each edited file's undo history, so undo survives closing it.",
+            .places => "Bookmarks (m) and jumps of files outside a project (a project's are in its .zilehistory).",
             .runner => "Your SPC r commands, per project.",
             .projects => "Projects you opened, for SPC p p.",
             .theme => "The theme you picked.",
@@ -69,6 +73,7 @@ pub const Store = enum {
             .visits => "Files no longer rank by use, and reopen at the top.",
             .sessions => "Projects open as new (this one's is saved again when you leave).",
             .undo => "Closed files lose the undo history from before; open files keep theirs.",
+            .places => "Every bookmark and the jumplist go; so do the .zilehistory files of the projects open now.",
             .runner => "SPC r starts empty in every project.",
             .projects => "SPC p p lists only projects opened from now on.",
             .theme => "The default theme, from the next start.",

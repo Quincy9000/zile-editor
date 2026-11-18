@@ -32,6 +32,7 @@ const run_popup = @import("../editor/run_popup.zig");
 const borders = @import("../editor/borders.zig");
 const resting = @import("../editor/resting.zig");
 const row_model = @import("../editor/row_model.zig");
+const jumplist = @import("../editor/jumplist.zig");
 const folding = @import("../editor/folding.zig");
 const code_motion = @import("../editor/code_motion.zig");
 const block_visual = @import("../editor/block_visual.zig");
@@ -189,6 +190,8 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     drawToasts(ed, font, theme, l);
     if (ed.picker) |p| picker_view.draw(p, font, theme, l);
     if (ed.grid) |*g| picker_view.drawGrid(g, font, theme, l);
+    // A command waiting for one key, and saying so (a bookmark's name).
+    if (ed.awaiting_char) |a| if (a.cmd.char_prompt.len > 0) picker_view.drawPromptBox(font, theme, l, a.cmd.char_prompt, "");
     if (ed.search_prompt) |*sp| if (sp.kind.boxed()) {
         if (sp.kind == .replace) {
             if (ed.replace) |r| picker_view.drawReplace(r, font, theme, l, &sp.input);
@@ -700,7 +703,10 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             // Breakpoints switched off stay, hollow.
             const glyph = if (marks.here) "▶" else if (ed.dbg.breakpoints_on) "●" else "○";
             _ = font.drawText(glyph, 0, y, if (marks.here) theme.diag_warning else if (ed.dbg.breakpoints_on) theme.diag_error else theme.gutter_fg);
-        }
+        } else if (first_piece) if (jumplist.bookmarkOn(ed, line)) |i| {
+            var name_buf: [4]u8 = undefined;
+            _ = font.drawText(ed.marks.items[i].shown(&name_buf), 0, y, theme.diag_info);
+        };
 
         if (ed.search_highlight) drawSearchMatches(ed, font, theme, l, line, y);
         drawYankFlash(ed, font, theme, l, line, y);
@@ -1167,7 +1173,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
             .rename => .{ " RENAME ", theme.mode_insert },
             .replace => .{ " REPLACE ", theme.mode_insert },
             .git_commit, .git_remote => .{ " GIT ", theme.mode_insert },
-            .new_file, .save_as, .rename_file, .copy_file, .new_pad => .{ " FILE ", theme.mode_insert },
+            .new_file, .save_as, .rename_file, .copy_file, .new_pad, .rename_pad => .{ " FILE ", theme.mode_insert },
             .run_command => .{ " RUN ", theme.mode_insert },
             .browse_new_folder, .browse_new_file, .browse_rename, .browse_move => .{ " FILE ", theme.mode_insert },
         },
@@ -1225,6 +1231,12 @@ fn projectPath(ed: *Editor, buf: []u8) []const u8 {
 
 fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (ed.macro_register) |r| try w.print("recording @{c}   ", .{r});
+    // Claude at work with its panel hidden: it shows here that it is.
+    if (ed.chat) |c| if (!ed.chat_panel.shown) switch (c.state) {
+        .idle => {},
+        .working => try w.writeAll("Claude working…   "),
+        .asking => try w.writeAll("Claude asks: SPC a y   "),
+    };
     if (ed.cursors.items.len > 0) try w.print("{d} cursors   ", .{ed.cursors.items.len + 1});
     const typed = code_motion.showcmdKeys(ed);
     try keys.formatSequenceDisplay(typed, w);
@@ -1299,7 +1311,7 @@ fn drawMatchesIn(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout,
     var i: usize = 0;
     while (pattern.forward(bytes, i)) |m| : (i = m + 1) {
         const c0 = dcol(bytes, m, tab);
-        const c1 = dcolEnd(bytes, m + pattern.needle.len, tab);
+        const c1 = dcolEnd(bytes, m + (pattern.matchLen(bytes, m) orelse continue), tab);
         if (c1 <= win_left or c0 >= winEnd(l)) continue;
         const start = @max(c0, win_left);
         const x = colX(font, l, start);

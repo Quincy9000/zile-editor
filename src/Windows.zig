@@ -363,20 +363,34 @@ pub fn next(ws: *const Windows, w: *Window) *Window {
 
 /// The split whose border is within `slop` of screen point (x, y): the
 /// innermost one, if borders meet.
-pub fn borderAt(ws: *const Windows, x: f32, y: f32, slop: f32) ?*Split {
+pub fn borderAt(ws: *const Windows, x: f32, y: f32, slop: Slop) ?*Split {
     return borderIn(ws.root, x, y, slop);
 }
 
-fn borderIn(n: *Node, x: f32, y: f32, slop: f32) ?*Split {
+/// How far from a border a point still takes it: either side of one between
+/// columns, above and below one between rows (a terminal's pointer is at a
+/// cell's centre, and its cells are taller than wide: there the row above
+/// the border, the upper window's status line, takes it).
+pub const Slop = struct {
+    x: f32,
+    above: f32,
+    below: f32,
+
+    pub fn all(d: f32) Slop {
+        return .{ .x = d, .above = d, .below = d };
+    }
+};
+
+fn borderIn(n: *Node, x: f32, y: f32, slop: Slop) ?*Split {
     const s = switch (n.kind) {
         .window => return null,
         .split => |*s| s,
     };
     const r = s.rect;
-    if (x < r.x - slop or x > r.x + r.w + slop or y < r.y - slop or y > r.y + r.h + slop) return null;
+    if (x < r.x - slop.x or x > r.x + r.w + slop.x or y < r.y - slop.above or y > r.y + r.h + slop.below) return null;
     if (borderIn(s.first, x, y, slop) orelse borderIn(s.second, x, y, slop)) |inner| return inner;
-    const along = if (s.axis == .horizontal) x else y;
-    return if (@abs(along - s.border) <= slop) s else null;
+    if (s.axis == .horizontal) return if (@abs(x - s.border) <= slop.x) s else null;
+    return if (y >= s.border - slop.above and y <= s.border + slop.below) s else null;
 }
 
 /// Whether `s` is still one of the splits.
@@ -484,8 +498,8 @@ test "a border found by position and dragged" {
     const right = try ws.split(a, .right, .{}, &b);
     _ = right;
     ws.layout(.{ .x = 0, .y = 0, .w = 800, .h = 600 }, 10, 20);
-    try testing.expectEqual(null, ws.borderAt(200, 100, 4));
-    const s = ws.borderAt(402, 100, 4).?;
+    try testing.expectEqual(null, ws.borderAt(200, 100, .all(4)));
+    const s = ws.borderAt(402, 100, .all(4)).?;
     dragBorder(s, 200);
     ws.layout(.{ .x = 0, .y = 0, .w = 800, .h = 600 }, 10, 20);
     try testing.expectEqual(200, a.rect.w);
@@ -498,7 +512,24 @@ test "a border at terminal cell sizes: the cells either side of it take it" {
     _ = try ws.split(ws.root.kind.window, .right, .{}, &b);
     ws.layout(.{ .x = 0, .y = 0, .w = 800, .h = 400 }, 10, 20);
     // Pointers at cell centres (x = col * 10 + 5); the border is at x 400.
-    try testing.expect(ws.borderAt(395, 50, 6) != null);
-    try testing.expect(ws.borderAt(405, 50, 6) != null);
-    try testing.expect(ws.borderAt(385, 50, 6) == null);
+    try testing.expect(ws.borderAt(395, 50, .all(6)) != null);
+    try testing.expect(ws.borderAt(405, 50, .all(6)) != null);
+    try testing.expect(ws.borderAt(385, 50, .all(6)) == null);
+}
+
+test "a border between rows at terminal cell sizes: the status line above it takes it" {
+    var b: Buffer = undefined;
+    var ws = try Windows.init(testing.allocator, &b);
+    defer ws.deinit();
+    _ = try ws.split(ws.root.kind.window, .down, .{}, &b);
+    ws.layout(.{ .w = 800, .h = 400 }, 10, 20);
+    // Pointers at cell centres (y = row * 20 + 10); the border is at y 200.
+    const slop: Slop = .{ .x = 6, .above = 12, .below = 0 };
+    try testing.expect(ws.borderAt(100, 190, slop) != null); // the upper window's last row
+    try testing.expect(ws.borderAt(100, 210, slop) == null); // the lower one's first: its text
+    try testing.expect(ws.borderAt(100, 170, slop) == null);
+    const s = ws.borderAt(100, 190, slop).?;
+    dragBorder(s, 290);
+    ws.layout(.{ .w = 800, .h = 400 }, 10, 20);
+    try testing.expectEqual(@as(f32, 300), s.border);
 }

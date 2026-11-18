@@ -391,6 +391,14 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ NV, "v", "visual_mode" },
     .{ NV, "V", "visual_line_mode" },
     .{ NV, "<C-v>", "visual_block_mode" },
+    // The system clipboard (`p` is the registers' alone). In a terminal its
+    // own paste key does the same.
+    .{ NV, "<C-S-v>", "paste_clipboard" },
+    .{ I, "<C-S-v>", "paste_clipboard" },
+    .{ I, "<C-v>", "paste_clipboard" },
+    .{ S, "<C-S-v>", "paste_clipboard" },
+    .{ S, "<C-v>", "paste_clipboard" },
+    .{ PA, "<C-S-v>", "paste_clipboard" },
     .{ V, "o", "visual_swap_ends" },
     .{ V, "O", "visual_swap_sides" },
     .{ V, "r", "visual_replace_char" },

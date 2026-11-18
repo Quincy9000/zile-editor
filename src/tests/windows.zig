@@ -87,6 +87,43 @@ test "scratch pads: SPC t s lists them; Tab writes in one (saved), n makes anoth
     try expectText(&ed, "code");
 }
 
+test "a scratch pad named for what it is (q.sql) is a file of that kind; r renames one, and it becomes what its new name says" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    var ed = try testEditor("code");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    ed.state_dir = dir;
+    const p = &ed.pad_panel;
+    try ed.feed("<cmd:toggle_scratch>");
+    // A name that says its kind: the file is that, and its language is SQL.
+    try ed.feed("nq.sql<CR>");
+    try testing.expectEqualStrings("q.sql", ed.pad_list.pads.items[p.sel].name);
+    try testing.expectEqualStrings("sql", ed.buffer.syntax.?.lang.name);
+    try ed.feed("select 1;<Esc><Esc>");
+    const q = try tmp.dir.readFileAlloc(testing.io, "scratch/q.sql", testing.allocator, .limited(1024));
+    defer testing.allocator.free(q);
+    try testing.expectEqualStrings("select 1;\n", q);
+    // A plain name is markdown still; renamed, it is what the new name says.
+    try ed.feed("nnotes<CR>select 2;<Esc><Esc>");
+    try testing.expectEqualStrings("notes", ed.pad_list.pads.items[p.sel].name);
+    try ed.feed("r.sql<CR>");
+    try testing.expectEqualStrings("notes.sql", ed.pad_list.pads.items[p.sel].name);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "scratch/notes.md", .{}));
+    const n = try tmp.dir.readFileAlloc(testing.io, "scratch/notes.sql", testing.allocator, .limited(1024));
+    defer testing.allocator.free(n);
+    try testing.expectEqualStrings("select 2;\n", n);
+    // Its buffer followed the file: gone into again, it is SQL.
+    try ed.feed("<Tab>");
+    try testing.expectEqualStrings("sql", ed.buffer.syntax.?.lang.name);
+    try ed.feed("<Esc>");
+    // A name another pad has is refused.
+    try ed.feed("r<C-u>q.sql<CR>");
+    try testing.expectEqualStrings("notes.sql", ed.pad_list.pads.items[p.sel].name);
+}
+
 test "SPC Q s saves every modified buffer, then quits; SPC q checks all buffers" {
     const gpa = testing.allocator;
     const io = testing.io;

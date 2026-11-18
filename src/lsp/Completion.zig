@@ -89,6 +89,10 @@ pub fn fromJson(gpa: Allocator, result: std.json.Value, word_start: usize) !Comp
     if (result == .object) if (Lsp.field(result, "isIncomplete")) |inc| {
         c.incomplete = inc == .bool and inc.bool;
     };
+    // A server with nothing to say is asked again as well: zls has no fields
+    // for a bare `.` in a struct literal inside that struct's own method (the
+    // struct does not parse), but has them once a letter follows.
+    if (list != .array or list.array.items.len == 0) c.incomplete = true;
     if (list != .array) return c;
     var items: std.ArrayList(Item) = .empty;
     for (list.array.items) |it| {

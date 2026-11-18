@@ -415,6 +415,7 @@ test "Claude's slash commands and models: the CLI's own lists, in pickers" {
     try ed.feed("<Esc>");
     try testing.expectEqual(null, ed.picker);
     // The permission mode.
+    try c.readModes("--permission-mode <mode> (choices: \"acceptEdits\", \"auto\", \"plan\")");
     try claude_chat.menu(&ed, .modes);
     support.settlePicker(&ed);
     try ed.feed("jj<CR>");
@@ -570,4 +571,27 @@ test "SPC a w: a selection rewritten by Claude in place, as a diff to take or dr
     claude_panel.claudeResolve(&ed, false);
     try testing.expectEqualStrings("a\n  b", claude_inline.clean("\n```\na\n  b\n```\n"));
     try testing.expectEqualStrings("  a", claude_inline.clean("  a\n"));
+}
+
+test "the wheel over Claude's panel scrolls it, and over a picker goes through its rows; the code stays" {
+    const picker_ops = @import("../editor/picker_ops.zig");
+    var ed = try Editor.init(testing.allocator, testing.io);
+    defer ed.deinit();
+    const p = &ed.chat_panel;
+    p.shown = true;
+    p.area = .{ .x = 0, .y = 200, .w = 800, .h = 200 };
+    p.text_x = 300;
+    p.lines = 50;
+    p.page = 10;
+    p.tail = false;
+    // Over the code: not taken.
+    try testing.expect(!picker_ops.wheel(&ed, 400, 100, 3));
+    // Over the text side: it scrolls.
+    try testing.expect(picker_ops.wheel(&ed, 400, 300, 3));
+    try testing.expectEqual(@as(usize, 3), p.scroll);
+    try testing.expect(picker_ops.wheel(&ed, 400, 300, -3));
+    try testing.expectEqual(@as(usize, 0), p.scroll);
+    // Hidden: the code's again.
+    p.shown = false;
+    try testing.expect(!picker_ops.wheel(&ed, 400, 300, 3));
 }

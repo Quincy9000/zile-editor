@@ -4,6 +4,7 @@ const std = @import("std");
 const testing = std.testing;
 const commands = @import("../commands.zig");
 const code_motion = @import("../editor/code_motion.zig");
+const jumplist = @import("../editor/jumplist.zig");
 const Editor = @import("../Editor.zig");
 const Mode = Editor.Mode;
 const support = @import("support.zig");
@@ -247,7 +248,7 @@ test "SPC ,: back to the last jump, and again: back here" {
     try testing.expectEqual(1, ed.cursorLine());
 }
 
-test "marks: m sets, ' and ` go (also as motions), SPC f m lists; global marks cross files" {
+test "bookmarks: m sets, ' and ` go (also as motions), SPC m lists; they cross files" {
     var ed = try testEditor("one\n  two\nthree\nfour");
     defer ed.deinit();
     try ed.feed("jwma"); // on "two"
@@ -268,25 +269,87 @@ test "marks: m sets, ' and ` go (also as motions), SPC f m lists; global marks c
     try ed.feed("5jmc");
     try ed.feed("<cmd:pick_mark>");
     settlePicker(&ed);
-    try testing.expectEqual(2, ed.picker.?.rowCount()); // B and this file's c
-    try ed.feed("q'B");
+    try testing.expectEqual(3, ed.picker.?.rowCount()); // every file's: a, B and c
+    try ed.feed("<Esc>q'B");
     try testing.expectEqual(null, ed.buffer.path); // back in the scratch buffer
 }
 
-test "f, t, F, T ignore letter case; ; and , repeat" {
-    var ed = try testEditor("xAbca\nDa");
+test "bookmarks: m shows a box for one key; the same key again removes; SPC m finds and removes" {
+    var ed = try testEditor("zero\none\ntwo\nthree");
     defer ed.deinit();
-    try ed.feed("fa");
-    try expectCursor(&ed, 0, 1); // the capital A
-    try ed.feed(".");
-    try expectCursor(&ed, 0, 4);
-    try ed.feed("FA"); // a capital finds lower case too
-    try expectCursor(&ed, 0, 1);
-    try ed.feed("0dtA"); // till still works after an operator
-    try expectText(&ed, "Abca\nDa");
-    try ed.feed("u");
-    try ed.feed("fd"); // on to the next line: "Da"
-    try expectCursor(&ed, 1, 0);
-    try ed.feed("$dFa"); // back across the line to the previous a; F is exclusive: "a\nD" goes
-    try expectText(&ed, "xAbca");
+    try ed.feed("jm");
+    try testing.expect(ed.awaiting_char.?.cmd.char_prompt.len > 0); // the box is up, for one key
+    try ed.feed("x");
+    try ed.feed("jjm "); // Space: no name
+    try testing.expectEqual(2, ed.marks.items.len);
+    try testing.expectEqual('x', ed.marks.items[0].name);
+    try ed.feed("m "); // again on the same line: off
+    try testing.expectEqual(1, ed.marks.items.len);
+    try ed.feed("m<Esc>"); // given up
+    try testing.expectEqual(1, ed.marks.items.len);
+    try ed.feed("m1ggO<Esc>"); // any key names one; bookmarks follow their text
+    try testing.expect(jumplist.bookmarkOn(&ed, 2) != null);
+    try testing.expect(jumplist.bookmarkOn(&ed, 4) != null);
+    try ed.feed("'1");
+    try testing.expectEqual(4, ed.cursorLine());
+    try ed.feed("gg<Space>m");
+    settlePicker(&ed);
+    try testing.expectEqual(2, ed.picker.?.rowCount());
+    try ed.feed("1"); // by name
+    settlePicker(&ed);
+    try ed.feed("<CR>");
+    try testing.expectEqual(4, ed.cursorLine());
+    try ed.feed("ggmx"); // a name in use moves
+    try testing.expectEqual(2, ed.marks.items.len);
+    try testing.expect(jumplist.bookmarkOn(&ed, 0) != null);
+    try testing.expect(jumplist.bookmarkOn(&ed, 2) == null);
+    try ed.feed("<Space>m");
+    settlePicker(&ed);
+    try ed.feed("<Esc>d"); // the first row is the oldest: 1
+    settlePicker(&ed);
+    try testing.expectEqual(1, ed.marks.items.len);
+    try testing.expectEqual('x', ed.marks.items[0].name);
+    try ed.feed("qjmyjmz'x"); // a jump to one puts it last
+    try testing.expectEqual('y', ed.marks.items[0].name);
+    try testing.expectEqual('x', ed.marks.items[2].name);
+    try ed.feed("<Space>m");
+    settlePicker(&ed);
+    try ed.feed("<CR>"); // y, the first row
+    try testing.expectEqual('z', ed.marks.items[0].name);
+    try testing.expectEqual('y', ed.marks.items[2].name);
+}
+
+
+test "jumplist picker: the place picked sinks to the bottom, the place left is on top" {
+    var ed = try testEditor("a\nb\nc\nd\ne\nf");
+    defer ed.deinit();
+    try ed.feed("jG"); // from line 1
+    try ed.feed("3gg"); // from line 5
+    try ed.feed("<Space>j");
+    settlePicker(&ed);
+    try testing.expectEqual(2, ed.picker.?.rowCount());
+    try ed.feed("<CR>"); // the top row: line 5, the last place left
+    try testing.expectEqual(5, ed.cursorLine());
+    try ed.feed("<Space>j");
+    settlePicker(&ed);
+    try testing.expectEqual(2, ed.picker.?.rowCount()); // line 2 (just left), then 1; not line 5, where the cursor is
+    try ed.feed("<CR>");
+    try testing.expectEqual(2, ed.cursorLine());
+    try ed.feed("<C-o>"); // and back where that jump left from
+    try testing.expectEqual(5, ed.cursorLine());
+}
+
+test "jumplist: a place the cursor is already on is passed over" {
+    var ed = try testEditor("a\nb\nc\nd\ne\nf");
+    defer ed.deinit();
+    try ed.feed("jG3gg"); // left line 1, then line 5
+    try ed.feed("<C-o>"); // back on line 5 (line 2 remembered)
+    try testing.expectEqual(5, ed.cursorLine());
+    try ed.feed("kkkk"); // by hand to line 1: where <C-o> would go next
+    try ed.feed("<Space>j");
+    settlePicker(&ed);
+    try testing.expectEqual(2, ed.picker.?.rowCount()); // lines 2 and 5, not this one
+    try ed.feed("q4j"); // on line 5 again, as the list has it
+    try ed.feed("<C-o>");
+    try testing.expectEqual(1, ed.cursorLine());
 }

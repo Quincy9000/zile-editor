@@ -20,6 +20,7 @@ comptime {
     _ = @import("syntax/objects.zig");
     _ = @import("input/LineInput.zig");
     _ = @import("core/search.zig");
+    _ = @import("core/regex.zig");
     _ = @import("lsp/Client.zig");
     _ = @import("lsp/Completion.zig");
     _ = @import("lsp/docs.zig");

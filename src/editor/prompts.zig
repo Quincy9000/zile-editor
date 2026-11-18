@@ -4,6 +4,7 @@ const std = @import("std");
 const Text = @import("../core/Text.zig");
 const LineInput = @import("../input/LineInput.zig");
 const search = @import("../core/search.zig");
+const Regex = @import("../core/regex.zig");
 const Lsp = @import("../lsp/Lsp.zig");
 const operators = @import("../operators.zig");
 const file_ops = @import("file_ops.zig");
@@ -149,9 +150,7 @@ pub fn searchIncremental(ed: *Editor) !void {
     if (sp.kind.boxed()) return;
     if (sp.kind == .select_in) {
         // Only shows the matches (the cursors come on <CR> / <Tab>).
-        try ed.last_search.resize(ed.gpa, 0);
-        try ed.last_search.appendSlice(ed.gpa, sp.input.items());
-        ed.last_search_whole_word = false;
+        sp.regex = Regex.compile(sp.input.items());
         ed.search_highlight = sp.input.items().len > 0;
         return;
     }
@@ -342,6 +341,7 @@ pub fn acceptSearch(ed: *Editor) !void {
         .select_in => return multicursor.cursorsFromPrompt(ed),
         .replace => return replacing.finishReplace(ed),
         .new_pad => return @import("pads.zig").finishNew(ed),
+        .rename_pad => return @import("pads.zig").finishRename(ed),
         .search, .snipe => {},
     }
     if (sp.input.items().len > 0) {

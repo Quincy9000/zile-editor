@@ -172,3 +172,17 @@ pub fn runChoice(ed: *Editor, choice: Picker.Choice, target_in: OpenTarget) anye
 pub fn centerCursor(ed: *Editor) void {
     row_model.setTop(ed, row_model.stepRows(ed, row_model.cursorRow(ed), -@as(isize, @intCast(ed.view.rows / 2))));
 }
+
+/// The wheel, where something over the code takes it: an open picker goes
+/// through its rows, a bottom panel under the pointer scrolls. True when
+/// it was taken (the code under it stays where it is).
+pub fn wheel(ed: *Editor, x: f32, y: f32, lines: isize) bool {
+    if (ed.picker) |p| {
+        if (lines != 0) {
+            p.sync();
+            p.moveClamped(if (lines > 0) 1 else -1);
+        }
+        return true;
+    }
+    return @import("claude_chat.zig").wheel(ed, x, y, lines) or @import("pads.zig").wheel(ed, x, y, lines);
+}

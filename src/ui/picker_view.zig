@@ -893,6 +893,8 @@ fn drawPanes(ed: *Editor, font: *const Font, theme: *const Theme, l: render.Layo
     const cw = font.cell_w;
     const ch = font.cell_h;
     const by = g.by;
+    p.area = .{ .x = 0, .y = by, .w = l.width, .h = g.bh };
+    p.text_x = g.text.x;
     rect(0, by, l.width, g.bh, theme.popup_bg);
     rect(0, by, l.width, 1, theme.popup_border);
 
@@ -1034,7 +1036,7 @@ pub fn drawPads(ed: *Editor, font: *const Font, theme: *const Theme, l: render.L
     const hint: []const u8 = if (ed.side_window != null)
         "vim's keys   Tab / Esc back to the pads (saved)"
     else if (p.focus)
-        "j/k pads   Tab / i write in it   n new   x delete   y copy   o in a window   Esc / q hide"
+        "j/k pads   Tab / i write in it   n new   r rename   x delete   y copy   o in a window   Esc / q hide"
     else
         "SPC n here   Esc hides";
     const Rows = struct {

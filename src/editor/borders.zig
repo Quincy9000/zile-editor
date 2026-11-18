@@ -14,18 +14,18 @@ pub const Pointer = enum { normal, resize_columns, resize_rows };
 
 /// The border within `slop` of screen point (`x`, `y`), unless something is
 /// open over the windows or text is being selected.
-pub fn borderUnder(ed: *Editor, x: f32, y: f32, slop: f32) ?*Windows.Split {
+pub fn borderUnder(ed: *Editor, x: f32, y: f32, slop: Windows.Slop) ?*Windows.Split {
     if (ed.cmd_float != null or run_popup.popupTerminal(ed) != null or ed.picker != null or ed.mouse_drag != null) return null;
     return ed.windows.borderAt(x, y, slop);
 }
 
-pub fn pointerAt(ed: *Editor, x: f32, y: f32, slop: f32) Pointer {
+pub fn pointerAt(ed: *Editor, x: f32, y: f32, slop: Windows.Slop) Pointer {
     const b = ed.border_drag orelse borderUnder(ed, x, y, slop) orelse return .normal;
     return if (b.axis == .horizontal) .resize_columns else .resize_rows;
 }
 
 /// A press at (`x`, `y`): true if it took a border (the press is used up).
-pub fn borderPress(ed: *Editor, x: f32, y: f32, slop: f32) bool {
+pub fn borderPress(ed: *Editor, x: f32, y: f32, slop: Windows.Slop) bool {
     ed.border_drag = borderUnder(ed, x, y, slop);
     if (ed.border_drag != null) ed.mouse_hover = null;
     return ed.border_drag != null;

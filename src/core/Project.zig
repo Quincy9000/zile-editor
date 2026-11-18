@@ -15,6 +15,8 @@ const Project = @This();
 root: []u8,
 /// It is a git repository (the git menu and ghost lines work here).
 git: bool,
+/// Its `.zilehistory` (bookmarks, jumps) was read already.
+places_loaded: bool = false,
 
 pub fn name(p: *const Project) []const u8 {
     return std.fs.path.basename(p.root);

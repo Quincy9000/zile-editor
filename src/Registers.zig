@@ -8,9 +8,12 @@
 //!   "_        black hole
 //!   "+ "*     system clipboard
 //!
-//! The unnamed register is synced with the system clipboard (like neovim's
-//! `clipboard=unnamedplus`): yanks and deletes land on the clipboard, and `p`
-//! pastes whatever is on it. Our own text read back keeps its linewise flag.
+//! The registers are our own: `p` pastes the unnamed one, never the system
+//! clipboard, and a delete leaves the clipboard alone (so what was copied
+//! elsewhere is still there to paste over what was just deleted). A yank is
+//! copied to the clipboard as well. The clipboard is pasted with
+//! Ctrl+Shift+V (`paste_clipboard`) or `"+p`; our own text read back from it
+//! keeps its linewise flag.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -117,6 +120,7 @@ pub fn store(r: *Registers, name: ?u8, kind: Kind, text: []const u8, linewise: b
                 .yank => {
                     try r.set(0, text, linewise);
                     r.unnamed = 0;
+                    r.setClipboard(text, linewise);
                 },
                 .delete => if (linewise or std.mem.indexOfScalar(u8, text, '\n') != null) {
                     // Shift "1.."8 into "2.."9.
@@ -129,7 +133,6 @@ pub fn store(r: *Registers, name: ?u8, kind: Kind, text: []const u8, linewise: b
                     r.unnamed = small_delete;
                 },
             }
-            r.setClipboard(text, linewise);
         },
     }
 }
@@ -152,7 +155,7 @@ pub fn noteBlock(r: *Registers, text: []const u8, width: usize) Allocator.Error!
 pub fn get(r: *Registers, name: ?u8) ?Value {
     const n = name orelse '"';
     const slot: usize = switch (n) {
-        '"' => r.readClipboard() orelse r.unnamed,
+        '"' => r.unnamed,
         '+', '*' => r.readClipboard() orelse return null,
         else => slotOf(n) orelse return null,
     };
@@ -170,18 +173,12 @@ fn setClipboard(r: *Registers, text: []const u8, linewise: bool) void {
     r.clip_linewise = linewise;
 }
 
-/// The slot holding the clipboard's text, or null to fall back to our own
-/// registers (no clipboard, empty, or it still holds what we put there).
+/// The slot holding the clipboard's text, or null (no clipboard, or empty).
 fn readClipboard(r: *Registers) ?usize {
     const cb = r.clipboard orelse return null;
     const text = cb.get(r.gpa) orelse return null;
     defer r.gpa.free(text);
     if (text.len == 0) return null;
-    if (std.mem.eql(u8, text, r.clip_last.items) and r.slots[r.unnamed].text.items.len > 0 and
-        std.mem.eql(u8, text, r.slots[r.unnamed].text.items))
-    {
-        return null;
-    }
     const linewise = if (std.mem.eql(u8, text, r.clip_last.items)) r.clip_linewise else text[text.len - 1] == '\n';
     r.set(scratch, text, linewise) catch return null;
     return scratch;

@@ -15,6 +15,7 @@ const notifications = @import("editor/notifications.zig");
 const window_ops = @import("editor/window_ops.zig");
 const smooth_scrolling = @import("editor/smooth_scrolling.zig");
 const run_popup = @import("editor/run_popup.zig");
+const picker_ops = @import("editor/picker_ops.zig");
 const borders = @import("editor/borders.zig");
 const resting = @import("editor/resting.zig");
 const row_model = @import("editor/row_model.zig");
@@ -106,6 +107,7 @@ pub fn main(init: std.process.Init) !void {
     defer {
         state_files.saveSession(&ed, false);
         state_files.rememberPositions(&ed);
+        state_files.saveAllPlaces(&ed);
         state_files.saveVisits(&ed);
     }
     for (config_report.problems) |p| notifications.notify(&ed, .err, "{s}", .{p});
@@ -312,6 +314,8 @@ fn handleMouse(ed: *Editor, font: *const Font) void {
     }
     if (wheel == 0 and !clicked) return;
     const lines = wheelLines(wheel);
+    // A picker, or a bottom panel under the pointer, takes the wheel.
+    if (wheel != 0 and !clicked and picker_ops.wheel(ed, pos.x, pos.y, lines)) return;
     // The command editor keeps focus while it is open.
     if (ed.cmd_float != null) {
         if (lines != 0) ed.scrollLines(lines);
@@ -349,7 +353,7 @@ var pointer_shown: borders.Pointer = .normal;
 /// Window borders (`borders.borderPress` and co.): true while the mouse is
 /// busy with one.
 fn borderMouse(ed: *Editor, pos: rl.Vector2, clicked: bool) bool {
-    const slop = 4;
+    const slop: Editor.Windows.Slop = .all(4);
     const busy = if (rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)) borders.borderDrag(ed, pos.x, pos.y) else borders.borderRelease(ed);
     const shape = borders.pointerAt(ed, pos.x, pos.y, slop);
     if (shape != pointer_shown) {

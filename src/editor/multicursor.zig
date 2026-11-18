@@ -5,6 +5,7 @@ const motions = @import("../core/motions.zig");
 const keys = @import("../input/keys.zig");
 const KeyEvent = keys.KeyEvent;
 const search = @import("../core/search.zig");
+const Regex = @import("../core/regex.zig");
 const operators = @import("../operators.zig");
 const textobjects = @import("../core/textobjects.zig");
 const Editor = @import("../Editor.zig");
@@ -230,8 +231,9 @@ pub fn cursorsOnLines(ed: *Editor, at_end: bool, insert: bool) !void {
     reportCursors(ed);
 }
 
-/// `s` (visual: in the selection; normal: in the whole file): asks for text, then puts a cursor on every match of it
-/// inside the selection, each match selected (`c` changes them all).
+/// `s` (visual: in the selection; normal: in the whole file): asks for a
+/// regex, then puts a cursor on every match of it inside the selection, each
+/// match selected (`c` changes them all).
 pub fn startSelectIn(ed: *Editor) void {
     if (ed.ghost != null or (ed.mode != .visual and ed.mode != .normal)) return;
     const t = ed.text();
@@ -260,7 +262,8 @@ pub fn cursorsFromPrompt(ed: *Editor) !void {
     const t = ed.text();
     var from: usize = 0;
     var to = t.len();
-    if (sp.kind == .select_in) {
+    const select = sp.kind == .select_in;
+    if (select) {
         from = sp.within_start;
         to = @min(sp.within_end, t.len());
     }
@@ -270,24 +273,31 @@ pub fn cursorsFromPrompt(ed: *Editor) !void {
     }
     prompts.cancelSearch(ed);
     const hay = t.slice(0, to);
-    const pattern = search.Pattern.init(needle, false);
-    var matches: std.ArrayList(usize) = .empty;
+    var pattern = search.Pattern.init(needle, false);
+    // `s` takes a regex (text that is not one is looked for as it is).
+    const regex: ?Regex = if (select) Regex.compile(needle) else null;
+    if (regex) |*re| pattern.regex = re;
+    const Found = struct { start: usize, len: usize };
+    var matches: std.ArrayList(Found) = .empty;
     defer matches.deinit(ed.gpa);
     var i = from;
-    while (pattern.forward(hay, i)) |m| : (i = m + needle.len) try matches.append(ed.gpa, m);
+    while (pattern.forward(hay, i)) |m| {
+        const n = pattern.matchLen(hay, m) orelse break;
+        try matches.append(ed.gpa, .{ .start = m, .len = n });
+        i = m + n;
+    }
     if (matches.items.len == 0) return ed.setMessage(.info, "no matches", .{});
 
     // The primary takes the match nearest the cursor.
     var primary: usize = 0;
     for (matches.items, 0..) |m, k| {
-        if (m <= ed.view.cursor) primary = k;
+        if (m.start <= ed.view.cursor) primary = k;
     }
     clearCursors(ed);
     if (ed.mode != .visual) ed.enterVisual(false);
     ed.visual_line = false;
-    const last_off = motions.prevChar(t, matches.items[0] + needle.len) - matches.items[0];
     for (matches.items, 0..) |m, k| {
-        const c: Cursor = .{ .pos = m + last_off, .anchor = m };
+        const c: Cursor = .{ .pos = motions.prevChar(t, m.start + m.len), .anchor = m.start };
         if (k == primary) {
             ed.view.cursor = c.pos;
             ed.view.anchor = c.anchor;
