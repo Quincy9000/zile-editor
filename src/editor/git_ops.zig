@@ -209,6 +209,8 @@ pub fn takePromptText(ed: *Editor) !?[]u8 {
 
 /// Re-reads HEAD for every buffer (after committing outside the editor).
 pub fn reloadGit(ed: *Editor) void {
+    // (A side-by-side view is of the HEAD there was.)
+    @import("compare.zig").close(ed);
     blame.dropAllBlames(ed);
     for (ed.buffers.items) |b| {
         if (b.git) |*g| g.deinit(ed.gpa);

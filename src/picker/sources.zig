@@ -44,9 +44,10 @@ const quickfix_list = @import("../editor/quickfix_list.zig");
 const run_popup = @import("../editor/run_popup.zig");
 const prompts = @import("../editor/prompts.zig");
 const git_ops = @import("../editor/git_ops.zig");
+const git_view = @import("../editor/git_view.zig");
 const lsp_actions = @import("../editor/lsp_actions.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_ask, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, claude_sessions, files_global, debug, stored_data };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, git_hunks, git_log, git_commit_files, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_ask, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, claude_sessions, files_global, debug, stored_data };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -61,6 +62,9 @@ fn Impl(comptime kind: Kind) type {
         .git_actions => GitActions,
         .git_branches => GitBranches,
         .git_changes => GitChanges,
+        .git_hunks => GitHunks,
+        .git_log => GitLog,
+        .git_commit_files => GitCommitFiles,
         .confirm_delete => ConfirmDelete,
         .browse => Browse,
         .jumps => Jumps,
@@ -115,13 +119,25 @@ pub const Preview = struct {
     numbered: bool = false,
     /// Syntax style per byte of `text` (empty when not highlighted).
     styles: std.ArrayList(Syntax.Style) = .empty,
+    /// The text is a diff: its `+` and `-` lines are coloured as such.
+    diff: bool = false,
 
     pub fn clear(p: *Preview) void {
         p.text.clearRetainingCapacity();
         p.styles.clearRetainingCapacity();
         p.focus_line = 0;
         p.numbered = false;
+        p.diff = false;
     }
+
+    /// Shows a diff (at most `max_diff` of it).
+    fn setDiff(p: *Preview, gpa: std.mem.Allocator, text: []const u8) !void {
+        try p.text.appendSlice(gpa, text[0..@min(text.len, max_diff)]);
+        if (text.len > max_diff) try p.text.appendSlice(gpa, "\n(and more)");
+        p.diff = true;
+    }
+
+    const max_diff = 256 * 1024;
 
     /// Shows file contents: numbered and, for known languages, highlighted.
     fn setCode(p: *Preview, gpa: std.mem.Allocator, text: []const u8, path: ?[]const u8) !void {
@@ -325,6 +341,12 @@ const scope_groups = [_][]const Scope{
         .{ .kind = .marks, .name = "marks", .command = "pick_mark" },
     },
     &.{
+        .{ .kind = .git_hunks, .name = "changes", .command = "git_changes" },
+        .{ .kind = .git_changes, .name = "files", .command = "git_changed_files" },
+        .{ .kind = .git_log, .name = "history", .command = "git_history" },
+        .{ .kind = .git_branches, .name = "branches", .command = "git_branches" },
+    },
+    &.{
         .{ .kind = .commands, .name = "commands", .command = "command_picker" },
         .{ .kind = .help, .name = "keys", .command = "help_keys" },
     },
@@ -398,7 +420,7 @@ const Leader = Menu("Leader", &.{
     .{ .key = 'r', .label = "Run (under gdb with breakpoints; C-Enter: always)", .command = "run_runner" },
     .{ .key = 'd', .label = "Debug (stack, stepping, breakpoints)", .command = "debug_menu" },
     .{ .key = ';', .label = "Run a shell command", .command = "run_shell" },
-    .{ .key = 'g', .label = "Git (changed files; commit, push, pull...)", .command = "git_changed_files" },
+    .{ .key = 'g', .label = "Git (changes; C-t: files, history, branches)", .command = "git_changes" },
     .{ .key = 'w', .label = "Windows", .command = "pick_windows" },
     .{ .key = 't', .label = "Toggles", .command = "pick_toggles" },
     .{ .key = 'p', .label = "Projects (and their sessions)", .command = "switch_project" },
@@ -3364,15 +3386,15 @@ const GitActions = struct {
     pub const start_mode: StartMode = .normal;
 
     const actions = [_]struct { []const u8, []const u8 }{
-        .{ "Commit all changes...", "SPC g c" },
+        .{ "Commit all changes...", "" },
         .{ "Push", "" },
         .{ "Pull", "" },
-        .{ "Switch branch / new branch...", "SPC g b" },
-        .{ "Changed files", "SPC g s" },
+        .{ "Switch branch / new branch...", "" },
+        .{ "Changed files", "" },
         .{ "Set remote URL...", "" },
-        .{ "Restore change at cursor", "SPC g r" },
-        .{ "Reload HEAD", "SPC g u" },
-        .{ "Make this a git repository (git init)", "SPC g i" },
+        .{ "Restore change at cursor", "" },
+        .{ "Reload HEAD", "" },
+        .{ "Make this a git repository (git init)", "" },
         .{ "Commit that changed this line", "" },
     };
     pub const row_keys: []const u8 = "cpPbsRruil";
@@ -3446,7 +3468,17 @@ const GitBranches = struct {
         try git_ops.gitSwitch(ed, name, true);
     }
 
-    pub fn preview(_: *Editor, _: *const Item, _: *Preview) !void {}
+    /// The branch's last commits.
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const root = project_ops.gitRoot(ed) orelse return;
+        const log = Git.log(ed.gpa, ed.io, root, item.text, "40") orelse return;
+        defer ed.gpa.free(log);
+        var it = std.mem.splitScalar(u8, log, '\n');
+        while (it.next()) |line| {
+            const c = GitLog.parse(line) orelse continue;
+            try out.text.print(ed.gpa, "{s}  {s}  ({s}, {s})\n", .{ c.hash, c.subject, c.when, c.who });
+        }
+    }
 };
 
 /// Files with uncommitted changes (`git status`).
@@ -3481,8 +3513,31 @@ const GitChanges = struct {
         try ed.openFile(item.text);
     }
 
+    /// What changed in the file (a new one: the file).
     pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (project_ops.gitRoot(ed)) |root| if (!std.mem.eql(u8, item.detail, "new")) {
+            if (git_view.repoRel(ed, root, item.text)) |rel| {
+                defer ed.gpa.free(rel);
+                if (Git.diffHead(ed.gpa, ed.io, root, rel)) |d| {
+                    defer ed.gpa.free(d);
+                    // From its first `@@`: the lines before say only which file.
+                    const from = std.mem.indexOf(u8, d, "\n@@ ") orelse 0;
+                    if (d.len > 0) return out.setDiff(ed.gpa, d[if (from > 0) from + 1 else 0..]);
+                }
+            }
+        };
         try previewAt(ed, item.text, 0, out);
+    }
+
+    fn restore(ed: *Editor, item: ?Item) anyerror!void {
+        const it = item orelse return;
+        try git_view.restoreFile(ed, it.text, it.detail);
+    }
+
+    fn sideBySide(ed: *Editor, item: ?Item) anyerror!void {
+        const it = item orelse return;
+        if (std.mem.eql(u8, it.detail, "deleted")) return ed.setMessage(.info, "{s} was deleted: r puts it back", .{it.text});
+        try git_view.sideBySideFile(ed, it.text);
     }
 
     fn run(comptime f: anytype) *const fn (*Editor, ?Item) anyerror!void {
@@ -3498,11 +3553,219 @@ const GitChanges = struct {
         .{ .label = "commit all...", .key = 'c', .any = true, .run = run(git_ops.gitCommitPrompt) },
         .{ .label = "push", .key = 'p', .any = true, .run = run(git_ops.gitPush) },
         .{ .label = "pull", .key = 'P', .any = true, .run = run(git_ops.gitPull) },
+        .{ .label = "restore the file from HEAD", .key = 'r', .run = restore },
+        .{ .label = "side by side with HEAD", .key = 'd', .run = sideBySide },
         .{ .label = "branches", .key = 'b', .any = true, .run = command("git_branches") },
-        .{ .label = "restore the change at the cursor", .key = 'r', .any = true, .run = command("git_restore_hunk") },
         .{ .label = "this line's commit", .key = 'l', .any = true, .run = command("git_line_commit") },
         .{ .label = "remote URL...", .key = 'R', .any = true, .run = run(git_ops.gitRemotePrompt) },
         .{ .label = "reload HEAD", .key = 'u', .stay = true, .any = true, .run = run(git_ops.reloadGit) },
         .{ .label = "git init", .key = 'i', .any = true, .run = run(git_ops.gitInit) },
     };
+};
+
+/// `SPC g`: git, as a picker of what isn't committed yet, a row for each
+/// change (what the gutter marks), its preview the change itself. Enter
+/// goes to it; `C-t` goes on to the changed files, the history, the
+/// branches; everything else git does is an action.
+const GitHunks = struct {
+    pub const title = "Git: changes";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    /// A row that is a whole new file, not one change of a file.
+    const new_file: u32 = std.math.maxInt(u32);
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        if (!git_ops.inRepo(ed)) return;
+        const root = project_ops.gitRoot(ed).?;
+        try git_view.loadChanges(ed, root);
+        for (ed.git_lists.rows.items, 0..) |c, i| {
+            const rel = try shownPath(ed, root, c.path);
+            defer ed.gpa.free(rel);
+            var tb: [std.fs.max_path_bytes + 16]u8 = undefined;
+            var db: [48]u8 = undefined;
+            const text = std.fmt.bufPrint(&tb, "{s}:{d}", .{ rel, c.line }) catch continue;
+            var w: std.Io.Writer = .fixed(&db);
+            if (c.deleted_file) w.writeAll("deleted") catch {} else {
+                if (c.added > 0) w.print("+{d}", .{c.added}) catch {};
+                if (c.added > 0 and c.removed > 0) w.writeAll(" ") catch {};
+                if (c.removed > 0) w.print("-{d}", .{c.removed}) catch {};
+            }
+            try items.append(.{ .text = text, .detail = w.buffered(), .id = @intCast(i) });
+        }
+        // Files git doesn't have yet: a row each (they are all change).
+        if (Git.status(ed.gpa, ed.io, root)) |out| {
+            defer ed.gpa.free(out);
+            var it = std.mem.splitScalar(u8, out, '\n');
+            while (it.next()) |line| {
+                if (line.len < 4 or !std.mem.startsWith(u8, line, "??")) continue;
+                const rel = try shownPath(ed, root, line[3..]);
+                defer ed.gpa.free(rel);
+                try items.append(.{ .text = rel, .detail = "new file", .id = new_file });
+            }
+        }
+        if (items.count() == 0) ed.setMessage(.info, "no changes (C-t: files, history, branches)", .{});
+    }
+
+    /// A path from the repository's top as the editor names files. Caller frees.
+    fn shownPath(ed: *Editor, root: []const u8, path: []const u8) ![]u8 {
+        const abs = try std.fs.path.join(ed.gpa, &.{ root, path });
+        defer ed.gpa.free(abs);
+        return ed.relativePath(abs);
+    }
+
+    /// The file and line (0-based) a row is of.
+    fn place(item: Item) struct { path: []const u8, line: usize } {
+        if (item.id == new_file) return .{ .path = item.text, .line = 0 };
+        const loc = parseLocation(item.text) orelse return .{ .path = item.text, .line = 0 };
+        return .{ .path = loc.path, .line = loc.line };
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (std.mem.eql(u8, item.detail, "deleted")) return ed.setMessage(.info, "{s} was deleted (C-t, then r on it, puts it back)", .{place(item).path});
+        const at = place(item);
+        try ed.jumpTo(at.path, at.line, 0);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id == new_file) return previewAt(ed, item.text, 0, out);
+        const c = git_view.changeText(ed, item.id) orelse return;
+        try out.setDiff(ed.gpa, c.text);
+        out.focus_line = c.focus;
+    }
+
+    fn restore(ed: *Editor, item: ?Item) anyerror!void {
+        const it = item orelse return;
+        if (it.id == new_file) return ed.setMessage(.info, "{s} is new: HEAD has nothing to put back", .{it.text});
+        const at = place(it);
+        if (std.mem.eql(u8, it.detail, "deleted")) return git_view.restoreFile(ed, at.path, "deleted");
+        try git_view.restoreChange(ed, at.path, at.line);
+    }
+
+    fn sideBySide(ed: *Editor, item: ?Item) anyerror!void {
+        const it = item orelse return;
+        if (it.id == new_file) return ed.setMessage(.info, "{s} is new: there is nothing to put beside it", .{it.text});
+        if (std.mem.eql(u8, it.detail, "deleted")) return ed.setMessage(.info, "the file was deleted: r puts it back", .{});
+        const at = place(it);
+        try git_view.sideBySide(ed, at.path, at.line);
+    }
+
+    pub const item_actions = [_]Action{
+        .{ .label = "restore from HEAD", .key = 'r', .run = restore },
+        .{ .label = "side by side with HEAD", .key = 'd', .run = sideBySide },
+        .{ .label = "commit all...", .key = 'c', .any = true, .run = GitChanges.run(git_ops.gitCommitPrompt) },
+        .{ .label = "push", .key = 'p', .any = true, .run = GitChanges.run(git_ops.gitPush) },
+        .{ .label = "pull", .key = 'P', .any = true, .run = GitChanges.run(git_ops.gitPull) },
+        .{ .label = "this line's commit", .key = 'l', .any = true, .run = command("git_line_commit") },
+        .{ .label = "reload HEAD", .key = 'u', .stay = true, .any = true, .run = GitChanges.run(git_ops.reloadGit) },
+    };
+};
+
+/// The history: a row for each commit, its preview what it changed. Enter
+/// lists its files (to see one side by side with how it was before).
+const GitLog = struct {
+    pub const title = "Git: history";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    const Commit = struct { hash: []const u8, when: []const u8, who: []const u8, subject: []const u8 };
+
+    /// A line of `Git.log`.
+    fn parse(line: []const u8) ?Commit {
+        var it = std.mem.splitScalar(u8, line, '\t');
+        const hash = it.next() orelse return null;
+        const when = it.next() orelse return null;
+        const who = it.next() orelse return null;
+        if (hash.len == 0) return null;
+        return .{ .hash = hash, .when = when, .who = who, .subject = it.rest() };
+    }
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        if (!git_ops.inRepo(ed)) return;
+        const log = Git.log(ed.gpa, ed.io, project_ops.gitRoot(ed).?, null, "1000") orelse
+            return ed.setMessage(.info, "no commits yet", .{});
+        defer ed.gpa.free(log);
+        var it = std.mem.splitScalar(u8, log, '\n');
+        var line_buf: std.ArrayList(u8) = .empty;
+        defer line_buf.deinit(ed.gpa);
+        while (it.next()) |line| {
+            const c = parse(line) orelse continue;
+            line_buf.clearRetainingCapacity();
+            try line_buf.print(ed.gpa, "{s} {s}", .{ c.hash, c.subject });
+            var db: [96]u8 = undefined;
+            const detail = std.fmt.bufPrint(&db, "{s}, {s}", .{ c.when, c.who[0..@min(c.who.len, 40)] }) catch c.when;
+            try items.append(.{ .text = line_buf.items, .detail = detail });
+        }
+    }
+
+    /// The hash a row starts with.
+    fn hashOf(item: Item) []const u8 {
+        return item.text[0 .. std.mem.indexOfScalar(u8, item.text, ' ') orelse item.text.len];
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        ed.git_lists.setCommit(hashOf(item));
+        try ed.openPicker(.git_commit_files, "");
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const root = project_ops.gitRoot(ed) orelse return;
+        const shown = Git.show(ed.gpa, ed.io, root, hashOf(item.*), null) orelse return;
+        defer ed.gpa.free(shown);
+        try out.setDiff(ed.gpa, shown);
+    }
+
+    fn copyHash(ed: *Editor, item: ?Item) anyerror!void {
+        const it = item orelse return;
+        try ed.registers.store(null, .yank, hashOf(it), false);
+        ed.setMessage(.info, "yanked {s}", .{hashOf(it)});
+    }
+
+    pub const item_actions = [_]Action{
+        .{ .label = "copy the hash", .key = 'y', .stay = true, .keep_rows = true, .run = copyHash },
+        .{ .label = "commit all...", .key = 'c', .any = true, .run = GitChanges.run(git_ops.gitCommitPrompt) },
+        .{ .label = "push", .key = 'p', .any = true, .run = GitChanges.run(git_ops.gitPush) },
+        .{ .label = "pull", .key = 'P', .any = true, .run = GitChanges.run(git_ops.gitPull) },
+    };
+};
+
+/// The files a commit changed (Enter on a row of the history): each one's
+/// preview is what the commit did to it; Enter shows it side by side with
+/// how it was before.
+const GitCommitFiles = struct {
+    pub const title = "Git: the commit's files";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        const root = project_ops.gitRoot(ed) orelse return;
+        const rev = ed.git_lists.commit();
+        if (rev.len == 0) return;
+        const out = Git.commitFiles(ed.gpa, ed.io, root, rev) orelse return;
+        defer ed.gpa.free(out);
+        var it = std.mem.splitScalar(u8, out, '\n');
+        while (it.next()) |line| {
+            var parts = std.mem.splitScalar(u8, line, '\t');
+            const status = parts.next() orelse continue;
+            var path = parts.next() orelse continue;
+            // A rename: the name it has after.
+            if (parts.next()) |renamed| path = renamed;
+            if (status.len == 0 or path.len == 0) continue;
+            try items.append(.{ .text = path, .detail = Git.describeStatus(status[0..1]) });
+        }
+        if (items.count() == 0) ed.setMessage(.info, "{s} changed no files (a merge)", .{rev});
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        const root = project_ops.gitRoot(ed) orelse return;
+        try Editor.compare.showCommit(ed, root, ed.git_lists.commit(), item.text);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        const root = project_ops.gitRoot(ed) orelse return;
+        const shown = Git.show(ed.gpa, ed.io, root, ed.git_lists.commit(), item.text) orelse return;
+        defer ed.gpa.free(shown);
+        const from = std.mem.indexOf(u8, shown, "\n@@ ") orelse 0;
+        try out.setDiff(ed.gpa, shown[if (from > 0) from + 1 else 0..]);
+    }
 };

@@ -32,6 +32,8 @@ comptime {
     _ = @import("config/toml.zig");
     _ = @import("config/config.zig");
     _ = @import("sql.zig");
+    _ = @import("git/patch.zig");
+    _ = @import("editor/compare.zig");
     _ = @import("ZigCheck.zig");
     _ = @import("Replace.zig");
     _ = @import("ai/Chat.zig");
@@ -50,6 +52,7 @@ comptime {
     _ = @import("tests/editing.zig");
     _ = @import("tests/files.zig");
     _ = @import("tests/git.zig");
+    _ = @import("tests/git_view.zig");
     _ = @import("tests/lsp.zig");
     _ = @import("tests/mini.zig");
     _ = @import("tests/motions.zig");

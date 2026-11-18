@@ -70,6 +70,48 @@ pub fn originUrl(gpa: Allocator, io: Io, root: []const u8) ?[]u8 {
     return gpa.dupe(u8, std.mem.trimEnd(u8, out, "\n")) catch null;
 }
 
+/// What isn't committed, against HEAD, as a unified diff (of `rel` only, if
+/// given; paths as they are, not quoted). Null if there is no HEAD yet.
+/// Caller frees.
+pub fn diffHead(gpa: Allocator, io: Io, root: []const u8, rel: ?[]const u8) ?[]u8 {
+    const base = [_][]const u8{ "git", "-C", root, "-c", "core.quotePath=false", "diff", "HEAD", "--no-color", "--no-ext-diff" };
+    return if (rel) |r| run(gpa, io, &(base ++ .{ "--", r })) else run(gpa, io, &base);
+}
+
+/// The last `count` commits of `rev` (HEAD if null), newest first: lines
+/// of `hash<TAB>when<TAB>who<TAB>subject`. Caller frees.
+pub fn log(gpa: Allocator, io: Io, root: []const u8, rev: ?[]const u8, comptime count: []const u8) ?[]u8 {
+    return run(gpa, io, &.{ "git", "-C", root, "log", "-n", count, "--date=relative", "--format=%h%x09%ad%x09%an%x09%s", rev orelse "HEAD" });
+}
+
+/// Commit `rev`: who, when, its message, then what it changed as a diff
+/// (of `rel` only, if given). Caller frees.
+pub fn show(gpa: Allocator, io: Io, root: []const u8, rev: []const u8, rel: ?[]const u8) ?[]u8 {
+    const base = [_][]const u8{ "git", "-C", root, "-c", "core.quotePath=false", "show", "--no-color", "--no-ext-diff", "--stat", "--patch", "--date=relative", "--format=%h  %an, %ad%n%n%B", rev };
+    return if (rel) |r| run(gpa, io, &(base ++ .{ "--", r })) else run(gpa, io, &base);
+}
+
+/// The files commit `rev` changed: lines of `status<TAB>path` (a rename:
+/// `R100<TAB>old<TAB>new`). Caller frees.
+pub fn commitFiles(gpa: Allocator, io: Io, root: []const u8, rev: []const u8) ?[]u8 {
+    return run(gpa, io, &.{ "git", "-C", root, "-c", "core.quotePath=false", "show", "--no-color", "--name-status", "--format=", rev });
+}
+
+/// File `rel` (from the repository's top) as it was in `rev`; null if it
+/// wasn't there. Caller frees.
+pub fn fileAt(gpa: Allocator, io: Io, root: []const u8, rev: []const u8, rel: []const u8) ?[]u8 {
+    const spec = std.fmt.allocPrint(gpa, "{s}:{s}", .{ rev, rel }) catch return null;
+    defer gpa.free(spec);
+    return run(gpa, io, &.{ "git", "-C", root, "show", spec });
+}
+
+/// Puts `rel` back as HEAD has it (a deleted file comes back). True if git did.
+pub fn checkoutHead(gpa: Allocator, io: Io, root: []const u8, rel: []const u8) bool {
+    const out = run(gpa, io, &.{ "git", "-C", root, "checkout", "HEAD", "--", rel }) orelse return false;
+    gpa.free(out);
+    return true;
+}
+
 /// stdout of a successful run, else null.
 fn run(gpa: Allocator, io: Io, argv: []const []const u8) ?[]u8 {
     const result = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(64 * 1024 * 1024) }) catch return null;

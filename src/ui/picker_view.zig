@@ -383,6 +383,19 @@ fn drawPreview(p: *Picker, font: *const Font, theme: *const Theme, x0: f32, y0: 
         }
         const offset = @intFromPtr(line.ptr) - @intFromPtr(pv.text.items.ptr);
         const styles = if (pv.styles.items.len == pv.text.items.len) pv.styles.items[offset..][0..line.len] else &.{};
+        // A diff: added and removed lines in their colours, the rest dimmer.
+        if (pv.diff) {
+            const color = if (line.len == 0) theme.fg else switch (line[0]) {
+                '+' => if (std.mem.startsWith(u8, line, "+++")) theme.status_dim else theme.diff_add,
+                '-' => if (std.mem.startsWith(u8, line, "---")) theme.status_dim else theme.diff_delete,
+                '@' => theme.diff_change,
+                ' ' => theme.status_fg,
+                else => theme.fg,
+            };
+            if (n == pv.focus_line and pv.focus_line > 0) rect(x0 - font.cell_w, y, @as(f32, @floatFromInt(cols + 2)) * font.cell_w, font.cell_h, theme.cursorline_bg);
+            _ = font.drawText(clipCells(line, cols), x, y, color);
+            continue;
+        }
         drawLine(font, theme, line, styles, x, y, cols -| gutter);
     }
 }

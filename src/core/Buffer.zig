@@ -33,6 +33,11 @@ label: ?[]u8 = null,
 /// Not to be changed by the user (Claude's conversation): commands that
 /// edit are refused, yanking and moving work.
 read_only: bool = false,
+/// A side of a side-by-side comparison (`editor/compare.zig`): its diff is
+/// against the other side, its changed lines are tinted (`old`: as removed,
+/// `new`: as added), and where it is the shorter side it shows blank rows
+/// instead of the other side's lines.
+compare: enum { none, old, new } = .none,
 /// Its lines are never wrapped, whatever the option says (a table: rows
 /// that are cut into pieces can't be read down a column).
 no_wrap: bool = false,

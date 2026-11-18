@@ -125,6 +125,8 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
             w.view.cols = wl.cols;
         }
     }
+    // Side by side: the two windows show the same rows.
+    Editor.compare.sync(ed);
     return screen;
 }
 
@@ -663,8 +665,12 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         const fold = folding.foldAt(ed, line);
         const is_current = line == cursor_line;
         if (fold != null) rect(0, y, l.width, font.cell_h, theme.fold_bg);
+        // Side by side: a changed line is tinted (the old side's as
+        // removed, the new side's as added).
+        if (ed.buffer.compare != .none and changedLine(ed, line))
+            rect(0, y, l.width, font.cell_h, mix(theme.bg, if (ed.buffer.compare == .old) theme.diff_delete else theme.diff_add, 0.16));
 
-        if (is_current and focused) rect(0, y, l.width, font.cell_h, theme.cursorline_bg);
+        if (is_current and focused) rect(0, y, l.width, font.cell_h, if (ed.buffer.compare != .none and changedLine(ed, line)) mix(theme.cursorline_bg, if (ed.buffer.compare == .old) theme.diff_delete else theme.diff_add, 0.22) else theme.cursorline_bg);
         const marks: debugging.Marks = if (debug_path) |dp| debugging.marks(ed, dp, line) else .{};
         // Where the debugger stopped: the line tinted.
         if (marks.here) rect(0, y, l.width, font.cell_h, withAlpha(theme.diag_warning, 40));
@@ -1245,10 +1251,10 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
 
     const line = ed.cursorLine();
     const total = ed.text().lineCount();
-    if (ed.ghost) |g| {
+    if (ed.ghost) |g| if (ed.buffer.compare == .none) {
         const h = row_model.ghostHunk(ed, g.line);
         if (h) |hh| try w.print("HEAD:{d}  ", .{hh.old_start + g.k + 1});
-    }
+    };
     try w.print("{d}:{d}  ", .{ line + 1, ed.cursorCol() + 1 });
     if (total <= 1) try w.writeAll("All ") else try w.print("{d: >3}% ", .{line * 100 / (total - 1)});
 }
@@ -1642,6 +1648,13 @@ fn drawCompletionDoc(c: *Completion, font: *const Font, theme: *const Theme, l: 
 
 /// A ghost line: an old HEAD line of a git hunk, shown inline (read-only).
 fn drawGhostRow(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, line: usize, k: u32, y: f32) void {
+    // Side by side: a blank row where the other side has a line.
+    if (ed.buffer.compare != .none) {
+        // (From the second cell: the first is the window's left border.)
+        rect(font.cell_w, y, l.width - font.cell_w, font.cell_h, theme.fold_bg);
+        if (ed.ghost) |g| if (g.line == line and g.k == k) rect(font.cell_w, y, l.width - font.cell_w, font.cell_h, theme.cursorline_bg);
+        return;
+    }
     rect(0, y, l.width, font.cell_h, theme.ghost_bg);
     if (ed.ghost) |g| {
         // A visual selection of ghost lines.
@@ -1685,10 +1698,36 @@ fn drawGhostCursor(ed: *Editor, font: *const Font, theme: *const Theme, l: Layou
     }
 }
 
+/// Whether `line` is one of a change's (of the buffer's diff).
+fn changedLine(ed: *const Editor, line: usize) bool {
+    const g = ed.buffer.git orelse return false;
+    for (g.hunks.items) |hunk| {
+        if (hunk.new_start > line) break;
+        if (line < hunk.new_start + hunk.new_count) return true;
+    }
+    return false;
+}
+
+/// `a` with `share` of `b` in it (a tint that is a colour of its own, as
+/// the terminal needs).
+fn mix(a: rl.Color, b: rl.Color, share: f32) rl.Color {
+    const f = struct {
+        fn ch(x: u8, y: u8, s: f32) u8 {
+            return @intFromFloat(@round(@as(f32, @floatFromInt(x)) * (1 - s) + @as(f32, @floatFromInt(y)) * s));
+        }
+    }.ch;
+    return .{ .r = f(a.r, b.r, share), .g = f(a.g, b.g, share), .b = f(a.b, b.b, share), .a = 255 };
+}
+
 /// Gutter bar for git changes: green added, yellow changed; with ghost lines
-/// off, a red tick where lines were deleted.
+/// off, a red tick where lines were deleted. (Side by side: the old side's
+/// lines are red, the new side's green.)
 fn drawGitSign(ed: *Editor, theme: *const Theme, line: usize, y: f32, h: f32) void {
     const g = ed.buffer.git orelse return;
+    if (ed.buffer.compare != .none) {
+        if (changedLine(ed, line)) rect(0, y, 3, h, if (ed.buffer.compare == .old) theme.diff_delete else theme.diff_add);
+        return;
+    }
     for (g.hunks.items) |hunk| {
         if (hunk.new_start > line + 1) break;
         if (hunk.new_count > 0 and line >= hunk.new_start and line < hunk.new_start + hunk.new_count) {

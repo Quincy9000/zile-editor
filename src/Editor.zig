@@ -92,6 +92,8 @@ pub const claude_chat = @import("editor/claude_chat.zig");
 pub const side_float = @import("editor/side_float.zig");
 pub const claude_inline = @import("editor/claude_inline.zig");
 pub const pads = @import("editor/pads.zig");
+pub const compare = @import("editor/compare.zig");
+pub const git_view = @import("editor/git_view.zig");
 pub const prompts = @import("editor/prompts.zig");
 pub const git_ops = @import("editor/git_ops.zig");
 pub const signature_help = @import("editor/signature_help.zig");
@@ -947,6 +949,10 @@ chat_proposal: ?claude_chat.Proposal = null,
 /// The scratch pads (`SPC t s`): their panel, and the pads there are.
 pad_panel: claude_chat.Panel = .{},
 pad_list: pads.List = .{},
+/// A file beside an older version of itself, while that is up.
+comparing: ?compare.Pair = null,
+/// What the git pickers list (the diff their rows are of).
+git_lists: git_view.State = .{},
 /// The text side of a bottom panel gone into with Tab (`side_float.zig`):
 /// a window outside the splits (owned), and the window to go back to.
 side_window: ?*Windows.Window = null,
@@ -1099,6 +1105,7 @@ pub fn deinit(ed: *Editor) void {
         ed.gpa.free(p.shown);
     }
     ed.pad_list.deinit(ed.gpa);
+    ed.git_lists.deinit(ed.gpa);
     if (ed.chat) |c| c.destroy();
     if (ed.browse_target) |p| ed.gpa.free(p);
     if (ed.browse_clip) |p| ed.gpa.free(p);
@@ -1217,6 +1224,7 @@ pub fn tick(ed: *Editor) void {
     claude_chat.tick(ed);
     claude_inline.tick(ed);
     pads.tick(ed);
+    compare.tick(ed);
     sql_ops.tickSqlSchema(ed);
     sql_ops.tickSqlResults(ed);
     row_model.tickCodeLens(ed);
@@ -1273,6 +1281,7 @@ pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
     if (sql_ops.gridKey(ed, ev)) return;
     if (run_popup.cmdFloatKey(ed, ev)) return;
     if (side_float.key(ed, ev)) return;
+    if (ed.macro_register == null and compare.key(ed, ev)) return;
     if (claude_chat.key(ed, ev)) return;
     if (pads.key(ed, ev)) return;
     if (ed.macro_register != null) ed.macro_keys.append(ed.gpa, ev) catch {};

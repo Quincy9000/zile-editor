@@ -272,6 +272,9 @@ const base = [_]Command{
     .{ .name = "git_pull", .doc = "Pull", .run = gitAction(.pull), .needs = "git" },
     .{ .name = "git_branches", .doc = "Switch / new branch", .run = openPicker(.git_branches), .needs = "git" },
     .{ .name = "git_changed_files", .doc = "Changed files", .run = openPicker(.git_changes), .needs = "git" },
+    .{ .name = "git_changes", .doc = "Git: changes not committed (each one, with its diff)", .run = openPicker(.git_hunks), .needs = "git" },
+    .{ .name = "git_history", .doc = "Git: history (commits, and what each changed)", .run = openPicker(.git_log), .needs = "git" },
+    .{ .name = "git_compare", .doc = "Side by side with HEAD (again: back to one window)", .run = gitCompare, .once = true, .needs = "git" },
     .{ .name = "git_init", .doc = "Make this a git repository", .run = gitAction(.init), .needs = "git" },
     .{ .name = "git_set_remote", .doc = "Set remote URL", .run = gitAction(.remote), .needs = "git" },
     .{ .name = "git_restore_hunk", .doc = "Restore hunk from HEAD", .run = gitCmd(.restore), .ghost = true, .needs = "git" },
@@ -851,6 +854,10 @@ fn gotoMark(comptime exact: bool) Handler {
 
 fn pickColor(c: Context) !void {
     color_wheel.openColorPicker(c.ed);
+}
+
+fn gitCompare(c: Context) !void {
+    try Editor.compare.toggleFile(c.ed);
 }
 
 fn gitLineCommit(c: Context) !void {

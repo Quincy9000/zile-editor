@@ -26,27 +26,39 @@ const max_segments = Editor.max_segments;
 const max_diagnostic_lists = lsp_ops.max_diagnostic_lists;
 
 /// The git hunk whose old lines show as ghost lines before text line `line`.
+///
+/// A side of a side-by-side comparison has blank rows there instead, only
+/// as many as it is shorter by: the hunk returned is those rows (its old
+/// lines are the ones the other side has beside them).
 pub fn ghostHunk(ed: *const Editor, line: usize) ?diff.Hunk {
-    if (!ed.options.ghost_lines) return null;
+    const comparing = ed.buffer.compare != .none;
+    if (!comparing and !ed.options.ghost_lines) return null;
     const g = ed.buffer.git orelse return null;
     for (g.hunks.items) |h| {
-        if (h.old_count == 0) continue;
         const at = h.new_start + h.new_count;
-        if (at == line) return h;
         if (at > line) break;
+        if (at != line) continue;
+        if (comparing) {
+            if (h.old_count <= h.new_count) continue;
+            return .{ .old_start = h.old_start + h.new_count, .old_count = h.old_count - h.new_count, .new_start = h.new_start, .new_count = h.new_count };
+        }
+        if (h.old_count > 0) return h;
     }
     return null;
 }
 
 pub fn hasGhosts(ed: *const Editor) bool {
-    if (!ed.options.ghost_lines) return false;
+    const comparing = ed.buffer.compare != .none;
+    if (!comparing and !ed.options.ghost_lines) return false;
     const g = ed.buffer.git orelse return false;
-    for (g.hunks.items) |h| if (h.old_count > 0) return true;
+    for (g.hunks.items) |h| if (if (comparing) h.old_count > h.new_count else h.old_count > 0) return true;
     return false;
 }
 
-/// The text of ghost line `k` before text line `line`.
+/// The text of ghost line `k` before text line `line` (a comparison's
+/// blank row: none).
 pub fn ghostText(ed: *const Editor, line: usize, k: u32) []const u8 {
+    if (ed.buffer.compare != .none) return "";
     const h = ghostHunk(ed, line) orelse return "";
     return ed.buffer.git.?.baseLine(h.old_start + k);
 }
