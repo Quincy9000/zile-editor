@@ -1244,6 +1244,10 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
         .asking => try w.writeAll("Claude asks: SPC a y   "),
     };
     if (ed.cursors.items.len > 0) try w.print("{d} cursors   ", .{ed.cursors.items.len + 1});
+    // Insert mode's Ctrl-v / Ctrl-k waiting for its keys.
+    var pending_buf: [16]u8 = undefined;
+    const waiting = Editor.insert_keys.indicator(ed, &pending_buf);
+    if (waiting.len > 0) try w.print("{s}   ", .{waiting});
     const typed = code_motion.showcmdKeys(ed);
     try keys.formatSequenceDisplay(typed, w);
     if (typed.len > 0) try w.writeAll("-   ");

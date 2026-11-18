@@ -340,7 +340,7 @@ Everything that lists things is a picker (`SPC f SPC` lists them all).
 | `SPC f r` / `SPC f v` | recent files (last opened first) / frecent files (most used lately first, with visit counts) |
 | `SPC f a` / `SPC f d` | files / folders anywhere on disk (`fd` per query, from three characters; a folder becomes the project) |
 | `SPC l a` / `SPC f w` / `SPC l i` | code actions (edit, `codeAction/resolve`, or a command answered through `workspace/applyEdit`); project symbols, searched by the server as you type (`Picker.refill`); implementations |
-| `SPC l t`, insert `<C-t>` | write a todo tag as a comment here |
+| `SPC l t`, normal `<C-t>` | write a todo tag as a comment here |
 | `SPC p p` | also lists projects found under `Options.project_dirs` (three levels deep) |
 | visual `SPC /`, `SPC SPC` | grep / find files for the selection |
 | in `SPC .` (list) | `o` folder, `n` file, `r` rename, `m` move, `x` / `dd` delete (asks; permanent), `yy` / `p` copy and paste; open buffers follow a move |

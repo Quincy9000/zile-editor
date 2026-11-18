@@ -322,7 +322,15 @@ const base = [_]Command{
     .{ .name = "insert_newline", .doc = "New line, keeping indentation", .run = insertNewline },
     .{ .name = "delete_backward", .doc = "Delete previous character", .run = deleteBackward },
     .{ .name = "delete_forward", .doc = "Delete next character", .run = deleteBy(motions.nextChar) },
-    .{ .name = "delete_word_backward", .doc = "Delete previous word", .run = deleteBy(wordBackwardInLine) },
+    .{ .name = "delete_word_backward", .doc = "Delete previous word", .run = insertKey(.delete_word) },
+    .{ .name = "insert_delete_line", .doc = "Insert: delete back to the line's first character", .run = insertKey(.delete_line), .hidden = true },
+    .{ .name = "insert_again", .doc = "Insert: what was typed last time, again", .run = insertKey(.again), .hidden = true },
+    .{ .name = "insert_literal", .doc = "Insert: the next key as it is (u and hex digits: a codepoint)", .run = insertKey(.literal), .hidden = true },
+    .{ .name = "insert_digraph", .doc = "Insert: a digraph (two keys, as e' for é)", .run = insertKey(.digraph), .hidden = true },
+    .{ .name = "insert_above", .doc = "Insert: the character above (or accept the completion)", .run = insertKey(.above), .hidden = true },
+    .{ .name = "insert_below", .doc = "Insert: the character below (or close the completion)", .run = insertKey(.below), .hidden = true },
+    .{ .name = "insert_indent", .doc = "Insert: indent the line", .run = insertKey(.indent), .hidden = true },
+    .{ .name = "insert_dedent", .doc = "Insert: dedent the line (after a 0: all of it)", .run = insertKey(.dedent), .hidden = true },
     .{ .name = "insert_tab", .doc = "Insert tab", .run = insertTab },
 
     // Files, buffers and session
@@ -2137,17 +2145,32 @@ fn deleteBy(comptime step: fn (*const Text, usize) usize) Handler {
         fn run(c: Context) anyerror!void {
             const from = c.ed.view.cursor;
             const to = step(c.ed.text(), from);
+            // (What was typed and is deleted again isn't Ctrl-a's.)
+            if (to < from) Editor.insert_keys.untyped(c.ed, from - to);
             try c.ed.deleteRange(@min(from, to), @max(from, to));
         }
     }.run;
 }
 
-/// Insert-mode <C-w>: back one word, but not past the start of the line
-/// unless already there (then it joins lines, like <BS>).
-fn wordBackwardInLine(t: *const Text, p: usize) usize {
-    const start = t.lineStart(t.lineOf(p));
-    const target = motions.wordBackward(t, p, false);
-    return if (target < start and p > start) start else target;
+/// Insert mode's own keys (`editor/insert_keys.zig`).
+fn insertKey(comptime what: enum { delete_word, delete_line, again, literal, digraph, above, below, indent, dedent }) Handler {
+    return &struct {
+        fn run(c: Context) anyerror!void {
+            const ed = c.ed;
+            const ik = Editor.insert_keys;
+            switch (what) {
+                .delete_word => try ik.deleteWord(ed),
+                .delete_line => try ik.deleteLine(ed),
+                .again => try ik.again(ed),
+                .literal => ik.begin(ed, .literal),
+                .digraph => ik.begin(ed, .{ .digraph = null }),
+                .above => if (!try ik.popupKey(ed, true)) try ik.copyFrom(ed, true),
+                .below => if (!try ik.popupKey(ed, false)) try ik.copyFrom(ed, false),
+                .indent => try ik.shift(ed, true),
+                .dedent => try ik.shift(ed, false),
+            }
+        }
+    }.run;
 }
 
 fn insertNewline(c: Context) !void {

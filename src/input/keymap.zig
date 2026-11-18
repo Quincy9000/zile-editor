@@ -395,7 +395,7 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     // own paste key does the same.
     .{ NV, "<C-S-v>", "paste_clipboard" },
     .{ I, "<C-S-v>", "paste_clipboard" },
-    .{ I, "<C-v>", "paste_clipboard" },
+    // (Insert mode's Ctrl-v is Vim's: the next key as it is.)
     .{ S, "<C-S-v>", "paste_clipboard" },
     .{ S, "<C-v>", "paste_clipboard" },
     .{ PA, "<C-S-v>", "paste_clipboard" },
@@ -454,7 +454,7 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ N, "m", "set_mark" },
     .{ NVO, "'", "goto_mark_line" },
     .{ NVO, "`", "goto_mark" },
-    .{ I, "<C-t>", "todo_tag" },
+    .{ N, "<C-t>", "todo_tag" },
 
     // ------------------------------------------------------------------
     // Leader menus, by what you are doing. Top level: only what is done
@@ -484,7 +484,9 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ I, "<A-;>", "ai_accept" },
     .{ I, "<A-l>", "ai_accept_line" },
     .{ I, "<A-Right>", "ai_accept_char" },
-    .{ I, "<C-y>", "completion_accept" },
+    // Ctrl-y: the completion that is open, else the character above (Vim's).
+    .{ I, "<C-y>", "insert_above" },
+    .{ I, "<C-e>", "insert_below" },
     .{ I, "<C-n>", "completion_next" },
     .{ I, "<C-p>", "completion_previous" },
     .{ I, "<C-Space>", "completion_next" },
@@ -493,6 +495,16 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ I, "<BS>", "delete_backward" },
     .{ I, "<Del>", "delete_forward" },
     .{ I, "<C-w>", "delete_word_backward" },
+    // Vim's insert keys (`editor/insert_keys.zig`).
+    .{ I, "<C-h>", "delete_backward" },
+    .{ I, "<C-u>", "insert_delete_line" },
+    .{ I, "<C-a>", "insert_again" },
+    .{ I, "<C-v>", "insert_literal" },
+    .{ I, "<C-k>", "insert_digraph" },
+    .{ I, "<C-j>", "completion_accept_or_newline" },
+    .{ I, "<C-m>", "completion_accept_or_newline" },
+    .{ I, "<C-t>", "insert_indent" },
+    .{ I, "<C-d>", "insert_dedent" },
     .{ I, "<C-;>", "append_semicolon" },
     .{ I, "<Left>", "move_left" },
     .{ I, "<Right>", "move_right" },

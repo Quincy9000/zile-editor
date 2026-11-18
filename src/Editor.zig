@@ -93,6 +93,7 @@ pub const side_float = @import("editor/side_float.zig");
 pub const claude_inline = @import("editor/claude_inline.zig");
 pub const pads = @import("editor/pads.zig");
 pub const compare = @import("editor/compare.zig");
+pub const insert_keys = @import("editor/insert_keys.zig");
 pub const git_view = @import("editor/git_view.zig");
 pub const prompts = @import("editor/prompts.zig");
 pub const git_ops = @import("editor/git_ops.zig");
@@ -1001,6 +1002,16 @@ ghost: ?GhostCursor = null,
 /// The git command running in the background, if any.
 git_job: ?*GitJob = null,
 
+/// Insert mode: Ctrl-v or Ctrl-k waiting for its keys (`insert_keys.zig`).
+insert_pending: insert_keys.Pending = .none,
+/// What this insert has typed so far, and what the one before it typed
+/// (Ctrl-a types that again).
+insert_typed: std.ArrayList(u8) = .empty,
+insert_last: std.ArrayList(u8) = .empty,
+/// Where the cursor was left by a `0` that was the last thing typed (`0`
+/// Ctrl-d takes that 0 and all of the indentation).
+insert_zero: ?usize = null,
+
 /// Keys of the command being typed, for the status line (vim's showcmd).
 showcmd: [16]KeyEvent = undefined,
 showcmd_len: usize = 0,
@@ -1148,6 +1159,8 @@ pub fn deinit(ed: *Editor) void {
     ed.change_keys.deinit(ed.gpa);
     ed.cursors.deinit(ed.gpa);
     ed.multi_keys.deinit(ed.gpa);
+    ed.insert_typed.deinit(ed.gpa);
+    ed.insert_last.deinit(ed.gpa);
     for (ed.jumps.items) |j| if (j.path) |p| ed.gpa.free(p);
     ed.jumps.deinit(ed.gpa);
     for (ed.marks.items) |m| if (m.path) |p| ed.gpa.free(p);
@@ -1448,6 +1461,14 @@ pub fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
         return ed.resetCommand();
     }
 
+    // Insert mode's Ctrl-v / Ctrl-k: the keys they wait for.
+    if (ed.mode == .insert and ed.insert_pending != .none) {
+        if (try insert_keys.pendingKey(ed, ev)) {
+            if (ed.capturing) try ed.change_keys.append(ed.gpa, ev);
+            return;
+        }
+    }
+
     // A picker's actions: Ctrl keys in either mode; in normal mode its
     // letters (and a menu's row keys), then vim keys edit the query.
     if ((ed.mode == .picker or ed.mode == .picker_normal) and try picker_query.openInKey(ed, ev)) return;
@@ -1532,17 +1553,23 @@ pub fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
             }
             if (cmd.repeat) ed.capture_repeatable = true;
             ed.find_shown = false;
+            // A `0` is only Ctrl-d's when nothing came between them.
+            if (ed.mode == .insert and !std.mem.eql(u8, cmd.name, "insert_dedent")) ed.insert_zero = null;
             if (cmd.takes_char) {
                 ed.awaiting_char = .{ .cmd = cmd, .count = @max(count, 1), .has_count = has_count, .register = register };
                 return;
             }
             if (ed.toolMissing(cmd)) return;
+            const typing = ed.mode == .insert;
             try cmd.run(.{
                 .ed = ed,
                 .count = @max(count, 1),
                 .has_count = has_count,
                 .register = register,
             });
+            // What the command that begins an insert puts in itself (the new
+            // line of `o`) isn't something typed.
+            if (!typing and ed.mode == .insert and !ed.replaying) ed.insert_typed.clearRetainingCapacity();
             // A sticky command keeps its menu open: the prefix stays typed.
             if (cmd.sticky and seq.len > 1 and ed.mode == .normal) {
                 ed.pending_len = seq.len - 1;
@@ -1574,6 +1601,7 @@ pub fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                     if (cp == '(') try completion_ops.commitCompletionName(ed);
                     try snippet_ops.snippetTypeOver(ed);
                     if (!try tags.typed(ed, cp) and !try pairs.typed(ed, cp)) try ed.insertCodepoint(cp);
+                    ed.insert_zero = if (cp == '0') ed.view.cursor else null;
                     if (cp == '}' or cp == ')' or cp == ']') try indenting.dedentCloser(ed);
                     after_typing.afterTyped(ed, cp);
                 },
@@ -1813,6 +1841,7 @@ pub fn insertAt(ed: *Editor, pos: usize, bytes: []const u8) !void {
 pub fn insertText(ed: *Editor, bytes: []const u8) !void {
     const pos = ed.view.cursor;
     try ed.insertAt(pos, bytes);
+    insert_keys.typed(ed, bytes);
     ed.view.cursor = pos + bytes.len;
     ed.view.want_col = null;
 }
@@ -1845,6 +1874,7 @@ pub fn deleteRangeKeepCursor(ed: *Editor, start: usize, end: usize) !void {
 }
 
 pub fn setMode(ed: *Editor, mode: Mode) void {
+    insert_keys.modeChange(ed, mode);
     ed.mode = mode;
     ed.placeCursor(ed.view.cursor);
 }

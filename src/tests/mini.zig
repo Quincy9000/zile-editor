@@ -165,7 +165,7 @@ test "todo tags: SPC l t writes a comment tag and leaves you typing; Ctrl-t from
     try testing.expectEqual(Mode.insert, ed.mode);
     try ed.feed("later<Esc>");
     try expectText(&ed, "x = 1 # FIXME: later\n    ");
-    try ed.feed("jA<C-t>");
+    try ed.feed("j<C-t>"); // (normal mode's key for it)
     settlePicker(&ed);
     try ed.feed("<CR>now<Esc>"); // TODO, on the blank line, keeping its indent
     try expectText(&ed, "x = 1 # FIXME: later\n    # TODO: now");

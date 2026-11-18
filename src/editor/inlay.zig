@@ -172,7 +172,7 @@ pub fn inlayHintsDue(ed: *const Editor) bool {
     return false;
 }
 
-/// Writes a todo tag as a comment (`SPC l t`, insert-mode `<C-t>`): a blank
+/// Writes a todo tag as a comment (`SPC l t`, normal-mode `<C-t>`): a blank
 /// line becomes the comment, a line of code gets it at its end. Then insert
 /// mode, after the tag.
 pub fn writeTodoTag(ed: *Editor, tag: []const u8) !void {

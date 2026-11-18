@@ -35,6 +35,8 @@ comptime {
     _ = @import("sql.zig");
     _ = @import("git/patch.zig");
     _ = @import("editor/compare.zig");
+    _ = @import("input/digraphs.zig");
+    _ = @import("tests/insert_keys.zig");
     _ = @import("ZigCheck.zig");
     _ = @import("Replace.zig");
     _ = @import("ai/Chat.zig");

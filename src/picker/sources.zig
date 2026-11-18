@@ -1778,7 +1778,7 @@ const Projects = struct {
     }
 };
 
-/// `SPC l t` (insert mode: `<C-t>`): a todo tag to write as a comment here.
+/// `SPC l t` (normal mode: `<C-t>`): a todo tag to write as a comment here.
 const TodoTags = struct {
     pub const title = "Todo tag";
     pub const prefix: ?u8 = null;

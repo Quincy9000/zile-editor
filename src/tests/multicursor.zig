@@ -100,7 +100,7 @@ test "clipboard: p is the registers' alone, Ctrl+Shift+V pastes the clipboard" {
     // Over a selection, and while typing.
     try ed.feed("ggve<C-S-v>");
     try expectText(&ed, "CLIP \none three");
-    try ed.feed("A<C-v>!<Esc>");
+    try ed.feed("A<C-S-v>!<Esc>"); // (insert mode's Ctrl-v is Vim's literal key)
     try expectText(&ed, "CLIP CLIP!\none three");
     // A yank is copied out.
     try ed.feed("j0yiw");

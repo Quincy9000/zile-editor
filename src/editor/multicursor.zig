@@ -18,7 +18,8 @@ const Cursor = Editor.Cursor;
 /// After each key: replays the command once it is complete.
 pub fn multiAfterKey(ed: *Editor) void {
     if (ed.replaying) return;
-    const done = ed.mode == .insert or ed.isIdle();
+    // (Ctrl-v and Ctrl-k in insert mode take more keys first.)
+    const done = (ed.mode == .insert and ed.insert_pending == .none) or ed.isIdle();
     if (!done) return;
     defer ed.multi_keys.clearRetainingCapacity();
     if (ed.multi_once or ed.mode == .picker or ed.mode == .picker_normal or ed.cursors.items.len == 0) return;
@@ -54,6 +55,7 @@ pub fn replayAtCursors(ed: *Editor, keys_: []const KeyEvent) void {
         ed.register = null;
         ed.awaiting_register = false;
         ed.awaiting_char = null;
+        ed.insert_pending = .none;
         for (keys_) |k| ed.handleKeyInner(k) catch {
             ed.resetCommand();
             break;
