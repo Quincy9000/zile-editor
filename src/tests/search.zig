@@ -26,6 +26,7 @@ test "replace across the project: from the grep picker, skipping a line and a fi
 
     var ed = try testEditor("");
     defer ed.deinit();
+    ed.options.autosave = true; // (the files it changes are written as it leaves them)
     ed.next_picker_root = dir;
     try ed.openPicker(.grep, "foo");
     try ed.feed("<C-r>");

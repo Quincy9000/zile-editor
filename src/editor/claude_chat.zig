@@ -9,6 +9,9 @@
 const std = @import("std");
 const Io = std.Io;
 const Chat = @import("../ai/Chat.zig");
+const fill = @import("../ai/fill.zig");
+const ai_fill = @import("ai_fill.zig");
+const settings = @import("../config/settings.zig");
 const Buffer = @import("../core/Buffer.zig");
 const Syntax = @import("../syntax/Syntax.zig");
 const Editor = @import("../Editor.zig");
@@ -64,11 +67,46 @@ pub const Panel = struct {
 const ask_toast: u64 = 0x636c617564_61736b;
 
 fn chat(ed: *Editor) !*Chat {
-    if (ed.chat) |c| return c;
-    ed.chat = try Chat.create(ed.gpa, ed.io, project_ops.projectRoot(ed), ed.wake_fn);
-    // (The tests never start a real CLI.)
-    if (@import("builtin").is_test) ed.chat.?.offline = true;
-    return ed.chat.?;
+    if (ed.chat == null) {
+        ed.chat = try Chat.create(ed.gpa, ed.io, project_ops.projectRoot(ed), ed.wake_fn);
+        ed.chat.?.environ = ed.environ;
+        ed.chat.?.backend = ed.options.chat_backend;
+        // (The tests never start a real CLI.)
+        if (@import("builtin").is_test) ed.chat.?.offline = true;
+    }
+    const c = ed.chat.?;
+    // config.zon changed who answers (saved from zile, or `SPC a d`).
+    _ = c.setBackend(ed.options.chat_backend);
+    return c;
+}
+
+/// Whether `b` can answer: Claude always (as the CLI is signed in), a
+/// service with its key in zile's environment.
+pub fn backendAvailable(ed: *const Editor, b: Chat.Backend) bool {
+    _ = ed;
+    const svc = b.service() orelse return true;
+    return ai_fill.envKey(svc) != null;
+}
+
+/// `SPC a d`'s choice: who answers in the conversation from now on (a new
+/// one), remembered in config.zon as `chatbackend`.
+pub fn setBackend(ed: *Editor, b: Chat.Backend) void {
+    if (!backendAvailable(ed, b)) {
+        return ed.setMessage(.err, "{s} needs {s} in the environment zile starts in", .{ b.title(), fill.keyName(b.service().?) });
+    }
+    const changed = ed.options.chat_backend != b;
+    ed.options.chat_backend = b;
+    if (ed.chat) |c| _ = c.setBackend(b);
+    const value = switch (b) {
+        inline else => |tag| "." ++ @tagName(tag),
+    };
+    const what = if (changed) "answers from here on (a new conversation)" else "answers";
+    if (settings.store(ed, "chatbackend", value)) |_| {
+        ed.setMessage(.info, "{s} {s}, kept in config.zon", .{ b.title(), what });
+    } else |err| switch (err) {
+        error.ConfigHasAMistake => ed.setMessage(.err, "{s} {s} until zile closes: config.zon has a mistake in it (SPC o)", .{ b.title(), what }),
+        else => ed.setMessage(.err, "{s} {s} until zile closes: config.zon couldn't be written ({s})", .{ b.title(), what, @errorName(err) }),
+    }
 }
 
 /// The CLI, started if it wasn't (nothing is said to Claude by that): its
@@ -249,7 +287,10 @@ pub fn tell(ed: *Editor, text: []const u8, about: ?About) !void {
     try show(ed, false);
     // What is said, and the answer to it, are what to look at.
     ed.chat_panel.follow = true;
-    try c.send(text, told);
+    c.send(text, told) catch |err| switch (err) {
+        error.NoApiKey => return ed.setMessage(.err, "{s} needs {s} in the environment zile starts in (SPC a d: who answers)", .{ c.backend.title(), fill.keyName(c.backend.service().?) }),
+        else => return err,
+    };
     tick(ed);
 }
 

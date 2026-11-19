@@ -52,6 +52,7 @@ const prompts = @import("editor/prompts.zig");
 const git_ops = @import("editor/git_ops.zig");
 const snippet_ops = @import("editor/snippet_ops.zig");
 const ai_ghost = @import("editor/ai_ghost.zig");
+const ai_fill = @import("editor/ai_fill.zig");
 const lsp_actions = @import("editor/lsp_actions.zig");
 const sql_ops = @import("editor/sql_ops.zig");
 const completion_ops = @import("editor/completion_ops.zig");
@@ -154,6 +155,7 @@ const base = [_]Command{
     .{ .name = "goto_definition", .doc = "Go to definition", .run = lspRequest(.definition) },
     .{ .name = "find_references", .doc = "Find references", .run = lspRequest(.references) },
     .{ .name = "hover", .doc = "Show documentation", .run = lspRequest(.hover) },
+    .{ .name = "yank_type", .doc = "Yank the type of what the cursor is on (and show it)", .run = lspRequest(.yank_type) },
     .{ .name = "goto_implementation", .doc = "Go to implementations", .run = lspRequest(.implementation) },
     .{ .name = "code_action", .doc = "Code actions (fixes, refactors)", .run = lspRequest(.code_actions), .once = true },
     .{ .name = "workspace_symbols", .doc = "Symbols in the project", .run = lspRequest(.workspace_symbols), .once = true },
@@ -300,6 +302,8 @@ const base = [_]Command{
     .{ .name = "surround_visual", .doc = "Surround selection", .run = surroundStep(.visual), .takes_char = true, .repeat = true },
     .{ .name = "format_buffer", .doc = "Format (file, or the selected lines)", .run = formatCmd, .once = true },
     .{ .name = "toggle_ai_complete", .doc = "AI completion", .run = toggleAi },
+    .{ .name = "ai_fill", .doc = "AI: fill in at the cursor (again: stop asking)", .run = aiFill, .once = true },
+    .{ .name = "ai_backend", .doc = "AI: who fills in (the local model, Anthropic, DeepSeek)", .run = openPicker(.ai_backends), .once = true },
     .{ .name = "toggle_format_on_save", .doc = "Format on save", .run = toggle("format_on_save", "format on save") },
     .{ .name = "zoom_in", .doc = "Bigger text", .run = zoom(.in), .once = true },
     .{ .name = "zoom_out", .doc = "Smaller text", .run = zoom(.out), .once = true },
@@ -312,6 +316,7 @@ const base = [_]Command{
     .{ .name = "cursor_all_matches", .doc = "Cursors on all matches", .run = cursorCmd(.all), .once = true },
     .{ .name = "cursor_down", .doc = "Cursor + move down", .run = cursorCmd(.down), .once = true },
     .{ .name = "cursor_up", .doc = "Cursor + move up", .run = cursorCmd(.up), .once = true },
+    .{ .name = "cursor_place", .doc = "Place a cursor here (they stay put while you move; an edit uses them)", .run = cursorCmd(.place), .once = true },
     .{ .name = "cursor_undo", .doc = "Remove last cursor", .run = cursorCmd(.undo), .once = true },
     .{ .name = "cursor_clear", .doc = "Remove all cursors", .run = cursorCmd(.clear), .once = true },
     .{ .name = "cursors_line_starts", .doc = "Cursors at line starts", .run = cursorCmd(.line_starts), .once = true },
@@ -359,6 +364,7 @@ const base = [_]Command{
     .{ .name = "claude_rewrite", .doc = "Claude: rewrite the selection in place", .run = claudeCmd(.rewrite), .once = true, .needs = "claude" },
     .{ .name = "claude_stop", .doc = "Claude: stop what it is doing", .run = claudeCmd(.stop), .once = true },
     .{ .name = "claude_new", .doc = "Claude: a new conversation", .run = claudeCmd(.new), .once = true, .needs = "claude" },
+    .{ .name = "chat_backend", .doc = "Claude: who answers in the conversation (Claude, DeepSeek)", .run = openPicker(.chat_backends), .once = true, .needs = "claude" },
     .{ .name = "claude_panel", .doc = "Claude Code's own terminal", .run = claudeCmd(.panel), .once = true, .needs = "claude" },
     .{ .name = "claude_send", .doc = "Send selection/file to Claude", .run = claudeCmd(.send), .once = true, .needs = "claude" },
     .{ .name = "claude_ask", .doc = "Tell Claude something (a box; Enter sends)", .run = claudeCmd(.ask), .once = true, .needs = "claude" },
@@ -703,11 +709,29 @@ fn textObject(comptime kind: ObjectKind, comptime scope: textobjects.Scope, comp
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             const pos = ed.view.cursor;
-            const r = switch (which) {
+            var r = switch (which) {
                 .here => objectAt(ed, kind, scope, pos, c.count),
                 .next => seekObject(ed, kind, scope, pos, true),
                 .previous => seekObject(ed, kind, scope, pos, false),
-            } orelse return fail(ed);
+            } orelse {
+                // `ciw` on an empty line has no word to change, and types
+                // there all the same (not: stays in normal mode, where what
+                // is typed next would be commands).
+                if (comptime std.meta.activeTag(kind) == .word and which == .here) {
+                    const t = ed.text();
+                    if (ed.pendingOperator() == .change and t.lineLen(t.lineOf(pos)) == 0) return ed.applyPending(.{ .start = pos, .end = pos });
+                }
+                return fail(ed);
+            };
+            // An element with its lines to itself is taken as those lines by
+            // y, d and c (`yat`, then `p`, puts it below, indented as it was;
+            // `dat` leaves no empty line). One that shares a line stays text.
+            if (comptime std.meta.activeTag(kind) == .tag and scope == .around) {
+                if (ed.mode == .operator) if (ed.op) |op| switch (op.op) {
+                    .yank, .delete, .change => r = wholeLines(ed.text(), r),
+                    else => {},
+                };
+            }
             switch (ed.mode) {
                 .operator => try ed.applyPending(r),
                 .visual => code_motion.selectRange(ed, r),
@@ -715,6 +739,17 @@ fn textObject(comptime kind: ObjectKind, comptime scope: textobjects.Scope, comp
             }
         }
     }.run;
+}
+
+/// `r` as whole lines when it has its lines to itself: it starts at its
+/// line's first character and nothing but blanks follows it.
+fn wholeLines(t: *const Text, r: textobjects.Range) textobjects.Range {
+    if (r.linewise or r.end <= r.start) return r;
+    const first = t.lineOf(r.start);
+    const last = t.lineOf(r.end - 1);
+    if (r.start != motions.firstNonBlank(t, first)) return r;
+    for (t.slice(r.end, t.lineEnd(last))) |b| if (b != ' ' and b != '\t') return r;
+    return operators.linesRange(t, first, last);
 }
 
 /// `g[` / `g]` + an object's key: a motion to its first / last character.
@@ -1012,7 +1047,25 @@ fn wordMotion(comptime which: enum { forward, backward, end }, comptime big: boo
                 return finishMotion(ed, from, to, .inclusive, .reset);
             }
             var to = from;
-            for (0..c.count) |_| to = step(t, to, big);
+            for (0..c.count) |i| {
+                const next = step(t, to, big);
+                // After an operator, the last `w` doesn't go on to the next
+                // line: `dw` on a line's last word takes it (and the blanks
+                // after it), not the line break and what follows. An empty
+                // line is the exception: it is taken whole.
+                if (which == .forward and ed.mode == .operator and i + 1 == c.count and t.lineOf(next) > t.lineOf(to)) {
+                    const line = t.lineOf(to);
+                    if (t.lineStart(line) == t.lineEnd(line)) {
+                        // Begun in its line's indentation: whole lines, as
+                        // any motion that ends at a line's start is.
+                        const first = t.lineOf(from);
+                        if (from <= motions.firstNonBlank(t, first)) return ed.applyPending(operators.linesRange(t, first, line));
+                        return ed.applyPending(.{ .start = from, .end = to });
+                    }
+                    return finishMotion(ed, from, t.lineEnd(line), kind, .reset);
+                }
+                to = next;
+            }
             try finishMotion(ed, from, to, kind, .reset);
         }
     }.run;
@@ -1208,13 +1261,19 @@ fn lastLine(ed: *Editor, _: usize, c: Context) ?usize {
 fn findChar(comptime forward: bool, comptime till: bool) Target {
     return struct {
         fn target(ed: *Editor, from: usize, c: Context) ?usize {
-            const f = motions.Find.init(c.char, forward, till) orelse return null;
+            var f = motions.Find.init(c.char, forward, till) orelse return null;
+            // After an operator f/t/F/T are vim's: the character as typed,
+            // on the cursor's line and nowhere else (`dfx` with no x on the
+            // line deletes nothing).
+            if (ed.mode == .operator) {
+                f.fold = false;
+                ed.last_find = f;
+                return motions.findInLine(ed.text(), from, f, c.count, false);
+            }
             ed.last_find = f;
             ed.find_shown = true;
-            if (ed.mode != .operator) {
-                ed.find_dot = true;
-                ed.snipe_dot = false;
-            }
+            ed.find_dot = true;
+            ed.snipe_dot = false;
             // `f` as a motion looks along the line from its start, wherever
             // the cursor is, so one key finds the first match and `;` walks
             // on to the rest. (After an operator, `f` still starts at the
@@ -1248,7 +1307,8 @@ fn repeatFind(comptime reverse: bool) Handler {
             var f = ed.last_find orelse return fail(ed);
             if (reverse) f.forward = !f.forward;
             const from = ed.view.cursor;
-            const to = motions.findAcross(ed.text(), from, f, c.count, true) orelse return fail(ed);
+            // (After an operator: on the line only, as `f` is there.)
+            const to = (if (ed.mode == .operator) motions.findInLine(ed.text(), from, f, c.count, true) else motions.findAcross(ed.text(), from, f, c.count, true)) orelse return fail(ed);
             ed.find_shown = true;
             ed.find_dot = true;
             ed.snipe_dot = false;
@@ -2188,9 +2248,18 @@ fn insertNewline(c: Context) !void {
 fn aiAccept(comptime part: ai_ghost.AiPart) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
+            // A completion asked for by hand first, else the one that
+            // came while typing.
+            if (try ai_fill.accept(c.ed, part)) return;
             _ = try ai_ghost.acceptAiSuggestion(c.ed, part);
         }
     }.run;
+}
+
+/// `SPC a f`, `<A-f>`: a model writes what belongs at the cursor, shown
+/// to take or drop.
+fn aiFill(c: Context) !void {
+    try ai_fill.press(c.ed);
 }
 
 /// <Tab> without a completion popup: the next placeholder, else a tab.
@@ -2843,7 +2912,7 @@ fn searchWord(comptime forward: bool) Handler {
 // ---------------------------------------------------------------------------
 // Language server
 
-fn lspRequest(comptime what: enum { definition, references, hover, implementation, code_actions, workspace_symbols }) Handler {
+fn lspRequest(comptime what: enum { definition, references, hover, yank_type, implementation, code_actions, workspace_symbols }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
             const l = lsp_ops.languageServer(c.ed) orelse return;
@@ -2851,6 +2920,7 @@ fn lspRequest(comptime what: enum { definition, references, hover, implementatio
                 .definition => try l.requestDefinition(c.ed),
                 .references => try l.requestReferences(c.ed),
                 .hover => try l.requestHover(c.ed),
+                .yank_type => try l.requestTypeYank(c.ed),
                 .implementation => try l.requestImplementation(c.ed),
                 .code_actions => {
                     // The cursor's line, or the selected lines.
@@ -2863,7 +2933,7 @@ fn lspRequest(comptime what: enum { definition, references, hover, implementatio
                         last = t.lineOf(@max(ed.view.anchor, ed.view.cursor));
                         code_motion.exitVisual(ed);
                     }
-                    try l.requestCodeActions(ed, first, last);
+                    try lsp_actions.requestCodeActions(ed, first, last);
                 },
                 .workspace_symbols => try lsp_actions.showWorkspaceSymbols(c.ed),
             }
@@ -2898,7 +2968,7 @@ fn clearSearchHighlight(c: Context) !void {
     }
 }
 
-fn cursorCmd(comptime action: enum { next, previous, skip, all, down, up, undo, clear, line_starts, line_ends, insert_starts, insert_ends, from_prompt }) Handler {
+fn cursorCmd(comptime action: enum { next, previous, skip, all, down, up, place, undo, clear, line_starts, line_ends, insert_starts, insert_ends, from_prompt }) Handler {
     return &struct {
         const move = verticalRow(if (action == .up) -1 else 1);
         fn run(c: Context) anyerror!void {
@@ -2915,6 +2985,7 @@ fn cursorCmd(comptime action: enum { next, previous, skip, all, down, up, undo, 
                     }
                     ed.setMessage(.info, "{d} cursors", .{ed.cursors.items.len + 1});
                 },
+                .place => try multicursor.placeCursor(ed),
                 .undo => multicursor.removeLastCursor(ed),
                 .clear => multicursor.clearCursors(ed),
                 .line_starts => try multicursor.cursorsOnLines(ed, false, false),

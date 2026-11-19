@@ -265,6 +265,7 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ NV, "qa", "cursor_all_matches" },
     .{ N, "qj", "cursor_down" },
     .{ N, "qk", "cursor_up" },
+    .{ N, "qp", "cursor_place" },
     .{ NV, "qu", "cursor_undo" },
     .{ NV, "qq", "cursor_clear" },
     .{ V, "qI", "cursors_line_starts" },
@@ -484,6 +485,7 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
     .{ I, "<A-;>", "ai_accept" },
     .{ I, "<A-l>", "ai_accept_line" },
     .{ I, "<A-Right>", "ai_accept_char" },
+    .{ I, "<A-f>", "ai_fill" },
     // Ctrl-y: the completion that is open, else the character above (Vim's).
     .{ I, "<C-y>", "insert_above" },
     .{ I, "<C-e>", "insert_below" },

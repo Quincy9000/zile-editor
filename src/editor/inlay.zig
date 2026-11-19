@@ -18,7 +18,7 @@ pub const LineHint = struct {
     text: []const u8,
 
     pub fn cells(h: LineHint) usize {
-        return std.unicode.utf8CountCodepoints(h.text) catch h.text.len;
+        return @import("../core/width.zig").ofText(h.text);
     }
 };
 

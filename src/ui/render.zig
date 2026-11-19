@@ -1,6 +1,7 @@
 //! Draws editor state. Reads `Editor`, never mutates it.
 
 const std = @import("std");
+const char_width = @import("../core/width.zig");
 const debugging = @import("../debugging.zig");
 const rl = @import("raylib");
 const Editor = @import("../Editor.zig");
@@ -203,7 +204,7 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
 
 
 pub fn cells(s: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(s) catch s.len;
+    return char_width.ofText(s);
 }
 
 fn keyCells(k: keys.KeyEvent) usize {
@@ -780,7 +781,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         var hp_i: usize = 0;
         // An AI suggestion at the cursor: its first line goes inline (the
         // rest of the line moves right), more lines are drawn below.
-        const ghost: ?[]const u8 = if (focused and is_current) ai_ghost.aiSuggestionHere(ed) else null;
+        const ghost: ?[]const u8 = if (focused and is_current) Editor.ai_fill.previewHere(ed) orelse ai_ghost.aiSuggestionHere(ed) else null;
         const ghost_at = if (ghost != null) v.cursor - ls else bytes.len + 1;
         const ghost_first = if (ghost) |g| std.mem.sliceTo(g, '\n') else "";
         const ghost_cells = cells(ghost_first);
@@ -793,7 +794,7 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
         while (true) {
             const offset = it.i;
             const cp = it.next() orelse break;
-            const next_col = if (cp == '\t') motions.nextTabStop(col, tab_width) else col + 1;
+            const next_col = if (cp == '\t') motions.nextTabStop(col, tab_width) else col + char_width.of(cp);
             defer col = next_col;
             defer ci += 1;
             const shift: usize = (if (offset >= ghost_at) ghost_cells else 0) + inlay.hintShift(hints, offset);
@@ -1221,7 +1222,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
     var w: std.Io.Writer = .fixed(&buf);
     writeRight(ed, &w) catch {};
     const right = w.buffered();
-    const right_x = l.width - @as(f32, @floatFromInt(std.unicode.utf8CountCodepoints(right) catch right.len + 1)) * font.cell_w;
+    const right_x = l.width - @as(f32, @floatFromInt(char_width.ofText(right) + 1)) * font.cell_w;
     _ = font.drawText(right, right_x, y, theme.status_dim);
 }
 
@@ -1243,7 +1244,13 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
         .working => try w.writeAll("Claude working…   "),
         .asking => try w.writeAll("Claude asks: SPC a y   "),
     };
-    if (ed.cursors.items.len > 0) try w.print("{d} cursors   ", .{ed.cursors.items.len + 1});
+    if (ed.cursors_placing) {
+        try w.print("placing: {d} cursors (qp here)   ", .{ed.cursors.items.len});
+    } else if (ed.cursors.items.len > 0) try w.print("{d} cursors   ", .{ed.cursors.items.len + 1});
+    // A completion asked for by hand: who is asked, or whose is on show.
+    var fill_buf: [64]u8 = undefined;
+    const filling = Editor.ai_fill.indicator(ed, &fill_buf);
+    if (filling.len > 0) try w.print("{s}   ", .{filling});
     // Insert mode's Ctrl-v / Ctrl-k waiting for its keys.
     var pending_buf: [16]u8 = undefined;
     const waiting = Editor.insert_keys.indicator(ed, &pending_buf);
@@ -1586,7 +1593,9 @@ fn drawSignature(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout)
 
 fn drawCompletion(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
     const c = completion_ops.completionShown(ed) orelse return;
-    const at = cellPos(ed, font, l, c.word_start) orelse return;
+    // Under the name being typed (not the `.` before it, when the server's
+    // edit starts there).
+    const at = cellPos(ed, font, l, @min(c.word_start + c.lead, ed.view.cursor)) orelse return;
     const max_rows = 10;
     const rows = @min(c.shown.items.len, max_rows);
     // Scroll so the selection is visible.
@@ -1679,7 +1688,7 @@ fn drawGhostRow(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, 
     var col: usize = 0;
     const left = ed.view.left;
     while (it.next()) |cp| {
-        const next_col = if (cp == '\t') motions.nextTabStop(col, ed.options.tab_width) else col + 1;
+        const next_col = if (cp == '\t') motions.nextTabStop(col, ed.options.tab_width) else col + char_width.of(cp);
         defer col = next_col;
         if (next_col <= left) continue;
         if (col >= left + l.cols) break;

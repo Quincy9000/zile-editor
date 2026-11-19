@@ -50,6 +50,8 @@ can_inlay: bool = false,
 can_lens: bool = false,
 can_resolve_lens: bool = false,
 can_resolve_action: bool = false,
+can_code_action: bool = false,
+can_resolve_completion: bool = false,
 /// The latest workspace-symbol request: answers to older ones are stale.
 ws_request: i64 = -1,
 sig_retriggers: std.ArrayList(u8) = .empty,
@@ -63,6 +65,10 @@ diagnostics: std.StringArrayHashMapUnmanaged([]Diagnostic) = .empty,
 /// What the server said about the file as it is sent, and about the real
 /// text when that differs (a shadow document); `diagnostics` is both, merged.
 raw_main: std.StringArrayHashMapUnmanaged([]Diagnostic) = .empty,
+/// Each document's diagnostics as the server last sent them (JSON, by
+/// uri): handed back whole with a code-action request, since servers find
+/// their fixes by a diagnostic's `code` and `data`, which we don't keep.
+diag_json: std.StringArrayHashMapUnmanaged([]u8) = .empty,
 raw_shadow: std.StringArrayHashMapUnmanaged([]Diagnostic) = .empty,
 
 const Doc = struct {
@@ -98,9 +104,17 @@ const Pending = union(enum) {
     definition,
     references,
     hover,
+    /// `SPC l y`: the hover is shown, and its type yanked.
+    yank_type,
     rename,
     symbols,
     completion: struct { buffer: *Buffer, word_start: usize },
+    /// A completion that was taken, sent back for the edits that go with
+    /// it (its import line).
+    completion_resolve: *Buffer,
+    /// The selected completion, sent back for its signature and
+    /// documentation: item `index` of list `serial`.
+    completion_docs: struct { serial: u64, index: u32 },
     signature: *Buffer,
     format: struct { buffer: *Buffer, then_save: bool },
     implementation,
@@ -320,14 +334,33 @@ pub fn start(ed: *Editor, index: usize, root_path: []const u8, database_url: ?[]
                 .codeLens = .{ .dynamicRegistration = false },
                 .synchronization = .{ .didSave = true },
                 // Snippets: function arguments arrive as placeholders.
-                .completion = .{ .completionItem = .{ .snippetSupport = true } },
+                // Where a name is from (`labelDetails`), and the import that
+                // comes with taking it (asked for when it is taken).
+                .completion = .{ .completionItem = .{
+                    .snippetSupport = true,
+                    .labelDetailsSupport = true,
+                    .resolveSupport = .{ .properties = &[_][]const u8{"additionalTextEdits"} },
+                } },
                 .signatureHelp = .{ .signatureInformation = .{
                     .documentationFormat = &[_][]const u8{ "plaintext", "markdown" },
                     .parameterInformation = .{ .labelOffsetSupport = true },
                     .activeParameterSupport = true,
                 } },
                 .hover = .{ .contentFormat = &[_][]const u8{ "plaintext", "markdown" } },
-                .publishDiagnostics = .{ .relatedInformation = false },
+                .publishDiagnostics = .{ .relatedInformation = false, .dataSupport = true },
+                // Actions come as actions (with their kind, and whether one
+                // is the fix to prefer), their edits asked for when picked.
+                .codeAction = .{
+                    .dynamicRegistration = false,
+                    .isPreferredSupport = true,
+                    .dataSupport = true,
+                    .resolveSupport = .{ .properties = &[_][]const u8{"edit"} },
+                    .codeActionLiteralSupport = .{ .codeActionKind = .{ .valueSet = &[_][]const u8{
+                        "",                "quickfix",        "refactor",               "refactor.extract", "refactor.inline",
+                        "refactor.rewrite", "refactor.move", "source",                 "source.organizeImports",
+                        "source.fixAll",
+                    } } },
+                },
                 .documentSymbol = .{ .hierarchicalDocumentSymbolSupport = true },
             },
         },
@@ -384,6 +417,11 @@ pub fn deinit(l: *Lsp) void {
         }
         m.deinit(gpa);
     }
+    for (l.diag_json.keys(), l.diag_json.values()) |k, v| {
+        gpa.free(k);
+        gpa.free(v);
+    }
+    l.diag_json.deinit(gpa);
     gpa.destroy(l);
 }
 
@@ -649,27 +687,31 @@ pub fn requestImplementation(l: *Lsp, ed: *Editor) !void {
 
 /// Fixes and refactors for lines `first..last` (inclusive) of the buffer.
 pub fn requestCodeActions(l: *Lsp, ed: *Editor, first: usize, last: usize) !void {
-    const uri = l.docUri(ed) orelse return;
+    const doc = l.docs.get(ed.buffer) orelse return error.NotOpen;
     try l.sync(ed);
     const t = ed.text();
     const Pos = struct { line: usize, character: usize };
     const Range = struct { start: Pos, end: Pos };
-    // The diagnostics on those lines go along: fixes are offered for them.
-    const Diag = struct { range: Range, severity: u8, message: []const u8 };
-    var diags: std.ArrayList(Diag) = .empty;
-    defer diags.deinit(l.gpa);
-    for (lsp_ops.diagnostics(ed, ed.buffer)) |d| {
-        if (d.end_line < first or d.line > last) continue;
-        try diags.append(l.gpa, .{
-            .range = .{ .start = .{ .line = d.line, .character = d.col }, .end = .{ .line = d.end_line, .character = d.end_col } },
-            .severity = @intFromEnum(d.severity),
-            .message = d.message,
-        });
+    // The diagnostics on those lines go along, as the server sent them
+    // (with their `code` and `data`): its fixes are found by those.
+    var arena: std.heap.ArenaAllocator = .init(l.gpa);
+    defer arena.deinit();
+    var diags: std.json.Array = .init(arena.allocator());
+    if (l.diag_json.get(doc.uri)) |json| {
+        const all = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{}) catch std.json.Value.null;
+        if (all == .array) for (all.array.items) |d| {
+            const range = field(d, "range");
+            const from = int(field(field(range, "start"), "line")) orelse continue;
+            const to = int(field(field(range, "end"), "line")) orelse from;
+            if (to < first or from > last) continue;
+            try diags.append(d);
+        };
     }
     const id = try l.client.request("textDocument/codeAction", .{
-        .textDocument = .{ .uri = uri },
+        .textDocument = .{ .uri = doc.uri },
         .range = Range{ .start = .{ .line = first, .character = 0 }, .end = .{ .line = last, .character = t.lineLen(@min(last, t.lineCount() - 1)) } },
-        .context = .{ .diagnostics = diags.items },
+        // (1: asked for, not offered in passing.)
+        .context = .{ .diagnostics = std.json.Value{ .array = diags }, .triggerKind = 1 },
     });
     try l.pending.put(l.gpa, id, .code_actions);
 }
@@ -752,6 +794,13 @@ pub fn requestHover(l: *Lsp, ed: *Editor) !void {
     try l.pending.put(l.gpa, id, .hover);
 }
 
+/// `SPC l y`: the hover of what the cursor is on, for the type in it.
+pub fn requestTypeYank(l: *Lsp, ed: *Editor) !void {
+    const uri = l.docUri(ed) orelse return;
+    const id = try l.client.request("textDocument/hover", .{ .textDocument = .{ .uri = uri }, .position = position(ed) });
+    try l.pending.put(l.gpa, id, .yank_type);
+}
+
 pub fn requestSymbols(l: *Lsp, ed: *Editor) !void {
     const uri = l.docUri(ed) orelse return;
     try l.sync(ed);
@@ -803,6 +852,32 @@ pub fn requestCompletion(l: *Lsp, ed: *Editor, word_start: usize) !void {
     try l.sync(ed);
     const id = try l.client.request("textDocument/completion", .{ .textDocument = .{ .uri = doc.uri }, .position = position(ed) });
     try l.pending.put(l.gpa, id, .{ .completion = .{ .buffer = ed.buffer, .word_start = word_start } });
+}
+
+/// The selected completion (`item`, as the server sent it) is asked about:
+/// its signature and documentation, for beside the list.
+pub fn requestCompletionDocs(l: *Lsp, item: []const u8, serial: u64, index: u32) !void {
+    if (!l.can_resolve_completion) return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, l.gpa, item, .{});
+    defer parsed.deinit();
+    const id = try l.client.request("completionItem/resolve", parsed.value);
+    try l.pending.put(l.gpa, id, .{ .completion_docs = .{ .serial = serial, .index = index } });
+}
+
+/// A completion was taken that brings something with it: its edits are
+/// applied if it has them, else the server is asked for them (`item` is the
+/// completion item as it sent it).
+pub fn completionTaken(l: *Lsp, ed: *Editor, item: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, l.gpa, item, .{});
+    defer parsed.deinit();
+    if (field(parsed.value, "additionalTextEdits")) |edits| {
+        if (edits == .array and edits.array.items.len > 0) return completion_ops.applyAdditionalEdits(ed, edits);
+    }
+    if (!l.can_resolve_completion) return;
+    // (After our edit: the server answers about the text as it is now.)
+    try l.sync(ed);
+    const id = try l.client.request("completionItem/resolve", parsed.value);
+    try l.pending.put(l.gpa, id, .{ .completion_resolve = ed.buffer });
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +932,10 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             req.inlay_hints.buffer.hint_version = req.inlay_hints.version;
             return;
         }
+        // (More about a suggestion that the server won't give: no matter.)
+        if (req == .completion_docs or req == .completion_resolve) return;
+        // One server with no answer doesn't hold back the others' actions.
+        if (req == .code_actions) return lsp_actions.codeActionsArrived(ed);
         if (req != .completion) ed.setMessage(.err, "lsp: {s}", .{str(field(e, "message")) orelse "request failed"});
         // Formatting before a save failed: save anyway.
         if (req == .format and req.format.then_save) file_ops.saveBufferNow(ed, req.format.buffer);
@@ -887,6 +966,8 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             l.can_lens = field(caps, "codeLensProvider") != null;
             l.can_resolve_lens = provides(field(field(caps, "codeLensProvider"), "resolveProvider"));
             l.can_resolve_action = provides(field(field(caps, "codeActionProvider"), "resolveProvider"));
+            l.can_code_action = field(caps, "codeActionProvider") != null and provides(field(caps, "codeActionProvider"));
+            l.can_resolve_completion = provides(field(field(caps, "completionProvider"), "resolveProvider"));
             l.can_format_range = provides(field(caps, "documentRangeFormattingProvider"));
             const sig = field(caps, "signatureHelpProvider");
             inline for (.{ .{ "triggerCharacters", &l.sig_triggers }, .{ "retriggerCharacters", &l.sig_retriggers } }) |f| {
@@ -927,15 +1008,15 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             try inlay.takeInlayHints(ed, ih.buffer, &hints, ih.first, ih.last, ih.version);
         },
         .code_actions => {
-            lsp_actions.clearCodeActions(ed);
             if (result == .array) for (result.array.items) |action| {
                 const title = str(field(action, "title")) orelse continue;
                 // Kept as the server wrote it, to hand back when picked.
                 const json = try std.json.Stringify.valueAlloc(l.gpa, action, .{});
                 errdefer l.gpa.free(json);
-                try lsp_actions.addCodeAction(ed, title, str(field(action, "kind")) orelse "", json);
+                const preferred = if (field(action, "isPreferred")) |p| p == .bool and p.bool else false;
+                try lsp_actions.addCodeAction(ed, l, title, str(field(action, "kind")) orelse "", preferred, json);
             };
-            try lsp_actions.showCodeActions(ed);
+            try lsp_actions.codeActionsArrived(ed);
         },
         .code_action_resolve => try l.finishCodeAction(ed, result),
         .save_action => {
@@ -1013,7 +1094,17 @@ fn dispatch(l: *Lsp, ed: *Editor, msg: std.json.Value) !void {
             const text = hoverText(result) orelse return ed.setMessage(.info, "no hover information", .{});
             try lsp_actions.showHover(ed, text);
         },
+        .yank_type => {
+            const text = hoverText(result) orelse return ed.setMessage(.info, "the language server says nothing about this", .{});
+            try lsp_actions.yankType(ed, text);
+        },
         .completion => |cp| try completion_ops.showServerCompletion(ed, cp.buffer, cp.word_start, result),
+        .completion_resolve => |b| if (b == ed.buffer) try completion_ops.applyAdditionalEdits(ed, field(result, "additionalTextEdits") orelse .null),
+        .completion_docs => |cd| {
+            // A string, or `{kind, value}`.
+            const doc = if (field(result, "documentation")) |d| (if (d == .string) d.string else str(field(d, "value")) orelse "") else "";
+            try completion_ops.docsArrived(ed, cd.serial, cd.index, str(field(result, "detail")) orelse "", doc);
+        },
         .signature => |b| try signature_help.showSignature(ed, b, result),
         .format => |f| {
             var edits: std.ArrayList(TextEdit) = .empty;
@@ -1188,6 +1279,20 @@ fn onDiagnostics(l: *Lsp, ed: *Editor, params: std.json.Value) !void {
         for (list.items) |d| l.gpa.free(d.message);
         list.deinit(l.gpa);
     }
+    // As sent, for the code actions asked about them later.
+    if (field(params, "diagnostics")) |arr| if (arr == .array) keep: {
+        const json = std.json.Stringify.valueAlloc(l.gpa, arr, .{}) catch break :keep;
+        const gop = l.diag_json.getOrPut(l.gpa, uri) catch {
+            l.gpa.free(json);
+            break :keep;
+        };
+        if (gop.found_existing) l.gpa.free(gop.value_ptr.*) else gop.key_ptr.* = l.gpa.dupe(u8, uri) catch {
+            _ = l.diag_json.swapRemove(uri);
+            l.gpa.free(json);
+            break :keep;
+        };
+        gop.value_ptr.* = json;
+    };
     if (field(params, "diagnostics")) |arr| if (arr == .array) for (arr.array.items) |d| {
         const range = field(d, "range") orelse continue;
         const from = field(range, "start") orelse continue;

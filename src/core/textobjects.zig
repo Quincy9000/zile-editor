@@ -45,21 +45,27 @@ pub fn word(t: *const Text, pos: usize, scope: Scope, big: bool, count: usize) ?
     const c0 = classOf(t.byteAt(p), big);
     while (start > ls and classOf(t.byteAt(start - 1), big) == c0) start -= 1;
     var end = run(t, p, le, big);
-    // Each further count adds the next run (word or whitespace).
+    if (scope == .inner) {
+        // Each further count adds the next run (word or whitespace).
+        for (1..count) |_| {
+            if (end >= le) break;
+            end = run(t, end, le, big);
+        }
+        return .{ .start = start, .end = end };
+    }
+    // Around, as vim counts it: each step takes what comes next with its
+    // neighbour, a word and the whitespace after it, or whitespace and the
+    // word after it. (`end` is past the first run already.)
+    if (end < le and (c0 == .space or classOf(t.byteAt(end), big) == .space)) end = run(t, end, le, big);
     for (1..count) |_| {
         if (end >= le) break;
+        const white = classOf(t.byteAt(end), big) == .space;
         end = run(t, end, le, big);
+        if (end < le and (white or classOf(t.byteAt(end), big) == .space)) end = run(t, end, le, big);
     }
-
-    if (scope == .around) {
-        if (c0 == .space) {
-            // Whitespace plus the following word.
-            if (end < le) end = run(t, end, le, big);
-        } else if (end < le and classOf(t.byteAt(end), big) == .space) {
-            end = run(t, end, le, big); // trailing whitespace
-        } else {
-            while (start > ls and classOf(t.byteAt(start - 1), big) == .space) start -= 1; // leading
-        }
+    // From a word, with no whitespace after the last one: what is before.
+    if (c0 != .space and classOf(t.byteAt(end - 1), big) != .space) {
+        while (start > ls and classOf(t.byteAt(start - 1), big) == .space) start -= 1;
     }
     return .{ .start = start, .end = end };
 }
@@ -379,19 +385,25 @@ fn isPreamble(t: *const Text, line: usize) bool {
 pub fn paragraph(t: *const Text, pos: usize, scope: Scope) ?Range {
     const n = t.lineCount();
     const line = t.lineOf(pos);
-    const blank = t.lineLen(line) == 0;
+    // (A line of only spaces and tabs is a blank one here, as in vim.)
+    const blank = blankLine(t, line);
     var first = line;
     var last = line;
-    while (first > 0 and (t.lineLen(first - 1) == 0) == blank) first -= 1;
-    while (last + 1 < n and (t.lineLen(last + 1) == 0) == blank) last += 1;
+    while (first > 0 and blankLine(t, first - 1) == blank) first -= 1;
+    while (last + 1 < n and blankLine(t, last + 1) == blank) last += 1;
     if (scope == .around and !blank) {
-        if (last + 1 < n and t.lineLen(last + 1) == 0) {
-            while (last + 1 < n and t.lineLen(last + 1) == 0) last += 1;
+        if (last + 1 < n and blankLine(t, last + 1)) {
+            while (last + 1 < n and blankLine(t, last + 1)) last += 1;
         } else {
-            while (first > 0 and t.lineLen(first - 1) == 0) first -= 1;
+            while (first > 0 and blankLine(t, first - 1)) first -= 1;
         }
     }
     return .{ .start = t.lineStart(first), .end = t.lineEnd(last), .linewise = true };
+}
+
+fn blankLine(t: *const Text, line: usize) bool {
+    for (t.lineSlice(line)) |b| if (b != ' ' and b != '\t') return false;
+    return true;
 }
 
 /// il / al: `il` is the cursor's line without its indentation and trailing

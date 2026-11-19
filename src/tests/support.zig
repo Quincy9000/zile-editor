@@ -15,6 +15,9 @@ const deinit = Editor.deinit;
 pub fn testEditor(content: []const u8) !Editor {
     var ed = try Editor.init(testing.allocator, testing.io);
     errdefer ed.deinit();
+    // Tests name files that aren't theirs to write (`x.zig`, in whatever
+    // folder the tests run in): nothing is saved unless a test asks.
+    ed.options.autosave = false;
     try ed.text().insert(ed.gpa, 0, content);
     return ed;
 }

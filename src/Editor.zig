@@ -100,6 +100,7 @@ pub const git_ops = @import("editor/git_ops.zig");
 pub const signature_help = @import("editor/signature_help.zig");
 pub const snippet_ops = @import("editor/snippet_ops.zig");
 pub const ai_ghost = @import("editor/ai_ghost.zig");
+pub const ai_fill = @import("editor/ai_fill.zig");
 pub const lsp_actions = @import("editor/lsp_actions.zig");
 pub const after_typing = @import("editor/after_typing.zig");
 pub const sql_ops = @import("editor/sql_ops.zig");
@@ -148,6 +149,17 @@ pub const Options = struct {
     format_on_save: bool = true,
     /// AI ghost completion while typing (a local model through Ollama).
     ai_complete: bool = true,
+    /// Who writes a completion asked for by hand (`SPC a f`): the local
+    /// model, Anthropic's when $ANTHROPIC_API_KEY is set, DeepSeek's when
+    /// $DEEPSEEK_API_KEY (or $DEEPSEEK_API) is.
+    ai_backend: ai_fill.Backend = .local,
+    /// The Anthropic model that is asked.
+    ai_model: []const u8 = "claude-haiku-5-5",
+    /// The DeepSeek model that is asked.
+    deepseek_model: []const u8 = "deepseek-flash",
+    /// Who answers in the conversation (`SPC a a`): Claude, as the CLI is
+    /// signed in, or DeepSeek through the same CLI.
+    chat_backend: Chat.Backend = .claude,
     /// Todo words and colour literals stand out (mini.hipatterns).
     highlight_patterns: bool = true,
     /// Other occurrences of the word under the cursor (mini.cursorword).
@@ -170,8 +182,8 @@ pub const Options = struct {
     /// Long lines wrap onto more rows, at word boundaries, keeping their
     /// indent (`SPC t l`); no sideways scrolling then.
     wrap: bool = true,
-    /// A modified file is written when you leave it (another buffer or
-    /// window) or zile loses focus, as the nvim config's autosave.
+    /// A modified file is written when you leave insert mode, when you
+    /// leave the file (another buffer or window), or zile loses focus.
     autosave: bool = true,
     /// File-type icons in pickers (needs a Nerd Font).
     icons: bool = true,
@@ -307,6 +319,10 @@ pub const CodeAction = struct {
     title: []u8,
     kind: []u8,
     json: []u8,
+    /// The server that offered it (the one to hand it back to).
+    server: ?*Lsp,
+    /// 0: the fix the server prefers; 1: a fix; 2: anything else.
+    rank: u8,
 };
 
 /// A project-wide symbol from the language server (`SPC f w`); owned strings.
@@ -664,7 +680,11 @@ sticky_menu: bool = false,
 cursors: std.ArrayList(Cursor) = .empty,
 /// Keys of the command in progress at the primary, and the mode it began in.
 multi_keys: std.ArrayList(KeyEvent) = .empty,
-multi_start: struct { mode: Mode = .normal, visual_line: bool = false } = .{},
+multi_start: struct { mode: Mode = .normal, visual_line: bool = false, version: u64 = 0 } = .{},
+/// Placing cursors (`qp` drops one): the cursors already placed stay where
+/// they are while you move on to where the next goes. It ends with the
+/// first key that changes the text or the mode, which all of them get.
+cursors_placing: bool = false,
 /// The command in progress runs at the primary only (undo, pickers, ...).
 multi_once: bool = false,
 /// Replaying a command at the extra cursors.
@@ -732,6 +752,8 @@ jumps: std.ArrayList(Jump) = .empty,
 jump_index: usize = 0,
 /// The language server's last answers for `SPC l a` and `SPC f w`.
 code_actions: std.ArrayList(CodeAction) = .empty,
+/// Servers asked for code actions that haven't answered yet.
+code_actions_waiting: usize = 0,
 workspace_symbols: std.ArrayList(WorkspaceSymbol) = .empty,
 /// Bookmarks (`m{key}`, `'{key}`, `SPC m`).
 marks: std.ArrayList(Mark) = .empty,
@@ -928,6 +950,8 @@ ai_asked: ?struct { buffer: *Buffer, pos: usize, version: u64 } = null,
 ai_suggestion: ?AiSuggestion = null,
 /// The model couldn't be reached: off until toggled again.
 ai_unreachable: bool = false,
+/// A completion asked for by hand: the question on its way, what came.
+ai_request: ai_fill.State = .{},
 /// Claude Code: the connection, its panel's terminal, pending diffs.
 claude: ?*Claude = null,
 /// The editor window to come back to from a terminal window.
@@ -1002,6 +1026,10 @@ ghost: ?GhostCursor = null,
 /// The git command running in the background, if any.
 git_job: ?*GitJob = null,
 
+/// The selections are the matches `s` (or <Tab> in a search) put cursors
+/// on: `i` / `a` / `o` / `O` then type at each (`multicursor.matchKey`),
+/// where in a selection of your own they begin a text object or swap ends.
+matches_selected: bool = false,
 /// Insert mode: Ctrl-v or Ctrl-k waiting for its keys (`insert_keys.zig`).
 insert_pending: insert_keys.Pending = .none,
 /// What this insert has typed so far, and what the one before it typed
@@ -1101,6 +1129,7 @@ pub fn deinit(ed: *Editor) void {
     signature_help.closeSignature(ed);
     snippet_ops.endSnippet(ed);
     ai_ghost.clearAiSuggestion(ed);
+    ed.ai_request.deinit(ed.gpa);
     if (ed.ai) |g| g.destroy();
     if (ed.claude) |c| c.destroy();
     for (ed.shells.items) |t| t.destroy();
@@ -1254,6 +1283,7 @@ pub fn tick(ed: *Editor) void {
     debugging.tickSearch(ed);
     debugging.tick(ed);
     ai_ghost.pollAi(ed);
+    ai_fill.poll(ed);
     claude_panel.tickClaude(ed);
     window_ops.pollShellWindows(ed);
     ed.highlightView();
@@ -1382,17 +1412,23 @@ pub fn processKey(ed: *Editor, ev: KeyEvent) void {
     const multi = ed.cursors.items.len > 0;
     if (multi) {
         if (ed.multi_keys.items.len == 0) {
-            ed.multi_start = .{ .mode = ed.mode, .visual_line = ed.visual_line };
+            ed.multi_start = .{ .mode = ed.mode, .visual_line = ed.visual_line, .version = ed.buffer.edit_version };
             ed.multi_once = false;
         }
         ed.multi_keys.append(ed.gpa, ev) catch {};
     }
+    const typing = ed.mode == .insert;
     ed.handleKeyInner(ev) catch |err| {
         ed.setMessage(.err, "error: {s}", .{@errorName(err)});
         ed.resetCommand();
     };
     if (multi) multicursor.multiAfterKey(ed);
+    // (After the other cursors had the key too: they are matches until then.)
+    if (ed.mode != .visual) ed.matches_selected = false;
     ed.afterKey();
+    // Autosave: what was just typed is written when insert mode is left
+    // (after the undo step is closed, so the file isn't "modified" still).
+    if (typing and ed.mode == .normal and ed.buffer == buffer_before) state_files.autosave(ed, ed.buffer);
     row_model.clampToFolds(ed);
     // Typing text (insert mode, a prompt) isn't a pending command.
     if (ed.mode == .insert or ed.mode == .search) ed.showcmd_len = 0;
@@ -1403,6 +1439,7 @@ pub fn processKey(ed: *Editor, ev: KeyEvent) void {
         signature_help.closeSignature(ed);
         snippet_ops.endSnippet(ed);
     }
+    ai_fill.afterKey(ed);
     ai_ghost.updateAi(ed);
     ed.scrollToCursor();
 }
@@ -1481,6 +1518,11 @@ pub fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
         const cp = ev.text() orelse return ed.resetCommand();
         if (ed.capturing) try ed.change_keys.append(ed.gpa, ev);
         return a.cmd.run(.{ .ed = ed, .count = a.count, .has_count = a.has_count, .register = a.register, .char = cp });
+    }
+
+    // On the matches `s` selected: i / a / o / O type at each of them.
+    if (ed.mode == .visual and ed.matches_selected and ed.pending_len == 0 and ed.count == 0) {
+        if (ev.text()) |cp| if (try multicursor.matchKey(ed, cp)) return;
     }
 
     const commandish = ed.mode == .normal or ed.mode == .visual or ed.mode == .operator;
@@ -1633,6 +1675,15 @@ pub fn applyPending(ed: *Editor, r: operators.Range) !void {
     ed.op = null;
     ed.mode = .normal;
     try operators.apply(ed, op.op, r, op.register);
+    // A yank leaves the cursor at the end of what it took: its last
+    // character, or the last of its lines.
+    if (op.op == .yank and !ed.replaying) {
+        const t = ed.text();
+        if (r.linewise) {
+            const last = t.lineOf(@min(r.end, t.len()));
+            if (last != ed.cursorLine()) ed.gotoLine(last);
+        } else if (r.end > r.start) ed.setCursor(motions.prevChar(t, @min(r.end, t.len())));
+    }
 }
 
 /// Waits for the character naming the next step of a surround (`ys`, `ds`,

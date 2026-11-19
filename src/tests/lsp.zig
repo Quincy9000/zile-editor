@@ -175,6 +175,144 @@ test "completion between JSX tags offers elements and the file's components" {
     try testing.expect(std.mem.indexOf(u8, ed.text().slice(0, ed.text().len()), "    <View></View>\n") != null);
 }
 
+test "completion: deleting the word back to its start closes the list, so a ( is only a bracket" {
+    const gpa = testing.allocator;
+    var ed = try testEditorAs("x.zig", "");
+    defer ed.deinit();
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[{"label":"drawText"},{"label":"print"}]}
+    , .{});
+    defer reply.deinit();
+    try ed.feed("idr");
+    try completion_ops.showCompletion(&ed, ed.buffer, ed.view.cursor - 2, reply.value);
+    try testing.expectEqualStrings("drawText", completion_ops.completionShown(&ed).?.current().?.label);
+    // One letter left: still the word's list.
+    try ed.feed("<BS>");
+    try testing.expect(completion_ops.completionShown(&ed) != null);
+    // Nothing left of it: no list of everything to take the top of.
+    try ed.feed("<BS>");
+    try testing.expectEqual(null, completion_ops.completionShown(&ed));
+    try ed.feed(" (");
+    try expectText(&ed, " ()");
+}
+
+test "completion: a number being typed is not a name to complete" {
+    var ed = try testEditorAs("x.ts", "const n = 16;\nconst a16 = n1 + 0x1f;");
+    defer ed.deinit();
+    const after_typing = @import("../editor/after_typing.zig");
+    const t = ed.text();
+    try testing.expect(after_typing.isNumber(&ed, 10)); // 16
+    try testing.expect(after_typing.isNumber(&ed, std.mem.indexOf(u8, t.slice(0, t.len()), "0x1f").?));
+    try testing.expect(!after_typing.isNumber(&ed, 6)); // n
+    try testing.expect(!after_typing.isNumber(&ed, std.mem.indexOf(u8, t.slice(0, t.len()), "a16").?)); // a name with digits in it
+    try testing.expect(!after_typing.isNumber(&ed, std.mem.indexOf(u8, t.slice(0, t.len()), "n1").?));
+    try testing.expect(!after_typing.isNumber(&ed, t.len())); // the end of the text
+}
+
+test "completion: members whose edit replaces the dot too (the TypeScript server's)" {
+    const gpa = testing.allocator;
+    var ed = try testEditorAs("x.tsx", "const q = grid");
+    defer ed.deinit();
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"isIncomplete":false,"items":[
+        \\ {"label":"concat","kind":2,"data":{"i":0},"filterText":".concat","insertText":".concat","textEdit":{"range":{"start":{"line":0,"character":14},"end":{"line":0,"character":15}},"newText":".concat"}},
+        \\ {"label":"map","kind":2,"filterText":".map","insertText":".map","textEdit":{"range":{"start":{"line":0,"character":14},"end":{"line":0,"character":15}},"newText":".map"}},
+        \\ {"label":"flatMap","kind":2,"filterText":".flatMap","insertText":".flatMap","textEdit":{"range":{"start":{"line":0,"character":14},"end":{"line":0,"character":15}},"newText":".flatMap"}}
+        \\]}
+    , .{});
+    defer reply.deinit();
+    try ed.feed("A.");
+    try completion_ops.showCompletion(&ed, ed.buffer, ed.view.cursor, reply.value);
+    // Right after the dot: every member, in the server's order (not the
+    // shortest name first: nothing of a name is typed to rank them by).
+    {
+        const all = completion_ops.completionShown(&ed).?;
+        try testing.expectEqual(3, all.shown.items.len);
+        try testing.expectEqualStrings("concat", all.items[all.shown.items[0]].label);
+        try testing.expectEqualStrings("map", all.items[all.shown.items[1]].label);
+        try testing.expectEqualStrings("flatMap", all.items[all.shown.items[2]].label);
+        // With nothing else said of it, an entry says what kind of thing it is.
+        try testing.expectEqualStrings("method", all.current().?.detail);
+        // Its signature and documentation come when the server is asked
+        // (it is, for the selected one): shown beside the list, the
+        // signature wrapped to fit.
+        try testing.expectEqualStrings("", all.docText());
+        try completion_ops.docsArrived(&ed, all.serial, all.shown.items[0], "(method) Array<any>.concat(...items: ConcatArray<any>[]): any[] (+1 overload)", "Combines two or more arrays.\nThis method returns a new array without modifying any existing arrays.");
+        const doc = all.docText();
+        try testing.expect(std.mem.startsWith(u8, doc, "(method) Array<any>.concat(...items: ConcatArray<any>[]):\n    any[] (+1 overload)\n"));
+        try testing.expect(std.mem.indexOf(u8, doc, "Combines two or more arrays.") != null);
+        var lines = std.mem.splitScalar(u8, doc, '\n');
+        while (lines.next()) |line| try testing.expect(line.len <= 64);
+        // An answer for a list that is gone is for nothing.
+        try completion_ops.docsArrived(&ed, all.serial + 99, all.shown.items[1], "x", "y");
+        try testing.expectEqualStrings("", all.items[all.shown.items[1]].doc);
+    }
+    try ed.feed("ma"); // narrowing as usual
+    const c = completion_ops.completionShown(&ed).?;
+    try testing.expectEqualStrings("map", c.current().?.label);
+    try ed.feed("<BS><BS>"); // back to the dot: the members again
+    try testing.expectEqual(3, completion_ops.completionShown(&ed).?.shown.items.len);
+    try ed.feed("fl<CR>");
+    try expectText(&ed, "const q = grid.flatMap");
+    // `(` with part of a member typed takes it, dot and all in place.
+    var call = try testEditorAs("x.tsx", "const q = grid");
+    defer call.deinit();
+    try call.feed("A.");
+    try completion_ops.showCompletion(&call, call.buffer, call.view.cursor, reply.value);
+    try call.feed("con(");
+    try expectText(&call, "const q = grid.concat()");
+    // `(` right after the dot, nothing of a name typed: a bracket, not the
+    // first member.
+    var bare = try testEditorAs("x.tsx", "const q = grid");
+    defer bare.deinit();
+    try bare.feed("A.");
+    try completion_ops.showCompletion(&bare, bare.buffer, bare.view.cursor, reply.value);
+    try testing.expect(completion_ops.completionShown(&bare) != null);
+    try bare.feed("(");
+    try expectText(&bare, "const q = grid.()");
+    try testing.expectEqual(null, completion_ops.completionShown(&bare));
+    // The dot deleted: nothing to complete.
+    var gone = try testEditorAs("x.tsx", "const q = grid");
+    defer gone.deinit();
+    try gone.feed("A.");
+    try completion_ops.showCompletion(&gone, gone.buffer, gone.view.cursor, reply.value);
+    try gone.feed("<BS>");
+    try testing.expectEqual(null, completion_ops.completionShown(&gone));
+}
+
+test "completion: a name from another module says where it is from, and its import goes in when it is taken" {
+    const gpa = testing.allocator;
+    var ed = try testEditorAs("x.tsx", "import React from \"react\";\n\nconst s = ");
+    defer ed.deinit();
+    const reply = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"items":[
+        \\ {"label":"StyleSheet","kind":7,"labelDetails":{"description":"react-native"},"data":{"x":1},
+        \\  "additionalTextEdits":[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":0}},"newText":"import { StyleSheet } from \"react-native\";\n"}]},
+        \\ {"label":"StyleSheet","kind":7,"detail":"var StyleSheet"}
+        \\]}
+    , .{});
+    defer reply.deinit();
+    try ed.feed("GAStyleSh");
+    try completion_ops.showCompletion(&ed, ed.buffer, ed.view.cursor - 7, reply.value);
+    const c = completion_ops.completionShown(&ed).?;
+    // The one in reach already comes first; the other says its module.
+    try testing.expectEqualStrings("var StyleSheet", c.current().?.detail);
+    try ed.feed("<Down>");
+    try testing.expectEqualStrings("react-native", c.current().?.detail);
+    try testing.expect(c.current().?.raw.len > 0);
+    // Taken: the name, and (as the server's edits say) its import line.
+    const item = try std.json.parseFromSlice(std.json.Value, gpa, c.current().?.raw, .{});
+    defer item.deinit();
+    try ed.feed("<CR>");
+    try completion_ops.applyAdditionalEdits(&ed, item.value.object.get("additionalTextEdits").?);
+    try expectText(&ed, "import React from \"react\";\nimport { StyleSheet } from \"react-native\";\n\nconst s = StyleSheet");
+    // The cursor is still after the name: typing goes on there.
+    try ed.feed(".create<Esc>");
+    try expectText(&ed, "import React from \"react\";\nimport { StyleSheet } from \"react-native\";\n\nconst s = StyleSheet.create");
+    try ed.feed("u"); // one step: the import goes with what was typed
+    try expectText(&ed, "import React from \"react\";\n\nconst s = ");
+}
+
 test "completion in CSS: a - keeps the list (background-color, --gap)" {
     const gpa = testing.allocator;
     var ed = try testEditorAs("x.css", "a {\n  \n}");
@@ -586,9 +724,9 @@ test "completion: a typo hides the list, fixing it brings the list back" {
     try testing.expectEqual(null, completion_ops.completionShown(&ed));
     try ed.feed("<BS>T"); // fix the typo and go on: "doT"
     try testing.expectEqual(1, completion_ops.completionShown(&ed).?.shown.items.len);
-    try ed.feed("<BS><BS><BS>"); // back to nothing typed: every item
+    try ed.feed("<BS><BS>"); // "d": both again
     try testing.expectEqual(2, completion_ops.completionShown(&ed).?.shown.items.len);
-    try ed.feed("d<Down><Tab>");
+    try ed.feed("<Down><Tab>");
     try expectText(&ed, "doTwo");
 }
 
@@ -603,7 +741,7 @@ test "completion: letter case never rules a suggestion out" {
     defer reply.deinit();
     try completion_ops.showCompletion(&ed, ed.buffer, 0, reply.value);
     try testing.expectEqual(2, completion_ops.completionShown(&ed).?.shown.items.len);
-    try ed.feed("<BS><BS><BS>arr");
+    try ed.feed("<BS>rr"); // "Arr"
     try testing.expectEqual(2, completion_ops.completionShown(&ed).?.shown.items.len);
 }
 

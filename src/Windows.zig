@@ -369,8 +369,8 @@ pub fn borderAt(ws: *const Windows, x: f32, y: f32, slop: Slop) ?*Split {
 
 /// How far from a border a point still takes it: either side of one between
 /// columns, above and below one between rows (a terminal's pointer is at a
-/// cell's centre, and its cells are taller than wide: there the row above
-/// the border, the upper window's status line, takes it).
+/// cell's centre: there the row below the border takes it, the lower
+/// window's header, which is the border one sees).
 pub const Slop = struct {
     x: f32,
     above: f32,
@@ -517,19 +517,21 @@ test "a border at terminal cell sizes: the cells either side of it take it" {
     try testing.expect(ws.borderAt(385, 50, .all(6)) == null);
 }
 
-test "a border between rows at terminal cell sizes: the status line above it takes it" {
+test "a border between rows at terminal cell sizes: the lower window's header takes it, and follows the pointer" {
     var b: Buffer = undefined;
     var ws = try Windows.init(testing.allocator, &b);
     defer ws.deinit();
     _ = try ws.split(ws.root.kind.window, .down, .{}, &b);
     ws.layout(.{ .w = 800, .h = 400 }, 10, 20);
     // Pointers at cell centres (y = row * 20 + 10); the border is at y 200.
-    const slop: Slop = .{ .x = 6, .above = 12, .below = 0 };
-    try testing.expect(ws.borderAt(100, 190, slop) != null); // the upper window's last row
-    try testing.expect(ws.borderAt(100, 210, slop) == null); // the lower one's first: its text
-    try testing.expect(ws.borderAt(100, 170, slop) == null);
-    const s = ws.borderAt(100, 190, slop).?;
-    dragBorder(s, 290);
+    const slop: Slop = .{ .x = 6, .above = 0, .below = 12 };
+    try testing.expect(ws.borderAt(100, 210, slop) != null); // the lower window's first row: its header
+    try testing.expect(ws.borderAt(100, 190, slop) == null); // the upper one's last: its text
+    try testing.expect(ws.borderAt(100, 230, slop) == null);
+    const s = ws.borderAt(100, 210, slop).?;
+    // Dragged to the row whose centre is at y 290, by its top edge (280):
+    // the header is on that row.
+    dragBorder(s, 290 - 10);
     ws.layout(.{ .w = 800, .h = 400 }, 10, 20);
-    try testing.expectEqual(@as(f32, 300), s.border);
+    try testing.expectEqual(@as(f32, 280), s.border);
 }

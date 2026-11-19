@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const Editor = @import("Editor.zig");
 const Text = @import("core/Text.zig");
 const motions = @import("core/motions.zig");
+const letters = @import("core/letters.zig");
 const textobjects = @import("core/textobjects.zig");
 const Registers = @import("Registers.zig");
 const textops = @import("textops.zig");
@@ -41,10 +42,17 @@ pub fn motionRange(t: *const Text, from: usize, to: usize, kind: MotionKind) Ran
             end = @min(motions.nextChar(t, end), t.lineEnd(t.lineOf(end)));
         },
         .exclusive => {
-            // An exclusive motion ending at the start of a later line stops at the
-            // end of the previous one (`dw` on a line's last word keeps the break).
+            // An exclusive motion ending at the start of a later line stops at
+            // the end of the line before it; when it also began at or before
+            // its own line's first character, it is those whole lines (vim's
+            // `:h exclusive`: `d}` from the start of a paragraph takes its
+            // lines, and leaves no empty one behind).
             const end_line = t.lineOf(end);
-            if (end > start and end_line > t.lineOf(start) and end == t.lineStart(end_line)) end -= 1;
+            const start_line = t.lineOf(start);
+            if (end > start and end_line > start_line and end == t.lineStart(end_line)) {
+                if (start <= motions.firstNonBlank(t, start_line)) return linesRange(t, start_line, end_line - 1);
+                end -= 1;
+            }
         },
     }
     return .{ .start = start, .end = end };
@@ -180,16 +188,28 @@ fn shiftLines(ed: *Editor, r: Range, right: bool) !void {
 fn changeCase(ed: *Editor, r: Range, op: Operator) !void {
     const t = ed.text();
     const old = t.slice(r.start, r.end);
-    const new = try ed.gpa.dupe(u8, old);
-    defer ed.gpa.free(new);
-    for (new) |*b| b.* = switch (op) {
-        .lowercase => std.ascii.toLower(b.*),
-        .uppercase => std.ascii.toUpper(b.*),
-        else => if (std.ascii.isUpper(b.*)) std.ascii.toLower(b.*) else std.ascii.toUpper(b.*),
-    };
-    if (!std.mem.eql(u8, old, new)) {
+    // Letter by letter (not byte by byte): é and я have cases too.
+    var new: std.ArrayList(u8) = .empty;
+    defer new.deinit(ed.gpa);
+    var i: usize = 0;
+    while (i < old.len) {
+        const n = std.unicode.utf8ByteSequenceLength(old[i]) catch 1;
+        const cp: ?u21 = if (i + n <= old.len) std.unicode.utf8Decode(old[i..][0..n]) catch null else null;
+        const to: ?u21 = if (cp) |c| switch (op) {
+            .lowercase => letters.lower(c),
+            .uppercase => letters.upper(c),
+            else => if (letters.lower(c) != c) letters.lower(c) else letters.upper(c),
+        } else null;
+        var buf: [4]u8 = undefined;
+        if (to) |c| {
+            const m = std.unicode.utf8Encode(c, &buf) catch 0;
+            try new.appendSlice(ed.gpa, buf[0..m]);
+        } else try new.appendSlice(ed.gpa, old[i..@min(i + n, old.len)]);
+        i += @max(n, 1);
+    }
+    if (!std.mem.eql(u8, old, new.items)) {
         try ed.deleteRange(r.start, r.end);
-        try ed.insertAt(r.start, new);
+        try ed.insertAt(r.start, new.items);
     }
     ed.setCursor(r.start);
 }

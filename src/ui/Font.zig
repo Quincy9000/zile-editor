@@ -6,6 +6,7 @@
 //! CJK, emoji and Nerd Font icons, especially in the terminal).
 
 const std = @import("std");
+const char_width = @import("../core/width.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const rl = @import("raylib");
@@ -164,13 +165,16 @@ pub fn drawGlyph(f: *const Font, glyph: u16, x: f32, y: f32, color: rl.Color) vo
     rl.DrawTexture(g.tex, @as(c_int, @intFromFloat(@round(x))) + g.x, @as(c_int, @intFromFloat(@round(y + f.glyph_y))) + g.y, color);
 }
 
-/// Draws UTF-8 `s` one cell per codepoint. Returns the x after the last cell.
+/// Draws UTF-8 `s`, a cell per character (two for a wide one, none for a
+/// combining mark). Returns the x after the last cell.
 pub fn drawText(f: *const Font, s: []const u8, x: f32, y: f32, color: rl.Color) f32 {
     var cx = x;
     var it = Utf8Lossy{ .bytes = s };
     while (it.next()) |cp| {
+        const w = char_width.of(cp);
+        if (w == 0) continue;
         if (cp != ' ') f.drawCodepoint(cp, cx, y, color);
-        cx += f.cell_w;
+        cx += f.cell_w * @as(f32, @floatFromInt(w));
     }
     return cx;
 }

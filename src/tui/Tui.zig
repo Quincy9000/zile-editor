@@ -140,6 +140,7 @@ pub fn run(gpa: Allocator, io: Io, ed: *Editor, opts: Options) !void {
             prev = try gpa.alloc(Grid.Cell, grid.cells.len);
             @memset(prev, .{ .cp = 0 }); // force a full redraw
         }
+        grid.settleWide();
         if (tty) {
             try frame(gpa, &out, &grid, prev);
             writeAll(out.items);
@@ -235,11 +236,13 @@ fn showPointer(shape: borders.Pointer) void {
 fn mouse(ed: *Editor, font: *const Font, m: input.Mouse) void {
     const x = (@as(f32, @floatFromInt(m.col)) + 0.5) * Grid.cell_w;
     const y = (@as(f32, @floatFromInt(m.row)) + 0.5) * Grid.cell_h;
-    // Window borders (`borders.borderPress` and co.): the cells either side
-    // of one take it.
-    const slop: Editor.Windows.Slop = .{ .x = Grid.cell_w * 0.6, .above = Grid.cell_h * 0.6, .below = 0 };
+    // Window borders (`borders.borderPress` and co.): between columns, the
+    // cells either side of one take it; between rows, the row that is the
+    // border on screen, the lower window's header (its file's name). It is
+    // dragged by its top edge, so it stays under the pointer.
+    const slop: Editor.Windows.Slop = .{ .x = Grid.cell_w * 0.6, .above = 0, .below = Grid.cell_h * 0.6 };
     const busy = switch (m.kind) {
-        .drag => borders.borderDrag(ed, x, y),
+        .drag => borders.borderDrag(ed, x, y - Grid.cell_h * 0.5),
         .release => borders.borderRelease(ed),
         .press => borders.borderPress(ed, x, y, slop),
         else => false,
@@ -312,6 +315,23 @@ var clicks: struct {
     }
 } = .{};
 
+/// One cell: its colours (when they aren't the pen's already), then its
+/// character.
+fn writeCell(gpa: Allocator, out: *std.ArrayList(u8), cell: Grid.Cell, pen: *?Grid.Cell) !void {
+    const same_pen = if (pen.*) |p| p.eql(.{ .cp = p.cp, .fg = cell.fg, .bg = cell.bg, .ul = cell.ul, .curly = cell.curly }) else false;
+    if (!same_pen) {
+        try out.print(gpa, "\x1b[0;38;2;{d};{d};{d};48;2;{d};{d};{d}", .{ cell.fg.r, cell.fg.g, cell.fg.b, cell.bg.r, cell.bg.g, cell.bg.b });
+        // An underline in its colour, curly for diagnostics (kitty's
+        // colon form; terminals without curls draw a plain one).
+        if (cell.ul) |u| try out.print(gpa, ";{s};58:2::{d}:{d}:{d}", .{ if (cell.curly) "4:3" else "4", u.r, u.g, u.b });
+        try out.append(gpa, 'm');
+        pen.* = cell;
+    }
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(if (cell.cp < 0x20) ' ' else cell.cp, &buf) catch 1;
+    try out.appendSlice(gpa, buf[0..n]);
+}
+
 /// The escape sequences that turn the previous frame into this one.
 fn frame(gpa: Allocator, out: *std.ArrayList(u8), g: *const Grid, prev: []const Grid.Cell) !void {
     out.clearRetainingCapacity();
@@ -321,21 +341,22 @@ fn frame(gpa: Allocator, out: *std.ArrayList(u8), g: *const Grid, prev: []const 
     for (0..g.rows) |r| for (0..g.cols) |c| {
         const i = r * g.cols + c;
         const cell = g.cells[i];
+        // A wide character's second cell: written with its first.
+        if (cell.cp == Grid.wide_tail) {
+            // Only the second half changed (its colours): the first is
+            // written again, which covers both.
+            if (!cell.eql(prev[i]) and g.cells[i - 1].eql(prev[i - 1])) {
+                try out.print(gpa, "\x1b[{d};{d}H", .{ r + 1, c });
+                try writeCell(gpa, out, g.cells[i - 1], &pen);
+                at = .{ r, c + 1 };
+            }
+            continue;
+        }
         if (cell.eql(prev[i])) continue;
         if (at == null or at.?[0] != r or at.?[1] != c) try out.print(gpa, "\x1b[{d};{d}H", .{ r + 1, c + 1 });
-        const same_pen = if (pen) |p| p.eql(.{ .cp = p.cp, .fg = cell.fg, .bg = cell.bg, .ul = cell.ul, .curly = cell.curly }) else false;
-        if (!same_pen) {
-            try out.print(gpa, "\x1b[0;38;2;{d};{d};{d};48;2;{d};{d};{d}", .{ cell.fg.r, cell.fg.g, cell.fg.b, cell.bg.r, cell.bg.g, cell.bg.b });
-            // An underline in its colour, curly for diagnostics (kitty's
-            // colon form; terminals without curls draw a plain one).
-            if (cell.ul) |u| try out.print(gpa, ";{s};58:2::{d}:{d}:{d}", .{ if (cell.curly) "4:3" else "4", u.r, u.g, u.b });
-            try out.append(gpa, 'm');
-            pen = cell;
-        }
-        var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(if (cell.cp < 0x20) ' ' else cell.cp, &buf) catch 1;
-        try out.appendSlice(gpa, buf[0..n]);
-        at = .{ r, c + 1 };
+        try writeCell(gpa, out, cell, &pen);
+        // A wide character moves the terminal's cursor two cells.
+        at = .{ r, c + @as(usize, if (c + 1 < g.cols and g.cells[i + 1].cp == Grid.wide_tail) 2 else 1) };
     };
     try out.appendSlice(gpa, "\x1b[0m");
     if (g.cursor) |cur| {
@@ -386,6 +407,7 @@ fn snapshot(gpa: Allocator, io: Io, g: *const Grid, path: []const u8) !void {
         for (0..g.cols) |c| {
             var buf: [4]u8 = undefined;
             const cp = g.cells[r * g.cols + c].cp;
+            if (cp == Grid.wide_tail) continue;
             const n = std.unicode.utf8Encode(if (cp < 0x20) ' ' else cp, &buf) catch 1;
             try line.appendSlice(gpa, buf[0..n]);
         }

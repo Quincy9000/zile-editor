@@ -6,10 +6,12 @@
 //!     translucent ones tint (the dim backdrop behind pickers);
 //!   - a thin horizontal one near a cell's bottom underlines (diagnostics);
 //!   - a thin vertical one draws `│` in empty cells (dividers, git signs);
-//!   - text puts one codepoint per cell.
+//!   - text puts one codepoint per cell; a wide one (CJK, emoji) takes two,
+//!     the second marked `wide_tail` (the terminal draws over it).
 //! The terminal's own cursor shows where the UI asks (`cursor`).
 
 const std = @import("std");
+const char_width = @import("../core/width.zig");
 const Allocator = std.mem.Allocator;
 const Color = @import("raylib").Color;
 
@@ -17,6 +19,9 @@ const Grid = @This();
 
 pub const cell_w: f32 = 10;
 pub const cell_h: f32 = 20;
+
+/// The second cell of a wide character: nothing is written for it.
+pub const wide_tail: u21 = 0x1FFFFF;
 
 pub const Cell = struct {
     cp: u21 = ' ',
@@ -183,19 +188,69 @@ pub fn squiggle(g: *Grid, x: f32, bottom: f32, w: f32, color: Color) void {
     };
 }
 
-/// One codepoint in the cell at (x, y).
+/// One codepoint in the cell at (x, y); a wide one in that cell and the
+/// next (or, without room for both, a blank).
 pub fn put(g: *Grid, cp: u21, x: f32, y: f32, color: Color) void {
     const s = g.span(x, y, cell_w, cell_h);
     if (s.c0 >= s.c1 or s.r0 >= s.r1) return;
+    const w = char_width.of(cp);
+    if (w == 0) return;
     const cell = &g.cells[s.r0 * g.cols + s.c0];
+    if (w == 2) {
+        const both = g.span(x, y, 2 * cell_w, cell_h);
+        if (both.c1 - both.c0 < 2) {
+            cell.cp = ' ';
+            return;
+        }
+        const tail = &g.cells[s.r0 * g.cols + s.c0 + 1];
+        tail.cp = wide_tail;
+        tail.fg = if (color.a == 255) color else blend(tail.bg, color);
+    }
     cell.cp = cp;
     cell.fg = if (color.a == 255) color else blend(cell.bg, color);
+}
+
+/// Wide characters that lost a half (something was drawn over one of
+/// their two cells) become blanks, so what is written matches the cells.
+pub fn settleWide(g: *Grid) void {
+    for (0..g.rows) |r| {
+        const row = g.cells[r * g.cols ..][0..g.cols];
+        for (row, 0..) |*cell, c| {
+            if (cell.cp == wide_tail) {
+                if (c == 0 or char_width.of(row[c - 1].cp) != 2) cell.cp = ' ';
+            } else if (char_width.of(cell.cp) == 2) {
+                if (c + 1 >= row.len or row[c + 1].cp != wide_tail) cell.cp = ' ';
+            }
+        }
+    }
 }
 
 pub fn setCursor(g: *Grid, x: f32, y: f32, shape: CursorShape) void {
     const s = g.span(x, y, cell_w, cell_h);
     if (s.c0 >= s.c1 or s.r0 >= s.r1) return;
     g.cursor = .{ .col = s.c0, .row = s.r0, .shape = shape };
+}
+
+test "a wide character takes two cells, and one that loses a half is a blank" {
+    var g: Grid = .{};
+    defer g.deinit(std.testing.allocator);
+    try g.resize(std.testing.allocator, 6, 1);
+    const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
+    const white: Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 };
+    g.clear(black);
+    g.put(0x554F, 0, 0, white); // 問
+    g.put('x', 20, 0, white);
+    try std.testing.expectEqual(0x554F, g.cells[0].cp);
+    try std.testing.expectEqual(wide_tail, g.cells[1].cp);
+    try std.testing.expectEqual('x', g.cells[2].cp);
+    // No room for both halves at the last column.
+    g.put(0x554F, 50, 0, white);
+    try std.testing.expectEqual(' ', g.cells[5].cp);
+    // Its second half drawn over: the rest of it goes.
+    g.put('y', 10, 0, white);
+    g.settleWide();
+    try std.testing.expectEqual(' ', g.cells[0].cp);
+    try std.testing.expectEqual('y', g.cells[1].cp);
 }
 
 test "rectangles, lines and text map onto cells" {

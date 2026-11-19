@@ -8,6 +8,7 @@
 //!         .projects = .{ "~/code" },         // folders SPC p p looks in
 //!         .wrap = false,
 //!         .tabwidth = 2,
+//!         .aibackend = .anthropic,           // who SPC a f asks (.local, .deepseek)
 //!         .keys = .{
 //!             .normal = .{ .{ "<Space>x", "git_changes" } },
 //!         },
@@ -54,6 +55,13 @@ pub const Settings = struct {
     autopairs: ?bool = null,
     formatonsave: ?bool = null,
     aicomplete: ?bool = null,
+    /// `.local`, `.anthropic` or `.deepseek`.
+    aibackend: ?Editor.ai_fill.Backend = null,
+    /// The Anthropic model.
+    aimodel: ?[]const u8 = null,
+    deepseekmodel: ?[]const u8 = null,
+    /// Who answers in the conversation: `.claude` or `.deepseek`.
+    chatbackend: ?@import("../ai/Chat.zig").Backend = null,
     highlightpatterns: ?bool = null,
     cursorword: ?bool = null,
     indentscope: ?bool = null,
@@ -253,6 +261,98 @@ pub fn fontFile(gpa: Allocator, io: Io, family: []const u8, problem: *?[]const u
     return gpa.dupe(u8, file) catch null;
 }
 
+/// Where a test's settings file is: tests never write the real one.
+pub var test_file: ?[]const u8 = null;
+
+/// The file a setting is written to (in `gpa`).
+fn writablePath(gpa: Allocator) ?[]u8 {
+    if (@import("builtin").is_test) return gpa.dupe(u8, test_file orelse return null) catch null;
+    return path(gpa);
+}
+
+/// Where a value written at `text[from..]` ends: a string at its closing
+/// quote, anything else at the comma, the comment or the blank after it.
+fn valueEnd(text: []const u8, from: usize) usize {
+    var i = from;
+    if (i < text.len and text[i] == '"') {
+        i += 1;
+        while (i < text.len and text[i] != '"') : (i += 1) {
+            if (text[i] == '\\') i += 1;
+        }
+        return @min(i + 1, text.len);
+    }
+    while (i < text.len and text[i] != ',' and text[i] != ' ' and text[i] != '\t' and !std.mem.startsWith(u8, text[i..], "//")) i += 1;
+    return i;
+}
+
+/// `source` with the setting `name` given `value`, written as the file
+/// writes it (`.local`, `true`, `"a name"`). The setting's line is changed
+/// where there is one (a commented-out one is brought back; what follows
+/// the value on the line stays), else a line is added at the end. Nothing
+/// else in the file is touched. Owned by the caller.
+pub fn withSetting(a: Allocator, source: []const u8, name: []const u8, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var found = false;
+    var closing: ?usize = null; // where the last `}` line starts, in `out`
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.append(a, '\n');
+        first = false;
+        const indent = line.len - std.mem.trimStart(u8, line, " \t").len;
+        var rest = line[indent..];
+        if (std.mem.startsWith(u8, rest, "//")) rest = std.mem.trimStart(u8, rest[2..], " \t");
+        const is_it = !found and rest.len > name.len + 1 and rest[0] == '.' and std.mem.startsWith(u8, rest[1..], name) and blk: {
+            const after = std.mem.trimStart(u8, rest[1 + name.len ..], " \t");
+            break :blk after.len > 0 and after[0] == '=' and (rest[1 + name.len] == ' ' or rest[1 + name.len] == '=' or rest[1 + name.len] == '\t');
+        };
+        if (!is_it) {
+            if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "}")) closing = out.items.len;
+            try out.appendSlice(a, line);
+            continue;
+        }
+        found = true;
+        const eq = std.mem.indexOfScalar(u8, rest, '=').?;
+        const value_at = eq + 1 + (rest.len - eq - 1 - std.mem.trimStart(u8, rest[eq + 1 ..], " \t").len);
+        var tail = rest[valueEnd(rest, value_at)..];
+        if (tail.len > 0 and tail[0] == ',') tail = tail[1..];
+        try out.print(a, "{s}.{s} = {s},{s}", .{ line[0..indent], name, value, tail });
+    }
+    if (!found) {
+        const at = closing orelse return error.NoPlaceForIt;
+        var buf: [256]u8 = undefined;
+        const added = std.fmt.bufPrint(&buf, "    .{s} = {s},\n", .{ name, value }) catch return error.NoPlaceForIt;
+        try out.insertSlice(a, at, added);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Writes one setting into config.zon, so it is what zile starts with:
+/// for a choice made in zile that is to be remembered (the AI backend).
+/// The file is made first when there is none. It is written only if it
+/// still reads as settings with the change; a file with a mistake in it
+/// is left as it is (`error.ConfigHasAMistake`).
+pub fn store(ed: *Editor, name: []const u8, value: []const u8) !void {
+    const gpa = ed.gpa;
+    const file = writablePath(gpa) orelse return error.NoConfigFile;
+    defer gpa.free(file);
+    _ = create(ed.io, file);
+    const source: []u8 = Io.Dir.cwd().readFileAlloc(ed.io, file, gpa, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => try gpa.dupe(u8, ".{\n}\n"),
+        else => return err,
+    };
+    defer gpa.free(source);
+    const changed = try withSetting(gpa, source, name, value);
+    defer gpa.free(changed);
+    if (std.mem.eql(u8, changed, source)) return;
+    const checked = try gpa.dupeSentinel(u8, changed, 0);
+    defer gpa.free(checked);
+    if (parse(checked).problems.len > 0) return error.ConfigHasAMistake;
+    if (std.fs.path.dirname(file)) |d| try Io.Dir.cwd().createDirPath(ed.io, d);
+    try Io.Dir.cwd().writeFile(ed.io, .{ .sub_path = file, .data = changed });
+}
+
 /// The command: opens the file (made first, from `default_file`, when
 /// there is none).
 pub fn open(ed: *Editor) !void {
@@ -336,10 +436,62 @@ test "config.zon: plain names for the options, projects and keys; what is wrong 
         const key = comptime plain(name);
         if (comptime isOption(name)) {
             const v = @field(fresh.settings, key) orelse return error.OptionMissingFromDefaultConfig;
-            try testing.expectEqual(@field(defaults, name), v);
+            try testing.expectEqualDeep(@field(defaults, name), v);
         }
     }
     try testing.expectEqual(18, fresh.settings.fontsize.?);
     try testing.expectEqual(0, fresh.settings.projects.?.len);
     try testing.expectEqual(null, fresh.settings.fontfamily);
+}
+
+test "config.zon: one setting written into the file: its line changed, brought back, or added; the rest untouched" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const file =
+        \\// mine
+        \\.{
+        \\    .fontsize = 18,
+        \\    .aibackend = .local, // who answers
+        \\    //.aimodel = "claude-haiku-5-5",
+        \\    .wrap = true,
+        \\}
+        \\
+    ;
+    // Its line: the value changes, the indentation and the comment stay.
+    const a = try withSetting(gpa, file, "aibackend", ".anthropic");
+    defer gpa.free(a);
+    try testing.expectEqualStrings(
+        \\// mine
+        \\.{
+        \\    .fontsize = 18,
+        \\    .aibackend = .anthropic, // who answers
+        \\    //.aimodel = "claude-haiku-5-5",
+        \\    .wrap = true,
+        \\}
+        \\
+    , a);
+    // The same value again: the same text.
+    const same = try withSetting(gpa, a, "aibackend", ".anthropic");
+    defer gpa.free(same);
+    try testing.expectEqualStrings(a, same);
+    // A commented-out line is the setting's line, brought back.
+    const b = try withSetting(gpa, file, "aimodel", "\"claude-sonnet-5-5\"");
+    defer gpa.free(b);
+    try testing.expect(std.mem.indexOf(u8, b, "\n    .aimodel = \"claude-sonnet-5-5\",\n") != null);
+    try testing.expect(std.mem.indexOf(u8, b, "//.aimodel") == null);
+    // A string with a comma and a comment marker in it ends at its quote.
+    const quoted = try withSetting(gpa, ".{\n    .fontfamily = \"A, B // C\", // mine\n}\n", "fontfamily", "\"D\"");
+    defer gpa.free(quoted);
+    try testing.expectEqualStrings(".{\n    .fontfamily = \"D\", // mine\n}\n", quoted);
+    // Not in the file: a line of its own before the closing brace. A
+    // longer name that begins the same isn't it.
+    const c = try withSetting(gpa, ".{\n    .tabwidth = 2,\n    .wrapping = 1,\n}\n", "wrap", "false");
+    defer gpa.free(c);
+    try testing.expectEqualStrings(".{\n    .tabwidth = 2,\n    .wrapping = 1,\n    .wrap = false,\n}\n", c);
+    const empty = try withSetting(gpa, ".{\n}\n", "aibackend", ".anthropic");
+    defer gpa.free(empty);
+    try testing.expectEqualStrings(".{\n    .aibackend = .anthropic,\n}\n", empty);
+    try testing.expectEqual(.anthropic, parse(".{\n    .aibackend = .anthropic,\n}\n").settings.aibackend.?);
+    // Nothing to add it to.
+    try testing.expectError(error.NoPlaceForIt, withSetting(gpa, "nothing", "wrap", "false"));
 }

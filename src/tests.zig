@@ -36,7 +36,10 @@ comptime {
     _ = @import("git/patch.zig");
     _ = @import("editor/compare.zig");
     _ = @import("input/digraphs.zig");
+    _ = @import("lsp/hover_type.zig");
+    _ = @import("core/letters.zig");
     _ = @import("tests/insert_keys.zig");
+    _ = @import("tests/ai_fill.zig");
     _ = @import("ZigCheck.zig");
     _ = @import("Replace.zig");
     _ = @import("ai/Chat.zig");
@@ -108,6 +111,8 @@ comptime {
     _ = @import("tui/input.zig");
     _ = @import("format.zig");
     _ = @import("ai/Ghost.zig");
+    _ = @import("ai/fill.zig");
+    _ = @import("core/width.zig");
     _ = @import("ai/WsServer.zig");
     _ = @import("tui/Grid.zig");
     _ = @import("ui/Gsub.zig");

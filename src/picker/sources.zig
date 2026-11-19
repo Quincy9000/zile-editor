@@ -38,6 +38,7 @@ const jumplist = @import("../editor/jumplist.zig");
 const browser = @import("../editor/browser.zig");
 const picker_ops = @import("../editor/picker_ops.zig");
 const claude_chat = @import("../editor/claude_chat.zig");
+const ai_fill = @import("../editor/ai_fill.zig");
 const Chat = @import("../ai/Chat.zig");
 const picker_query = @import("../editor/picker_query.zig");
 const quickfix_list = @import("../editor/quickfix_list.zig");
@@ -47,7 +48,7 @@ const git_ops = @import("../editor/git_ops.zig");
 const git_view = @import("../editor/git_view.zig");
 const lsp_actions = @import("../editor/lsp_actions.zig");
 
-pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, git_hunks, git_log, git_commit_files, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, claude_sessions, files_global, debug, stored_data };
+pub const Kind = enum { files, buffers, commands, lines, grep, locations, diagnostics, symbols, git_actions, git_branches, git_changes, git_hunks, git_log, git_commit_files, confirm_delete, browse, jumps, run_errors, projects, open_in, quickfix, recent, todos, themes, messages, start, confirm_remove, runner, registers, marks, undo, help, pickers, files_anywhere, folders_anywhere, code_actions, workspace_symbols, todo_tags, man, frecent, windows, toggles, code_menu, leader, leader_projects, leader_claude, leader_quit, claude_commands, claude_models, claude_modes, claude_efforts, claude_usage, claude_sessions, files_global, debug, stored_data, ai_backends, chat_backends };
 
 fn Impl(comptime kind: Kind) type {
     return switch (kind) {
@@ -101,6 +102,8 @@ fn Impl(comptime kind: Kind) type {
         .claude_models => ClaudeList(.models),
         .claude_modes => ClaudeList(.modes),
         .claude_efforts => ClaudeList(.efforts),
+        .ai_backends => AiBackends,
+        .chat_backends => ChatBackends,
         .claude_usage => ClaudeList(.usage),
         .claude_sessions => ClaudeList(.sessions),
         .leader_quit => QuitMenu,
@@ -452,6 +455,9 @@ const ClaudeMenu = Menu("Claude", &.{
     .{ .key = 'p', .label = "Permission mode (ask first, accept edits, plan)", .command = "claude_mode" },
     .{ .key = 'u', .label = "Usage (your limits, the context)", .command = "claude_usage" },
     .{ .key = 'w', .label = "Rewrite the selection in place...", .command = "claude_rewrite" },
+    .{ .key = 'f', .label = "Fill in at the cursor (AI; Alt-; takes it)", .command = "ai_fill" },
+    .{ .key = 'b', .label = "Fill-in backend (Local, Anthropic, DeepSeek)", .command = "ai_backend" },
+    .{ .key = 'd', .label = "Who answers here (Claude, DeepSeek)", .command = "chat_backend" },
     .{ .key = 'r', .label = "Resume a conversation of before", .command = "claude_resume" },
     .{ .key = 'x', .label = "Stop what Claude is doing", .command = "claude_stop" },
     .{ .key = 'c', .label = "A new conversation", .command = "claude_new" },
@@ -461,6 +467,117 @@ const ClaudeMenu = Menu("Claude", &.{
     .{ .key = 'y', .label = "Yes: allow the tool / accept the proposal", .command = "claude_accept" },
     .{ .key = 'n', .label = "No: refuse the tool / reject the proposal", .command = "claude_reject" },
 });
+
+/// `SPC a b`: who writes a completion asked for by hand. Anthropic is
+/// listed without its key too, as not available, so it is plain why.
+const AiBackends = struct {
+    pub const title = "AI completion: who answers";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    const backends = std.enums.values(ai_fill.Backend);
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        for (backends, 0..) |b, i| {
+            var buf: [200]u8 = undefined;
+            const r = ai_fill.row(ed, b, &buf);
+            try items.append(.{ .text = r.text, .detail = r.detail, .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id < backends.len) ai_fill.setBackend(ed, backends[item.id]);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= backends.len) return;
+        try out.text.appendSlice(ed.gpa, switch (backends[item.id]) {
+            .local =>
+            \\The model on this machine, through Ollama: the one that
+            \\suggests while you type ($OLLAMA_HOST, $ZILE_AI_MODEL).
+            \\Nothing leaves the machine and nothing is paid for.
+            \\
+            \\SPC a f (Alt-f while typing) asks for what belongs at the
+            \\cursor. Alt-; takes what it wrote, Esc drops it.
+            \\
+            \\The one you pick here is remembered: it is written to
+            \\config.zon as aibackend.
+            ,
+            .anthropic =>
+            \\Claude, through Anthropic's API: the model named by aimodel
+            \\in config.zon (claude-haiku-5-5 unless you change it). The
+            \\whole file is sent with each question, and each is paid for.
+            \\
+            \\The one you pick here is remembered: it is written to
+            \\config.zon as aibackend.
+            \\
+            \\Needs ANTHROPIC_API_KEY in the environment zile starts in.
+            ,
+            .deepseek =>
+            \\DeepSeek, through its Anthropic-compatible API: the model
+            \\named by deepseekmodel in config.zon (deepseek-flash unless
+            \\you change it). The whole file is sent with each question,
+            \\and each is paid for.
+            \\
+            \\The one you pick here is remembered: it is written to
+            \\config.zon as aibackend.
+            \\
+            \\Needs DEEPSEEK_API_KEY (or DEEPSEEK_API) in the environment
+            \\zile starts in.
+            ,
+        });
+    }
+};
+
+/// `SPC a d`: who answers in the conversation. DeepSeek is listed without
+/// its key too, as not available.
+const ChatBackends = struct {
+    pub const title = "Conversation: who answers";
+    pub const prefix: ?u8 = null;
+    pub const start_mode: StartMode = .normal;
+
+    const backends = std.enums.values(Chat.Backend);
+
+    pub fn fill(ed: *Editor, items: *Items) !void {
+        for (backends, 0..) |b, i| {
+            const detail = if (!claude_chat.backendAvailable(ed, b)) "no API key" else if (ed.options.chat_backend == b) "current" else "";
+            try items.append(.{ .text = b.title(), .detail = detail, .id = @intCast(i) });
+        }
+    }
+
+    pub fn accept(ed: *Editor, item: Item) !void {
+        if (item.id < backends.len) claude_chat.setBackend(ed, backends[item.id]);
+    }
+
+    pub fn preview(ed: *Editor, item: *const Item, out: *Preview) !void {
+        if (item.id >= backends.len) return;
+        try out.text.appendSlice(ed.gpa, switch (backends[item.id]) {
+            .claude =>
+            \\Claude Code as it is signed in (your subscription, or its
+            \\own key): the model picker (SPC a m) chooses among Claude's.
+            \\
+            \\The one you pick here is remembered: it is written to
+            \\config.zon as chatbackend. A change starts a new
+            \\conversation.
+            ,
+            .deepseek =>
+            \\The same Claude Code, its tools and permission questions
+            \\too, pointed at DeepSeek's Anthropic-compatible API with
+            \\your DeepSeek key (Claude's credentials aren't passed on).
+            \\deepseek-flash answers; choosing Opus in the model picker
+            \\(SPC a m) asks deepseek-v4-pro. Each message is paid for
+            \\with DeepSeek.
+            \\
+            \\The one you pick here is remembered: it is written to
+            \\config.zon as chatbackend. A change starts a new
+            \\conversation.
+            \\
+            \\Needs DEEPSEEK_API_KEY (or DEEPSEEK_API) in the environment
+            \\zile starts in.
+            ,
+        });
+    }
+};
 
 /// `SPC Q`.
 const QuitMenu = Menu("Quit", &.{
@@ -486,6 +603,7 @@ const CodeMenu = Menu("Code", &.{
     .{ .key = 'i', .label = "Go to implementations", .command = "goto_implementation" },
     .{ .key = 'r', .label = "Find references", .command = "find_references" },
     .{ .key = 'k', .label = "Documentation", .command = "hover" },
+    .{ .key = 'y', .label = "Yank the type here (and show it)", .command = "yank_type" },
     .{ .key = 'l', .label = "Symbols (C-t: project)", .command = "goto_symbol" },
     .{ .key = 'w', .label = "Symbols in the project", .command = "workspace_symbols" },
     .{ .key = 'x', .label = "Errors and warnings", .command = "list_diagnostics" },
@@ -1448,7 +1566,7 @@ const Messages = struct {
 /// The start screen (mini.starter), shown when zile opens without a file:
 /// the files you were last in, then first steps.
 const Start = struct {
-    pub const title = "zile";
+    pub const title = "zile " ++ @import("../version.zig").text;
     pub const prefix: ?u8 = null;
     pub const start_mode: StartMode = .normal;
 
@@ -2901,7 +3019,7 @@ const CodeActions = struct {
     pub const start_mode: StartMode = .normal;
 
     pub fn fill(ed: *Editor, items: *Items) !void {
-        for (ed.code_actions.items, 0..) |a, i| try items.append(.{ .text = a.title, .detail = a.kind, .id = @intCast(i) });
+        for (ed.code_actions.items, 0..) |a, i| try items.append(.{ .text = a.title, .detail = if (a.rank == 0) "preferred fix" else a.kind, .id = @intCast(i) });
     }
 
     pub fn accept(ed: *Editor, item: Item) !void {

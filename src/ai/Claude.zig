@@ -272,8 +272,8 @@ fn handle(c: *Claude, ed: *Editor, conn: u32, text: []const u8) !void {
             if (std.mem.eql(u8, v, asked)) break v;
         } else "2024-11-05";
         const result = try std.fmt.allocPrint(c.gpa,
-            \\{{"protocolVersion":"{s}","capabilities":{{"logging":{{}},"prompts":{{"listChanged":true}},"tools":{{"listChanged":true}}}},"serverInfo":{{"name":"zile","version":"0.1.0"}}}}
-        , .{version});
+            \\{{"protocolVersion":"{s}","capabilities":{{"logging":{{}},"prompts":{{"listChanged":true}},"tools":{{"listChanged":true}}}},"serverInfo":{{"name":"zile","version":"{s}"}}}}
+        , .{ version, @import("../version.zig").number });
         defer c.gpa.free(result);
         c.reply(conn, id_json, result);
         c.ready = true;

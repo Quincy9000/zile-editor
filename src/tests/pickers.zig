@@ -302,7 +302,7 @@ test "colour wheel: SPC l c edits the colour at the cursor; Enter writes, Esc le
 test "pickers: registers paste, undo history travels the tree, help finds keys" {
     var ed = try testEditor("alpha beta");
     defer ed.deinit();
-    try ed.feed("\"ayiww\"byiw");
+    try ed.feed("\"ayiww\"byiwb"); // (back to the word's start: a yank ends at its end)
     try ed.feed("<Space>fy");
     settlePicker(&ed);
     const p = ed.picker.?;
@@ -364,12 +364,26 @@ test "pickers: the list of pickers opens one; code actions and project symbols l
     try testing.expectEqual(.lines, ed.picker.?.kind);
     try ed.feed("<Esc><Esc>");
 
-    try lsp_actions.showCodeActions(&ed); // none: a message, no picker
+    // Code actions: two servers asked. The first has none: no picker, and
+    // no "none" yet either (the other may have some).
+    ed.code_actions_waiting = 2;
+    try lsp_actions.codeActionsArrived(&ed);
     try testing.expectEqual(null, ed.picker);
-    try lsp_actions.addCodeAction(&ed, "Remove unused variable", "quickfix", try testing.allocator.dupe(u8, "{}"));
-    try lsp_actions.showCodeActions(&ed);
+    try testing.expectEqual(1, ed.code_actions_waiting);
+    // The second's: fixes before refactorings, the preferred fix first.
+    const gpa = testing.allocator;
+    try lsp_actions.addCodeAction(&ed, null, "Extract to function", "refactor.extract", false, try gpa.dupe(u8, "{}"));
+    try lsp_actions.addCodeAction(&ed, null, "Remove unused variable", "quickfix", false, try gpa.dupe(u8, "{}"));
+    try lsp_actions.addCodeAction(&ed, null, "Add import from \"react-native\"", "quickfix", true, try gpa.dupe(u8, "{}"));
+    try lsp_actions.addCodeAction(&ed, null, "Disable no-unused-vars for this line", "quickfix", false, try gpa.dupe(u8, "{}"));
+    try lsp_actions.codeActionsArrived(&ed);
     settlePicker(&ed);
-    try testing.expectEqualStrings("Remove unused variable", ed.picker.?.itemAt(0).?.text);
+    try testing.expectEqual(4, ed.picker.?.rowCount());
+    try testing.expectEqualStrings("Add import from \"react-native\"", ed.picker.?.itemAt(0).?.text);
+    try testing.expectEqualStrings("preferred fix", ed.picker.?.itemAt(0).?.detail);
+    try testing.expectEqualStrings("Remove unused variable", ed.picker.?.itemAt(1).?.text);
+    try testing.expectEqualStrings("Disable no-unused-vars for this line", ed.picker.?.itemAt(2).?.text);
+    try testing.expectEqualStrings("Extract to function", ed.picker.?.itemAt(3).?.text);
     try ed.feed("q");
 
     try ed.openPicker(.workspace_symbols, "");
@@ -457,4 +471,11 @@ test "the errors list has what zile's own Zig check found, not only the server's
     try testing.expectEqual(2, ed.picker.?.rowCount());
     try testing.expectEqualStrings("src/pairs.zig:10:1", ed.picker.?.itemAt(1).?.detail);
     try ed.feed("<Esc>");
+}
+
+test "the start screen's title carries the version from build.zig.zon" {
+    const sources = @import("../picker/sources.zig");
+    const version = @import("../version.zig");
+    try testing.expect(std.SemanticVersion.parse(version.number) != error.InvalidVersion);
+    try testing.expect(std.mem.startsWith(u8, sources.title(.start), "zile " ++ version.number));
 }

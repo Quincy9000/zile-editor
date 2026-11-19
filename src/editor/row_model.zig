@@ -1,6 +1,7 @@
 //! Rows: text lines plus ghost lines; within a line, its code lens row, then its wrapped pieces.
 
 const std = @import("std");
+const char_width = @import("../core/width.zig");
 const Buffer = @import("../core/Buffer.zig");
 const motions = @import("../core/motions.zig");
 const diff = @import("../git/diff.zig");
@@ -97,7 +98,7 @@ pub fn segments(ed: *const Editor, line: usize, buf: *[max_segments]Seg) []Seg {
     while (i < bytes.len) {
         const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 1;
         const cp_end = @min(i + len, bytes.len);
-        const next_col = if (bytes[i] == '\t') motions.nextTabStop(col, tab) else col + 1;
+        const next_col = if (bytes[i] == '\t') motions.nextTabStop(col, tab) else col + char_width.at(bytes, i).cells;
         const v0 = col + hintShift(hints, i);
         const v1 = next_col + hintShift(hints, i);
         if (v1 > row_start + width and v0 > row_start and n + 1 < max_segments) {
@@ -310,7 +311,7 @@ pub fn firstLine(s: []const u8) []const u8 {
 }
 
 pub fn cells(s: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(s) catch s.len;
+    return char_width.ofText(s);
 }
 
 /// The start of `s` that fits in `width` cells (to its first newline,

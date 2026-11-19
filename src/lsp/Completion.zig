@@ -39,7 +39,50 @@ pub const Item = struct {
     /// Taking it should open the suggestions again (the server says so: a
     /// CSS property, completed to `name: `, is followed by its values).
     again: bool = false,
+    /// Taking it brings something in from elsewhere: an import line for a
+    /// name of another module (`detail` then says which).
+    brings: bool = false,
+    /// The item as the server sent it (JSON), kept when the server has more
+    /// to say about it on request (`completionItem/resolve`): its signature
+    /// and documentation while it is selected, the edits that come with it
+    /// (an import) when it is taken.
+    raw: []const u8 = "",
+    /// The server was asked for the rest of it (once).
+    resolved: bool = false,
 };
+
+/// What a `CompletionItemKind` is called, for a server that says nothing
+/// else about an item in its list (the TypeScript server: the signature
+/// comes when the item is selected). "" for plain text and unknown kinds.
+pub fn kindName(kind: i64) []const u8 {
+    return switch (kind) {
+        2 => "method",
+        3 => "function",
+        4 => "constructor",
+        5 => "field",
+        6 => "variable",
+        7 => "class",
+        8 => "interface",
+        9 => "module",
+        10 => "property",
+        11 => "unit",
+        12 => "value",
+        13 => "enum",
+        14 => "keyword",
+        15 => "snippet",
+        16 => "color",
+        17 => "file",
+        18 => "reference",
+        19 => "folder",
+        20 => "enum member",
+        21 => "constant",
+        22 => "struct",
+        23 => "event",
+        24 => "operator",
+        25 => "type parameter",
+        else => "",
+    };
+}
 
 arena: std.heap.ArenaAllocator,
 items: []Item,
@@ -52,11 +95,18 @@ selected: usize = 0,
 /// of the items' `textEdit` range), when it says. It knows better than a
 /// guess from the text: zls completes `@import` from after the `@`.
 edit_col: ?usize = null,
+/// How much of the text from `word_start` is before the name itself: the
+/// server's edits begin there (the `.` of a member, for the TypeScript
+/// server), so it is not something typed of the name.
+lead: usize = 0,
 /// The server cut the list short (`isIncomplete`): it has to be asked again
 /// as the text changes, since what was left out might be what matches.
 incomplete: bool = false,
 /// What `shown` was last ranked against (a hash of the typed text).
 ranked_for: ?u64 = null,
+/// Which list this is, for an answer about one of its items that comes
+/// back later (the list may be another by then).
+serial: u64 = 0,
 
 /// The documentation last shown: item `index`'s, as plain text.
 doc_shown: ?struct { index: u32, text: []const u8 } = null,
@@ -77,8 +127,11 @@ pub fn docText(c: *Completion) []const u8 {
 }
 
 /// Builds the popup from a `textDocument/completion` result.
+var last_serial: u64 = 0;
+
 pub fn fromJson(gpa: Allocator, result: std.json.Value, word_start: usize) !Completion {
-    var c: Completion = .{ .arena = .init(gpa), .items = &.{}, .word_start = word_start };
+    last_serial += 1;
+    var c: Completion = .{ .arena = .init(gpa), .items = &.{}, .word_start = word_start, .serial = last_serial };
     errdefer c.arena.deinit();
     const a = c.arena.allocator();
     const list = switch (result) {
@@ -109,11 +162,26 @@ pub fn fromJson(gpa: Allocator, result: std.json.Value, word_start: usize) !Comp
         }
         const insert = Lsp.str(Lsp.field(Lsp.field(it, "textEdit"), "newText")) orelse
             Lsp.str(Lsp.field(it, "insertText")) orelse label;
+        // A name from another module: the server says where it is from
+        // (`labelDetails`), and has edits to go with it (the import), here
+        // or to be asked for.
+        const details = Lsp.field(it, "labelDetails");
+        const source = std.mem.trim(u8, Lsp.str(Lsp.field(details, "description")) orelse Lsp.str(Lsp.field(details, "detail")) orelse "", " ");
+        const edits = Lsp.field(it, "additionalTextEdits");
+        const has_edits = if (edits) |e| e == .array and e.array.items.len > 0 else false;
+        const has_data = Lsp.field(it, "data") != null;
+        const brings = has_edits or (source.len > 0 and has_data);
+        // What the list's second column says: where it is from, else what
+        // the server says of it, else at least what kind of thing it is.
+        const said = Lsp.str(Lsp.field(it, "detail")) orelse "";
+        const kind = if (Lsp.field(it, "kind")) |k| (if (k == .integer) k.integer else 0) else 0;
         try items.append(a, .{
+            .brings = brings,
+            .raw = if (brings or has_data) try std.json.Stringify.valueAlloc(a, it, .{}) else "",
             .label = try a.dupe(u8, label),
             .filter = try a.dupe(u8, Lsp.str(Lsp.field(it, "filterText")) orelse label),
             .insert = try a.dupe(u8, insert),
-            .detail = try a.dupe(u8, Lsp.str(Lsp.field(it, "detail")) orelse ""),
+            .detail = try a.dupe(u8, if (source.len > 0) source else if (said.len > 0) said else kindName(kind)),
             .snippet = if (Lsp.field(it, "insertTextFormat")) |f| f == .integer and f.integer == 2 else false,
             .is_type = if (Lsp.field(it, "kind")) |k| k == .integer and switch (k.integer) {
                 7, 8, 13, 22, 25 => true,
@@ -254,6 +322,59 @@ pub fn addSnippets(c: *Completion, lists: [3][]const snippets.Snippet, indent: [
     c.ranked_for = null;
 }
 
+/// The rest of item `index`, from the server (`completionItem/resolve`):
+/// its signature (`detail`) and documentation (markdown). They become what
+/// is shown beside the list while it is selected.
+pub fn takeDocs(c: *Completion, index: usize, detail: []const u8, doc: []const u8) !void {
+    if (index >= c.items.len) return;
+    const a = c.arena.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    const sig = std.mem.trim(u8, detail, " \t\r\n");
+    if (sig.len > 0) {
+        // As code, and wrapped here: code blocks keep their lines, and a
+        // signature is often one long one.
+        try out.appendSlice(a, "```\n");
+        var lines = std.mem.splitScalar(u8, sig, '\n');
+        while (lines.next()) |line| try wrapCode(a, &out, line, doc_cols - 2);
+        try out.appendSlice(a, "```\n");
+    }
+    const text = std.mem.trim(u8, doc, " \t\r\n");
+    if (text.len > 0) {
+        if (out.items.len > 0) try out.append(a, '\n');
+        try out.appendSlice(a, text);
+    }
+    if (out.items.len == 0) return;
+    c.items[index].doc = out.items;
+    if (c.doc_shown) |d| if (d.index == index) {
+        c.doc_shown = null;
+    };
+}
+
+/// `line` in pieces of at most `width` bytes, broken after a space or a
+/// comma where there is one, the pieces after the first indented.
+fn wrapCode(a: Allocator, out: *std.ArrayList(u8), line: []const u8, width: usize) !void {
+    var rest = line;
+    var first = true;
+    while (true) {
+        const room = if (first) width else width -| 4;
+        if (!first) try out.appendSlice(a, "    ");
+        if (rest.len <= room) {
+            try out.appendSlice(a, rest);
+            try out.append(a, '\n');
+            return;
+        }
+        var cut = room;
+        while (cut > room / 2 and rest[cut - 1] != ' ' and rest[cut - 1] != ',') cut -= 1;
+        if (cut <= room / 2) cut = room;
+        // (Never inside a character of several bytes.)
+        while (cut > 1 and rest[cut] & 0xC0 == 0x80) cut -= 1;
+        try out.appendSlice(a, std.mem.trimEnd(u8, rest[0..cut], " "));
+        try out.append(a, '\n');
+        rest = std.mem.trimStart(u8, rest[cut..], " ");
+        first = false;
+    }
+}
+
 pub fn deinit(c: *Completion, gpa: Allocator) void {
     c.shown.deinit(gpa);
     c.arena.deinit();
@@ -275,7 +396,7 @@ pub fn filter(c: *Completion, gpa: Allocator, typed: []const u8, types_first: bo
     var q = fuzzy.Query.init(typed);
     q.case_sensitive = false;
     var scratch: fuzzy.Scratch = .{};
-    const Scored = struct { index: u32, score: i32, len: usize, exact: bool, same_case: bool, prefix: bool, buffer: bool, type_wanted: bool, snippet_exact: bool };
+    const Scored = struct { index: u32, score: i32, len: usize, exact: bool, same_case: bool, prefix: bool, buffer: bool, type_wanted: bool, snippet_exact: bool, brings: bool };
     var scored: std.ArrayList(Scored) = .empty;
     defer scored.deinit(gpa);
     // Nothing typed yet (after `.`, or `justify-content: `): what the server
@@ -284,20 +405,27 @@ pub fn filter(c: *Completion, gpa: Allocator, typed: []const u8, types_first: bo
     const from_server = for (c.items) |item| {
         if (!item.from_buffer and !item.user_snippet and !item.markup) break true;
     } else false;
-    const only_server = typed.len == 0 and from_server;
+    // (What the server's edit starts with, the `.` of a member, isn't
+    // something typed of the name: right after it nothing is, yet.)
+    const named = typed.len -| c.lead;
+    const only_server = named == 0 and from_server;
     for (c.items, 0..) |item, i| {
-        if (only_server and (item.from_buffer or item.user_snippet or item.markup)) continue;
+        const ours = item.from_buffer or item.user_snippet or item.markup;
+        // Ours go in place of the name alone: not where the server's
+        // edits replace more than that.
+        if (ours and (only_server or c.lead > 0)) continue;
         const s = fuzzy.score(q, item.filter, &scratch) orelse continue;
         try scored.append(gpa, .{
             .index = @intCast(i),
             .score = s,
-            .len = if (typed.len == 0) 0 else item.filter.len,
+            .len = if (named == 0) 0 else item.filter.len,
             .exact = typed.len > 0 and std.ascii.eqlIgnoreCase(typed, item.filter),
             .same_case = std.mem.eql(u8, typed, item.filter),
             .prefix = typed.len > 0 and item.filter.len >= typed.len and std.ascii.eqlIgnoreCase(typed, item.filter[0..typed.len]),
             .buffer = item.from_buffer or item.user_snippet,
             .snippet_exact = item.user_snippet and std.mem.eql(u8, typed, item.filter),
             .type_wanted = types_first and item.is_type,
+            .brings = item.brings,
         });
     }
     // What was typed in full comes first (`drawtext` is `DrawText`, not the
@@ -315,6 +443,8 @@ pub fn filter(c: *Completion, gpa: Allocator, typed: []const u8, types_first: bo
             // only contain it; the server's before the file's own words.
             if (a.prefix != b.prefix) return a.prefix;
             if (a.score != b.score) return a.score > b.score;
+            // What is in reach already, before what an import would bring.
+            if (a.brings != b.brings) return b.brings;
             if (a.buffer != b.buffer) return b.buffer;
             if (a.len != b.len) return a.len < b.len;
             return a.index < b.index;

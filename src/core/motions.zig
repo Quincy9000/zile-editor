@@ -7,6 +7,7 @@
 //! always fall on codepoint boundaries.
 
 const std = @import("std");
+const char_width = @import("width.zig");
 const Text = @import("Text.zig");
 
 pub fn isContinuation(b: u8) bool {
@@ -53,8 +54,8 @@ pub fn nextTabStop(col: usize, tab_width: usize) usize {
     return (col / tab_width + 1) * tab_width;
 }
 
-/// Display column of byte offset `off` within `line` (tabs expanded).
-/// TODO: wide characters (use ghostty's unicode width tables, see DESIGN.md).
+/// Display column of byte offset `off` within `line` (tabs expanded, wide
+/// characters two cells, combining marks none).
 pub fn displayCol(line: []const u8, off: usize, tab_width: usize) usize {
     var col: usize = 0;
     var i: usize = 0;
@@ -63,8 +64,9 @@ pub fn displayCol(line: []const u8, off: usize, tab_width: usize) usize {
             col = nextTabStop(col, tab_width);
             i += 1;
         } else {
-            col += 1;
-            i += 1;
+            const ch = char_width.at(line, i);
+            col += ch.cells;
+            i += ch.len;
             while (i < line.len and isContinuation(line[i])) i += 1;
         }
     }
@@ -77,7 +79,7 @@ pub fn byteAtCol(line: []const u8, col: usize, tab_width: usize) usize {
     var c: usize = 0;
     var i: usize = 0;
     while (i < line.len) {
-        const next_c = if (line[i] == '\t') nextTabStop(c, tab_width) else c + 1;
+        const next_c = if (line[i] == '\t') nextTabStop(c, tab_width) else c + char_width.at(line, i).cells;
         if (col < next_c) return i;
         c = next_c;
         i += 1;
@@ -195,6 +197,9 @@ pub const Find = struct {
     forward: bool,
     /// t/T: stop one character before the match.
     till: bool,
+    /// A letter matches in either case (moving with `f`); not after an
+    /// operator, where it is the character typed and nothing else.
+    fold: bool = true,
 
     pub fn init(cp: u21, forward: bool, till: bool) ?Find {
         var f: Find = .{ .bytes = undefined, .len = 0, .forward = forward, .till = till };
@@ -204,6 +209,14 @@ pub const Find = struct {
 
     pub fn needle(f: *const Find) []const u8 {
         return f.bytes[0..f.len];
+    }
+
+    fn next(f: *const Find, hay: []const u8, from: usize) ?usize {
+        return if (f.fold) indexOfFold(hay, from, f.needle()) else std.mem.indexOfPos(u8, hay, from, f.needle());
+    }
+
+    fn previous(f: *const Find, hay: []const u8) ?usize {
+        return if (f.fold) lastIndexOfFold(hay, f.needle()) else std.mem.lastIndexOf(u8, hay, f.needle());
     }
 };
 
@@ -236,18 +249,17 @@ pub fn findInLine(t: *const Text, pos: usize, f: Find, count: usize, repeat: boo
     const line = t.lineOf(pos);
     const ls = t.lineStart(line);
     const bytes = t.lineSlice(line);
-    const needle = f.needle();
     var at = pos - ls;
     for (0..count) |i| {
         const skip: usize = @intFromBool(f.till and repeat and i == 0);
         if (f.forward) {
             const from = at + 1 + skip;
             if (from > bytes.len) return null;
-            at = indexOfFold(bytes, from, needle) orelse return null;
+            at = f.next(bytes, from) orelse return null;
         } else {
             const end = at -| skip;
             if (end == 0) return null;
-            at = lastIndexOfFold(bytes[0..end], needle) orelse return null;
+            at = f.previous(bytes[0..end]) orelse return null;
         }
     }
     const target = ls + at;
@@ -259,18 +271,17 @@ pub fn findInLine(t: *const Text, pos: usize, f: Find, count: usize, repeat: boo
 /// in the text (mini.jump).
 pub fn findAcross(t: *const Text, pos: usize, f: Find, count: usize, repeat: bool) ?usize {
     const bytes = t.slice(0, t.len());
-    const needle = f.needle();
     var at = pos;
     for (0..count) |i| {
         const skip: usize = @intFromBool(f.till and repeat and i == 0);
         if (f.forward) {
             const from = at + 1 + skip;
             if (from > bytes.len) return null;
-            at = indexOfFold(bytes, from, needle) orelse return null;
+            at = f.next(bytes, from) orelse return null;
         } else {
             const end = at -| skip;
             if (end == 0) return null;
-            at = lastIndexOfFold(bytes[0..end], needle) orelse return null;
+            at = f.previous(bytes[0..end]) orelse return null;
         }
     }
     if (!f.till) return at;

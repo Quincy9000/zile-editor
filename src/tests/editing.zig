@@ -73,7 +73,7 @@ test "counts multiply and dd/yy/p are linewise" {
 test "pastes in a row stack in order: the cursor ends on the last pasted line" {
     var ed = try testEditor("a\nb\nend");
     defer ed.deinit();
-    try ed.feed("2yyjpp");
+    try ed.feed("2yypp"); // (the yank leaves the cursor on the last line it took)
     try expectText(&ed, "a\nb\na\nb\na\nb\nend");
     try expectCursor(&ed, 5, 0);
     try ed.feed("u");
@@ -98,24 +98,34 @@ test "P in a row stacks in order too: the cursor ends on the first pasted line" 
     try expectCursor(&ed2, 0, 2);
 }
 
-test "yanking leaves the cursor where it is" {
+test "a yank leaves the cursor at the end of what it took" {
     var ed = try testEditor("one\n    foo(bar, baz)\nthree\n\nfour");
     defer ed.deinit();
     try ed.feed("j$h"); // on the last `z`
-    try ed.feed("yil");
+    try ed.feed("yil"); // the line's text: its last character
+    try expectCursor(&ed, 1, 16);
+    try ed.feed("yib"); // inside the brackets: the last character there
     try expectCursor(&ed, 1, 15);
-    try ed.feed("yib");
-    try expectCursor(&ed, 1, 15);
-    try ed.feed("yip");
-    try expectCursor(&ed, 1, 15);
-    try ed.feed("yb");
-    try expectCursor(&ed, 1, 15);
-    // Visual: back to where `v` was pressed, even from the other end.
-    try ed.feed("Vjy");
-    try expectCursor(&ed, 1, 15);
-    try ed.feed("vipy");
-    try expectCursor(&ed, 1, 15);
+    try ed.feed("0yw"); // the indentation, up to the word
+    try expectCursor(&ed, 1, 3);
+    try ed.feed("wyiw");
+    try expectCursor(&ed, 1, 6);
+    try ed.feed("yy"); // its own line: it stays
+    try expectCursor(&ed, 1, 6);
+    try ed.feed("yk"); // the line above and this one: this one is the last
+    try testing.expectEqual(1, ed.cursorLine());
+    try ed.feed("yj"); // this one and the next: the next
+    try testing.expectEqual(2, ed.cursorLine());
+    try ed.feed("ggyip"); // a paragraph: its last line
+    try testing.expectEqual(2, ed.cursorLine());
     try testing.expectEqualStrings("one\n    foo(bar, baz)\nthree\n", ed.registers.get(null).?.text);
+    // Visual: back to where `v` was pressed, even from the other end.
+    try ed.feed("ggjw");
+    const at = ed.view.cursor;
+    try ed.feed("Vjy");
+    try testing.expectEqual(at, ed.view.cursor);
+    try ed.feed("vipy");
+    try testing.expectEqual(at, ed.view.cursor);
 }
 
 test "gp / gP paste a yanked line inline, inside brackets" {
@@ -292,7 +302,7 @@ test "registers: named, append, black hole" {
     defer ed.deinit();
     try ed.feed("\"ayiww\"Ayiw");
     try testing.expectEqualStrings("alphabeta", ed.registers.get('a').?.text);
-    try ed.feed("\"_dw"); // black hole: the unnamed register still points at "a
+    try ed.feed("b\"_dw"); // black hole: the unnamed register still points at "a
     try testing.expectEqualStrings("alphabeta", ed.registers.get(null).?.text);
     try ed.feed("$\"ap");
     try expectText(&ed, "alpha alphabeta");
@@ -320,6 +330,145 @@ test "dit / dat / cit on tags" {
     try expectText(&ed, "<ul><li></li></ul>");
     try ed.feed("04ld2it"); // on <li>: li is level 1, ul level 2
     try expectText(&ed, "<ul></ul>");
+}
+
+test "yat / dat / cat: an element with its lines to itself is whole lines (p puts it below)" {
+    const html = "<ul>\n  <li>\n    one\n  </li>\n  <li>two</li>\n</ul>";
+    var ed = try testEditor(html);
+    defer ed.deinit();
+    // Several lines: yanked from inside it, pasted below it, indented as it was.
+    try ed.feed("jjyatp"); // (the yank left the cursor on its last line)
+    try expectText(&ed, "<ul>\n  <li>\n    one\n  </li>\n  <li>\n    one\n  </li>\n  <li>two</li>\n</ul>");
+    try ed.feed("u");
+    // One line: below as well, not in the middle of the cursor's line.
+    try ed.feed("gg4j^yatggp");
+    try expectText(&ed, "<ul>\n  <li>two</li>\n  <li>\n    one\n  </li>\n  <li>two</li>\n</ul>");
+    try ed.feed("u");
+    // dat takes the lines with it (no empty one stays); p puts them back.
+    try ed.feed("ggjjdat");
+    try expectText(&ed, "<ul>\n  <li>two</li>\n</ul>");
+    try ed.feed("p");
+    try expectText(&ed, "<ul>\n  <li>two</li>\n  <li>\n    one\n  </li>\n</ul>");
+    // cat keeps a line to type on, with the indentation.
+    try ed.feed("ggj^cat<lt>p/><Esc>");
+    try expectText(&ed, "<ul>\n  <p/>\n  <li>\n    one\n  </li>\n</ul>");
+
+    // An element that shares its line is text, as before: p is inline.
+    var shared = try testEditor("<b>x</b> and <i>y</i>");
+    defer shared.deinit();
+    try shared.feed("yat$p");
+    try expectText(&shared, "<b>x</b> and <i>y</i><b>x</b>");
+    // gp is inline for the whole-line kind too.
+    var inl = try testEditor("  <li>two</li>\nhere: ");
+    defer inl.deinit();
+    try inl.feed("^yatj$gp");
+    try expectText(&inl, "  <li>two</li>\nhere: <li>two</li>");
+}
+
+test "dw on a line's last word stops at the end of the line; an empty line goes whole" {
+    var ed = try testEditor("foo qux  \n  next x");
+    defer ed.deinit();
+    try ed.feed("wdw"); // the word and the blanks after it, not the line break
+    try expectText(&ed, "foo \n  next x");
+    try testing.expectEqualStrings("qux  ", ed.registers.get(null).?.text);
+    try ed.feed("u0wd2w"); // a count goes on over the break; its last word stops
+    try expectText(&ed, "foo x");
+    try ed.feed("u0wyw");
+    try testing.expectEqualStrings("qux  ", ed.registers.get(null).?.text);
+
+    var lines = try testEditor("foo\n\n  bar baz");
+    defer lines.deinit();
+    try lines.feed("dw"); // the only word of its line: the line stays, empty
+    try expectText(&lines, "\n\n  bar baz");
+    try lines.feed("jdw"); // an empty line is taken whole
+    try expectText(&lines, "\n  bar baz");
+    try lines.feed("jdW"); // (j has nowhere to go: the cursor is on bar)
+    try expectText(&lines, "\n  baz");
+}
+
+test "an exclusive motion from a line's start to another line's start is whole lines (d}, d{, db)" {
+    var ed = try testEditor("one\ntwo\n\nthree\nfour");
+    defer ed.deinit();
+    try ed.feed("d}"); // the paragraph's lines: one empty line stays, not two
+    try expectText(&ed, "\nthree\nfour");
+    try testing.expect(ed.registers.get(null).?.linewise);
+    try ed.feed("uGd{"); // from the last line's start, back over the paragraph
+    try expectText(&ed, "one\ntwo\nfour");
+    try ed.feed("uggld}"); // from inside a line: text only, as before
+    try expectText(&ed, "o\n\nthree\nfour");
+    try ed.feed("uggjdb"); // at a line's start: the line before goes
+    try expectText(&ed, "two\n\nthree\nfour");
+}
+
+test "f, t, F, T after an operator: on the line only, the exact character" {
+    var ed = try testEditor("abc Abc\nxyz x");
+    defer ed.deinit();
+    try ed.feed("dfx"); // no x on this line: nothing, though the next has one
+    try expectText(&ed, "abc Abc\nxyz x");
+    try ed.feed("dfA"); // the capital, not the a under the cursor's neighbour
+    try expectText(&ed, "bc\nxyz x");
+    try ed.feed("u$dFa"); // backward: the small one, past the capital
+    try expectText(&ed, "c\nxyz x");
+    try ed.feed("uj0dtx"); // t: up to it; the first x on this line is the cursor's own
+    try expectText(&ed, "abc Abc\nx");
+    try ed.feed("u0ctz!<Esc>");
+    try expectText(&ed, "abc Abc\n!z x");
+}
+
+test "ciw on an empty line types there" {
+    var ed = try testEditor("a\n\nb");
+    defer ed.deinit();
+    try ed.feed("jciwnew<Esc>");
+    try expectText(&ed, "a\nnew\nb");
+    try testing.expectEqual(Mode.normal, ed.mode);
+    var other = try testEditor("a\n\nb");
+    defer other.deinit();
+    try other.feed("jdiw"); // nothing to delete: nothing happens
+    try expectText(&other, "a\n\nb");
+    try testing.expectEqual(Mode.normal, other.mode);
+}
+
+test "~, gU, gu and visual U / u change letters with accents, Greek and Cyrillic" {
+    var ed = try testEditor("éa Öb ÿ σ я");
+    defer ed.deinit();
+    try ed.feed("~~");
+    try expectText(&ed, "ÉA Öb ÿ σ я");
+    try ed.feed("gUU");
+    try expectText(&ed, "ÉA ÖB Ÿ Σ Я");
+    try ed.feed("guu");
+    try expectText(&ed, "éa öb ÿ σ я");
+    try ed.feed("0vlU");
+    try expectText(&ed, "ÉA öb ÿ σ я");
+    try ed.feed("g~~");
+    try expectText(&ed, "éa ÖB Ÿ Σ Я");
+}
+
+test "ip / ap: a line of only spaces is a blank line" {
+    var ed = try testEditor("one\n   \ntwo\n\nthree");
+    defer ed.deinit();
+    try ed.feed("dip");
+    try expectText(&ed, "   \ntwo\n\nthree");
+    try ed.feed("udap"); // with the blank line after it
+    try expectText(&ed, "two\n\nthree");
+    try ed.feed("ujdip"); // on the blank line: the blank lines
+    try expectText(&ed, "one\ntwo\n\nthree");
+}
+
+test "aw with a count: that many words, each with its whitespace" {
+    var ed = try testEditor("foo  bar  baz");
+    defer ed.deinit();
+    try ed.feed("wd2aw"); // no whitespace after the last: what is before goes
+    try expectText(&ed, "foo");
+    try ed.feed("u0d2aw");
+    try expectText(&ed, "baz");
+    try ed.feed("u03ld2aw"); // from the whitespace: it and the word, twice
+    try expectText(&ed, "foo");
+    var punct = try testEditor("foo bar.baz");
+    defer punct.deinit();
+    try punct.feed("d2aw");
+    try expectText(&punct, ".baz");
+    try punct.feed("ud3iw"); // iw counts runs: foo, the space, bar
+    try expectText(&punct, ".baz");
 }
 
 test "autopairs: pair, step over, quotes, split blocks" {

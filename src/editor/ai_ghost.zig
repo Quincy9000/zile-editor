@@ -33,7 +33,9 @@ pub fn aiSuggestionHere(ed: *Editor) ?[]const u8 {
 /// drop it and (at a line's end) ask for a new one.
 pub fn updateAi(ed: *Editor) void {
     if (!ed.options.ai_complete or ed.ai_unreachable or ed.mode != .insert or
-        ed.replaying or ed.cursors.items.len > 0 or ed.cmd_float != null)
+        ed.replaying or ed.cursors.items.len > 0 or ed.cmd_float != null or
+        // A completion asked for by hand is being fetched or shown.
+        Editor.ai_fill.busy(ed))
     {
         clearAiSuggestion(ed);
         return;
@@ -53,16 +55,24 @@ pub fn updateAi(ed: *Editor) void {
         const cfg = aiConfig();
         ed.ai = Ghost.create(ed.gpa, ed.io, ed.wake_fn, cfg.host, cfg.model) catch return;
     }
-    // A window around the cursor: from a line start ~6KB back, ~2KB ahead.
-    var from = c -| 6000;
-    if (from > 0) from = t.lineStart(t.lineOf(from));
-    const to = @min(t.len(), c + 2000);
+    const w = window(ed, c);
+    const from = w.from;
+    const to = w.to;
     const tail: []const u8 = if (to == t.len() and b.final_newline) "\n" else "";
     const suffix = std.mem.concat(ed.gpa, u8, &.{ t.slice(c, to), tail }) catch return;
     defer ed.gpa.free(suffix);
     ed.ai_gen += 1;
     ed.ai.?.submit(ed.ai_gen, t.slice(from, c), suffix) catch return;
     ed.ai_asked = .{ .buffer = b, .pos = c, .version = b.edit_version };
+}
+
+/// What the local model is given of the file: a window around the cursor
+/// `c`, from a line start ~6KB back to ~2KB ahead.
+pub fn window(ed: *Editor, c: usize) struct { from: usize, to: usize } {
+    const t = ed.text();
+    var from = c -| 6000;
+    if (from > 0) from = t.lineStart(t.lineOf(from));
+    return .{ .from = from, .to = @min(t.len(), c + 2000) };
 }
 
 /// Picks up the model's reply, if it still fits where the cursor is.
@@ -88,17 +98,19 @@ pub fn pollAi(ed: *Editor) void {
     const prefix_on_line = t.slice(t.lineStart(line), ed.view.cursor);
     const suggestion = Ghost.dropRepeats(tidied, prefix_on_line, t.slice(ctx_from, ctx_to));
     if (suggestion.len == 0) return;
+    // Chinese or Japanese in a file that has none: the model drifting.
+    const w = window(ed, a.pos);
+    if (Ghost.foreignScript(suggestion, t.slice(w.from, w.to))) return;
     clearAiSuggestion(ed);
     ed.ai_suggestion = .{ .buffer = ed.buffer, .pos = a.pos, .text = ed.gpa.dupe(u8, suggestion) catch return };
 }
 
 pub const AiPart = enum { all, line, char };
 
-/// Takes the suggestion (<A-;>), its current line (<A-l>; at a line break,
-/// the break and the next line), or one character (<A-Right>). What's left
-/// stays offered. False when there is none.
-pub fn acceptAiSuggestion(ed: *Editor, part: AiPart) !bool {
-    const rest = aiSuggestionHere(ed) orelse return false;
+/// The start of `rest` (not empty) that `part` takes: all of it, its
+/// current line (at a line break, the break and the next line), or one
+/// character.
+pub fn partOf(rest: []const u8, part: AiPart) []const u8 {
     const n = switch (part) {
         .all => rest.len,
         .line => blk: {
@@ -107,7 +119,15 @@ pub fn acceptAiSuggestion(ed: *Editor, part: AiPart) !bool {
         },
         .char => std.unicode.utf8ByteSequenceLength(rest[0]) catch 1,
     };
-    const taken = try ed.gpa.dupe(u8, rest[0..@min(n, rest.len)]);
+    return rest[0..@min(n, rest.len)];
+}
+
+/// Takes the suggestion (<A-;>), its current line (<A-l>; at a line break,
+/// the break and the next line), or one character (<A-Right>). What's left
+/// stays offered. False when there is none.
+pub fn acceptAiSuggestion(ed: *Editor, part: AiPart) !bool {
+    const rest = aiSuggestionHere(ed) orelse return false;
+    const taken = try ed.gpa.dupe(u8, partOf(rest, part));
     defer ed.gpa.free(taken);
     // Typing it in keeps the rest of the suggestion on offer.
     try ed.insertText(taken);

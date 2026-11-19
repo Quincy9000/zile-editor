@@ -23,6 +23,14 @@ pub fn multiAfterKey(ed: *Editor) void {
     if (!done) return;
     defer ed.multi_keys.clearRetainingCapacity();
     if (ed.multi_once or ed.mode == .picker or ed.mode == .picker_normal or ed.cursors.items.len == 0) return;
+    // Placing: a key that only moved you is yours alone (the cursors placed
+    // stay where they were put). One that changed the text or the mode is
+    // the first of the work they are for: placing is over, and they get it.
+    if (ed.cursors_placing) {
+        const moved_only = ed.mode == .normal and ed.multi_start.mode == .normal and ed.buffer.edit_version == ed.multi_start.version;
+        if (moved_only) return;
+        ed.cursors_placing = false;
+    }
     replayAtCursors(ed, ed.multi_keys.items);
 }
 
@@ -139,9 +147,30 @@ pub fn addCursorHere(ed: *Editor) !void {
 
 pub fn clearCursors(ed: *Editor) void {
     ed.cursors.clearRetainingCapacity();
+    ed.cursors_placing = false;
+}
+
+/// `qp`: a cursor stays here, and placing begins (or goes on): move to
+/// where the next one goes and press it again; what you do then (`i`, `a`,
+/// `c`, `d`, `x`...) happens at every one of them, and where you are.
+pub fn placeCursor(ed: *Editor) !void {
+    const here = ed.view.cursor;
+    for (ed.cursors.items) |c| if (c.pos == here) {
+        ed.cursors_placing = true;
+        return ed.setMessage(.info, "a cursor is here already ({d} placed): move, then qp for the next; an edit uses them", .{ed.cursors.items.len});
+    };
+    try addCursorHere(ed);
+    ed.cursors_placing = true;
+    ed.setMessage(.info, "{d} placed: move, then qp for the next; an edit (i, a, c, d...) uses them, and where you are", .{ed.cursors.items.len});
 }
 
 pub fn removeLastCursor(ed: *Editor) void {
+    // While placing: the cursor placed last goes, and you stay where you are.
+    if (ed.cursors_placing) {
+        _ = ed.cursors.pop();
+        if (ed.cursors.items.len == 0) ed.cursors_placing = false;
+        return ed.setMessage(.info, "{d} placed", .{ed.cursors.items.len});
+    }
     if (ed.cursors.pop()) |c| {
         ed.view.cursor = c.pos;
         ed.view.anchor = c.anchor;
@@ -305,5 +334,32 @@ pub fn cursorsFromPrompt(ed: *Editor) !void {
             ed.view.anchor = c.anchor;
         } else try ed.cursors.append(ed.gpa, c);
     }
+    ed.matches_selected = true;
     reportCursors(ed);
+}
+
+/// A key on the matches `s` selected: `i` types before each, `a` after
+/// each, `o` / `O` on a new line below / above each. (`c`, `d`, `y` and the
+/// rest are visual mode's own; `I` / `A` are its line starts and ends.)
+/// False for any other key. It runs once for each cursor, as every key does.
+pub fn matchKey(ed: *Editor, cp: u21) !bool {
+    if (cp != 'i' and cp != 'a' and cp != 'o' and cp != 'O') return false;
+    const t = ed.text();
+    const r = code_motion.visualRange(ed);
+    code_motion.exitVisual(ed);
+    switch (cp) {
+        'i', 'a' => {
+            ed.setMode(.insert);
+            ed.view.cursor = if (cp == 'i') r.start else r.end;
+            ed.view.want_col = null;
+        },
+        else => {
+            // On the match's last line (or first), then vim's own o / O.
+            ed.setCursor(if (cp == 'o' and r.end > r.start) motions.prevChar(t, r.end) else r.start);
+            const commands = @import("../commands.zig");
+            const cmd = if (cp == 'o') commands.get("open_below") else commands.get("open_above");
+            try cmd.run(.{ .ed = ed, .count = 1, .has_count = false, .register = null });
+        },
+    }
+    return true;
 }

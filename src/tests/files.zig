@@ -88,9 +88,24 @@ test "autosave on leaving a file; the cursor and undo come back next time" {
         var ed = try testEditor("");
         defer ed.deinit();
         ed.state_dir = dir;
+        ed.options.autosave = true;
         try ed.openFile(a);
-        try ed.feed("jjAx<Esc>");
-        try ed.openFile(b); // leaving a.txt saves it
+        try ed.feed("jjAx");
+        // Still typing: nothing is written yet.
+        {
+            const typing = try tmp.dir.readFileAlloc(testing.io, "a.txt", gpa, .limited(1024));
+            defer gpa.free(typing);
+            try testing.expectEqualStrings("one\ntwo\nthree\n", typing);
+        }
+        // Leaving insert mode writes it, and it isn't "modified" after.
+        try ed.feed("<Esc>");
+        {
+            const written = try tmp.dir.readFileAlloc(testing.io, "a.txt", gpa, .limited(1024));
+            defer gpa.free(written);
+            try testing.expectEqualStrings("one\ntwo\nthreex\n", written);
+            try testing.expect(!ed.buffer.modified);
+        }
+        try ed.openFile(b); // (leaving a.txt saves it too, when it changed)
         ed.tick(); // ...and keeps its undo history
         const saved = try tmp.dir.readFileAlloc(testing.io, "a.txt", gpa, .limited(1024));
         defer gpa.free(saved);

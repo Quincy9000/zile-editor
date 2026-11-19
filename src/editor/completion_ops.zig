@@ -14,6 +14,7 @@ const after_typing = @import("after_typing.zig");
 const sql_ops = @import("sql_ops.zig");
 const Editor = @import("../Editor.zig");
 const lsp_ops = @import("lsp_ops.zig");
+const prompts = @import("prompts.zig");
 
 /// Asks for completions for the word starting at `start`, unless the answer
 /// to that same question is still on its way.
@@ -31,12 +32,24 @@ pub fn askCompletion(ed: *Editor, l: *Lsp, start: usize) void {
 /// retyped from its start.
 pub fn afterDeleted(ed: *Editor) void {
     if (ed.cursors.items.len > 0 or ed.replaying) return;
+    // The word deleted back to where it began: there is nothing left to
+    // complete, and a list kept open would be one of everything (its top
+    // taken by the next `(`). After a trigger (`foo.`) the list is that
+    // character's own, and stays: the server's edit starts with it (`lead`),
+    // or it is one of the server's trigger characters.
+    if (ed.completion) |c| if (ed.view.cursor <= c.word_start + c.lead and c.lead == 0) {
+        const t = ed.text();
+        const cur = ed.view.cursor;
+        const before: ?u8 = if (cur > t.lineStart(ed.cursorLine())) t.byteAt(cur - 1) else null;
+        const after_trigger = if (before) |b| (if (lsp_ops.lspFor(ed, ed.buffer)) |l| l.isTrigger(b) else sql_ops.isSql(ed) and b == '.') else false;
+        if (!after_trigger) return after_typing.closeCompletion(ed);
+    };
     if (sql_ops.isSql(ed) and lsp_ops.lspFor(ed, ed.buffer) == null) {
         if (ed.completion != null) return;
         const start = after_typing.wordStart(ed);
         const t = ed.text();
         const after_dot = ed.view.cursor > 0 and t.byteAt(ed.view.cursor - 1) == '.';
-        if (ed.view.cursor > start or after_dot) sql_ops.sqlCompletion(ed, start);
+        if ((ed.view.cursor > start and !after_typing.isNumber(ed, start)) or after_dot) sql_ops.sqlCompletion(ed, start);
         return;
     }
     const l = lsp_ops.lspFor(ed, ed.buffer) orelse return;
@@ -50,6 +63,7 @@ pub fn afterDeleted(ed: *Editor) void {
     const start = after_typing.wordStart(ed);
     const after_trigger = cur > t.lineStart(ed.cursorLine()) and l.isTrigger(t.byteAt(cur - 1));
     if (cur == start and !after_trigger) return; // nothing here to complete
+    if (after_typing.isNumber(ed, start) and !after_trigger) return; // a number isn't a name
     askCompletion(ed, l, start);
 }
 
@@ -94,7 +108,13 @@ pub fn showCompletion(ed: *Editor, b: *Buffer, word_start: usize, result: std.js
     // completes builtins from after the `@`, and filters without it).
     if (ed.completion.?.edit_col) |col| {
         const start = ed.text().lineStart(ed.cursorLine()) + col;
-        if (start <= ed.view.cursor) ed.completion.?.word_start = start;
+        if (start <= ed.view.cursor) {
+            // It may start before the name: the TypeScript server's members
+            // replace the `.` too (`.concat` for the `.` after `grid`). What
+            // is before the name is the server's to match, whatever it is.
+            if (start < word_start) ed.completion.?.lead = word_start - start;
+            ed.completion.?.word_start = start;
+        }
     }
     // Words of the file as well: the server may not have parsed it.
     if (ed.text().len() <= 2 << 20) {
@@ -152,12 +172,37 @@ pub fn refreshCompletion(ed: *Editor) !void {
         t.lineOf(c.word_start) == ed.cursorLine();
     if (!valid) return after_typing.closeCompletion(ed);
     const typed = t.slice(c.word_start, ed.view.cursor);
-    for (typed) |b| if (!after_typing.isNameChar(ed, b)) return after_typing.closeCompletion(ed);
+    // (Deleted back into what the server's edit starts with: the `.` gone.)
+    if (typed.len < c.lead) return after_typing.closeCompletion(ed);
+    for (typed[c.lead..]) |b| if (!after_typing.isNameChar(ed, b)) return after_typing.closeCompletion(ed);
     try c.filter(ed.gpa, typed, typeExpected(ed, c.word_start));
     // No match for what is typed (a typo, say): the list is kept, hidden,
     // and returns as soon as the text matches again. An empty answer has
     // nothing to bring back.
-    if (c.items.len == 0) after_typing.closeCompletion(ed);
+    if (c.items.len == 0) return after_typing.closeCompletion(ed);
+    askAboutSelected(ed);
+}
+
+/// The selected suggestion's signature and documentation, when the server
+/// keeps them until asked (the TypeScript server does): asked for once,
+/// and shown beside the list when they come (`docsArrived`).
+fn askAboutSelected(ed: *Editor) void {
+    const c = &(ed.completion orelse return);
+    if (c.shown.items.len == 0) return;
+    const index = c.shown.items[c.selected];
+    const item = &c.items[index];
+    if (item.raw.len == 0 or item.resolved or item.doc.len > 0) return;
+    const l = lsp_ops.lspFor(ed, ed.buffer) orelse return;
+    item.resolved = true;
+    l.requestCompletionDocs(item.raw, c.serial, index) catch {};
+}
+
+/// The server's answer about item `index` of list `serial` (still the one
+/// showing, or the answer is for nothing).
+pub fn docsArrived(ed: *Editor, serial: u64, index: u32, detail: []const u8, doc: []const u8) !void {
+    const c = &(ed.completion orelse return);
+    if (c.serial != serial) return;
+    try c.takeDocs(index, detail, doc);
 }
 
 /// Replaces the typed word with the selected item.
@@ -165,10 +210,16 @@ pub fn refreshCompletion(ed: *Editor) !void {
 /// Enter would, but only its name: the `(` that follows is the call's own
 /// (with its closing pair), so `drawtex(` becomes `drawText(|)`, not
 /// `drawText(args)(`.
+///
+/// Only when some of the name is typed. A list that opened by itself
+/// (after a `.`, or a quote where a string is expected) has its first item
+/// selected without your having asked for anything: there the `(` is a
+/// bracket and nothing else.
 pub fn commitCompletionName(ed: *Editor) !void {
     const c = completionShown(ed) orelse return;
     const item = c.current() orelse return;
     const start = c.word_start;
+    if (ed.view.cursor <= start + c.lead) return after_typing.closeCompletion(ed);
     var snip: ?Snippet = null;
     defer if (snip) |s| s.deinit(ed.gpa);
     // What the suggestion inserts, up to where its arguments begin.
@@ -199,6 +250,12 @@ pub fn acceptCompletion(ed: *Editor) !void {
     // A function (by its kind, or text that ends in a call when the server
     // doesn't say): <Tab> after it can end the statement with `;`.
     const is_call = !ours and (item.call or std.mem.endsWith(u8, std.mem.trimEnd(u8, insert, "$0"), ")"));
+    // What it brings with it (an import line), once it is in.
+    const raw: ?[]u8 = if (item.brings and item.raw.len > 0) try ed.gpa.dupe(u8, item.raw) else null;
+    defer if (raw) |r| {
+        if (lsp_ops.lspFor(ed, ed.buffer)) |l| l.completionTaken(ed, r) catch {};
+        ed.gpa.free(r);
+    };
     after_typing.closeCompletion(ed);
     try ed.deleteRange(start, ed.view.cursor);
     if (!is_snippet) {
@@ -214,6 +271,43 @@ pub fn acceptCompletion(ed: *Editor) !void {
     if (ours) if (ed.snippet) |*sn| {
         sn.keep_defaults = true;
     };
+}
+
+/// The edits a taken completion comes with (LSP `additionalTextEdits`: the
+/// import line of a name from another module), applied to this buffer. The
+/// cursor stays on the text it was on; it is part of the same undo step as
+/// what was typed.
+pub fn applyAdditionalEdits(ed: *Editor, edits: std.json.Value) !void {
+    if (edits != .array or edits.array.items.len == 0) return;
+    const Edit = struct { start: usize, end: usize, text: []const u8 };
+    var list: std.ArrayList(Edit) = .empty;
+    defer list.deinit(ed.gpa);
+    for (edits.array.items) |e| {
+        const range = Lsp.field(e, "range") orelse continue;
+        const from = Lsp.field(range, "start") orelse continue;
+        const to = Lsp.field(range, "end") orelse continue;
+        const start = prompts.offsetOf(ed, @intCast(@max(Lsp.int(Lsp.field(from, "line")) orelse 0, 0)), @intCast(@max(Lsp.int(Lsp.field(from, "character")) orelse 0, 0)));
+        const end = prompts.offsetOf(ed, @intCast(@max(Lsp.int(Lsp.field(to, "line")) orelse 0, 0)), @intCast(@max(Lsp.int(Lsp.field(to, "character")) orelse 0, 0)));
+        try list.append(ed.gpa, .{ .start = start, .end = @max(start, end), .text = Lsp.str(Lsp.field(e, "newText")) orelse "" });
+    }
+    // Last first: the positions before an edit stay what the server meant.
+    std.mem.sort(Edit, list.items, {}, struct {
+        fn later(_: void, a: Edit, b: Edit) bool {
+            return a.start > b.start;
+        }
+    }.later);
+    var first_line: ?[]const u8 = null;
+    for (list.items) |e| {
+        const cursor = ed.view.cursor;
+        try ed.deleteRangeKeepCursor(e.start, e.end);
+        try ed.insertAt(e.start, e.text);
+        // Text put in before the cursor pushes it along (what was taken
+        // out before it has moved it back already).
+        if (cursor >= e.end) ed.view.cursor += e.text.len;
+        const line = std.mem.trim(u8, e.text, " \t\r\n");
+        if (line.len > 0) first_line = line[0 .. std.mem.indexOfScalar(u8, line, '\n') orelse line.len];
+    }
+    if (first_line) |line| ed.setMessage(.info, "added: {s}", .{line[0..@min(line.len, 100)]});
 }
 
 /// Insert-mode <Tab> after an Emmet abbreviation in markup (`div`,

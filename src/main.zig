@@ -20,6 +20,7 @@ const picker_ops = @import("editor/picker_ops.zig");
 const borders = @import("editor/borders.zig");
 const resting = @import("editor/resting.zig");
 const row_model = @import("editor/row_model.zig");
+const version = @import("version.zig");
 
 const usage =
     \\usage: zile [options] [file]
@@ -32,6 +33,7 @@ const usage =
     \\  -t, --tui           draw in the terminal instead of a window (automatic
     \\                      when there is no display, e.g. over SSH)
     \\  -h, --help          show this help
+    \\  -V, --version       show the version
     \\  --grammar install [name...]
     \\                      fetch and build the grammars named in
     \\                      ~/.config/zile/languages.toml
@@ -60,6 +62,9 @@ fn parseArgs(init: std.process.Init) !Args {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print("{s}", .{usage});
+            std.process.exit(0);
+        } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
+            std.Io.File.stdout().writeStreamingAll(init.io, "zile " ++ version.text ++ "\n") catch {};
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tui")) {
             out.tui = true;

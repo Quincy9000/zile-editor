@@ -90,13 +90,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = zileExe(b, target, optimize);
+    // The version, from build.zig.zon (the one place it is written), for
+    // the start screen and `zile --version`.
+    const info = b.addOptions();
+    info.addOption([]const u8, "version", @import("build.zig.zon").version);
+    const build_info = info.createModule();
+
+    const exe = zileExe(b, target, optimize, build_info);
     b.installArtifact(exe);
 
     // `zig build release`: an optimized zile in zig-out/release/zile, apart
     // from the debug one `zig build` installs, for everyday use (it starts
     // in a millisecond and opens a big file in a fraction of the time).
-    const release = b.addInstallArtifact(zileExe(b, target, .ReleaseFast), .{
+    const release = b.addInstallArtifact(zileExe(b, target, .ReleaseFast, build_info), .{
         .dest_dir = .{ .override = .{ .custom = "release" } },
     });
     const release_step = b.step("release", "Build an optimized zile into zig-out/release/zile");
@@ -122,6 +128,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    test_mod.addImport("build_info", build_info);
     addSyntax(b, test_mod, target, optimize);
     addTerminal(b, test_mod, target, optimize);
     // For the terminal-mode grid's color type (no window code runs in tests).
@@ -174,13 +181,14 @@ fn addTtf(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarge
 }
 
 /// The editor executable, built with `optimize`.
-fn zileExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+fn zileExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_info: *std.Build.Module) *std.Build.Step.Compile {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    exe_mod.addImport("build_info", build_info);
     exe_mod.addImport("raylib", raylibDep(b, target, optimize).module("raylib"));
     addTtf(b, exe_mod, target, optimize);
     // raylib's X11 / GL libraries, for the final link of a portable build.

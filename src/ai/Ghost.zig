@@ -8,6 +8,7 @@
 //! still fits where the cursor is.
 
 const std = @import("std");
+const char_width = @import("../core/width.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -44,7 +45,7 @@ const max_tokens = 96;
 pub fn create(gpa: Allocator, io: Io, wake: *const fn () void, host: []const u8, model: []const u8) !*Ghost {
     const g = try gpa.create(Ghost);
     errdefer gpa.destroy(g);
-    const url = try std.fmt.allocPrint(gpa, "{s}/api/generate", .{std.mem.trimEnd(u8, host, "/")});
+    const url = try generateUrl(gpa, host);
     errdefer gpa.free(url);
     g.* = .{ .gpa = gpa, .io = io, .wake = wake, .url = url, .model = try gpa.dupe(u8, model) };
     g.thread = try std.Thread.spawn(.{}, run, .{g});
@@ -123,13 +124,7 @@ fn run(g: *Ghost) void {
 }
 
 fn ask(g: *Ghost, client: *std.http.Client, job: Job) ![]u8 {
-    const body = try std.json.Stringify.valueAlloc(g.gpa, .{
-        .model = g.model,
-        .prompt = job.prefix,
-        .suffix = job.suffix,
-        .stream = false,
-        .options = .{ .num_predict = max_tokens, .temperature = 0.1 },
-    }, .{});
+    const body = try requestBody(g.gpa, g.model, job.prefix, job.suffix, max_tokens);
     defer g.gpa.free(body);
     var reply: Io.Writer.Allocating = .init(g.gpa);
     defer reply.deinit();
@@ -141,9 +136,33 @@ fn ask(g: *Ghost, client: *std.http.Client, job: Job) ![]u8 {
         .response_writer = &reply.writer,
     });
     if (res.status != .ok) return error.BadStatus;
-    const parsed = try std.json.parseFromSlice(struct { response: []const u8 = "" }, g.gpa, reply.written(), .{ .ignore_unknown_fields = true });
+    return replyText(g.gpa, reply.written());
+}
+
+/// What Ollama's `/api/generate` is sent for fill-in-the-middle: the text
+/// before the cursor as `prompt`, after it as `suffix` (the model's
+/// template puts its own FIM tokens around them), at most `tokens` back.
+/// Shared with the completion asked for by hand (`fill.zig`).
+pub fn requestBody(gpa: Allocator, model: []const u8, prefix: []const u8, suffix: []const u8, tokens: u32) ![]u8 {
+    return std.json.Stringify.valueAlloc(gpa, .{
+        .model = model,
+        .prompt = prefix,
+        .suffix = suffix,
+        .stream = false,
+        .options = .{ .num_predict = tokens, .temperature = 0.1 },
+    }, .{});
+}
+
+/// The model's text in Ollama's reply (owned by the caller).
+pub fn replyText(gpa: Allocator, body: []const u8) ![]u8 {
+    const parsed = try std.json.parseFromSlice(struct { response: []const u8 = "" }, gpa, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    return g.gpa.dupe(u8, parsed.value.response);
+    return gpa.dupe(u8, parsed.value.response);
+}
+
+/// Where Ollama at `host` generates (owned by the caller).
+pub fn generateUrl(gpa: Allocator, host: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/api/generate", .{std.mem.trimEnd(u8, host, "/")});
 }
 
 /// Tidies a model's suggestion for the spot it was asked for: no trailing
@@ -188,6 +207,30 @@ pub fn dropRepeats(text: []const u8, line_prefix: []const u8, context: []const u
     return text;
 }
 
+/// Whether `s` has a wide character (CJK, kana, hangul, fullwidth forms).
+fn hasWide(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        const ch = char_width.at(s, i);
+        if (ch.cells == 2) {
+            // Emoji are wide too, and not a model changing language.
+            const len = ch.len;
+            const cp = std.unicode.utf8Decode(s[i .. i + len]) catch 0;
+            if (cp < 0x1F000) return true;
+        }
+        i += ch.len;
+    }
+    return false;
+}
+
+/// A suggestion in a script the file doesn't use: small code models drift
+/// into Chinese or Japanese (in strings and comments most of all), which
+/// is noise in a file that has none. `context` is the text around the
+/// cursor the model was given.
+pub fn foreignScript(text: []const u8, context: []const u8) bool {
+    return hasWide(text) and !hasWide(context);
+}
+
 /// Some line of `context`, trimmed, equals `head ++ tail` (trimmed).
 fn appearsIn(context: []const u8, head: []const u8, tail: []const u8) bool {
     var it = std.mem.splitScalar(u8, context, '\n');
@@ -213,4 +256,12 @@ test "tidy" {
     try std.testing.expectEqualStrings("a + b;", tidy("a + b;\n\n", "", 8));
     try std.testing.expectEqualStrings("x, y", tidy("x, y)", ")", 8));
     try std.testing.expectEqualStrings("one\ntwo", tidy("one\ntwo\nthree", "", 2));
+}
+
+test "foreignScript: CJK the file doesn't have is dropped; a file that has it keeps it" {
+    try std.testing.expect(foreignScript("\"お問い合わせください\",", "const messages = {\n  title: \""));
+    try std.testing.expect(!foreignScript("\"お問い合わせ\",", "title: \"お知らせ\",\nbody: \""));
+    try std.testing.expect(!foreignScript("return a + b;", "fn add() {"));
+    // Emoji aren't a change of language.
+    try std.testing.expect(!foreignScript("\"done 🎉\"", "const x = \""));
 }

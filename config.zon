@@ -43,6 +43,22 @@
     .debugvalues = true,
     .aicomplete = true,
 
+    // AI completion asked for with SPC a f (Alt-f while typing): who
+    // writes it. .local is the model on this machine. .anthropic is the
+    // model named by aimodel, and needs ANTHROPIC_API_KEY in the
+    // environment; .deepseek the one named by deepseekmodel, and needs
+    // DEEPSEEK_API_KEY (or DEEPSEEK_API). Keys are never kept here.
+    // SPC a b picks one and writes it here.
+    .aibackend = .local,
+    .aimodel = "claude-haiku-5-5",
+    .deepseekmodel = "deepseek-flash",
+
+    // Who answers in the conversation (SPC a a): .claude, as Claude Code
+    // is signed in, or .deepseek, Claude Code pointed at DeepSeek's API
+    // (needs DEEPSEEK_API_KEY or DEEPSEEK_API). SPC a d picks one and
+    // writes it here; each change starts a new conversation.
+    .chatbackend = .claude,
+
     // The Files picker's search of your home folder skips caches and
     // build output.
     .homefilter = true,

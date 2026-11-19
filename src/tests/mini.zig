@@ -135,8 +135,15 @@ test "mini.jump: f and t reach across lines; ; repeats" {
     try expectCursor(&ed, 0, 0);
     try ed.feed("l");
     try testing.expect(!ed.find_shown);
-    try ed.feed("dtx");
-    try expectText(&ed, "ax\nyy x");
+    // After an operator f and t are vim's: the line only, the exact letter.
+    try ed.feed("dtx"); // no x on this line: nothing goes
+    try expectText(&ed, "abc\ndef x\nyy x");
+    try ed.feed("j0dtx");
+    try expectText(&ed, "abc\nx\nyy x");
+    try ed.feed("u0dfF"); // no capital F on the line
+    try expectText(&ed, "abc\ndef x\nyy x");
+    try ed.feed("dff");
+    try expectText(&ed, "abc\n x\nyy x");
 }
 
 test "mini.bracketed: conflict markers and comment blocks; trailing whitespace" {

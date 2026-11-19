@@ -9,12 +9,77 @@
 //! A reader thread queues the CLI's lines; the main thread takes them in
 //! `poll`. The CLI is started by the first message and started again
 //! (resuming the session) if it has gone.
+//!
+//! Who answers is `backend`: Claude, as the CLI is signed in, or another
+//! service with Anthropic's API that the CLI is pointed at (`Backend`,
+//! the environment it is started in): DeepSeek's. The CLI does the rest
+//! the same way, its tools and permission questions too.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const Environ = std.process.Environ;
+const fill = @import("fill.zig");
 
 const Chat = @This();
+
+/// Who answers in the conversation.
+pub const Backend = enum {
+    /// Claude, as the CLI is signed in (its own login or key).
+    claude,
+    /// DeepSeek: the CLI with DeepSeek's Anthropic-compatible API and its
+    /// key ($DEEPSEEK_API_KEY or $DEEPSEEK_API).
+    deepseek,
+
+    pub fn title(b: Backend) []const u8 {
+        return switch (b) {
+            .claude => "Claude",
+            .deepseek => "DeepSeek",
+        };
+    }
+
+    /// The completion backend whose key it needs, if any.
+    pub fn service(b: Backend) ?fill.Backend {
+        return switch (b) {
+            .claude => null,
+            .deepseek => .deepseek,
+        };
+    }
+};
+
+/// What the CLI is pointed at for DeepSeek (as DeepSeek's guide for
+/// Claude Code has it). Opus is its larger model, so choosing Opus in the
+/// model picker asks that one; everything else is Flash.
+const deepseek_env = [_][2][]const u8{
+    .{ "ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic" },
+    .{ "ANTHROPIC_MODEL", "deepseek-flash[1m]" },
+    .{ "ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro[1m]" },
+    .{ "ANTHROPIC_DEFAULT_SONNET_MODEL", "deepseek-flash[1m]" },
+    .{ "ANTHROPIC_DEFAULT_HAIKU_MODEL", "deepseek-flash" },
+    .{ "CLAUDE_CODE_SUBAGENT_MODEL", "deepseek-flash" },
+    .{ "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "786432" },
+};
+
+/// Credentials of Claude's that must not go along: the CLI would send them
+/// to the service it is pointed at.
+const claude_credentials = [_][]const u8{ "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS" };
+
+/// The environment the CLI is started in for `b`: `ours`, or for a service
+/// ours with the CLI pointed at it and its key as the only credential.
+/// Null when it is ours as it is. The key is looked for in `ours`.
+pub fn environFor(gpa: Allocator, b: Backend, ours: *const Environ.Map) !?Environ.Map {
+    const svc = b.service() orelse return null;
+    const api = fill.apiOf(svc).?;
+    const key = for (api.key_names) |name| {
+        if (ours.get(name)) |v| if (fill.hasKey(v)) break v;
+    } else return error.NoApiKey;
+    var env = try ours.clone(gpa);
+    errdefer env.deinit();
+    for (claude_credentials) |name| _ = env.swapRemove(name);
+    for (deepseek_env) |kv| try env.put(kv[0], kv[1]);
+    try env.put("ANTHROPIC_AUTH_TOKEN", std.mem.trim(u8, key, " \t\r\n"));
+    return env;
+}
 
 pub const State = enum { idle, working, asking };
 
@@ -91,6 +156,15 @@ root: []u8,
 
 child: ?std.process.Child = null,
 reader: ?std.Thread = null,
+/// Reads what the CLI writes to stderr (its errors), keeping the end.
+err_reader: ?std.Thread = null,
+/// The last of that (guarded by `mutex`): what the panel says when the CLI
+/// stops by itself.
+err_tail: [err_tail_max]u8 = undefined,
+err_len: usize = 0,
+/// Tells `errLoop` to stop reading (a process the CLI started may keep
+/// its stderr open after it has gone).
+err_stop: std.atomic.Value(bool) = .init(false),
 mutex: Io.Mutex = .init,
 /// Lines from the CLI (owned), guarded by `mutex`.
 inbox: std.ArrayList([]u8) = .empty,
@@ -147,6 +221,11 @@ last_sent: std.ArrayList(u8) = .empty,
 next_request: usize = 1,
 /// No CLI is ever started (the tests: nothing is said to a real Claude).
 offline: bool = false,
+/// Who answers (`setBackend` changes it).
+backend: Backend = .claude,
+/// The environment zile was started in, which the CLI's is made from (not
+/// owned; null in the tests, where the CLI inherits it).
+environ: ?*const Environ.Map = null,
 
 pub fn create(gpa: Allocator, io: Io, root: []const u8, wake: *const fn () void) !*Chat {
     const c = try gpa.create(Chat);
@@ -231,12 +310,32 @@ fn freeAsk(gpa: Allocator, a: Ask) void {
     if (a.suggestions) |s| gpa.free(s);
 }
 
+const err_tail_max = 2048;
+
 fn stopProcess(c: *Chat) void {
-    // Killing the CLI ends its output, which ends the reader thread.
-    if (c.child) |*ch| ch.kill(c.io);
+    // Its input closed, `claude -p` ends by itself; it is asked to as well,
+    // and made to after two seconds. Its output closing ends the reader
+    // threads; then it is waited for and its pipes are closed (not before:
+    // a thread still reading a closed descriptor could read another file
+    // that took its number).
+    if (c.child) |*ch| {
+        if (ch.stdin) |f| f.close(c.io);
+        ch.stdin = null;
+        if (ch.id) |pid| {
+            std.posix.kill(pid, .TERM) catch {};
+            var waited: usize = 0;
+            while (waited < 200 and !c.isClosed()) : (waited += 1) c.io.sleep(.fromMilliseconds(10), .awake) catch {};
+            if (!c.isClosed()) std.posix.kill(pid, .KILL) catch {};
+        }
+    }
     if (c.reader) |t| t.join();
+    c.err_stop.store(true, .release);
+    if (c.err_reader) |t| t.join();
+    c.err_stop.store(false, .release);
+    if (c.child) |*ch| ch.kill(c.io);
     c.child = null;
     c.reader = null;
+    c.err_reader = null;
     for (c.inbox.items) |m| c.gpa.free(m);
     c.inbox.clearAndFree(c.gpa);
     c.closed = false;
@@ -405,6 +504,19 @@ pub fn reset(c: *Chat) void {
     c.cost = 0;
 }
 
+/// Who answers from now on. A conversation isn't carried from one to the
+/// other (what one wrote, its thinking, the other can't take up): the
+/// CLI is stopped, and the next message starts a new one. True when it
+/// changed.
+pub fn setBackend(c: *Chat, b: Backend) bool {
+    if (c.backend == b) return false;
+    c.backend = b;
+    c.reset();
+    var buf: [64]u8 = undefined;
+    _ = c.add(.note, std.fmt.bufPrint(&buf, "{s} answers from here on", .{b.title()}) catch "", "", "") catch {};
+    return true;
+}
+
 fn startProcess(c: *Chat) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(c.gpa);
@@ -420,13 +532,29 @@ fn startProcess(c: *Chat) !void {
         try argv.appendSlice(c.gpa, &.{ "--mcp-config", m });
         if (c.mcp_allowed.len > 0) try argv.appendSlice(c.gpa, &.{ "--allowedTools", c.mcp_allowed });
     }
-    c.child = try std.process.spawn(c.io, .{ .argv = argv.items, .cwd = .{ .path = c.root }, .stdin = .pipe, .stdout = .pipe, .stderr = .ignore });
+    var env: ?Environ.Map = null;
+    defer if (env) |*e| e.deinit();
+    if (c.backend != .claude) {
+        const ours = c.environ orelse return error.NoEnvironment;
+        env = try environFor(c.gpa, c.backend, ours);
+    }
+    c.child = try std.process.spawn(c.io, .{ .argv = argv.items, .cwd = .{ .path = c.root }, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe, .environ_map = if (env) |*e| e else null });
     errdefer {
         c.child.?.kill(c.io);
         c.child = null;
     }
     c.closed = false;
+    c.mutex.lockUncancelable(c.io);
+    c.err_len = 0;
+    c.mutex.unlock(c.io);
     c.reader = try std.Thread.spawn(.{}, readLoop, .{c});
+    // Without it, errors go unread (a full pipe would stall the CLI, so
+    // then nothing is read from it at all: it is closed).
+    c.err_reader = std.Thread.spawn(.{}, errLoop, .{c}) catch blk: {
+        if (c.child.?.stderr) |f| f.close(c.io);
+        c.child.?.stderr = null;
+        break :blk null;
+    };
     // What it has: its slash commands, its models (it answers at once,
     // before anything is said).
     c.write("{\"type\":\"control_request\",\"request_id\":\"zile-init\",\"request\":{\"subtype\":\"initialize\"}}");
@@ -691,6 +819,83 @@ fn readLoop(c: *Chat) void {
     }
 }
 
+fn isClosed(c: *Chat) bool {
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    return c.closed;
+}
+
+/// Keeps the end of what the CLI writes to stderr, until it ends or
+/// `err_stop`.
+fn errLoop(c: *Chat) void {
+    const stderr = c.child.?.stderr orelse return;
+    var chunk: [4096]u8 = undefined;
+    while (!c.err_stop.load(.acquire)) {
+        var fds = [_]std.posix.pollfd{.{ .fd = stderr.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, 100) catch return;
+        if (ready == 0) continue;
+        const n = stderr.readStreaming(c.io, &.{&chunk}) catch return;
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        keepTail(&c.err_tail, &c.err_len, chunk[0..n]);
+    }
+}
+
+/// `tail[0..len.*]` followed by `more`, cut to its last `tail.len` bytes.
+fn keepTail(tail: []u8, len: *usize, more: []const u8) void {
+    if (more.len >= tail.len) {
+        @memcpy(tail, more[more.len - tail.len ..]);
+        len.* = tail.len;
+        return;
+    }
+    const kept = @min(len.*, tail.len - more.len);
+    std.mem.copyForwards(u8, tail[0..kept], tail[len.* - kept .. len.*]);
+    @memcpy(tail[kept..][0..more.len], more);
+    len.* = kept + more.len;
+}
+
+/// The last line of `text` that isn't blank.
+fn lastLine(text: []const u8) []const u8 {
+    var it = std.mem.splitBackwardsScalar(u8, text, '\n');
+    while (it.next()) |l| {
+        const t = std.mem.trim(u8, l, " \t\r");
+        if (t.len > 0) return t;
+    }
+    return "";
+}
+
+/// Why the CLI's output ended: how it exited (looked at without reaping
+/// it, so `stopProcess` still can), and the last thing it wrote to stderr.
+fn whyStopped(c: *Chat, buf: []u8) []const u8 {
+    var how: []const u8 = "it ended";
+    var how_buf: [48]u8 = undefined;
+    if (@import("builtin").os.tag == .linux) if (c.child) |ch| if (ch.id) |pid| {
+        const linux = std.os.linux;
+        // Its output closes as it exits: a moment for the exit to land.
+        for (0..20) |_| {
+            var info: linux.siginfo_t = undefined;
+            info.fields.common.first.piduid.pid = 0;
+            const rc = linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, null);
+            if (linux.errno(rc) != .SUCCESS) break;
+            if (info.fields.common.first.piduid.pid == pid) {
+                const status = info.fields.common.second.sigchld.status;
+                how = switch (info.code) {
+                    1 => std.fmt.bufPrint(&how_buf, "exit code {d}", .{status}) catch how,
+                    2, 3 => std.fmt.bufPrint(&how_buf, "killed by signal {d}{s}", .{ status, if (info.code == 3) ", core dumped" else "" }) catch how,
+                    else => how,
+                };
+                break;
+            }
+            c.io.sleep(.fromMilliseconds(5), .awake) catch {};
+        } else how = "its output closed, still running";
+    };
+    c.mutex.lockUncancelable(c.io);
+    defer c.mutex.unlock(c.io);
+    const said = lastLine(c.err_tail[0..c.err_len]);
+    if (said.len == 0) return std.fmt.bufPrint(buf, "{s}", .{how}) catch how;
+    return std.fmt.bufPrint(buf, "{s}: {s}", .{ how, said[0..@min(said.len, 200)] }) catch how;
+}
+
 fn write(c: *Chat, line: []const u8) void {
     c.last_sent.clearRetainingCapacity();
     c.last_sent.appendSlice(c.gpa, line) catch {};
@@ -840,10 +1045,17 @@ pub fn poll(c: *Chat) void {
     }
     if (closed and c.child != null) {
         // It has gone (it crashed, or was killed): the next message starts
-        // it again, with the session.
+        // it again, with the session. Why is said: how it exited, and the
+        // last thing it wrote to stderr.
+        var why_buf: [320]u8 = undefined;
+        const why = c.whyStopped(&why_buf);
         c.stopProcess();
         c.endText();
-        if (c.state != .idle) _ = c.add(.note, "Claude Code stopped; your next message starts it again", "", "") catch {};
+        if (c.state != .idle) {
+            const text = std.fmt.allocPrint(c.gpa, "Claude Code stopped ({s}); your next message starts it again", .{why}) catch null;
+            defer if (text) |t| c.gpa.free(t);
+            _ = c.add(.note, text orelse "Claude Code stopped; your next message starts it again", "", "") catch {};
+        }
         c.clearAsks();
         c.state = .idle;
         // What that used.
@@ -1333,4 +1545,63 @@ test "the permission modes are the CLI's own: the choices in its help" {
     try std.testing.expectEqualStrings("plan", c.modes[3]);
     try c.event("{\"type\":\"system\",\"subtype\":\"status\",\"permissionMode\":\"default\"}");
     try std.testing.expect(c.modeInUse("manual") and !c.modeInUse("auto"));
+}
+
+test "the end of the CLI's stderr is kept, and its last line is what is said" {
+    var tail: [8]u8 = undefined;
+    var len: usize = 0;
+    keepTail(&tail, &len, "abc");
+    try std.testing.expectEqualStrings("abc", tail[0..len]);
+    keepTail(&tail, &len, "defgh");
+    try std.testing.expectEqualStrings("abcdefgh", tail[0..len]);
+    keepTail(&tail, &len, "ij");
+    try std.testing.expectEqualStrings("cdefghij", tail[0..len]);
+    keepTail(&tail, &len, "0123456789");
+    try std.testing.expectEqualStrings("23456789", tail[0..len]);
+    try std.testing.expectEqualStrings("Error: out of memory", lastLine("warning\nError: out of memory\n\n  \n"));
+    try std.testing.expectEqualStrings("", lastLine("\n \n"));
+}
+
+test "chat: DeepSeek answers through the same CLI, pointed at it, with its key and none of Claude's" {
+    const gpa = std.testing.allocator;
+    var ours: Environ.Map = .init(gpa);
+    defer ours.deinit();
+    try ours.put("PATH", "/usr/bin");
+    try ours.put("ANTHROPIC_API_KEY", "sk-ant-test");
+    try ours.put("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test");
+    // Claude: the environment as it is.
+    try std.testing.expectEqual(null, try environFor(gpa, .claude, &ours));
+    // No DeepSeek key: said, nothing started.
+    try std.testing.expectError(error.NoApiKey, environFor(gpa, .deepseek, &ours));
+    try ours.put("DEEPSEEK_API_KEY", "  ");
+    try std.testing.expectError(error.NoApiKey, environFor(gpa, .deepseek, &ours));
+    // The second name it may be under.
+    try ours.put("DEEPSEEK_API", "sk-ds-test\n");
+    var env = (try environFor(gpa, .deepseek, &ours)).?;
+    defer env.deinit();
+    try std.testing.expectEqualStrings("https://api.deepseek.com/anthropic", env.get("ANTHROPIC_BASE_URL").?);
+    try std.testing.expectEqualStrings("sk-ds-test", env.get("ANTHROPIC_AUTH_TOKEN").?);
+    try std.testing.expectEqualStrings("deepseek-flash[1m]", env.get("ANTHROPIC_MODEL").?);
+    try std.testing.expectEqual(null, env.get("ANTHROPIC_API_KEY"));
+    try std.testing.expectEqual(null, env.get("CLAUDE_CODE_OAUTH_TOKEN"));
+    try std.testing.expectEqualStrings("/usr/bin", env.get("PATH").?);
+    // Ours is untouched.
+    try std.testing.expectEqualStrings("sk-ant-test", ours.get("ANTHROPIC_API_KEY").?);
+}
+
+test "chat: changing who answers starts a new conversation, said in it" {
+    const c = try Chat.create(std.testing.allocator, std.testing.io, "/tmp", struct {
+        fn f() void {}
+    }.f);
+    defer c.destroy();
+    c.offline = true;
+    try std.testing.expect(!c.setBackend(.claude));
+    try c.say("hi", null);
+    c.session = try c.gpa.dupe(u8, "abc-1");
+    try std.testing.expect(c.setBackend(.deepseek));
+    try std.testing.expectEqual(null, c.session);
+    try std.testing.expectEqual(Backend.deepseek, c.backend);
+    const last = c.entries.items[c.entries.items.len - 1];
+    try std.testing.expectEqual(Entry.Kind.note, last.kind);
+    try std.testing.expectEqualStrings("DeepSeek answers from here on", last.title);
 }

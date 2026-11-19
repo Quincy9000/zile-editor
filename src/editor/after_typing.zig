@@ -35,8 +35,17 @@ pub fn wordStart(ed: *Editor) usize {
     return p;
 }
 
+/// The word starting at `start` is a number being typed (`16`, `0x1f`,
+/// `2e3`): not a name, so nothing is suggested for it. (A list of
+/// everything with a 1 and a 6 in it, `Int16Array` first, would be what
+/// Enter then takes in place of the number.)
+pub fn isNumber(ed: *Editor, start: usize) bool {
+    const t = ed.text();
+    return start < t.len() and std.ascii.isDigit(t.byteAt(start));
+}
+
 /// After typing in insert mode: asks for completions after one of the
-/// server's trigger characters (`.`, `::`, `->`...) or two identifier chars.
+/// server's trigger characters (`.`, `::`, `->`...) or a character of a name.
 pub fn afterTyped(ed: *Editor, cp: u21) void {
     if (ed.cursors.items.len > 0 or ed.replaying) return; // completion is single-cursor
     // Signature help: `(` opens it, `,` updates it, `)` closes it.
@@ -47,7 +56,7 @@ pub fn afterTyped(ed: *Editor, cp: u21) void {
         if (cp == '.') closeCompletion(ed);
         if (ed.completion != null) return;
         const start = wordStart(ed);
-        if (cp == '.' or (cp < 0x80 and isNameChar(ed, @intCast(cp)) and ed.view.cursor > start)) sql_ops.sqlCompletion(ed, start);
+        if (cp == '.' or (cp < 0x80 and isNameChar(ed, @intCast(cp)) and ed.view.cursor > start and !isNumber(ed, start))) sql_ops.sqlCompletion(ed, start);
         return;
     }
     const l = lsp_ops.lspFor(ed, ed.buffer) orelse return;
@@ -55,14 +64,19 @@ pub fn afterTyped(ed: *Editor, cp: u21) void {
     // call, say): the server answers with nothing outside a call.
     // After a `)` too: the call around the one just closed takes over.
     if (cp == ')' or l.isSignatureTrigger(cp, true)) l.requestSignature(ed) catch {};
-    const trigger = l.isTrigger(cp);
+    // A space ends the word and the suggestions with it, whatever the
+    // server says (some have it as a trigger, and offer a list of everything
+    // after `if `): a `(` typed next is a bracket, not the top suggestion's
+    // call. (CSS values after `property: ` are the one list a space opens.)
+    if (cp == ' ') closeCompletion(ed);
+    const trigger = cp != ' ' and l.isTrigger(cp);
     // A trigger starts a new list even if a popup is open.
     if (trigger) closeCompletion(ed);
     // A list we have is refiltered as you type (and comes back by itself
     // when a typo is fixed); only a cut-short one needs asking for again.
     if (ed.completion) |c| if (!c.incomplete) return;
     const start = wordStart(ed);
-    const ask = trigger or (cp < 0x80 and isNameChar(ed, @intCast(cp)) and ed.view.cursor > start) or
+    const ask = trigger or (cp < 0x80 and isNameChar(ed, @intCast(cp)) and ed.view.cursor > start and !isNumber(ed, start)) or
         (cp == ' ' and cssValueStarts(ed));
     if (!ask) return;
     completion_ops.askCompletion(ed, l, start);
