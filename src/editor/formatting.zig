@@ -216,9 +216,16 @@ pub fn saveAll(ed: *Editor) void {
     ed.setMessage(.info, "saved {d} buffer(s)", .{n});
 }
 
+/// `b`'s place in the buffer list, which it must be in.
 pub fn bufferIndex(ed: *const Editor, b: *const Buffer) usize {
+    return listIndex(ed, b).?;
+}
+
+/// `b`'s place in the buffer list, if it's in it: the buffers of floats
+/// (the command editor, a conversation row opened with Tab) aren't.
+pub fn listIndex(ed: *const Editor, b: *const Buffer) ?usize {
     for (ed.buffers.items, 0..) |o, i| if (o == b) return i;
-    unreachable;
+    return null;
 }
 
 /// Cycles through buffers in list order.
@@ -226,7 +233,7 @@ pub fn cycleBuffer(ed: *Editor, delta: isize) void {
     // The command editor's buffer isn't one of the list.
     if (ed.cmd_float != null) return ed.setMessage(.info, "close the command editor first (<Esc> in normal mode)", .{});
     const n: isize = @intCast(ed.buffers.items.len);
-    const i: isize = @intCast(bufferIndex(ed, ed.buffer));
+    const i: isize = @intCast(listIndex(ed, ed.buffer) orelse return ed.setMessage(.info, "this text isn't one of the buffers: Esc first", .{}));
     ed.switchTo(ed.buffers.items[@intCast(@mod(i + delta, n))]);
 }
 

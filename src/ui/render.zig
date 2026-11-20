@@ -1278,7 +1278,8 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var pending_buf: [16]u8 = undefined;
     const waiting = Editor.insert_keys.indicator(ed, &pending_buf);
     if (waiting.len > 0) try w.print("{s}   ", .{waiting});
-    if (ed.buffers.items.len > 1 and ed.cmd_float == null) try w.print("[{d}/{d}]  ", .{ formatting.bufferIndex(ed, ed.buffer) + 1, ed.buffers.items.len });
+    // (A float's own text, not one of the buffers, has no place among them.)
+    if (ed.buffers.items.len > 1) if (formatting.listIndex(ed, ed.buffer)) |i| try w.print("[{d}/{d}]  ", .{ i + 1, ed.buffers.items.len });
 
     const line = ed.cursorLine();
     const total = ed.text().lineCount();
@@ -2139,4 +2140,30 @@ test "terminal mode: signature help is two rows under the line being typed; the 
     try std.testing.expectEqual(call + 1, Find.row(&grid, "fn f(a: u8) void").?);
     try std.testing.expectEqual(call + 2, Find.row(&grid, "Does f.").?);
     try std.testing.expectEqual(call + 3, Find.row(&grid, "below").?);
+}
+
+test "terminal mode: a conversation row opened with Tab, other buffers open, draws (its text isn't one of them)" {
+    const Grid = @import("../tui/Grid.zig");
+    const Chat = @import("../ai/Chat.zig");
+    const gpa = std.testing.allocator;
+    var ed = try Editor.init(gpa, std.testing.io);
+    defer ed.deinit();
+    try formatting.newBuffer(&ed); // two buffers: the status line counts them
+    ed.chat = try Chat.create(gpa, ed.io, ".", Editor.noWake);
+    ed.chat.?.offline = true;
+    try ed.chat.?.say("what is this error", null);
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 100, 20);
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    try Editor.claude_chat.toggle(&ed);
+    try ed.feed("<Tab>");
+    try std.testing.expect(Editor.side_float.focused(&ed));
+    // (It was "reached unreachable code": its place among the buffers.)
+    draw(&ed, &font, Theme.get(ed.theme_index), prepare(&ed, &font, 100 * Grid.cell_w, 20 * Grid.cell_h));
+    try ed.feed("<Tab>");
+    try std.testing.expect(!Editor.side_float.focused(&ed));
+    draw(&ed, &font, Theme.get(ed.theme_index), prepare(&ed, &font, 100 * Grid.cell_w, 20 * Grid.cell_h));
 }
