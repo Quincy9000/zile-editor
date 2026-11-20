@@ -80,6 +80,11 @@ fn chat(ed: *Editor) !*Chat {
     return c;
 }
 
+/// Who answers in the conversation, by name: for what is said about it.
+pub fn who(ed: *const Editor) []const u8 {
+    return ed.options.chat_backend.title();
+}
+
 /// Whether `b` can answer: Claude always (as the CLI is signed in), a
 /// service with its key in zile's environment.
 pub fn backendAvailable(ed: *const Editor, b: Chat.Backend) bool {
@@ -100,7 +105,9 @@ pub fn setBackend(ed: *Editor, b: Chat.Backend) void {
     const value = switch (b) {
         inline else => |tag| "." ++ @tagName(tag),
     };
-    const what = if (changed) "answers from here on (a new conversation)" else "answers";
+    // Claude Code's own terminal, running, goes on with the one it has.
+    const term = if (ed.claude) |cl| cl.term != null else false;
+    const what = if (!changed) "answers" else if (term) "answers from here on (a new conversation; Claude Code's terminal keeps its own until it is closed)" else "answers from here on (a new conversation)";
     if (settings.store(ed, "chatbackend", value)) |_| {
         ed.setMessage(.info, "{s} {s}, kept in config.zon", .{ b.title(), what });
     } else |err| switch (err) {
@@ -275,7 +282,7 @@ pub fn hide(ed: *Editor) void {
 pub fn toggle(ed: *Editor) !void {
     if (ed.chat_panel.shown and ed.chat_panel.focus) return hide(ed);
     try show(ed, true);
-    if (ed.chat.?.entries.items.len == 0) ed.setMessage(.info, "SPC a i: tell Claude something (it answers here)", .{});
+    if (ed.chat.?.entries.items.len == 0) ed.setMessage(.info, "SPC a i: tell {s} something (it answers here)", .{who(ed)});
 }
 
 /// Says `text` to Claude; the conversation is shown, the keyboard stays.
@@ -332,9 +339,9 @@ fn face(ed: *Editor, a: Chat.Ask) void {
     const c = ed.chat orelse return;
     for (c.entries.items, 0..) |*e, i| if (std.mem.eql(u8, e.id, a.id)) select(ed, i);
     if (a.question)
-        ed.setMessage(.info, "Claude's question: the number of an answer picks it", .{})
+        ed.setMessage(.info, "{s}'s question: the number of an answer picks it", .{who(ed)})
     else
-        ed.setMessage(.info, "Claude asks to use {s}: y allows, n refuses", .{a.tool});
+        ed.setMessage(.info, "{s} asks to use {s}: y allows, n refuses", .{ who(ed), a.tool });
 }
 
 fn reply(ed: *Editor, r: Chat.Reply) void {
@@ -385,7 +392,7 @@ pub fn menu(ed: *Editor, which: Menu) !void {
     if (which == .modes) c.loadModes();
     if (which == .sessions) {
         c.listSessions();
-        if (c.listed.len == 0) return ed.setMessage(.info, "no conversations with Claude in this project yet", .{});
+        if (c.listed.len == 0) return ed.setMessage(.info, "no conversations in this project yet", .{});
     }
     const empty = switch (which) {
         .commands => c.commands.len == 0,
@@ -395,7 +402,7 @@ pub fn menu(ed: *Editor, which: Menu) !void {
         .usage => !c.usage.known,
         .sessions => false,
     };
-    if (empty) return ed.setMessage(.info, "Claude is starting: its {s} here in a moment", .{switch (which) {
+    if (empty) return ed.setMessage(.info, "{s} is starting: its {s} here in a moment", .{ who(ed), switch (which) {
         .commands => "commands are",
         .models => "models are",
         .modes => "permission modes are",
@@ -427,28 +434,44 @@ pub fn menuPick(ed: *Editor, which: Menu, row: usize) !void {
             if (row >= c.models.len) return;
             const m = c.models[row];
             try c.setModel(m.name);
-            ed.setMessage(.info, "Claude answers with {s} from now on", .{if (m.title.len > 0) m.title else m.name});
+            ed.setMessage(.info, "{s} answers with {s} from now on", .{ who(ed), if (m.title.len > 0) m.title else m.name });
         },
         .modes => {
             if (row >= c.modes.len) return;
             try c.setMode(c.modes[row]);
-            ed.setMessage(.info, "Claude's permission mode is {s} from now on", .{c.modes[row]});
+            ed.setMessage(.info, "the permission mode is {s} from now on", .{c.modes[row]});
         },
         .efforts => {
             const levels = c.efforts();
             if (row >= levels.len) return;
             try c.setEffort(levels[row]);
-            ed.setMessage(.info, "Claude's effort is {s} from now on", .{levels[row]});
+            ed.setMessage(.info, "the effort is {s} from now on", .{levels[row]});
         },
         // Only to look at.
         .usage => {},
         .sessions => {
             if (row >= c.listed.len) return;
-            try c.resumeSession(c.listed[row].id, c.listed[row].path);
+            const picked = c.listed[row];
+            // The one it is in: shown, and left running (resuming it would
+            // start the CLI over, and that ends the turn under way).
+            if (c.session) |id| if (std.mem.eql(u8, id, picked.id)) {
+                ed.chat_panel.follow = true;
+                try show(ed, true);
+                tick(ed);
+                return if (c.state == .idle)
+                    ed.setMessage(.info, "already in that conversation (SPC a a continues it)", .{})
+                else
+                    ed.setMessage(.info, "already in that conversation: {s} is still at it (SPC a a continues it)", .{who(ed)});
+            };
+            const was_working = c.state != .idle;
+            try c.resumeSession(picked.id, picked.path);
             ed.chat_panel.follow = true;
             try show(ed, true);
             tick(ed);
-            ed.setMessage(.info, "back in that conversation: what you say next carries on with it", .{});
+            if (was_working)
+                ed.setMessage(.info, "switched to that conversation (what {s} was doing in the other one was stopped)", .{who(ed)})
+            else
+                ed.setMessage(.info, "switched to that conversation: what you say next carries on with it", .{});
         },
     }
 }
@@ -484,10 +507,10 @@ pub fn until(ed: *const Editor, at: i64, buf: []u8) []const u8 {
 
 /// `SPC a x`: stops what Claude is doing.
 pub fn stop(ed: *Editor) void {
-    const c = ed.chat orelse return ed.setMessage(.info, "Claude isn't doing anything", .{});
-    if (c.state == .idle) return ed.setMessage(.info, "Claude isn't doing anything", .{});
+    const c = ed.chat orelse return ed.setMessage(.info, "{s} isn't doing anything", .{who(ed)});
+    if (c.state == .idle) return ed.setMessage(.info, "{s} isn't doing anything", .{who(ed)});
     c.interrupt();
-    ed.setMessage(.info, "stopping Claude", .{});
+    ed.setMessage(.info, "stopping {s}", .{who(ed)});
 }
 
 /// `SPC a c`: a new conversation (the old one's rows stay, above a note).
@@ -496,7 +519,7 @@ pub fn startOver(ed: *Editor) !void {
     c.reset();
     try show(ed, false);
     tick(ed);
-    ed.setMessage(.info, "a new conversation with Claude", .{});
+    ed.setMessage(.info, "a new conversation with {s}", .{who(ed)});
 }
 
 /// Takes what Claude has said since the last frame. While the last row is
@@ -514,10 +537,10 @@ pub fn tick(ed: *Editor) void {
         const where: []const u8 = if (p.shown) "" else " (SPC a a)";
         const last: ?*const Chat.Entry = if (c.entries.items.len > 0) &c.entries.items[c.entries.items.len - 1] else null;
         if (last) |e| switch (e.kind) {
-            .note => notifications.notify(ed, .err, "Claude: {s}{s}", .{ Chat.rowLine(e), where }),
-            .claude => notifications.notify(ed, .info, "Claude is done: {s}{s}", .{ cut(Chat.rowLine(e), 70), where }),
-            else => notifications.notify(ed, .info, "Claude is done{s}", .{where}),
-        } else notifications.notify(ed, .info, "Claude is done{s}", .{where});
+            .note => notifications.notify(ed, .err, "{s}: {s}{s}", .{ who(ed), Chat.rowLine(e), where }),
+            .claude => notifications.notify(ed, .info, "{s} is done: {s}{s}", .{ who(ed), cut(Chat.rowLine(e), 70), where }),
+            else => notifications.notify(ed, .info, "{s} is done{s}", .{ who(ed), where }),
+        } else notifications.notify(ed, .info, "{s} is done{s}", .{ who(ed), where });
     }
     if (p.version != c.version) {
         p.version = c.version;
@@ -535,12 +558,12 @@ pub fn tick(ed: *Editor) void {
         ed.chat_asked = waiting;
         if (c.asking()) |a| {
             if (a.question)
-                notifications.progress(ed, ask_toast, true, "Claude has a question: SPC a y to answer", .{})
+                notifications.progress(ed, ask_toast, true, "{s} has a question: SPC a a to answer it", .{who(ed)})
             else if (std.mem.eql(u8, a.tool, "Edit") or std.mem.eql(u8, a.tool, "Write"))
-                notifications.progress(ed, ask_toast, true, "Claude asks to change a file: SPC a y shows it (SPC a n refuses)", .{})
+                notifications.progress(ed, ask_toast, true, "{s} asks to change a file: SPC a a to answer", .{who(ed)})
             else
-                notifications.progress(ed, ask_toast, true, "Claude asks to use {s}: SPC a y to answer (SPC a n refuses)", .{a.tool});
-        } else notifications.progress(ed, ask_toast, false, "Claude has its answer", .{});
+                notifications.progress(ed, ask_toast, true, "{s} asks to use {s}: SPC a a to answer", .{ who(ed), a.tool });
+        } else notifications.progress(ed, ask_toast, false, "{s} has its answer", .{who(ed)});
     }
 }
 
@@ -605,7 +628,7 @@ fn intoText(ed: *Editor) !void {
     errdefer b.deinit(ed.gpa);
     try b.text.insert(ed.gpa, 0, e.text.items);
     b.syntax = Syntax.forPath("claude.md");
-    b.label = try ed.gpa.dupe(u8, "Claude");
+    b.label = try ed.gpa.dupe(u8, who(ed));
     b.read_only = true;
     try side_float.open(ed, b, true);
 }
@@ -621,7 +644,7 @@ fn openRow(ed: *Editor) !void {
     try b.text.insert(ed.gpa, 0, e.text.items);
     b.syntax = Syntax.forPath("claude.md");
     const line = Chat.rowLine(e);
-    b.label = try std.fmt.allocPrint(ed.gpa, "Claude: {s}", .{line[0..@min(line.len, 40)]});
+    b.label = try std.fmt.allocPrint(ed.gpa, "{s}: {s}", .{ who(ed), line[0..@min(line.len, 40)] });
     b.read_only = true;
     try ed.buffers.append(ed.gpa, b);
     ed.chat_panel.focus = false;

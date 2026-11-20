@@ -1001,7 +1001,9 @@ pub fn drawChat(ed: *Editor, font: *const Font, theme: *const Theme, l: render.L
     if (c.effort.len > 0) w.print(" {s}", .{c.effort[0..@min(c.effort.len, 8)]}) catch {};
     if (c.usage.five_hour) |pct| w.print(" · 5h {d:.0}%", .{pct}) catch {};
     if (c.mode.len > 0 and !std.mem.eql(u8, c.mode, "default")) w.print(" · {s}", .{c.mode[0..@min(c.mode.len, 20)]}) catch {};
-    if (state.len > 0) w.print(" · {s}", .{state}) catch {} else if (c.cost > 0) w.print(" · ${d:.2}", .{c.cost}) catch {};
+    // (The CLI prices what it was told at Claude's rates: only Claude's
+    // cost is the real one.)
+    if (state.len > 0) w.print(" · {s}", .{state}) catch {} else if (c.cost > 0 and c.backend == .claude) w.print(" · ${d:.2}", .{c.cost}) catch {};
     const about = w.buffered();
     const ask = c.asking();
     const asking = ask != null;
@@ -1009,8 +1011,8 @@ pub fn drawChat(ed: *Editor, font: *const Font, theme: *const Theme, l: render.L
     const hint: []const u8 = if (ed.side_window != null)
         "vim's keys: y copies   Tab / Esc back to the rows"
     else if (p.focus)
-        (if (question) "1-9 picks an answer   Tab into the text   i tell Claude   Esc / q hide" else if (asking) "y allow   a allow from now on   n refuse   Tab into the text   i tell Claude   Esc / q hide" else "j/k rows   Tab text   y copy   i tell   / commands   m model   e effort   u usage   r resume   C-c stop   Esc hide")
-    else if (question) "SPC a y to answer   Esc hides" else if (asking) "SPC a y allows   SPC a n refuses   Esc hides" else "SPC a a here   SPC a i tell Claude   Esc hides";
+        (if (question) "1-9 picks an answer   Tab into the text   i tell   Esc / q hide" else if (asking) "y allow   a allow from now on   n refuse   Tab into the text   i tell   Esc / q hide" else "j/k rows   Tab text   y copy   i tell   / commands   m model   e effort   u usage   r switch   C-c stop   Esc hide")
+    else if (question or asking) "SPC a a to answer   Esc hides" else "SPC a a here   SPC a i tell   Esc hides";
     const entries = c.entries.items;
     const sel: ?*const Chat.Entry = if (entries.len > 0) &entries[@min(p.sel, entries.len - 1)] else null;
     const Rows = struct {
@@ -1028,12 +1030,12 @@ pub fn drawChat(ed: *Editor, font: *const Font, theme: *const Theme, l: render.L
         }
     };
     drawPanes(ed, font, theme, l, bottom, p, .{
-        .title = "Claude",
+        .title = c.backend.title(),
         .about = about,
         .about_color = if (c.state == .asking) theme.diff_add else theme.status_dim,
         .hint = hint,
         .count = entries.len,
-        .empty = "nothing said yet: SPC a i tells Claude something",
+        .empty = "nothing said yet: SPC a i says something",
         .text = if (sel) |e| e.text.items else "",
         // A tool's row is its input and what came back; an ask's, the edit.
         .plain = if (sel) |e| e.kind == .tool or e.kind == .ask else false,

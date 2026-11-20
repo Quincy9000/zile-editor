@@ -613,3 +613,32 @@ test "the wheel over Claude's panel scrolls it, and over a picker goes through i
     p.shown = false;
     try testing.expect(!picker_ops.wheel(&ed, 400, 300, 3));
 }
+
+test "Claude drawn by zile: picking the conversation it is in from SPC a r leaves it running" {
+    var ed = try testEditor("code");
+    defer ed.deinit();
+    ed.windows.layout(.{ .w = 100, .h = 50 }, 1, 1);
+    ed.chat = try Chat.create(ed.gpa, ed.io, ".", noWake);
+    const c = ed.chat.?;
+    c.offline = true;
+    try c.say("make it work", null);
+    try c.event("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"abc-1\",\"model\":\"m\"}");
+    try testing.expectEqual(Chat.State.working, c.state);
+    const rows = c.entries.items.len;
+    c.listed = try c.listing.allocator().dupe(Chat.Session, &.{
+        .{ .id = "other-2", .path = "/nonexistent/other-2.jsonl", .first = "something else", .modified = 0 },
+        .{ .id = "abc-1", .path = "/nonexistent/abc-1.jsonl", .first = "make it work", .modified = 0 },
+    });
+
+    try claude_chat.menuPick(&ed, .sessions, 1);
+    try testing.expectEqual(Chat.State.working, c.state);
+    try testing.expectEqualStrings("abc-1", c.session.?);
+    try testing.expectEqual(rows, c.entries.items.len);
+    try testing.expect(ed.chat_panel.shown);
+    try testing.expect(std.mem.indexOf(u8, ed.message.text(), "still at it") != null);
+
+    // Another one: it is gone back to (and the work under way is said to stop).
+    try claude_chat.menuPick(&ed, .sessions, 0);
+    try testing.expectEqualStrings("other-2", c.session.?);
+    try testing.expect(std.mem.indexOf(u8, ed.message.text(), "was stopped") != null);
+}

@@ -938,7 +938,7 @@ environ: ?*const std.process.Environ.Map = null,
 /// The window border being dragged with the mouse.
 border_drag: ?*Windows.Split = null,
 completion: ?Completion = null,
-/// The call the cursor is in (signature help), shown above it while typing.
+/// The call the cursor is in (signature help), shown under its line while typing.
 signature: ?SignatureHelp = null,
 /// Placeholders of an accepted snippet (function arguments) to fill in.
 snippet: ?SnippetSession = null,
@@ -1043,6 +1043,10 @@ insert_zero: ?usize = null,
 /// Keys of the command being typed, for the status line (vim's showcmd).
 showcmd: [16]KeyEvent = undefined,
 showcmd_len: usize = 0,
+/// The last keys pressed, in any mode, oldest first (the status line shows
+/// them). Replayed keys (macros, `.`) aren't pressed, so not in it.
+recent_keys: [5]KeyEvent = undefined,
+recent_len: usize = 0,
 
 message: Message = .{},
 should_quit: bool = false,
@@ -1318,6 +1322,7 @@ pub fn text(ed: *Editor) *Text {
 // Input
 
 pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
+    ed.rememberKey(ev);
     if (color_wheel.colorKey(ed, ev)) return;
     if (run_popup.popupKey(ed, ev)) return;
     if (sql_ops.gridKey(ed, ev)) return;
@@ -1339,6 +1344,15 @@ pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
         }
         ed.processKey(ed.queue.orderedRemove(0));
     }
+}
+
+fn rememberKey(ed: *Editor, ev: KeyEvent) void {
+    if (ed.recent_len == ed.recent_keys.len) {
+        std.mem.copyForwards(KeyEvent, ed.recent_keys[0 .. ed.recent_len - 1], ed.recent_keys[1..ed.recent_len]);
+        ed.recent_len -= 1;
+    }
+    ed.recent_keys[ed.recent_len] = ev;
+    ed.recent_len += 1;
 }
 
 /// Feeds a key notation string, e.g. "ihello<Esc>". For tests and scripting.
@@ -1523,6 +1537,12 @@ pub fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
     // On the matches `s` selected: i / a / o / O type at each of them.
     if (ed.mode == .visual and ed.matches_selected and ed.pending_len == 0 and ed.count == 0) {
         if (ev.text()) |cp| if (try multicursor.matchKey(ed, cp)) return;
+    }
+
+    // On a rewrite or a proposed change: Enter takes it, Esc drops it.
+    if (ed.mode == .normal and ed.pending_len == 0 and ed.count == 0 and !ev.mods.any() and ev.key == .special) {
+        const k = ev.key.special;
+        if ((k == .enter or k == .escape) and claude_panel.proposalKey(ed, k == .enter)) return;
     }
 
     const commandish = ed.mode == .normal or ed.mode == .visual or ed.mode == .operator;

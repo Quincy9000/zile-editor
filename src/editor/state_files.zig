@@ -65,7 +65,10 @@ pub fn tickZigChecks(ed: *Editor) void {
         if (!bufferAlive(ed, zc.buffer)) continue;
         const diags = zc.job.diagnostics.toOwnedSlice(ed.gpa) catch continue;
         Lsp.sortDiagnostics(diags);
-        for (ed.check_results.items) |*r| if (r.buffer == zc.buffer) {
+        // The buffer's earlier result is replaced; else the result is added.
+        // (The `else` is the loop's, run when no result was the buffer's.)
+        for (ed.check_results.items) |*r| {
+            if (r.buffer != zc.buffer) continue;
             freeDiagnosticList(ed.gpa, r.diags);
             r.diags = diags;
             r.libc = zc.job.needed_libc;
@@ -616,6 +619,9 @@ test "places: a file's bookmarks and jumps are kept, and come back when it is op
     var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "one\ntwo\nthree\nfour\n" });
+    // A project of its own: not zile's checkout (the folder is inside it),
+    // whose `.zilehistory` this would read and write.
+    try tmp.dir.createDirPath(testing.io, ".git");
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const file = try std.fmt.bufPrint(&path_buf, "{s}/a.txt", .{dir});
     {

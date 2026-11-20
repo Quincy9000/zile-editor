@@ -20,6 +20,20 @@ const testEditor = support.testEditor;
 const testEditorAs = support.testEditorAs;
 const expectText = support.expectText;
 
+test "the status line's recent keys: the last five pressed, in any mode, not replayed ones" {
+    var ed = try testEditor("one two\n");
+    defer ed.deinit();
+    try ed.feed("ihello<Esc>");
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try @import("../input/keys.zig").formatSequenceDisplay(ed.recent_keys[0..ed.recent_len], &w);
+    try testing.expectEqualStrings("e l l o ESC", w.buffered());
+    // `.` replays its keys without pressing them.
+    try ed.feed("x.");
+    try testing.expectEqual(5, ed.recent_len);
+    try testing.expectEqual(@as(u21, '.'), ed.recent_keys[4].key.codepoint);
+}
+
 test "scrolling keeps the cursor in view" {
     var ed = try testEditor("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19");
     defer ed.deinit();

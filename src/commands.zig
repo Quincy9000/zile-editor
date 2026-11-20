@@ -266,7 +266,7 @@ const base = [_]Command{
     .{ .name = "jump_toggle", .doc = "Back to the last jump, and again: back here", .run = jumpToggle, .once = true },
     .{ .name = "leader_menu", .doc = "Leader menu (everything)", .run = openPicker(.leader), .once = true },
     .{ .name = "projects_menu", .doc = "Projects and sessions", .run = openPicker(.leader_projects) },
-    .{ .name = "claude_menu", .doc = "Claude", .run = openPicker(.leader_claude) },
+    .{ .name = "claude_menu", .doc = "AI (Claude, DeepSeek)", .run = openPicker(.leader_claude) },
     .{ .name = "quit_menu", .doc = "Quit", .run = openPicker(.leader_quit) },
     .{ .name = "code_menu", .doc = "Code (rename, actions, format, definitions, symbols...)", .run = openPicker(.code_menu) },
     .{ .name = "git_commit", .doc = "Commit all changes", .run = gitAction(.commit), .needs = "git" },
@@ -354,22 +354,22 @@ const base = [_]Command{
     .{ .name = "next_buffer", .doc = "Next buffer", .run = cycleBuffer(1) , .jump = true },
     .{ .name = "previous_buffer", .doc = "Previous buffer", .run = cycleBuffer(-1) , .jump = true },
     .{ .name = "switch_project", .doc = "Switch project", .run = openPicker(.projects), .once = true },
-    .{ .name = "claude_chat", .doc = "Claude: the conversation (drawn by zile)", .run = claudeCmd(.chat), .once = true, .needs = "claude" },
-    .{ .name = "claude_commands", .doc = "Claude: its slash commands", .run = claudeCmd(.commands), .once = true, .needs = "claude" },
-    .{ .name = "claude_model", .doc = "Claude: the model that answers", .run = claudeCmd(.model), .once = true, .needs = "claude" },
-    .{ .name = "claude_mode", .doc = "Claude: how much it may do without asking", .run = claudeCmd(.mode), .once = true, .needs = "claude" },
-    .{ .name = "claude_effort", .doc = "Claude: how hard it thinks (effort)", .run = claudeCmd(.effort), .once = true, .needs = "claude" },
-    .{ .name = "claude_usage", .doc = "Claude: how much of your limits is used", .run = claudeCmd(.usage), .once = true, .needs = "claude" },
-    .{ .name = "claude_resume", .doc = "Claude: go back to a conversation of before", .run = claudeCmd(.resume_), .once = true, .needs = "claude" },
-    .{ .name = "claude_rewrite", .doc = "Claude: rewrite the selection in place", .run = claudeCmd(.rewrite), .once = true, .needs = "claude" },
-    .{ .name = "claude_stop", .doc = "Claude: stop what it is doing", .run = claudeCmd(.stop), .once = true },
-    .{ .name = "claude_new", .doc = "Claude: a new conversation", .run = claudeCmd(.new), .once = true, .needs = "claude" },
-    .{ .name = "chat_backend", .doc = "Claude: who answers in the conversation (Claude, DeepSeek)", .run = openPicker(.chat_backends), .once = true, .needs = "claude" },
+    .{ .name = "claude_chat", .doc = "AI: continue the conversation (shows it, or hides it from inside)", .run = claudeCmd(.chat), .once = true, .needs = "claude" },
+    .{ .name = "claude_commands", .doc = "AI: the conversation's slash commands", .run = claudeCmd(.commands), .once = true, .needs = "claude" },
+    .{ .name = "claude_model", .doc = "AI: the model that answers", .run = claudeCmd(.model), .once = true, .needs = "claude" },
+    .{ .name = "claude_mode", .doc = "AI: how much it may do without asking", .run = claudeCmd(.mode), .once = true, .needs = "claude" },
+    .{ .name = "claude_effort", .doc = "AI: how hard it thinks (effort)", .run = claudeCmd(.effort), .once = true, .needs = "claude" },
+    .{ .name = "claude_usage", .doc = "AI: how much of your Claude limits is used", .run = claudeCmd(.usage), .once = true, .needs = "claude" },
+    .{ .name = "claude_resume", .doc = "AI: switch to another conversation of this project", .run = claudeCmd(.resume_), .once = true, .needs = "claude" },
+    .{ .name = "claude_rewrite", .doc = "AI: rewrite the selection in place", .run = claudeCmd(.rewrite), .once = true, .needs = "claude" },
+    .{ .name = "claude_stop", .doc = "AI: stop what it is doing", .run = claudeCmd(.stop), .once = true },
+    .{ .name = "claude_new", .doc = "AI: a new conversation", .run = claudeCmd(.new), .once = true, .needs = "claude" },
+    .{ .name = "chat_backend", .doc = "AI: who answers in the conversation (Claude, DeepSeek)", .run = openPicker(.chat_backends), .once = true, .needs = "claude" },
     .{ .name = "claude_panel", .doc = "Claude Code's own terminal", .run = claudeCmd(.panel), .once = true, .needs = "claude" },
-    .{ .name = "claude_send", .doc = "Send selection/file to Claude", .run = claudeCmd(.send), .once = true, .needs = "claude" },
-    .{ .name = "claude_ask", .doc = "Tell Claude something (a box; Enter sends)", .run = claudeCmd(.ask), .once = true, .needs = "claude" },
-    .{ .name = "claude_accept", .doc = "Accept Claude's change", .run = claudeCmd(.accept), .once = true },
-    .{ .name = "claude_reject", .doc = "Reject Claude's change", .run = claudeCmd(.reject), .once = true },
+    .{ .name = "claude_send", .doc = "AI: send the selection / file to the conversation", .run = claudeCmd(.send), .once = true, .needs = "claude" },
+    .{ .name = "claude_ask", .doc = "AI: say something to the conversation (a box; Enter sends)", .run = claudeCmd(.ask), .once = true, .needs = "claude" },
+    .{ .name = "claude_accept", .doc = "AI: accept the proposed change", .run = claudeCmd(.accept), .once = true },
+    .{ .name = "claude_reject", .doc = "AI: reject the proposed change", .run = claudeCmd(.reject), .once = true },
     .{ .name = "terminal_window", .doc = "Terminal here (in this window)", .run = termCmd(.window), .once = true },
     .{ .name = "terminal_toggle", .doc = "Terminal popup", .run = termCmd(.toggle), .once = true },
     .{ .name = "run_runner", .doc = "Code runner (commands run here)", .run = termCmd(.runner), .once = true },
@@ -567,6 +567,8 @@ pub const ObjectKind = union(enum) {
     statement,
     /// One item of a bracketed, comma-separated list (by the text alone).
     argument,
+    /// What follows an `=` or `:` (by the text alone).
+    value,
 };
 
 pub const ObjectSpec = struct {
@@ -601,6 +603,7 @@ pub const text_object_specs = [_]ObjectSpec{
     .{ .name = "function", .doc = "function", .keys = "f", .kind = .{ .syntax = .function } },
     .{ .name = "class", .doc = "class/struct", .keys = "c", .kind = .{ .syntax = .class } },
     .{ .name = "argument", .doc = "argument", .keys = "a", .kind = .argument },
+    .{ .name = "value", .doc = "value (after = or :)", .keys = "v", .kind = .value },
 };
 
 /// Which instance of an object: the one at the cursor (seeking ahead when
@@ -655,6 +658,10 @@ fn objectAt(ed: *Editor, comptime kind: ObjectKind, scope: textobjects.Scope, po
         .tag => textobjects.tag(t, pos, scope, count),
         .syntax => |obj| if (ed.buffer.syntax) |*s| syntax_objects.find(s, t, pos, obj, scope, count) else null,
         .argument => textobjects.argument(t, pos, scope),
+        .value => blk: {
+            const style = textops.commentStyle(ed, t.lineOf(pos));
+            break :blk textobjects.value(t, pos, scope, if (style.close.len == 0) std.mem.trimEnd(u8, style.open, " ") else "");
+        },
         .statement => textobjects.statement(t, pos, scope, count),
         .indent => blk: {
             const s = indents.scope(t, t.lineOf(pos), ed.options.tab_width, true) orelse break :blk null;
@@ -676,6 +683,8 @@ fn objectCandidate(comptime kind: ObjectKind, b: u8, forward: bool) bool {
         .statement => b == @as(u8, if (forward) '{' else '}'),
         // Arguments start after a bracket or comma, and end before one.
         .argument => true,
+        // A value is found from its operator.
+        .value => b == '=' or b == ':',
         else => b != ' ' and b != '\t' and b != '\n',
     };
 }
@@ -2387,7 +2396,10 @@ fn claudeCmd(comptime action: enum { chat, commands, model, mode, effort, usage,
         fn run(c: Context) anyerror!void {
             const ed = c.ed;
             switch (action) {
-                .panel => claude_panel.toggleClaude(ed) catch |err| ed.setMessage(.err, "could not start Claude Code: {s}", .{@errorName(err)}),
+                .panel => claude_panel.toggleClaude(ed) catch |err| switch (err) {
+                    error.NoApiKey => ed.setMessage(.err, "{s} needs its API key in the environment zile starts in (SPC a d: who answers)", .{claude_chat.who(ed)}),
+                    else => ed.setMessage(.err, "could not start Claude Code: {s}", .{@errorName(err)}),
+                },
                 .chat => try claude_chat.toggle(ed),
                 .commands => try claude_chat.menu(ed, .commands),
                 .model => try claude_chat.menu(ed, .models),
@@ -2554,7 +2566,7 @@ fn smartClose(c: Context) !void {
         const claude = window_ops.isClaudeTerm(ed, t);
         window_ops.focusWindow(ed, w);
         window_ops.closeWindow(ed);
-        if (claude) ed.setMessage(.info, "Claude panel hidden (SPC a a shows it again)", .{}) else ed.setMessage(.info, "terminal closed", .{});
+        if (claude) ed.setMessage(.info, "Claude Code's terminal hidden (SPC a t shows it again)", .{}) else ed.setMessage(.info, "terminal closed", .{});
         return;
     };
     if (ed.buffers.items.len > 1) {

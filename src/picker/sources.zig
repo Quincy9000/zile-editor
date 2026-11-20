@@ -427,7 +427,7 @@ const Leader = Menu("Leader", &.{
     .{ .key = 't', .label = "Toggles", .command = "pick_toggles" },
     .{ .key = 'o', .label = "Options: your config.zon (saving it applies it)", .command = "settings" },
     .{ .key = 'p', .label = "Projects (and their sessions)", .command = "switch_project" },
-    .{ .key = 'a', .label = "Claude", .command = "claude_menu" },
+    .{ .key = 'a', .label = "AI (Claude, DeepSeek)", .command = "claude_menu" },
     .{ .key = 'n', .label = "Notes: the scratch pads", .command = "toggle_scratch" },
     .{ .key = 'm', .label = "Bookmarks (m and a key makes one)", .command = "pick_mark" },
     .{ .key = 'j', .label = "Jumps (the places you jumped from)", .command = "jump_list" },
@@ -447,25 +447,23 @@ const ProjectsMenu = Menu("Projects", &.{
 });
 
 /// `SPC a`.
-const ClaudeMenu = Menu("Claude", &.{
-    .{ .key = 'a', .label = "Claude (the conversation, drawn here)", .command = "claude_chat" },
+const ClaudeMenu = Menu("AI", &.{
+    .{ .key = 'a', .label = "Continue the conversation", .command = "claude_chat" },
     .{ .key = '/', .label = "Slash commands", .command = "claude_commands" },
     .{ .key = 'm', .label = "Model", .command = "claude_model" },
     .{ .key = 'e', .label = "Effort (how hard it thinks)", .command = "claude_effort" },
     .{ .key = 'p', .label = "Permission mode (ask first, accept edits, plan)", .command = "claude_mode" },
-    .{ .key = 'u', .label = "Usage (your limits, the context)", .command = "claude_usage" },
+    .{ .key = 'u', .label = "Usage (your Claude limits, the context)", .command = "claude_usage" },
     .{ .key = 'w', .label = "Rewrite the selection in place...", .command = "claude_rewrite" },
     .{ .key = 'f', .label = "Fill in at the cursor (AI; Alt-; takes it)", .command = "ai_fill" },
     .{ .key = 'b', .label = "Fill-in backend (Local, Anthropic, DeepSeek)", .command = "ai_backend" },
-    .{ .key = 'd', .label = "Who answers here (Claude, DeepSeek)", .command = "chat_backend" },
-    .{ .key = 'r', .label = "Resume a conversation of before", .command = "claude_resume" },
-    .{ .key = 'x', .label = "Stop what Claude is doing", .command = "claude_stop" },
+    .{ .key = 'd', .label = "Who answers (Claude, DeepSeek)", .command = "chat_backend" },
+    .{ .key = 'r', .label = "Switch to another conversation...", .command = "claude_resume" },
+    .{ .key = 'x', .label = "Stop what it is doing", .command = "claude_stop" },
     .{ .key = 'c', .label = "A new conversation", .command = "claude_new" },
-    .{ .key = 't', .label = "Claude's own terminal", .command = "claude_panel" },
+    .{ .key = 't', .label = "Claude Code's own terminal", .command = "claude_panel" },
     .{ .key = 's', .label = "Send the file / selection", .command = "claude_send" },
-    .{ .key = 'i', .label = "Tell Claude... (a box: Enter sends, you stay in the code)", .command = "claude_ask" },
-    .{ .key = 'y', .label = "Yes: allow the tool / accept the proposal", .command = "claude_accept" },
-    .{ .key = 'n', .label = "No: refuse the tool / reject the proposal", .command = "claude_reject" },
+    .{ .key = 'i', .label = "Tell it... (a box: Enter sends, you stay in the code)", .command = "claude_ask" },
 });
 
 /// `SPC a b`: who writes a completion asked for by hand. Anthropic is
@@ -896,12 +894,12 @@ const Toggles = struct {
 fn ClaudeList(comptime which: claude_chat.Menu) type {
     return struct {
         pub const title = switch (which) {
-            .commands => "Claude: slash commands",
-            .models => "Claude: model",
-            .modes => "Claude: permission mode",
-            .efforts => "Claude: effort",
-            .usage => "Claude: usage",
-            .sessions => "Claude: conversations",
+            .commands => "AI: slash commands",
+            .models => "AI: model",
+            .modes => "AI: permission mode",
+            .efforts => "AI: effort",
+            .usage => "AI: usage",
+            .sessions => "AI: switch to a conversation",
         };
         pub const prefix: ?u8 = null;
         pub const start_mode: StartMode = if (which == .commands or which == .sessions) .insert else .normal;
@@ -917,7 +915,8 @@ fn ClaudeList(comptime which: claude_chat.Menu) type {
                 .models => for (c.models) |r| try list.append(a, .{
                     .text = if (r.title.len > 0) r.title else r.name,
                     .detail = r.description,
-                    .current = if (c.want_model) |m| std.mem.eql(u8, m, r.name) else false,
+                    // The one chosen, else the one the CLI says answers.
+                    .current = std.mem.eql(u8, c.want_model orelse c.model, r.name),
                 }),
                 .modes => for (c.modes) |name| try list.append(a, .{ .text = name, .current = c.modeInUse(name) }),
                 .efforts => for (c.efforts()) |level| try list.append(a, .{ .text = level, .current = std.mem.eql(u8, c.effort, level) }),

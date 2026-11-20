@@ -22,6 +22,7 @@ const code_motion = @import("code_motion.zig");
 const prompts = @import("prompts.zig");
 const run_popup = @import("run_popup.zig");
 const claude_chat = @import("claude_chat.zig");
+const Chat = @import("../ai/Chat.zig");
 const git_ops = @import("git_ops.zig");
 const lsp_ops = @import("lsp_ops.zig");
 const diagnostics = lsp_ops.diagnostics;
@@ -84,8 +85,12 @@ pub fn showClaude(ed: *Editor) !void {
     if (c.term == null) {
         var env_buf: [64]u8 = undefined;
         const env = c.env(&env_buf);
+        const backend = ed.options.chat_backend;
+        if (!claude_chat.backendAvailable(ed, backend)) return error.NoApiKey;
+        const cmd = try Chat.shellCommand(ed.gpa, backend);
+        defer ed.gpa.free(cmd);
         c.term = try Terminal.create(ed.gpa, ed.io, .{
-            .argv = &.{ "/bin/sh", "-c", "exec claude" },
+            .argv = &.{ "/bin/sh", "-c", cmd },
             .cwd = project_ops.projectRoot(ed),
             .cols = 80,
             .rows = 24,
@@ -119,7 +124,7 @@ pub fn openProposal(ed: *Editor, path: []const u8, contents: []const u8) !*Buffe
     b.project = project_ops.projectOf(ed, path);
     const rel = try ed.normalizePath(path);
     defer ed.gpa.free(rel);
-    b.label = try std.fmt.allocPrint(ed.gpa, "Claude: {s}", .{rel});
+    b.label = try std.fmt.allocPrint(ed.gpa, "{s}: {s}", .{ claude_chat.who(ed), rel });
     // The base: the file as the editor has it (unsaved edits included), else on disk.
     const base: []u8 = if (bufferForPath(ed, path)) |open| try ed.gpa.dupe(u8, open.text.slice(0, open.text.len())) else blk: {
         const raw = Io.Dir.cwd().readFileAlloc(ed.io, path, ed.gpa, .limited(64 << 20)) catch break :blk try ed.gpa.dupe(u8, "");
@@ -138,7 +143,7 @@ pub fn openProposal(ed: *Editor, path: []const u8, contents: []const u8) !*Buffe
         row_model.revealLine(ed, line);
         ed.setCursor(motions.firstNonBlank(&b.text, line));
     }
-    ed.setMessage(.info, "Claude proposes changes to {s}: SPC a y accept, SPC a n reject (edit it first if you like)", .{rel});
+    ed.setMessage(.info, "{s} proposes changes to {s}: Enter takes it, Esc drops it (change it first if you like)", .{ claude_chat.who(ed), rel });
     return b;
 }
 
@@ -274,7 +279,7 @@ pub const ClaudeTarget = struct { path: []u8, lines: ?[2]usize };
 pub fn claudeTarget(ed: *Editor) !?ClaudeTarget {
     if (ed.window.term != null) return null;
     const path = ed.buffer.path orelse {
-        ed.setMessage(.info, "save the file first: Claude refers to files by path", .{});
+        ed.setMessage(.info, "save the file first: {s} refers to files by path", .{claude_chat.who(ed)});
         return null;
     };
     const abs = try ed.absolutePath(path);
@@ -319,13 +324,15 @@ pub fn claudeAskWith(ed: *Editor, text: []const u8) !void {
 
 /// The box's title: what it is, and the lines it was opened on.
 pub fn tellTitle(ed: *const Editor, buf: []u8) []const u8 {
-    const ask = ed.claude_ask orelse return "Tell Claude";
-    const lines = ask.lines orelse return "Tell Claude";
+    const who = claude_chat.who(ed);
+    const plain = std.fmt.bufPrint(buf, "Tell {s}", .{who}) catch "Tell";
+    const ask = ed.claude_ask orelse return plain;
+    const lines = ask.lines orelse return plain;
     const name = std.fs.path.basename(ask.path);
     return (if (lines[0] == lines[1])
-        std.fmt.bufPrint(buf, "Tell Claude about {s}:{d}", .{ name, lines[0] + 1 })
+        std.fmt.bufPrint(buf, "Tell {s} about {s}:{d}", .{ who, name, lines[0] + 1 })
     else
-        std.fmt.bufPrint(buf, "Tell Claude about {s}:{d}-{d}", .{ name, lines[0] + 1, lines[1] + 1 })) catch "Tell Claude";
+        std.fmt.bufPrint(buf, "Tell {s} about {s}:{d}-{d}", .{ who, name, lines[0] + 1, lines[1] + 1 })) catch "Tell";
 }
 
 /// What is typed into Claude's prompt for `text`: after the lines the box
@@ -364,8 +371,36 @@ pub fn tellClaude(ed: *Editor, text: []const u8) !void {
     try ed.claude.?.say(ed, message);
 }
 
-/// `SPC a y` / `SPC a n`: accepts or rejects the proposal shown (or shows
-/// the first one waiting, if another buffer is shown).
+/// A proposal changed by hand that Esc was pressed on once (and the edit it
+/// was at): a second Esc drops it, the changes too.
+var drop_armed: ?struct { buffer: *const Buffer, version: u64 } = null;
+
+/// Enter / Esc in normal mode while a rewrite (`SPC a w`) or a change
+/// proposed from Claude Code's terminal is the buffer showing: takes it,
+/// or drops it. One changed by hand takes a second Esc to drop. True when
+/// the key was for that.
+pub fn proposalKey(ed: *Editor, take: bool) bool {
+    const rewrite = if (ed.inline_edit.proposal) |p| p == ed.buffer else false;
+    const diff: ?usize = if (rewrite) null else if (ed.claude) |c| c.diffFor(ed.buffer) else null;
+    if (!rewrite and diff == null) return false;
+    if (!take and ed.buffer.modified) {
+        const armed = if (drop_armed) |d| d.buffer == ed.buffer and d.version == ed.buffer.edit_version else false;
+        if (!armed) {
+            drop_armed = .{ .buffer = ed.buffer, .version = ed.buffer.edit_version };
+            ed.setMessage(.info, "Esc again drops it, your changes to it too (Enter takes it)", .{});
+            return true;
+        }
+    }
+    drop_armed = null;
+    if (rewrite) {
+        _ = @import("claude_inline.zig").resolve(ed, take);
+    } else ed.claude.?.resolve(ed, diff.?, take);
+    return true;
+}
+
+/// The accept / reject commands (in the command picker): accepts or
+/// rejects the proposal shown (or shows the first one waiting, if another
+/// buffer is shown).
 pub fn claudeResolve(ed: *Editor, accept: bool) void {
     // A rewrite of a selection that is showing comes first.
     if (@import("claude_inline.zig").resolve(ed, accept)) return;
@@ -376,5 +411,5 @@ pub fn claudeResolve(ed: *Editor, accept: bool) void {
     if (c.diffs.items.len == 0) return ed.setMessage(.info, "no proposed changes", .{});
     window_ops.focusEditorWindow(ed);
     ed.switchTo(c.diffs.items[0].buffer);
-    ed.setMessage(.info, "Claude's proposal for {s}: SPC a y accept, SPC a n reject", .{std.fs.path.basename(c.diffs.items[0].path)});
+    ed.setMessage(.info, "{s}'s proposal for {s}: Enter takes it, Esc drops it", .{ claude_chat.who(ed), std.fs.path.basename(c.diffs.items[0].path) });
 }

@@ -60,6 +60,26 @@ const deepseek_env = [_][2][]const u8{
     .{ "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "786432" },
 };
 
+/// The models to choose from when DeepSeek answers. The CLI's own list
+/// is Claude's, renamed: its Default and Opus are V4 Pro, its Sonnet and
+/// custom model both Flash, and a Claude model of its own (Fable, with
+/// Claude's prices) would be answered by Flash. So these are listed
+/// instead, sent as they are.
+const deepseek_models = [_]Named{
+    .{ .name = "deepseek-flash[1m]", .title = "DeepSeek Flash", .description = "deepseek-flash, 1M context: the one that answers unless you choose" },
+    .{ .name = "deepseek-v4-pro[1m]", .title = "DeepSeek V4 Pro", .description = "deepseek-v4-pro, 1M context: the larger model, at DeepSeek's Pro price" },
+};
+
+/// A service's models, with the effort levels the CLI gives its models.
+fn serviceModels(a: Allocator, cli: []const Named) ![]const Named {
+    const levels = for (cli) |m| {
+        if (m.efforts.len > 0) break m.efforts;
+    } else &.{};
+    const out = try a.dupe(Named, &deepseek_models);
+    for (out) |*m| m.efforts = levels;
+    return out;
+}
+
 /// Credentials of Claude's that must not go along: the CLI would send them
 /// to the service it is pointed at.
 const claude_credentials = [_][]const u8{ "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS" };
@@ -504,6 +524,27 @@ pub fn reset(c: *Chat) void {
     c.cost = 0;
 }
 
+/// The shell command that starts Claude Code in a terminal for `b`: for a
+/// service, pointed at it, Claude's credentials unset and the service's key
+/// passed on by the shell from zile's environment (it is in no argument
+/// list, nor in zile's memory).
+pub fn shellCommand(a: Allocator, b: Backend) ![]u8 {
+    const svc = b.service() orelse return a.dupe(u8, "exec claude");
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "unset");
+    for (claude_credentials) |name| try out.print(a, " {s}", .{name});
+    try out.appendSlice(a, "; export");
+    for (deepseek_env) |kv| try out.print(a, " {s}='{s}'", .{ kv[0], kv[1] });
+    // `${A:-${B:-}}`: the first of its names that is set.
+    const names = fill.apiOf(svc).?.key_names;
+    try out.appendSlice(a, " ANTHROPIC_AUTH_TOKEN=\"");
+    for (names) |name| try out.print(a, "${{{s}:-", .{name});
+    for (names) |_| try out.append(a, '}');
+    try out.appendSlice(a, "\"; exec claude");
+    return out.toOwnedSlice(a);
+}
+
 /// Who answers from now on. A conversation isn't carried from one to the
 /// other (what one wrote, its thinking, the other can't take up): the
 /// CLI is stopped, and the next message starts a new one. True when it
@@ -784,7 +825,7 @@ fn controlResponse(c: *Chat, v: std.json.Value) !void {
                 .efforts = levels.items,
             });
         }
-        c.models = list.items;
+        c.models = if (c.backend == .claude) list.items else try serviceModels(a, list.items);
     };
     c.version += 1;
 }
@@ -1224,7 +1265,7 @@ fn askRow(c: *Chat, a: Allocator, tool: []const u8, input: std.json.Value, id: [
 fn questionRow(c: *Chat, input: std.json.Value, id: []const u8) !void {
     const all = member(input, "questions") orelse return;
     if (all != .array or all.array.items.len == 0) return;
-    const first = oneLine(string(all.array.items[0], "question") orelse "Claude has a question");
+    const first = oneLine(string(all.array.items[0], "question") orelse "a question");
     const e = try c.add(.ask, first, "", id);
     for (all.array.items, 0..) |q, i| {
         if (i > 0) try e.text.appendSlice(c.gpa, "\n\n");
@@ -1260,7 +1301,7 @@ pub fn stateText(c: *const Chat) []const u8 {
     return switch (c.state) {
         .idle => "",
         .working => "working…",
-        .asking => "asks: SPC a y answers",
+        .asking => "asks: SPC a a answers",
     };
 }
 
@@ -1604,4 +1645,29 @@ test "chat: changing who answers starts a new conversation, said in it" {
     const last = c.entries.items[c.entries.items.len - 1];
     try std.testing.expectEqual(Entry.Kind.note, last.kind);
     try std.testing.expectEqualStrings("DeepSeek answers from here on", last.title);
+}
+
+test "chat: Claude Code's own terminal, for DeepSeek: pointed at it by the shell, the key never in an argument" {
+    const a = std.testing.allocator;
+    const plain = try shellCommand(a, .claude);
+    defer a.free(plain);
+    try std.testing.expectEqualStrings("exec claude", plain);
+    const cmd = try shellCommand(a, .deepseek);
+    defer a.free(cmd);
+    try std.testing.expect(std.mem.startsWith(u8, cmd, "unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN"));
+    try std.testing.expect(std.mem.indexOf(u8, cmd, " ANTHROPIC_BASE_URL='https://api.deepseek.com/anthropic'") != null);
+    try std.testing.expect(std.mem.endsWith(u8, cmd, " ANTHROPIC_AUTH_TOKEN=\"${DEEPSEEK_API_KEY:-${DEEPSEEK_API:-}}\"; exec claude"));
+}
+
+test "chat: DeepSeek's models are listed, not Claude's renamed ones" {
+    const c = try create(std.testing.allocator, std.testing.io, ".", noWake);
+    defer c.destroy();
+    c.backend = .deepseek;
+    try c.event(
+        \\{"type":"control_response","response":{"subtype":"success","request_id":"zile-init","response":{"commands":[],"models":[{"value":"default","displayName":"Default (recommended)","description":"currently deepseek-v4-pro[1m]","supportedEffortLevels":["low","high"]},{"value":"claude-fable-5-2","displayName":"Fable","description":"$8/$40 per Mtok"},{"value":"deepseek-flash[1m]","displayName":"deepseek-flash[1m]","description":"Custom model"}]}}}
+    );
+    try std.testing.expectEqual(2, c.models.len);
+    try std.testing.expectEqualStrings("deepseek-flash[1m]", c.models[0].name);
+    try std.testing.expectEqualStrings("DeepSeek V4 Pro", c.models[1].title);
+    try std.testing.expectEqualStrings("high", c.models[1].efforts[1]);
 }

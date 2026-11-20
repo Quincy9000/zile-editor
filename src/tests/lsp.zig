@@ -15,6 +15,9 @@ const prompts = @import("../editor/prompts.zig");
 const signature_help = @import("../editor/signature_help.zig");
 const completion_ops = @import("../editor/completion_ops.zig");
 const lsp_ops = @import("../editor/lsp_ops.zig");
+const state_files = @import("../editor/state_files.zig");
+const formatting = @import("../editor/formatting.zig");
+const ZigCheck = @import("../ZigCheck.zig");
 const Editor = @import("../Editor.zig");
 const LineHint = Editor.LineHint;
 const max_line_hints = Editor.max_line_hints;
@@ -915,6 +918,48 @@ test "completion: the exact name first, then shorter names, whatever order the s
     try testing.expectEqualStrings("DrawTexture", d.items[d.shown.items[2]].label);
     try ed.feed("<CR>"); // Enter takes the first one
     try expectText(&ed, "DrawText");
+}
+
+/// A standalone-file check that has already finished with one error.
+fn finishedCheck(ed: *Editor, message: []const u8) !*ZigCheck {
+    const c = try ed.gpa.create(ZigCheck);
+    c.* = .{
+        .gpa = ed.gpa,
+        .io = ed.io,
+        .path = try ed.gpa.dupe(u8, "/nowhere/loose.zig"),
+        .dir = try ed.gpa.dupe(u8, "/nowhere"),
+        .has_main = true,
+        .has_test = false,
+        .wake = struct {
+            fn wake() void {}
+        }.wake,
+        .joined = true, // no thread to wait for
+    };
+    c.done.store(true, .release);
+    try c.diagnostics.append(ed.gpa, .{ .line = 0, .col = 0, .end_line = 0, .end_col = 1, .severity = .err, .message = try ed.gpa.dupe(u8, message) });
+    return c;
+}
+
+test "zig checks: each buffer keeps one result, its latest (none leaked, none freed twice)" {
+    var ed = try testEditor("const a = 1;\n");
+    defer ed.deinit();
+    const first = ed.buffer;
+    try formatting.newBuffer(&ed);
+    const second = ed.buffer;
+    // The first result there is: kept (it was dropped and leaked).
+    try ed.zig_checks.append(ed.gpa, .{ .buffer = first, .job = try finishedCheck(&ed, "one") });
+    state_files.tickZigChecks(&ed);
+    try testing.expectEqual(1, ed.check_results.items.len);
+    // Another buffer's: added once (not once per other buffer's result).
+    try ed.zig_checks.append(ed.gpa, .{ .buffer = second, .job = try finishedCheck(&ed, "two") });
+    state_files.tickZigChecks(&ed);
+    try ed.zig_checks.append(ed.gpa, .{ .buffer = second, .job = try finishedCheck(&ed, "three") });
+    state_files.tickZigChecks(&ed);
+    try testing.expectEqual(2, ed.check_results.items.len);
+    for (ed.check_results.items) |r| {
+        try testing.expectEqual(1, r.diags.len);
+        try testing.expectEqualStrings(if (r.buffer == first) "one" else "three", r.diags[0].message);
+    }
 }
 
 test "diagnostics: a long message wraps onto rows under its line, which j skips" {

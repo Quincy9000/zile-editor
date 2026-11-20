@@ -182,8 +182,7 @@ pub fn draw(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void
     gfx.pushOffset(fl.x0, fl.y0);
     drawHover(ed, font, theme, fl);
     drawDiagHover(ed, font, theme, fl);
-    drawSignature(ed, font, theme, fl);
-    drawCompletion(ed, font, theme, fl);
+    drawCompletion(ed, font, theme, fl, @as(f32, @floatFromInt(signatureRows(ed))) * font.cell_h);
     gfx.popOffset();
     drawPopup(ed, font, theme, l);
     gfx.pushOffset(fl.x0, fl.y0);
@@ -867,6 +866,16 @@ fn drawText(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, focu
             }
             ghost_below = null;
         }
+        // Signature help: rows of its own under the line being typed.
+        if (is_current and last_piece and focused and ed.signature != null) {
+            const at_x = if (cellPos(ed, font, l, ed.view.cursor)) |c| c.x - font.cell_w else l.text_x;
+            const rows_n = signatureRows(ed);
+            if (row + virtual + rows_n < l.rows) {
+                const yy = @as(f32, @floatFromInt(row + virtual + 1)) * font.cell_h + y_off + first_index * font.cell_h;
+                drawSignatureRows(ed, font, theme, l, at_x, yy);
+                virtual += rows_n;
+            }
+        }
     }
 
     drawContext(ed, font, theme, l);
@@ -1204,7 +1213,7 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
         gfx.cursor(x, y, .bar);
     } else if (ed.message.len > 0) {
         const color = if (ed.message.kind == .err) theme.message_err else theme.message_info;
-        _ = font.drawText(ed.message.text(), x, y, color);
+        x = font.drawText(ed.message.text(), x, y, color);
     } else {
         // "project  path/in/project"
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1214,16 +1223,30 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
         }
         x = font.drawText(projectPath(ed, &path_buf), x, y, theme.status_fg);
         if (ed.buffer.hex) x = font.drawText(" [hex]", x, y, theme.whichkey_group);
-        if (ed.buffer.modified) _ = font.drawText(" [+]", x, y, theme.status_fg);
+        if (ed.buffer.modified) x = font.drawText(" [+]", x, y, theme.status_fg);
     }
 
-    // Right side: pending keys and position, e.g. "2d   12:5  40%".
+    // Right side: what's going on and the position, e.g. "[2/3]  12:5  40%".
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     writeRight(ed, &w) catch {};
     const right = w.buffered();
     const right_x = l.width - @as(f32, @floatFromInt(char_width.ofText(right) + 1)) * font.cell_w;
     _ = font.drawText(right, right_x, y, theme.status_dim);
+
+    // Middle: the last keys pressed, a `-` after them while a command is half
+    // typed. Left out when the two sides leave no room for it.
+    var keys_buf: [64]u8 = undefined;
+    var kw: std.Io.Writer = .fixed(&keys_buf);
+    keys.formatSequenceDisplay(ed.recent_keys[0..ed.recent_len], &kw) catch {};
+    if (code_motion.showcmdKeys(ed).len > 0) kw.writeByte('-') catch {};
+    const typed = kw.buffered();
+    if (typed.len == 0) return;
+    const cols: usize = @intFromFloat(l.width / font.cell_w);
+    const n = char_width.ofText(typed);
+    const mid_x = @as(f32, @floatFromInt((cols -| n) / 2)) * font.cell_w;
+    if (mid_x < x + font.cell_w * 2 or mid_x + @as(f32, @floatFromInt(n)) * font.cell_w > right_x - font.cell_w * 2) return;
+    _ = font.drawText(typed, mid_x, y, theme.status_dim);
 }
 
 /// The current file's path inside its project (else as the buffer has it).
@@ -1238,11 +1261,11 @@ fn projectPath(ed: *Editor, buf: []u8) []const u8 {
 
 fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (ed.macro_register) |r| try w.print("recording @{c}   ", .{r});
-    // Claude at work with its panel hidden: it shows here that it is.
+    // The conversation at work with its panel hidden: it shows here.
     if (ed.chat) |c| if (!ed.chat_panel.shown) switch (c.state) {
         .idle => {},
-        .working => try w.writeAll("Claude working…   "),
-        .asking => try w.writeAll("Claude asks: SPC a y   "),
+        .working => try w.print("{s} working…   ", .{c.backend.title()}),
+        .asking => try w.print("{s} asks: SPC a a   ", .{c.backend.title()}),
     };
     if (ed.cursors_placing) {
         try w.print("placing: {d} cursors (qp here)   ", .{ed.cursors.items.len});
@@ -1255,9 +1278,6 @@ fn writeRight(ed: *Editor, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var pending_buf: [16]u8 = undefined;
     const waiting = Editor.insert_keys.indicator(ed, &pending_buf);
     if (waiting.len > 0) try w.print("{s}   ", .{waiting});
-    const typed = code_motion.showcmdKeys(ed);
-    try keys.formatSequenceDisplay(typed, w);
-    if (typed.len > 0) try w.writeAll("-   ");
     if (ed.buffers.items.len > 1 and ed.cmd_float == null) try w.print("[{d}/{d}]  ", .{ formatting.bufferIndex(ed, ed.buffer) + 1, ed.buffers.items.len });
 
     const line = ed.cursorLine();
@@ -1468,10 +1488,18 @@ fn cellPos(ed: *Editor, font: *const Font, l: Layout, pos: usize) ?struct { x: f
 
 /// A bordered box of `rows` x `cols` cells next to the line at `anchor_y`:
 /// below it if there is room, else above. Returns its top-left.
-fn popupBox(font: *const Font, theme: *const Theme, l: Layout, x0: f32, anchor_y: f32, cols: usize, rows: usize) struct { x: f32, y: f32 } {
+const BoxAt = struct { x: f32, y: f32 };
+
+fn popupBox(font: *const Font, theme: *const Theme, l: Layout, x0: f32, anchor_y: f32, cols: usize, rows: usize) BoxAt {
+    return popupBoxUnder(font, theme, l, x0, anchor_y, 0, cols, rows);
+}
+
+/// `popupBox`, below the line at `anchor_y` and `gap` more (room for
+/// another popup there), else above the line.
+fn popupBoxUnder(font: *const Font, theme: *const Theme, l: Layout, x0: f32, anchor_y: f32, gap: f32, cols: usize, rows: usize) BoxAt {
     const w = @as(f32, @floatFromInt(cols)) * font.cell_w;
     const h = @as(f32, @floatFromInt(rows)) * font.cell_h;
-    const below = anchor_y + font.cell_h;
+    const below = anchor_y + font.cell_h + gap;
     const y = if (below + h <= l.status_y) below else @max(anchor_y - h, 0);
     const x = @max(@min(x0, l.width - w - 1), 0);
     rect(x - 1, y - 1, w + 2, h + 2, theme.popup_border);
@@ -1550,11 +1578,19 @@ fn drawDiagHover(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout)
     }
 }
 
-/// Signature help: the call's signature above the cursor with the current
-/// parameter highlighted, and its documentation's first line.
-fn drawSignature(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
+/// The rows signature help takes under the cursor line: its signature,
+/// and its documentation's first line.
+fn signatureRows(ed: *const Editor) usize {
+    const sig = ed.signature orelse return 0;
+    return if (sig.doc.len > 0) 2 else 1;
+}
+
+/// Signature help, as virtual lines under the cursor line (the text below
+/// moves down for them, so nothing is covered): the call's signature with
+/// the current parameter highlighted, then its documentation's first line.
+/// `x`: where the call is; `y`: the first row's.
+fn drawSignatureRows(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, x0: f32, y: f32) void {
     const sig = ed.signature orelse return;
-    const at = cellPos(ed, font, l, ed.view.cursor) orelse return;
     const max_cols: usize = @min(@as(usize, @intFromFloat(l.width / font.cell_w)) -| 4, 100);
     const label_cells = cells(sig.label);
     // Long signatures: show the window around the current parameter.
@@ -1566,13 +1602,9 @@ fn drawSignature(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout)
     const shown_cells = @min(label_cells - skip, max_cols);
     const doc_cells = @min(cells(sig.doc), max_cols);
     const cols = @max(shown_cells, doc_cells) + 2;
-    const rows: usize = if (sig.doc.len > 0) 2 else 1;
     const w = @as(f32, @floatFromInt(cols)) * font.cell_w;
-    const h = @as(f32, @floatFromInt(rows)) * font.cell_h;
-    // Above the cursor line (completion uses below), else below.
-    const y = if (at.y - h >= 0) at.y - h else at.y + font.cell_h;
-    const x = @max(@min(at.x - font.cell_w, l.width - w - 1), 0);
-    rect(x - 1, y - 1, w + 2, h + 2, theme.popup_border);
+    const h = @as(f32, @floatFromInt(signatureRows(ed))) * font.cell_h;
+    const x = @max(@min(x0, l.width - w - 1), l.text_x);
     rect(x, y, w, h, theme.popup_bg);
 
     var cx = x + font.cell_w;
@@ -1591,7 +1623,9 @@ fn drawSignature(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout)
     if (sig.doc.len > 0) _ = font.drawText(clip(sig.doc, max_cols), x + font.cell_w, y + font.cell_h, theme.status_dim);
 }
 
-fn drawCompletion(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) void {
+/// `sig_below`: the height signature help takes under the cursor line (the
+/// list goes below it).
+fn drawCompletion(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout, sig_below: f32) void {
     const c = completion_ops.completionShown(ed) orelse return;
     // Under the name being typed (not the `.` before it, when the server's
     // edit starts there).
@@ -1609,7 +1643,7 @@ fn drawCompletion(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout
     label_w = @min(label_w, 40);
     detail_w = @min(detail_w, 40);
     const cols = label_w + (if (detail_w > 0) detail_w + 2 else 0) + 2;
-    const box = popupBox(font, theme, l, at.x - font.cell_w, at.y, cols, rows);
+    const box = popupBoxUnder(font, theme, l, at.x - font.cell_w, at.y, sig_below, cols, rows);
     for (c.shown.items[first .. first + rows], first..) |i, row| {
         const item = c.items[i];
         const y = box.y + @as(f32, @floatFromInt(row - first)) * font.cell_h;
@@ -2068,4 +2102,41 @@ test "terminal mode: Claude's conversation in a panel along the bottom, the box 
     const title2 = (try Rows.find(&grid, gpa, "Claude · working")).?;
     try std.testing.expect(title2 < title and box > title2);
     try std.testing.expect((try Rows.find(&grid, gpa, "A second line of the answer.")).? < box);
+}
+
+test "terminal mode: signature help is two rows under the line being typed; the code below moves down for them" {
+    const Grid = @import("../tui/Grid.zig");
+    const gpa = std.testing.allocator;
+    var ed = try Editor.init(gpa, std.testing.io);
+    defer ed.deinit();
+    try ed.text().insert(gpa, 0, "top\nf(\nbelow\n");
+    try ed.feed("jA");
+    ed.signature = .{ .label = try gpa.dupe(u8, "fn f(a: u8) void"), .param_start = 5, .param_end = 10, .doc = try gpa.dupe(u8, "Does f.") };
+    var grid: Grid = .{};
+    defer grid.deinit(gpa);
+    try grid.resize(gpa, 80, 20);
+    gfx.grid = &grid;
+    defer gfx.grid = null;
+    var font = Font.cells();
+    const theme = Theme.get(ed.theme_index);
+    const l = prepare(&ed, &font, 80 * Grid.cell_w, 20 * Grid.cell_h);
+    draw(&ed, &font, theme, l);
+    const Find = struct {
+        fn row(g: *const Grid, needle: []const u8) ?usize {
+            for (0..g.rows) |r| {
+                var line: [160]u8 = undefined;
+                var n: usize = 0;
+                for (g.cells[r * g.cols ..][0..g.cols]) |cell| {
+                    n += std.unicode.utf8Encode(if (cell.cp == 0 or cell.cp > 0x10FFFF) ' ' else cell.cp, line[n..]) catch 0;
+                    if (n + 4 > line.len) break;
+                }
+                if (std.mem.indexOf(u8, line[0..n], needle) != null) return r;
+            }
+            return null;
+        }
+    };
+    const call = Find.row(&grid, "f(").?;
+    try std.testing.expectEqual(call + 1, Find.row(&grid, "fn f(a: u8) void").?);
+    try std.testing.expectEqual(call + 2, Find.row(&grid, "Does f.").?);
+    try std.testing.expectEqual(call + 3, Find.row(&grid, "below").?);
 }

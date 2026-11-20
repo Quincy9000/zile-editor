@@ -224,6 +224,22 @@ test "syntax text objects: dif, daa, cia, vac" {
     try testing.expectEqual(.visual, ed.mode); // no class here: selection unchanged
 }
 
+test "value objects: civ, dav, vinv, yiv" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    try ed.openFile("edit-test-values.zig"); // missing file: empty, but `//` comments
+    try ed.insertAt(0, "const a: u8 = foo(1, 2); // one\nconst b = .{ .x = 1, .y = 2 };\n");
+    try ed.buffer.history.commit(ed.gpa);
+    try ed.feed("f2civ3<Esc>"); // from inside the value: all of it
+    try expectText(&ed, "const a: u8 = 3; // one\nconst b = .{ .x = 1, .y = 2 };\n");
+    try ed.feed("0dav"); // from the name: the value with its `=`
+    try expectText(&ed, "const a: u8; // one\nconst b = .{ .x = 1, .y = 2 };\n");
+    try ed.feed("j0vinvy"); // the next value ahead
+    try testing.expectEqualStrings(".{ .x = 1, .y = 2 }", ed.registers.get(null).?.text);
+    try ed.feed("fyyiv"); // on `.y`: its value
+    try testing.expectEqualStrings("2", ed.registers.get(null).?.text);
+}
+
 test "dib / ci\" jump to the nearest pair ahead" {
     var ed = try testEditor("let v = foo(a, b);\nprint(\"old\")");
     defer ed.deinit();
@@ -336,6 +352,16 @@ test "jumplist picker: the place picked sinks to the bottom, the place left is o
     try ed.feed("<CR>");
     try testing.expectEqual(2, ed.cursorLine());
     try ed.feed("<C-o>"); // and back where that jump left from
+    try testing.expectEqual(5, ed.cursorLine());
+}
+
+test "jumplist: ; goes back from a jump, Tab forward again" {
+    var ed = try testEditor("a\nb\nc\nd\ne\nf");
+    defer ed.deinit();
+    try ed.feed("jG"); // jumped from line 1 to the last
+    try ed.feed(";");
+    try testing.expectEqual(1, ed.cursorLine());
+    try ed.feed("<Tab>");
     try testing.expectEqual(5, ed.cursorLine());
 }
 

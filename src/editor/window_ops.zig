@@ -117,7 +117,7 @@ pub fn closeWindow(ed: *Editor) void {
     const shell = closing.term;
     // Never leave only a terminal panel on screen.
     if (closing.term == null and codeWindowCount(ed) <= 1 and ed.window_list.items.len > 1)
-        return ed.setMessage(.info, "this is the last code window (SPC a a hides Claude)", .{});
+        return ed.setMessage(.info, "this is the last code window (SPC a a hides the conversation)", .{});
     // The only window, showing a shell: the shell ends, the file shows.
     if (shell != null and ed.window_list.items.len == 1 and !isClaudeTerm(ed, shell.?)) {
         closing.term = null;

@@ -10,6 +10,9 @@ const Io = std.Io;
 const Buffer = @import("../core/Buffer.zig");
 const Editor = @import("../Editor.zig");
 const claude_panel = @import("claude_panel.zig");
+const claude_chat = @import("claude_chat.zig");
+const Chat = @import("../ai/Chat.zig");
+const fill = @import("../ai/fill.zig");
 const code_motion = @import("code_motion.zig");
 const notifications = @import("notifications.zig");
 const project_ops = @import("project_ops.zig");
@@ -31,6 +34,9 @@ const Job = struct {
     prompt: []u8,
     root: []u8,
     model: ?[]u8,
+    /// The environment it is started in, when it isn't zile's (another
+    /// service answers: `Chat.environFor`).
+    env: ?std.process.Environ.Map = null,
     thread: std.Thread = undefined,
     done: std.atomic.Value(bool) = .init(false),
     /// Valid once `done`: what it wrote (owned), or that it couldn't.
@@ -53,7 +59,7 @@ const Job = struct {
         // No tools: it only writes. Nothing can ask for permission.
         try argv.appendSlice(j.gpa, &.{ "claude", "-p", "--output-format", "text", "--tools", "", "--permission-prompts", "none" });
         if (j.model) |m| try argv.appendSlice(j.gpa, &.{ "--model", m });
-        var child = try std.process.spawn(j.io, .{ .argv = argv.items, .cwd = .{ .path = j.root }, .stdin = .pipe, .stdout = .pipe, .stderr = .ignore });
+        var child = try std.process.spawn(j.io, .{ .argv = argv.items, .cwd = .{ .path = j.root }, .stdin = .pipe, .stdout = .pipe, .stderr = .ignore, .environ_map = if (j.env) |*e| e else null });
         defer child.kill(j.io);
         if (child.stdin) |in| {
             in.writeStreamingAll(j.io, j.prompt) catch {};
@@ -76,6 +82,7 @@ const Job = struct {
         j.gpa.free(j.prompt);
         j.gpa.free(j.root);
         if (j.model) |m| j.gpa.free(m);
+        if (j.env) |*e| e.deinit();
         j.gpa.free(j.out);
         j.gpa.destroy(j);
     }
@@ -107,8 +114,8 @@ pub const State = struct {
 pub fn prompt(ed: *Editor) !void {
     if (ed.cmd_float != null) return;
     const s = &ed.inline_edit;
-    if (s.job != null) return ed.setMessage(.info, "Claude is still writing the last one", .{});
-    if (ed.window.term != null or ed.buffer.read_only) return ed.setMessage(.info, "nothing here for Claude to rewrite", .{});
+    if (s.job != null) return ed.setMessage(.info, "{s} is still writing the last one", .{claude_chat.who(ed)});
+    if (ed.window.term != null or ed.buffer.read_only) return ed.setMessage(.info, "nothing here for {s} to rewrite", .{claude_chat.who(ed)});
     drop(ed);
     const t = ed.text();
     s.lines = if (ed.mode == .visual)
@@ -124,12 +131,13 @@ pub fn prompt(ed: *Editor) !void {
 /// The box's title: the lines it is about.
 pub fn title(ed: *const Editor, buf: []u8) []const u8 {
     const s = &ed.inline_edit;
-    const b = s.target orelse return "Rewrite with Claude";
+    const who = claude_chat.who(ed);
+    const b = s.target orelse return std.fmt.bufPrint(buf, "Rewrite with {s}", .{who}) catch "Rewrite";
     const name = std.fs.path.basename(b.displayName());
     return (if (s.lines[0] == s.lines[1])
-        std.fmt.bufPrint(buf, "Rewrite {s}:{d} with Claude", .{ name, s.lines[0] + 1 })
+        std.fmt.bufPrint(buf, "Rewrite {s}:{d} with {s}", .{ name, s.lines[0] + 1, who })
     else
-        std.fmt.bufPrint(buf, "Rewrite {s}:{d}-{d} with Claude", .{ name, s.lines[0] + 1, s.lines[1] + 1 })) catch "Rewrite with Claude";
+        std.fmt.bufPrint(buf, "Rewrite {s}:{d}-{d} with {s}", .{ name, s.lines[0] + 1, s.lines[1] + 1, who })) catch "Rewrite";
 }
 
 /// What Claude is asked: the instruction, the lines, and what is around
@@ -177,14 +185,23 @@ pub fn start(ed: *Editor, instruction: []const u8) !void {
     errdefer ed.gpa.free(root);
     const model: ?[]u8 = if (ed.chat) |c| (if (c.want_model) |m| try ed.gpa.dupe(u8, m) else null) else null;
     errdefer if (model) |m| ed.gpa.free(m);
+    var env: ?std.process.Environ.Map = null;
+    if (ed.options.chat_backend != .claude) {
+        const ours = ed.environ orelse return error.NoEnvironment;
+        env = Chat.environFor(ed.gpa, ed.options.chat_backend, ours) catch |err| switch (err) {
+            error.NoApiKey => return ed.setMessage(.err, "{s} needs {s} in the environment zile starts in (SPC a d: who answers)", .{ claude_chat.who(ed), fill.keyName(ed.options.chat_backend.service().?) }),
+            else => return err,
+        };
+    }
+    errdefer if (env) |*e| e.deinit();
     const j = try ed.gpa.create(Job);
-    j.* = .{ .gpa = ed.gpa, .io = ed.io, .wake = ed.wake_fn, .prompt = q, .root = root, .model = model };
+    j.* = .{ .gpa = ed.gpa, .io = ed.io, .wake = ed.wake_fn, .prompt = q, .root = root, .model = model, .env = env };
     j.thread = std.Thread.spawn(.{}, Job.run, .{j}) catch |err| {
         ed.gpa.destroy(j);
         return err;
     };
     s.job = j;
-    notifications.progress(ed, toast, true, "Claude is rewriting {d} line{s}…", .{ s.lines[1] - s.lines[0] + 1, if (s.lines[1] == s.lines[0]) "" else "s" });
+    notifications.progress(ed, toast, true, "{s} is rewriting {d} line{s}…", .{ claude_chat.who(ed), s.lines[1] - s.lines[0] + 1, if (s.lines[1] == s.lines[0]) "" else "s" });
 }
 
 /// Takes what Claude wrote, when it has.
@@ -195,12 +212,12 @@ pub fn tick(ed: *Editor) void {
     s.job = null;
     defer j.destroy();
     if (j.failed) {
-        notifications.progress(ed, toast, false, "Claude could not rewrite it", .{});
+        notifications.progress(ed, toast, false, "{s} could not rewrite it", .{claude_chat.who(ed)});
         s.target = null;
         return;
     }
-    notifications.progress(ed, toast, false, "Claude's rewrite is here: SPC a y accepts, SPC a n drops it", .{});
-    finish(ed, j.out) catch |err| ed.setMessage(.err, "could not show Claude's rewrite: {s}", .{@errorName(err)});
+    notifications.progress(ed, toast, false, "{s}'s rewrite is here: Enter takes it, Esc drops it", .{claude_chat.who(ed)});
+    finish(ed, j.out) catch |err| ed.setMessage(.err, "could not show the rewrite: {s}", .{@errorName(err)});
 }
 
 /// What Claude wrote, without a code fence around it or blank lines at its
@@ -226,7 +243,7 @@ pub fn finish(ed: *Editor, answer: []const u8) !void {
     const b = s.target orelse return;
     if (!state_files.bufferAlive(ed, b) or b.edit_version != s.version) {
         s.target = null;
-        return ed.setMessage(.info, "the text changed while Claude wrote: its rewrite was dropped", .{});
+        return ed.setMessage(.info, "the text changed while it was rewritten: the rewrite was dropped", .{});
     }
     const t = &b.text;
     const last = @min(s.lines[1], t.lineCount() -| 1);
@@ -243,7 +260,7 @@ pub fn finish(ed: *Editor, answer: []const u8) !void {
         // No file to show a diff of.
         s.target = null;
         try apply(ed, b, std.mem.trimEnd(u8, whole, "\n"));
-        return ed.setMessage(.info, "rewritten by Claude (u undoes it)", .{});
+        return ed.setMessage(.info, "rewritten by {s} (u undoes it)", .{claude_chat.who(ed)});
     };
     const abs = try ed.absolutePath(path);
     errdefer ed.gpa.free(abs);
@@ -297,9 +314,9 @@ pub fn resolve(ed: *Editor, accept: bool) bool {
     drop(ed);
     if (text) |new| if (b) |target| if (state_files.bufferAlive(ed, target)) {
         apply(ed, target, new) catch |err| ed.setMessage(.err, "could not take the rewrite: {s}", .{@errorName(err)});
-        ed.setMessage(.info, "took Claude's rewrite (u undoes it; not saved yet)", .{});
+        ed.setMessage(.info, "took the rewrite (u undoes it; not saved yet)", .{});
         return true;
     };
-    ed.setMessage(.info, "dropped Claude's rewrite", .{});
+    ed.setMessage(.info, "dropped the rewrite", .{});
     return true;
 }

@@ -636,6 +636,11 @@ const argument_reach = 20_000;
 /// inside its list).
 fn listOpen(t: *const Text, pos: usize) ?usize {
     if (pos < t.len() and listBracket(t, pos, 0)) return pos;
+    return listOpenBefore(t, pos);
+}
+
+/// The bracket that opens the list around `pos`, looking only before it.
+fn listOpenBefore(t: *const Text, pos: usize) ?usize {
     var depth: usize = 0;
     var i = @min(pos, t.len());
     const stop = pos -| argument_reach;
@@ -771,6 +776,230 @@ test "arguments: any brackets, nested lists and strings, first / middle / last" 
     try expectArgument("f(\n    one,\n    two,\n)", "one", .around, "    one,");
     try expectArgument("f(\n    one,\n    two\n)", "two", .around, ",\n    two");
     try expectArgument("f(\n    one,\n    two,\n)", "one", .inner, "one");
+}
+
+// ---------------------------------------------------------------------------
+// Values (iv / av): what follows an `=` or `:`, by the text alone.
+
+/// `iv` / `av`: the value of the assignment, field, key or switch prong the
+/// cursor is in: what follows its `=` (or `+=`, `:=`, `=>`, ...), else its
+/// `:` (`"key": 1`, `x: u8`), up to the `,`, `;`, closing bracket or line end
+/// that ends it (a line ending in an operator goes on). The cursor can be on
+/// the name, or inside the value: in `.a = foo(x, y)` from `x` it's
+/// `foo(x, y)` (the first item outwards that has a value). Comments and the
+/// blanks after it are left out. `av` takes the operator and the blanks
+/// before it too: `dav` makes `const x: u8 = 1;` `const x: u8;`.
+/// `line_comment` is the file's ("" when it has none); `/* */` always counts.
+pub fn value(t: *const Text, pos: usize, scope: Scope, line_comment: []const u8) ?Range {
+    if (t.len() == 0) return null;
+    var at = @min(pos, t.len() - 1);
+    var open = listOpen(t, at);
+    for (0..16) |_| {
+        const it = valueItem(t, open, at, line_comment) orelse return null;
+        if (it.op) |op| {
+            var a = op.end;
+            while (a < it.code_end and std.ascii.isWhitespace(t.byteAt(a))) a += 1;
+            if (a < it.code_end) {
+                if (scope == .inner) return .{ .start = a, .end = it.code_end };
+                var s = op.start;
+                while (s > it.start and (t.byteAt(s - 1) == ' ' or t.byteAt(s - 1) == '\t')) s -= 1;
+                return .{ .start = s, .end = it.code_end };
+            }
+        }
+        // No value here: the item of the list around this one (not out of a
+        // block of statements, `{ foo(x); }`, into the function it's in).
+        const o = open orelse return null;
+        if (!it.may_leave) return null;
+        at = o;
+        open = listOpenBefore(t, o);
+    }
+    return null;
+}
+
+const ValueOp = struct { start: usize, end: usize };
+
+const ValueItem = struct {
+    /// Just after the separator or bracket before it.
+    start: usize,
+    /// After its last byte of code (comments and blanks not counted).
+    code_end: usize,
+    /// Its first `=`-like operator, else its first `:`.
+    op: ?ValueOp,
+    /// Whether the list it's in can be left for the one around it.
+    may_leave: bool,
+};
+
+/// The item holding `at` in the list opening at `open` (else at the top
+/// level): items end at `,` and `;`, and in `{ }` and at the top level also
+/// at line ends.
+fn valueItem(t: *const Text, open: ?usize, at: usize, line_comment: []const u8) ?ValueItem {
+    const kind: u8 = if (open) |o| t.byteAt(o) else 0;
+    const lines_split = kind == 0 or kind == '{';
+    var i: usize = if (open) |o| o + 1 else t.lineStart(t.lineOf(at) -| 200);
+    var item: ValueItem = .{ .start = i, .code_end = i, .op = null, .may_leave = true };
+    var colon: ?ValueOp = null;
+    var earlier_items: usize = 0;
+    var commas = false;
+    var semicolons = false;
+    var depth: usize = 0;
+    var in_quote: u8 = 0;
+    const len = t.len();
+    while (i < len) : (i += 1) {
+        if (i > at + argument_reach) return null;
+        const b = t.byteAt(i);
+        if (in_quote != 0) {
+            if (b == '\\') i += 1 else if (b == in_quote or b == '\n') in_quote = 0;
+            item.code_end = @min(i + 1, len);
+            continue;
+        }
+        // Comments, and Zig's `\\` lines: to the end of the line.
+        if ((line_comment.len > 0 and startsAt(t, i, line_comment)) or startsAt(t, i, "\\\\")) {
+            const nl = t.lineEnd(t.lineOf(i));
+            if (nl <= i) continue;
+            i = nl - 1;
+            continue;
+        }
+        if (startsAt(t, i, "/*")) {
+            var e = i + 2;
+            while (e + 1 < len and !(t.byteAt(e) == '*' and t.byteAt(e + 1) == '/')) e += 1;
+            i = @min(e + 1, len - 1);
+            continue;
+        }
+        const separator = depth == 0 and (b == ',' or b == ';' or
+            (b == '\n' and lines_split and !continues(t, item, i)));
+        if (separator) {
+            if (i >= at) {
+                item.op = item.op orelse colon;
+                item.may_leave = kind != '{' or commas or (!semicolons and earlier_items == 0 and b != ';');
+                return item;
+            }
+            if (item.code_end > item.start) earlier_items += 1;
+            if (b == ',') commas = true;
+            if (b == ';') semicolons = true;
+            item = .{ .start = i + 1, .code_end = i + 1, .op = null, .may_leave = true };
+            colon = null;
+            continue;
+        }
+        if (depth == 0 and listBracket(t, i, 1)) {
+            // The list ends: the item holding `at` is the last one.
+            if (i < at) return null;
+            item.op = item.op orelse colon;
+            item.may_leave = kind != '{' or commas or (!semicolons and earlier_items == 0);
+            return item;
+        }
+        if (!std.ascii.isWhitespace(b)) item.code_end = i + 1;
+        if (b == '"' or b == '`') {
+            in_quote = b;
+        } else if (b == '\'') {
+            // A string or character literal when it closes on this line (not
+            // a Rust lifetime, or an apostrophe).
+            const le = t.lineEnd(t.lineOf(i));
+            if (i + 1 < le and std.mem.indexOfScalar(u8, t.slice(i + 1, le), '\'') != null) in_quote = b;
+        } else if (listBracket(t, i, 0)) {
+            depth += 1;
+        } else if (listBracket(t, i, 1)) {
+            depth -= 1;
+        } else if (depth == 0 and b == '=' and item.op == null) {
+            const next: u8 = if (i + 1 < len) t.byteAt(i + 1) else 0;
+            const prev: u8 = if (i > item.start) t.byteAt(i - 1) else 0;
+            if (next == '=') {
+                // `==`, `===`: a comparison.
+                while (i + 1 < len and t.byteAt(i + 1) == '=') i += 1;
+                continue;
+            }
+            if (next == '>') {
+                item.op = .{ .start = i, .end = i + 2 };
+                i += 1;
+                continue;
+            }
+            if (prev == '!' or prev == '=') continue;
+            // `<=`, `>=` compare; `<<=`, `>>=` assign.
+            if ((prev == '<' or prev == '>') and !(i >= item.start + 2 and t.byteAt(i - 2) == prev)) continue;
+            var s = i;
+            while (s > item.start and std.mem.indexOfScalar(u8, "+-*/%|&^:<>~?", t.byteAt(s - 1)) != null) s -= 1;
+            item.op = .{ .start = s, .end = i + 1 };
+        } else if (depth == 0 and b == ':' and colon == null) {
+            const next: u8 = if (i + 1 < len) t.byteAt(i + 1) else 0;
+            const prev: u8 = if (i > item.start) t.byteAt(i - 1) else 0;
+            if (next == ':') {
+                i += 1; // `::`, a path
+                continue;
+            }
+            if (next == '=' or prev == ':') continue;
+            colon = .{ .start = i, .end = i + 1 };
+        }
+    }
+    // The end of the text ends the item (an unclosed list doesn't).
+    if (open != null) return null;
+    item.op = item.op orelse colon;
+    item.may_leave = false;
+    return item;
+}
+
+fn startsAt(t: *const Text, i: usize, s: []const u8) bool {
+    if (i + s.len > t.len()) return false;
+    for (s, 0..) |c, k| if (t.byteAt(i + k) != c) return false;
+    return true;
+}
+
+/// Whether the line ending at `nl` goes on into the next (the item so far
+/// ends in an operator, or the next line starts with `.` or `?`).
+fn continues(t: *const Text, item: ValueItem, nl: usize) bool {
+    if (item.code_end <= item.start) return true; // nothing yet: blank lines
+    if (std.mem.indexOfScalar(u8, "=+-*/%|&^.?:<>", t.byteAt(item.code_end - 1)) != null) return true;
+    var j = nl + 1;
+    while (j < t.len() and (t.byteAt(j) == ' ' or t.byteAt(j) == '\t')) j += 1;
+    return j < t.len() and (t.byteAt(j) == '.' or t.byteAt(j) == '?') and !startsAt(t, j, "..");
+}
+
+fn expectValue(src: []const u8, cursor: []const u8, scope: Scope, comment_prefix: []const u8, expected: ?[]const u8) !void {
+    const gpa = std.testing.allocator;
+    var t = try Text.init(gpa, src);
+    defer t.deinit(gpa);
+    const pos = std.mem.indexOf(u8, src, cursor).?;
+    const r = value(&t, pos, scope, comment_prefix);
+    if (expected) |e| {
+        if (r == null) {
+            std.debug.print("no value at \"{s}\" in: {s}\n", .{ cursor, src });
+            return error.TestExpectedEqual;
+        }
+        try std.testing.expectEqualStrings(e, src[r.?.start..r.?.end]);
+    } else try std.testing.expectEqual(null, r);
+}
+
+test "values: after `=`, else `:`, from the name or inside the value" {
+    const zig = "//";
+    try expectValue("const x = foo(1, 2);", "x", .inner, zig, "foo(1, 2)");
+    try expectValue("const x = foo(1, 2);", "const", .inner, zig, "foo(1, 2)");
+    try expectValue("const x = foo(1, 2);", "2", .inner, zig, "foo(1, 2)"); // inside: outwards
+    try expectValue("const x: u8 = 5;", "u8", .inner, zig, "5"); // `=` over `:`
+    try expectValue("const x: u8 = 5;", "x", .around, zig, " = 5");
+    try expectValue("const x: u8 = 5; // five", "5", .inner, zig, "5");
+    try expectValue(".{ .a = 1, .b = \"x, y\" }", ".b", .inner, zig, "\"x, y\"");
+    try expectValue(".{ .a = 1, .b = 2 }", "1", .around, zig, " = 1");
+    try expectValue("fn f(a: u8, b: Map<K, V>) void", "b", .inner, zig, "Map<K, V>");
+    try expectValue("switch (x) {\n    .a => one(),\n    .b => 2,\n}", ".a", .inner, zig, "one()");
+    try expectValue("x += a == b;", "x", .inner, zig, "a == b");
+    try expectValue("x += 1;", "x", .around, zig, " += 1");
+    try expectValue("if (a <= b) {}", "a", .inner, zig, null);
+    try expectValue("x := 5", "x", .inner, zig, "5");
+    try expectValue("const s = .{\n    1,\n    2,\n};", "2", .inner, zig, ".{\n    1,\n    2,\n}");
+    // A line ending in an operator goes on.
+    try expectValue("const x = a +\n    b;\nconst y = 2;", "x", .inner, zig, "a +\n    b");
+    try expectValue("const x = a\n    .b();", "x", .inner, zig, "a\n    .b()");
+    // Not out of a block of statements, into the function it's in.
+    try expectValue("const f = fn () void {\n    foo(a);\n    bar();\n};", "a)", .inner, zig, null);
+    try expectValue("{ foo(a); }", "a", .inner, zig, null);
+    // Other languages: keys, lines, their comments.
+    const py = "#";
+    try expectValue("d = {\"k\": [1, 2], 'v': x // 2}", "k", .inner, py, "[1, 2]");
+    try expectValue("d = {\"k\": [1, 2], 'v': x // 2}", "v", .inner, py, "x // 2");
+    try expectValue("a = 1\nb = 2  # two\n", "b", .inner, py, "2");
+    try expectValue("def f(x=1, y: int = 2):", "y", .inner, py, "2");
+    try expectValue("[server]\nport = 8080\n", "port", .inner, py, "8080");
+    try expectValue("color: red;", "color", .inner, "", "red");
+    try expectValue("let v: Vec<u8> = vec![1];", "v", .inner, zig, "vec![1]");
+    try expectValue("std::mem::swap(a, b)", "mem", .inner, zig, null);
 }
 
 test "statement: a block with its header, as whole lines" {

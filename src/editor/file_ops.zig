@@ -135,7 +135,7 @@ pub fn yankPath(ed: *Editor, absolute: bool) !void {
 pub fn saveCurrent(ed: *Editor) !void {
     const b = ed.buffer;
     if (ed.claude) |c| if (c.diffFor(b) != null)
-        return ed.setMessage(.info, "this is Claude's proposal: SPC a y accepts it, SPC a n rejects it", .{});
+        return ed.setMessage(.info, "this is a proposal: Enter takes it, Esc drops it", .{});
     if (b.path == null) return filePrompt(ed, .save_as);
     if (ed.options.trim_on_save) _ = try textops.trimTrailing(ed);
     // JavaScript / TypeScript: eslint's fixes and organized imports first.
