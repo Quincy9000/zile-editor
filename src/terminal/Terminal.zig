@@ -108,7 +108,10 @@ pub fn destroy(t: *Terminal) void {
     t.reader.join();
     if (!t.exited.load(.acquire)) {
         t.pty.hangup();
-        t.pty.kill();
+        // All of it: a shell's `-c` command runs its programs as children
+        // (`zig build-exe x.zig && ./x`: the server), which killing the
+        // shell alone would leave running (holding its port).
+        t.pty.killGroup();
         t.exit_code = t.pty.wait();
     }
     t.pty.close();
@@ -165,6 +168,12 @@ pub fn finish(t: *Terminal, code: u8) void {
 
 pub fn isRunning(t: *const Terminal) bool {
     return !t.exited.load(.acquire);
+}
+
+/// Ends its program and everything that started (the terminal and its
+/// output stay; it finishes as any program that ends).
+pub fn stop(t: *Terminal) void {
+    if (t.isRunning()) t.pty.killGroup();
 }
 
 /// Shows `bytes` as if the program printed them (e.g. "[exited 0]").

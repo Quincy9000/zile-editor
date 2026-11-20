@@ -243,13 +243,15 @@ pub fn create(kind: Kind, ed: *Editor, query: []const u8) !void {
 
 /// The mode a picker opens in: `.insert` (typing the query) for ones you
 /// search, `.normal` (moving with j/k) for short lists you step through.
-/// Every source must choose.
+/// Every source must choose; one can also decide as it opens (`startMode`:
+/// the runner moves through its commands, or types when it has none).
 pub const StartMode = enum { insert, normal };
 
-pub fn startsNormal(kind: Kind) bool {
+pub fn startsNormal(ed: *Editor, kind: Kind) bool {
     return switch (kind) {
         inline else => |k| blk: {
             if (!@hasDecl(Impl(k), "start_mode")) @compileError("picker source " ++ @tagName(k) ++ " must declare start_mode");
+            if (@hasDecl(Impl(k), "startMode")) break :blk Impl(k).startMode(ed) == .normal;
             break :blk Impl(k).start_mode == .normal;
         },
     };
@@ -1994,7 +1996,7 @@ fn shortPath(cwd: []const u8, path: []const u8) []const u8 {
     return path[parent_start + 1 ..];
 }
 
-/// `SPC r e`: errors found in the last run's output.
+/// `E` in the runner: errors found in the last run's output.
 const RunErrors = struct {
     pub const title = "Errors from the last run";
     pub const prefix: ?u8 = null;
@@ -3068,7 +3070,7 @@ const WorkspaceSymbols = struct {
     }
 };
 
-/// `SPC r r`: the code runner. This project's commands, newest first:
+/// `SPC r`: the code runner. This project's commands, newest first:
 /// Enter on the list runs the last one again, any other can be picked, and
 /// typed text is a new command (it stays the first row, so Enter runs what
 /// you typed, not an old command it resembles). `x` forgets one.
@@ -3079,6 +3081,17 @@ const Runner = struct {
     pub const start_mode: StartMode = .insert;
     pub const create_first = true;
     pub const create_label = "Run ";
+
+    /// On the last command (Enter runs it again); typing when there's none
+    /// yet. (Enter with nothing there types one too: `acceptPickerAs`.)
+    pub fn startMode(ed: *Editor) StartMode {
+        const history = run_popup.runnerHistory(ed) catch return .insert;
+        defer {
+            for (history) |c| ed.gpa.free(c);
+            ed.gpa.free(history);
+        }
+        return if (history.len > 0) .normal else .insert;
+    }
 
     pub fn fill(ed: *Editor, items: *Items) !void {
         const history = try run_popup.runnerHistory(ed);
@@ -3107,21 +3120,46 @@ const Runner = struct {
         try debugging.open(ed);
     }
 
-    fn edit(ed: *Editor, _: ?Item) anyerror!void {
-        try run_popup.runnerEdit(ed);
+    /// The selected command, or the one typed (owned; null: neither). The
+    /// picker is closed after: what it's for takes over.
+    fn takeCommand(ed: *Editor) !?[]u8 {
+        const p = ed.picker orelse return null;
+        const choice = try p.choice();
+        defer choice.deinit(ed.gpa);
+        const cmd: ?[]u8 = switch (choice) {
+            .none => null,
+            .item => |c| try ed.gpa.dupe(u8, c.item.text),
+            .create => |c| try ed.gpa.dupe(u8, c.query),
+        };
+        picker_query.closePicker(ed);
+        return cmd;
     }
 
-    /// `c`: the command in the command editor (a vim buffer, any number of
-    /// lines); with no row, an empty one.
-    fn change(ed: *Editor, item: ?Item) anyerror!void {
-        try run_popup.editCommand(ed, if (item) |it| it.text else "", .runner, null);
+    /// `s` / Ctrl-s: the selected command (or the one typed), with the shell
+    /// under its output, to try what it runs (curl the server) meanwhile.
+    fn withShell(ed: *Editor, _: ?Item) anyerror!void {
+        const cmd = try takeCommand(ed) orelse return;
+        defer ed.gpa.free(cmd);
+        try run_popup.runWithShell(ed, cmd);
+    }
+
+    /// `e` / Ctrl-e: the selected command (or the one typed so far) in the
+    /// command editor, a vim buffer of any number of lines; Enter in its
+    /// normal mode runs it. With neither, an empty one.
+    fn edit(ed: *Editor, _: ?Item) anyerror!void {
+        const cmd = try takeCommand(ed);
+        defer if (cmd) |c| ed.gpa.free(c);
+        try run_popup.editCommand(ed, cmd orelse "", .runner, null);
     }
 
     pub const item_actions = [_]Action{
-        .{ .label = "edit it", .key = 'e', .ctrl = 'e', .stay = true, .run = edit },
+        // (These stay: they read the typed command, then close the picker.)
+        // `r`: as Enter, so `SPC r r` runs the last command again.
+        .{ .label = "run", .key = 'r', .stay = true, .any = true, .run = command("picker_accept") },
+        .{ .label = "run with a terminal", .key = 's', .ctrl = 's', .stay = true, .any = true, .run = withShell },
+        .{ .label = "edit it (vim)", .key = 'e', .ctrl = 'e', .stay = true, .any = true, .run = edit },
         .{ .label = "forget it", .key = 'x', .ctrl = 'x', .stay = true, .run = command("picker_delete") },
         .{ .label = "debugger", .key = 'd', .any = true, .run = openDebug },
-        .{ .label = "change it (vim)", .key = 'c', .any = true, .run = change },
         .{ .label = "again", .key = '.', .any = true, .run = command("run_again") },
         .{ .label = "output", .key = 'o', .any = true, .run = command("run_output") },
         .{ .label = "errors", .key = 'E', .any = true, .run = command("run_errors") },

@@ -163,6 +163,13 @@ pub fn kill(p: *const Pty) void {
     if (p.pid > 0) _ = killProcess(p.pid, SIGKILL);
 }
 
+/// Ends the child and all it started: forkpty made it a session leader, so
+/// its process group is it and its children (a shell's `-c` command, the
+/// server that started).
+pub fn killGroup(p: *const Pty) void {
+    if (p.pid > 0) _ = killProcess(-p.pid, SIGKILL);
+}
+
 /// Waits up to `ms` for output (or the child going away).
 pub fn waitReadable(p: *const Pty, ms: i32) bool {
     var fds = [_]std.c.pollfd{.{ .fd = p.fd, .events = std.c.POLL.IN, .revents = 0 }};

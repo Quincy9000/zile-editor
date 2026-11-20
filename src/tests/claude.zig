@@ -100,7 +100,7 @@ test "claude: lock file, handshake, selection, mentions, openDiff accepted" {
     defer gpa.free(men);
     try testing.expect(std.mem.indexOf(u8, men, "\"lineStart\":0,\"lineEnd\":1") != null);
 
-    // A proposed edit opens as a diff; SPC a y accepts it.
+    // A proposed edit opens as a diff; Enter accepts it.
     const call = try std.fmt.allocPrint(gpa,
         \\{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"openDiff","arguments":{{"old_file_path":"{s}","new_file_path":"{s}","new_file_contents":"const a = 10;\nconst b = 2;\n","tab_name":"t1"}}}}}}
     , .{ file, file });
@@ -114,7 +114,7 @@ test "claude: lock file, handshake, selection, mentions, openDiff accepted" {
     try testing.expectEqual(1, c.diffs.items.len);
     try testing.expect(std.mem.startsWith(u8, ed.buffer.displayName(), "Claude: "));
     try testing.expectEqual(1, ed.buffer.git.?.hunks.items.len); // line 1 changed
-    try ed.feed("<Space>ay");
+    try ed.feed("<CR>"); // (Enter takes a proposal)
     const saved = try cli.expect(&ed, "\"id\":3");
     defer gpa.free(saved);
     try testing.expect(std.mem.indexOf(u8, saved, "FILE_SAVED") != null);
@@ -131,7 +131,7 @@ test "claude: lock file, handshake, selection, mentions, openDiff accepted" {
         if (c.diffs.items.len > 0) break;
         io.sleep(.fromMilliseconds(5), .awake) catch {};
     }
-    try ed.feed("<Space>an");
+    try ed.feed("<Esc>"); // (Esc drops one)
     const rejected = try cli.expect(&ed, "\"id\":4");
     defer gpa.free(rejected);
     try testing.expect(std.mem.indexOf(u8, rejected, "DIFF_REJECTED") != null);

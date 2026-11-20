@@ -93,7 +93,13 @@ pub fn prepare(ed: *Editor, font: *const Font, width: i32, height: i32) Layout {
         .cell_w = @intFromFloat(font.cell_w),
         .cell_h = @intFromFloat(font.cell_h),
     };
-    if (run_popup.popupTerminal(ed)) |t| t.resize(ed.term_size.cols, ed.term_size.rows, ed.term_size.cell_w, ed.term_size.cell_h);
+    const sz = ed.term_size;
+    if (run_popup.splitShown(ed)) {
+        // The run above, the shell (under its own header line) below.
+        const rows = splitRows(sz.rows);
+        ed.run.?.resize(sz.cols, rows[0], sz.cell_w, sz.cell_h);
+        ed.shell.?.resize(sz.cols, rows[1], sz.cell_w, sz.cell_h);
+    } else if (run_popup.popupTerminal(ed)) |t| t.resize(sz.cols, sz.rows, sz.cell_w, sz.cell_h);
     if (ed.cmd_float) |f| {
         f.rect = cmdFloatRect(ed, font, screen);
         const fl = floatLayout(ed, font, f);
@@ -309,7 +315,7 @@ fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.
     rect(r.x, r.y, r.w, font.cell_h, theme.status_bg);
     const debug = ed.cmd_purpose == .debug;
     var title_buf: [160]u8 = undefined;
-    const title: []const u8 = if (rewrite) Editor.claude_inline.title(ed, &title_buf) else if (claude) claude_panel.tellTitle(ed, &title_buf) else if (debug) "Debug command (this session)" else "Run command";
+    const title: []const u8 = if (rewrite) Editor.claude_inline.title(ed, &title_buf) else if (claude) claude_panel.tellTitle(ed, &title_buf) else if (debug) "Debug command (this session)" else if (ed.cmd_prompt) |sp| sp.kind.title() else "Run command";
     _ = font.drawText(title, r.x + font.cell_w, r.y, theme.mode_picker);
     const hint = if (claude)
         (if (ed.mode == .normal) "Enter sends   Esc closes" else "Enter sends   S-Enter new line   Esc normal")
@@ -356,7 +362,9 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
         .shell => "Terminal",
         .run => std.fmt.bufPrint(&buf, "$ {s}", .{ed.run_command orelse ""}) catch "$",
     };
-    _ = font.drawText(title, r.x + cw, r.y, theme.status_fg);
+    const split = run_popup.splitShown(ed);
+    const run_keys = !split or !ed.split_keys_shell;
+    _ = font.drawText(title, r.x + cw, r.y, if (run_keys) theme.status_fg else theme.status_dim);
     var right_buf: [96]u8 = undefined;
     const right, const right_color = if (ed.popup.? == .shell)
         .{ "Esc Esc hides", theme.status_dim }
@@ -384,7 +392,25 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
     _ = font.drawText(right, r.x + r.w - @as(f32, @floatFromInt(cells(right) + 1)) * cw, r.y, right_color);
 
     // The screen, one cell of padding at the sides.
-    drawTerminalScreen(t, font, theme, r.x + cw, r.y + ch, true);
+    drawTerminalScreen(t, font, theme, r.x + cw, r.y + ch, run_keys);
+    if (!split) return;
+
+    // The shell under the run, with a header line of its own.
+    const rows = splitRows(ed.term_size.rows);
+    const sy = r.y + ch * @as(f32, @floatFromInt(1 + rows[0]));
+    rect(r.x, sy, r.w, ch, theme.status_bg);
+    _ = font.drawText("Terminal", r.x + cw, sy, if (run_keys) theme.status_dim else theme.status_fg);
+    const hint = "C-\\: the other   Esc Esc hides";
+    _ = font.drawText(hint, r.x + r.w - @as(f32, @floatFromInt(cells(hint) + 1)) * cw, sy, theme.status_dim);
+    drawTerminalScreen(ed.shell.?, font, theme, r.x + cw, sy + ch, !run_keys);
+}
+
+/// The rows of the run and of the shell in a split popup of `rows` (the
+/// shell's header line is between them).
+fn splitRows(rows: u16) [2]u16 {
+    const panes = @max(rows, 3) - 1;
+    const top = panes / 2;
+    return .{ @max(top, 1), @max(panes - top, 1) };
 }
 
 /// A terminal's screen with its top-left cell at (x0, y0), and its cursor
@@ -1190,7 +1216,6 @@ fn drawStatus(ed: *Editor, font: *const Font, theme: *const Theme, l: Layout) vo
             .replace => .{ " REPLACE ", theme.mode_insert },
             .git_commit, .git_remote => .{ " GIT ", theme.mode_insert },
             .new_file, .save_as, .rename_file, .copy_file, .new_pad, .rename_pad => .{ " FILE ", theme.mode_insert },
-            .run_command => .{ " RUN ", theme.mode_insert },
             .browse_new_folder, .browse_new_file, .browse_rename, .browse_move => .{ " FILE ", theme.mode_insert },
         },
     };

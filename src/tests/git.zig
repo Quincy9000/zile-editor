@@ -174,7 +174,7 @@ test "git: commit from the editor in a real repository" {
     try ed.openFile(file);
     try ed.feed("ihello<Esc>");
 
-    try ed.feed("<cmd:git_commit>first commit<CR>");
+    try ed.feed("<cmd:git_commit>first commit<Esc><CR>"); // (a vim window: Esc, then Enter commits)
     try testing.expect(!ed.buffer.modified); // saved before committing
     while (ed.git_job) |job| {
         if (job.done.load(.acquire)) break;

@@ -9,6 +9,7 @@ const project_ops = @import("../editor/project_ops.zig");
 const Editor = @import("../Editor.zig");
 const PromptKind = Editor.PromptKind;
 const support = @import("support.zig");
+const Mode = @import("../Editor.zig").Mode;
 const testEditor = support.testEditor;
 const expectText = support.expectText;
 const expectCursor = support.expectCursor;
@@ -160,9 +161,9 @@ test "opening a file: its cursor's line is centred in the window, not at the edg
     ed.setViewSize(40, 80); // the next frame
     try testing.expectEqual(200, ed.cursorLine());
     try testing.expectEqual(180, ed.view.top);
-    // Within the view: no scrolling.
+    // Within the view: centered all the same (as every jump).
     try ed.jumpTo(path, 205, 0);
-    try testing.expectEqual(180, ed.view.top);
+    try testing.expectEqual(185, ed.view.top);
     try ed.jumpTo(path, 20, 0);
     try testing.expectEqual(0, ed.view.top);
 }
@@ -271,9 +272,8 @@ test "files: save as, rename, copy, delete, new" {
 
     // A scratch buffer: SPC s asks for a name, then saves there.
     try ed.feed("ihello<Esc><Space>s");
-    try testing.expectEqual(PromptKind.save_as, ed.search_prompt.?.kind);
-    try ed.search_prompt.?.input.set(gpa, a);
-    try ed.feed("<CR>");
+    try testing.expectEqual(PromptKind.save_as, support.promptKind(&ed).?); // in a vim window
+    try support.answerPrompt(&ed, a);
     try testing.expect(std.mem.endsWith(u8, a, ed.buffer.path.?));
     try testing.expect(!ed.buffer.modified);
     const saved = try tmp.dir.readFileAlloc(io, "a.txt", gpa, .limited(1024));
@@ -282,9 +282,9 @@ test "files: save as, rename, copy, delete, new" {
 
     // Rename into a new folder: the file moves and the language follows.
     try ed.feed("<cmd:rename_file>");
-    try testing.expect(std.mem.endsWith(u8, a, ed.search_prompt.?.input.items())); // prefilled
-    try ed.search_prompt.?.input.set(gpa, b);
-    try ed.feed("<CR>");
+    try testing.expect(std.mem.endsWith(u8, a, support.promptText(&ed))); // prefilled
+    try testing.expectEqual(Mode.normal, ed.mode); // (to change it with vim's keys)
+    try support.answerPrompt(&ed, b);
     try testing.expect(std.mem.endsWith(u8, b, ed.buffer.path.?));
     try testing.expect(ed.buffer.syntax != null);
     try testing.expectError(error.FileNotFound, tmp.dir.access(io, "a.txt", .{}));
@@ -295,16 +295,14 @@ test "files: save as, rename, copy, delete, new" {
     // saves it).
     ed.options.autosave = false;
     try ed.feed("A!<Esc><cmd:copy_file>");
-    try ed.search_prompt.?.input.set(gpa, c);
-    try ed.feed("<CR>");
+    try support.answerPrompt(&ed, c);
     try testing.expect(std.mem.endsWith(u8, c, ed.buffer.path.?));
     try testing.expectEqualStrings("hello!", ed.text().slice(0, ed.text().len()));
     try testing.expect(ed.buffers.items[0].modified);
 
     // Refuses to overwrite an existing file.
     try ed.feed("<cmd:save_file_as>");
-    try ed.search_prompt.?.input.set(gpa, b);
-    try ed.feed("<CR>");
+    try support.answerPrompt(&ed, b);
     try testing.expectEqual(.err, ed.message.kind);
     try testing.expect(std.mem.endsWith(u8, c, ed.buffer.path.?));
 
@@ -318,8 +316,9 @@ test "files: save as, rename, copy, delete, new" {
 
     // New file: prefilled with the current folder; created on first save.
     try ed.feed("<cmd:new_file>");
-    try testing.expect(std.mem.endsWith(u8, ed.search_prompt.?.input.items(), "sub/"));
-    try ed.feed("new.txt<CR>");
+    try testing.expect(std.mem.endsWith(u8, support.promptText(&ed), "sub/"));
+    try ed.feed("Anew.txt<Esc><CR>"); // vim's keys: appended
+    try testing.expectEqual(null, ed.cmd_float);
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "sub/new.txt"));
     try testing.expectEqual(2, ed.buffers.items.len);
 }
@@ -562,7 +561,7 @@ test "file browser: new folder and file, rename, move, copy and paste, delete" {
     settlePicker(&ed);
     try testing.expectEqual(.browse, ed.picker.?.kind);
 
-    try ed.feed("onewdir<CR>"); // o: a folder; back in the browser, on it
+    try ed.feed("onewdir<Esc><CR>"); // o: a folder (named in a vim window); back in the browser, on it
     settlePicker(&ed);
     try testing.expect(exists(tmp.dir, "newdir"));
     try testing.expectEqualStrings("newdir/", ed.picker.?.itemAt(ed.picker.?.selected).?.text);
@@ -574,7 +573,7 @@ test "file browser: new folder and file, rename, move, copy and paste, delete" {
     settlePicker(&ed);
     try testing.expect(exists(tmp.dir, "a copy.txt"));
 
-    try ed.feed("r<C-u>b.txt<CR>"); // rename the copy (selected after the paste)
+    try ed.feed("rccb.txt<Esc><CR>"); // rename the copy (selected after the paste): its name, changed
     settlePicker(&ed);
     try testing.expect(exists(tmp.dir, "b.txt"));
     try testing.expect(!exists(tmp.dir, "a copy.txt"));
@@ -586,7 +585,7 @@ test "file browser: new folder and file, rename, move, copy and paste, delete" {
         try ed.feed("j");
         settlePicker(&ed);
     }
-    try ed.feed("m<C-u>sub/a.txt<CR>");
+    try ed.feed("mccsub/a.txt<Esc><CR>");
     settlePicker(&ed);
     try testing.expect(exists(tmp.dir, "sub/a.txt"));
     try testing.expect(std.mem.endsWith(u8, ed.buffer.path.?, "sub/a.txt"));
@@ -603,8 +602,9 @@ test "file browser: new folder and file, rename, move, copy and paste, delete" {
     settlePicker(&ed);
     try testing.expect(!exists(tmp.dir, "sub/a.txt"));
     try testing.expectEqual(null, ed.buffer.path);
-    // Esc in a prompt goes back to the browser.
-    try ed.feed("nxyz<Esc>");
+    // Giving up on a prompt goes back to the browser (in its vim window:
+    // Esc, then Esc in normal mode).
+    try ed.feed("nxyz<Esc><Esc>");
     try testing.expectEqual(.browse, ed.picker.?.kind);
     try ed.feed("q");
 }

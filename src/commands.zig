@@ -88,8 +88,11 @@ pub const Command = struct {
     /// With several cursors, runs at the primary only instead of at each one
     /// (undo, `.`, macros, cursor management). Leader commands always are.
     once: bool = false,
-    /// A jump: the place it leaves goes on the jumplist (`<C-o>` returns).
+    /// A jump: the place it leaves goes on the jumplist (`<C-o>` returns),
+    /// and the view centers on where it lands.
     jump: bool = false,
+    /// A jump to a place on the screen (H, M, L): the view stays.
+    in_view: bool = false,
     /// Run from a menu (`SPC w r l`), the menu stays open for the next key
     /// (`l l h`), until a key it doesn't have (that key then acts as usual).
     sticky: bool = false,
@@ -132,9 +135,9 @@ const base = [_]Command{
     .{ .name = "match_bracket", .doc = "Matching bracket", .run = motion(matchBracket, .inclusive, .reset) , .jump = true },
     .{ .name = "paragraph_forward", .doc = "Next paragraph", .run = motion(paragraphForward, .exclusive, .reset) , .jump = true },
     .{ .name = "paragraph_backward", .doc = "Previous paragraph", .run = motion(paragraphBackward, .exclusive, .reset) , .jump = true },
-    .{ .name = "screen_top", .doc = "Top of screen", .run = motion(screenLine(.top), .linewise, .reset) , .jump = true },
-    .{ .name = "screen_middle", .doc = "Middle of screen", .run = motion(screenLine(.middle), .linewise, .reset) , .jump = true },
-    .{ .name = "screen_bottom", .doc = "Bottom of screen", .run = motion(screenLine(.bottom), .linewise, .reset) , .jump = true },
+    .{ .name = "screen_top", .doc = "Top of screen", .run = motion(screenLine(.top), .linewise, .reset) , .jump = true, .in_view = true },
+    .{ .name = "screen_middle", .doc = "Middle of screen", .run = motion(screenLine(.middle), .linewise, .reset) , .jump = true, .in_view = true },
+    .{ .name = "screen_bottom", .doc = "Bottom of screen", .run = motion(screenLine(.bottom), .linewise, .reset) , .jump = true, .in_view = true },
     .{ .name = "search_next", .doc = "Next match", .run = searchNextCmd(false), .ghost = true , .jump = true },
     .{ .name = "search_previous", .doc = "Previous match", .run = searchNextCmd(true), .ghost = true , .jump = true },
 
@@ -2427,7 +2430,7 @@ fn termCmd(comptime action: enum { toggle, window, runner, command, again, outpu
                 .toggle => try run_popup.toggleShell(ed),
                 .window => window_ops.openTermWindow(ed) catch |err| ed.setMessage(.err, "could not start the shell: {s}", .{@errorName(err)}),
                 .runner => try run_popup.runPrompt(ed, true),
-                .shell => run_popup.shellPrompt(ed),
+                .shell => try run_popup.shellPrompt(ed),
                 .command => try run_popup.runPrompt(ed, false),
                 .again => try run_popup.runAgain(ed),
                 .output => run_popup.showRunOutput(ed),
@@ -2471,6 +2474,8 @@ fn qfCmd(comptime action: enum { next, previous, list, from_picker, clear }) Han
 fn jumpCmd(comptime dir: enum { older, newer }) Handler {
     return &struct {
         fn run(c: Context) anyerror!void {
+            // Where it lands is centered, as for the jump that left it.
+            c.ed.center_from = .{ .buffer = c.ed.buffer, .line = c.ed.cursorLine() };
             switch (dir) {
                 .older => try jumplist.jumpOlder(c.ed, c.count),
                 .newer => try jumplist.jumpNewer(c.ed, c.count),

@@ -194,3 +194,27 @@ pub fn expectVars(vars: []const u8, wanted: []const []const u8) !void {
     errdefer std.debug.print("{s}\n", .{vars});
     for (wanted) |want| try testing.expect(std.mem.indexOf(u8, vars, want) != null);
 }
+
+/// The boxed prompt being answered in the command editor (a vim window),
+/// if one is: its kind.
+pub fn promptKind(ed: *const Editor) ?Editor.PromptKind {
+    return if (ed.cmd_prompt) |sp| sp.kind else null;
+}
+
+/// That prompt's text as it stands in the window.
+pub fn promptText(ed: *Editor) []const u8 {
+    std.debug.assert(ed.cmd_prompt != null and ed.window == ed.cmd_float.?);
+    const t = ed.text();
+    return t.slice(0, t.len());
+}
+
+/// Answers it with `text`: the window's text replaced, then Enter in normal
+/// mode (Esc first when typing; in normal mode Esc would cancel it).
+pub fn answerPrompt(ed: *Editor, text: []const u8) !void {
+    std.debug.assert(ed.cmd_prompt != null and ed.window == ed.cmd_float.?);
+    const t = ed.text();
+    t.delete(0, t.len());
+    try t.insert(ed.gpa, 0, text);
+    if (ed.mode != .normal) try ed.feed("<Esc>");
+    try ed.feed("<CR>");
+}

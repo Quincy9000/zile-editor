@@ -34,6 +34,36 @@ test "the status line's recent keys: the last five pressed, in any mode, not rep
     try testing.expectEqual(@as(u21, '.'), ed.recent_keys[4].key.codepoint);
 }
 
+test "jumps and searches center the line they land on; H and a search that finds nothing don't scroll" {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    for (0..200) |i| try text.print(testing.allocator, "{s} {d}\n", .{ if (i == 60 or i == 150) "mark" else "line", i });
+    var ed = try testEditor(text.items);
+    defer ed.deinit();
+    ed.setViewSize(20, 80);
+    try ed.feed("/mark<CR>"); // line 60, from the top: in the middle
+    try testing.expectEqual(60, ed.cursorLine());
+    try testing.expectEqual(50, ed.view.top);
+    try ed.feed("n"); // line 150
+    try testing.expectEqual(150, ed.cursorLine());
+    try testing.expectEqual(140, ed.view.top);
+    try ed.feed("/nothing<CR>"); // not found: stays
+    try testing.expectEqual(140, ed.view.top);
+    try ed.feed("H"); // a place on the screen: the view stays
+    try testing.expectEqual(140, ed.cursorLine());
+    try testing.expectEqual(140, ed.view.top);
+    try ed.feed("5j;"); // back from the H jump, centered (it was in view)
+    try testing.expectEqual(150, ed.cursorLine());
+    try testing.expectEqual(140, ed.view.top);
+    try ed.feed("gg");
+    try testing.expectEqual(0, ed.view.top);
+    try ed.feed("100G");
+    try testing.expectEqual(89, ed.view.top);
+    // Plain motions still scroll only as far as they must.
+    try ed.feed("5j");
+    try testing.expectEqual(89, ed.view.top);
+}
+
 test "scrolling keeps the cursor in view" {
     var ed = try testEditor("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19");
     defer ed.deinit();

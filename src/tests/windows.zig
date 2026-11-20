@@ -64,7 +64,7 @@ test "scratch pads: SPC t s lists them; Tab writes in one (saved), n makes anoth
     ed.tick();
     try testing.expectEqualStrings("note", std.mem.trimEnd(u8, ed.pad_list.text.items, "\n"));
     // n: a new pad, gone into to write.
-    try ed.feed("nideas<CR>");
+    try ed.feed("nideas<Esc><CR>");
     try testing.expectEqual(3, ed.pad_list.pads.items.len);
     try testing.expectEqualStrings("ideas", ed.pad_list.pads.items[p.sel].name);
     try testing.expectEqual(Editor.Mode.insert, ed.mode);
@@ -99,7 +99,7 @@ test "a scratch pad named for what it is (q.sql) is a file of that kind; r renam
     const p = &ed.pad_panel;
     try ed.feed("<cmd:toggle_scratch>");
     // A name that says its kind: the file is that, and its language is SQL.
-    try ed.feed("nq.sql<CR>");
+    try ed.feed("nq.sql<Esc><CR>");
     try testing.expectEqualStrings("q.sql", ed.pad_list.pads.items[p.sel].name);
     try testing.expectEqualStrings("sql", ed.buffer.syntax.?.lang.name);
     try ed.feed("select 1;<Esc><Esc>");
@@ -107,9 +107,9 @@ test "a scratch pad named for what it is (q.sql) is a file of that kind; r renam
     defer testing.allocator.free(q);
     try testing.expectEqualStrings("select 1;\n", q);
     // A plain name is markdown still; renamed, it is what the new name says.
-    try ed.feed("nnotes<CR>select 2;<Esc><Esc>");
+    try ed.feed("nnotes<Esc><CR>select 2;<Esc><Esc>");
     try testing.expectEqualStrings("notes", ed.pad_list.pads.items[p.sel].name);
-    try ed.feed("r.sql<CR>");
+    try ed.feed("rA.sql<Esc><CR>"); // its name in a vim window: appended to
     try testing.expectEqualStrings("notes.sql", ed.pad_list.pads.items[p.sel].name);
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "scratch/notes.md", .{}));
     const n = try tmp.dir.readFileAlloc(testing.io, "scratch/notes.sql", testing.allocator, .limited(1024));
@@ -120,7 +120,7 @@ test "a scratch pad named for what it is (q.sql) is a file of that kind; r renam
     try testing.expectEqualStrings("sql", ed.buffer.syntax.?.lang.name);
     try ed.feed("<Esc>");
     // A name another pad has is refused.
-    try ed.feed("r<C-u>q.sql<CR>");
+    try ed.feed("rccq.sql<Esc><CR>");
     try testing.expectEqualStrings("notes.sql", ed.pad_list.pads.items[p.sel].name);
 }
 

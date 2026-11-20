@@ -94,6 +94,29 @@ pub fn popupTerminal(ed: *Editor) ?*Terminal {
     };
 }
 
+/// The popup shows the run with the shell under it (a run started with a
+/// terminal, the shell still there).
+pub fn splitShown(ed: *const Editor) bool {
+    return ed.popup == .run and ed.run_split and ed.shell != null and ed.run != null;
+}
+
+/// The terminal the popup's keys go to: in the split, the pane that has
+/// them.
+pub fn keyTerminal(ed: *Editor) ?*Terminal {
+    if (splitShown(ed) and ed.split_keys_shell) return ed.shell;
+    return popupTerminal(ed);
+}
+
+/// The runner's `s` / Ctrl-s: runs `command` with the shell under its
+/// output, which has the keys (to curl the server it starts, say).
+pub fn runWithShell(ed: *Editor, command: []const u8) !void {
+    if (std.mem.trim(u8, command, " \t").len == 0) return;
+    if (ed.shell == null) ed.shell = try spawnTerminal(ed, &.{Pty.userShell()});
+    try runFromRunner(ed, command);
+    ed.run_split = true;
+    ed.split_keys_shell = true;
+}
+
 /// `SPC r t` / <C-\>: shows or hides the shell (started on first use).
 pub fn toggleShell(ed: *Editor) !void {
     if (ed.popup == .shell) {
@@ -106,7 +129,7 @@ pub fn toggleShell(ed: *Editor) !void {
 
 /// `SPC r o`: shows the last run's output again.
 pub fn showRunOutput(ed: *Editor) void {
-    if (ed.run == null) return ed.setMessage(.info, "nothing has been run yet (SPC r r)", .{});
+    if (ed.run == null) return ed.setMessage(.info, "nothing has been run yet (SPC r)", .{});
     ed.popup = .run;
 }
 
@@ -221,10 +244,17 @@ pub fn popupKey(ed: *Editor, ev: KeyEvent) bool {
         }
         return false;
     }
-    const t = popupTerminal(ed) orelse {
+    const shown = popupTerminal(ed) orelse {
         ed.popup = null;
         return false;
     };
+    // A run with the shell under it: Ctrl-\ gives the keys to the other.
+    if (splitShown(ed) and isCtrlBackslash(ev)) {
+        ed.split_keys_shell = !ed.split_keys_shell;
+        return true;
+    }
+    const t = keyTerminal(ed) orelse shown;
+    const in_shell = t != shown;
     if (isCtrlBackslash(ev) or (t.isRunning() and doubleEsc(ed, t, ev))) {
         ed.popup = null;
         return true;
@@ -243,7 +273,7 @@ pub fn popupKey(ed: *Editor, ev: KeyEvent) bool {
         };
         return true;
     }
-    if (ed.popup == .run and ed.dbg.session != null and ev.mods.ctrl and !ev.mods.alt and ev.key == .codepoint and ev.key.codepoint == 'c') {
+    if (ed.popup == .run and !in_shell and ed.dbg.session != null and ev.mods.ctrl and !ev.mods.alt and ev.key == .codepoint and ev.key.codepoint == 'c') {
         if (ed.dbg.session) |d| d.pause() catch {};
         return true;
     }
@@ -337,6 +367,8 @@ pub fn closeCommandEditor(ed: *Editor) void {
     ed.cmd_float = null;
     ed.cmd_return = null;
     ed.cmd_purpose = .run;
+    // A prompt answered here, closed without Enter: given up.
+    prompts.cancelParked(ed);
 }
 
 /// In the command editor's normal mode: <CR> runs, <Esc> cancels.
@@ -377,7 +409,14 @@ pub fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
             const from = ed.cmd_from;
             ed.cmd_from = null;
             defer if (from) |f| ed.gpa.free(f);
+            // A prompt's answer (empty too: the prompt says what that means).
+            const parked = ed.cmd_prompt;
+            ed.cmd_prompt = null;
             closeCommandEditor(ed);
+            if (parked) |sp| {
+                prompts.answerParked(ed, sp, cmd) catch |err| ed.setMessage(.err, "{s}", .{@errorName(err)});
+                return true;
+            }
             if (cmd.len == 0) return true;
             const one_line = std.mem.indexOfScalar(u8, cmd, '\n') == null;
             (switch (purpose) {
@@ -387,6 +426,7 @@ pub fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
                 // The history is a line per command.
                 .runner => if (one_line) runFromRunner(ed, cmd) else startRun(ed, cmd),
                 .debug => debugging.edited(ed, from orelse cmd, cmd),
+                .prompt => {},
             }) catch |err| ed.setMessage(.err, "could not run: {s}", .{@errorName(err)});
         },
         else => return false,
@@ -394,8 +434,8 @@ pub fn cmdFloatKey(ed: *Editor, ev: KeyEvent) bool {
     return true;
 }
 
-/// `SPC r r`: the code runner's prompt, prefilled with the last command.
-/// `SPC r r`: the runner, a picker of this project's commands, newest
+/// The code runner.s prompt, prefilled with the last command.
+/// `SPC r`: the runner, a picker of this project's commands, newest
 /// first (Enter runs the last one again); typing a new one runs that.
 /// `SPC r c`: the multi-line command editor.
 pub fn runPrompt(ed: *Editor, runner: bool) !void {
@@ -416,6 +456,7 @@ pub fn runnerHistory(ed: *Editor) ![][]u8 {
 pub fn runFromRunner(ed: *Editor, command: []const u8) !void {
     const cmd = std.mem.trim(u8, command, " \t");
     if (cmd.len == 0) return;
+    ed.run_split = false; // (`runWithShell` sets it after)
     if (runMemoryPath(ed)) |path| {
         const key = try runKey(ed);
         defer ed.gpa.free(key);
@@ -439,19 +480,6 @@ pub fn runOrDebug(ed: *Editor, cmd: []const u8) !void {
     try debugging.debug(ed, cmd);
 }
 
-/// <Tab> in the runner: the selected command goes into the query line, to
-/// add to or cut down (typing, <BS>, <C-w>) before Enter runs the result.
-pub fn runnerEdit(ed: *Editor) !void {
-    const p = ed.picker orelse return;
-    if (p.kind != .runner) return;
-    p.sync();
-    // The "Run <typed>" row has nothing of its own to copy.
-    const item = p.itemAt(p.selected) orelse return;
-    try p.query.set(ed.gpa, item.text);
-    ed.mode = .picker;
-    try p.queryChanged();
-}
-
 /// `x` / `dd` in the runner: forgets the selected command.
 pub fn pickerForgetCommand(ed: *Editor) !void {
     const p = ed.picker orelse return;
@@ -466,10 +494,11 @@ pub fn pickerForgetCommand(ed: *Editor) !void {
     ed.mode = .picker_normal;
 }
 
-/// `SPC ;`: a one-off shell command. The prompt starts empty and what runs
-/// isn't remembered as the project's runner command (`SPC r r`).
-pub fn shellPrompt(ed: *Editor) void {
-    prompts.startSearch(ed, true, .run_command);
+/// `SPC ;`: a one-off shell command, in the command editor (empty, typing;
+/// Esc then Enter runs it). What runs isn't remembered as the project's
+/// runner command (`SPC r`).
+pub fn shellPrompt(ed: *Editor) !void {
+    try openCommandEditor(ed);
 }
 
 pub fn runMemoryPath(ed: *Editor) ?[]const u8 {
@@ -500,14 +529,6 @@ pub fn loadRunnerCommand(ed: *Editor) ?[]u8 {
     return RunMemory.load(ed.gpa, ed.io, path, key);
 }
 
-pub fn finishRunPrompt(ed: *Editor, kind: PromptKind) !void {
-    const raw = try git_ops.takePromptText(ed) orelse return;
-    defer ed.gpa.free(raw);
-    const cmd = std.mem.trim(u8, raw, " \t");
-    if (cmd.len == 0) return;
-    _ = kind;
-    try startRun(ed, cmd);
-}
 
 pub const libcSetenv = @extern(*const fn ([*:0]const u8, [*:0]const u8, c_int) callconv(.c) c_int, .{ .name = "setenv" });
 
@@ -585,7 +606,14 @@ pub fn startSqlStatement(ed: *Editor, url: []const u8, statement: []const u8, sh
 pub fn runAgain(ed: *Editor) !void {
     const cmd = loadRunnerCommand(ed) orelse return runPrompt(ed, true);
     defer ed.gpa.free(cmd);
+    try splitShellAgain(ed);
     try runOrDebug(ed, cmd);
+}
+
+/// A run started with a terminal, run again, gets it again (leaving it
+/// ended the run with it).
+fn splitShellAgain(ed: *Editor) !void {
+    if (ed.run_split and ed.shell == null) ed.shell = try spawnTerminal(ed, &.{Pty.userShell()});
 }
 
 pub fn rerun(ed: *Editor) !void {
@@ -597,6 +625,7 @@ pub fn rerun(ed: *Editor) !void {
     };
     const cmd = try ed.gpa.dupe(u8, ed.run_command orelse return);
     defer ed.gpa.free(cmd);
+    try splitShellAgain(ed);
     try startRun(ed, cmd);
 }
 
@@ -616,8 +645,13 @@ pub fn startRun(ed: *Editor, cmd: []const u8) !void {
     errdefer ed.gpa.free(owned);
     const folder = try commandFolder(ed);
     errdefer ed.gpa.free(folder);
+    // The old run ends first, all of it: a server still running would hold
+    // the port the new one wants (AddressInUse).
+    if (ed.run) |old| {
+        old.destroy();
+        ed.run = null;
+    }
     const t = try spawnTerminalIn(ed, &.{ Pty.userShell(), "-c", cmd }, folder);
-    if (ed.run) |old| old.destroy();
     if (ed.run_command) |old| ed.gpa.free(old);
     if (ed.run_root_owned) |old| ed.gpa.free(old);
     ed.run = t;
@@ -627,6 +661,7 @@ pub fn startRun(ed: *Editor, cmd: []const u8) !void {
     ed.run_root = folder;
     ed.run_started = Io.Timestamp.now(ed.io, .awake);
     ed.run_reported = false;
+    ed.run_stopped = false;
     ed.run_debug = false;
     ed.dbg.outcome = null;
     ed.popup = .run;

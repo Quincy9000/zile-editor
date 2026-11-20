@@ -38,6 +38,8 @@ pub fn pushJumpAt(ed: *Editor, pos: usize) void {
         if (path) |jp| ed.gpa.free(jp);
     };
     ed.jump_index = ed.jumps.items.len;
+    // Where it lands goes in the middle of the view (`scrollToCursor`).
+    ed.center_from = .{ .buffer = b, .line = line };
 }
 
 /// `<C-o>`: back to an older place.

@@ -19,7 +19,7 @@ const waitForRun = support.waitForRun;
 const settlePicker = support.settlePicker;
 const io_sleep = support.io_sleep;
 
-test "run: SPC r c shows output and how it ended; SPC r r remembers its command" {
+test "run: SPC r c shows output and how it ended; SPC r remembers its command" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -50,17 +50,20 @@ test "run: SPC r c shows output and how it ended; SPC r r remembers its command"
     settlePicker(&ed);
     try testing.expectEqual(.runner, ed.picker.?.kind);
     try testing.expectEqual(0, ed.picker.?.rowCount());
+    try testing.expectEqual(Mode.picker, ed.mode); // none yet: typing one
+    try ed.feed("<Esc><CR>"); // Enter with nothing to run: typing one again
+    try testing.expectEqual(Mode.picker, ed.mode);
     try ed.feed("echo runner<CR>");
     waitForRun(&ed);
     try testing.expectEqual(0, ed.run.?.exit_code);
-    try ed.feed("q<cmd:run_runner>echo second<CR>");
+    try ed.feed("q<cmd:run_runner>iecho second<CR>"); // (on the list now: i types)
     waitForRun(&ed);
     try ed.feed("q<cmd:run_runner>");
     settlePicker(&ed);
     try testing.expectEqualStrings("echo second", ed.picker.?.itemAt(0).?.text); // newest first
     try testing.expectEqualStrings("echo runner", ed.picker.?.itemAt(1).?.text);
     // Typing filters the history; the typed text itself stays the first row.
-    try ed.feed("run");
+    try ed.feed("irun");
     settlePicker(&ed);
     try testing.expectEqual(0, ed.picker.?.createRow().?);
     try testing.expectEqualStrings("echo runner", ed.picker.?.itemAt(1).?.text);
@@ -68,8 +71,9 @@ test "run: SPC r c shows output and how it ended; SPC r r remembers its command"
     try testing.expectEqualStrings("echo runner", ed.run_command.?);
     waitForRun(&ed);
     // It is the newest now; x forgets one.
-    try ed.feed("q<cmd:run_runner><Esc>");
+    try ed.feed("q<cmd:run_runner>"); // on the list (normal mode) when it has commands
     settlePicker(&ed);
+    try testing.expectEqual(Mode.picker_normal, ed.mode);
     try testing.expectEqualStrings("echo runner", ed.picker.?.itemAt(0).?.text);
     try ed.feed("jx");
     settlePicker(&ed);
@@ -82,6 +86,164 @@ test "run: SPC r c shows output and how it ended; SPC r r remembers its command"
     try testing.expectEqual(0, ed.run.?.exit_code);
     try ed.feed("q<cmd:run_output>"); // the output comes back
     try testing.expectEqual(.run, ed.popup.?);
+    // SPC r r: the runner, on the last command, and r runs it.
+    try ed.feed("q");
+    const before = ed.run.?;
+    try ed.feed("<Space>rr");
+    try testing.expectEqual(null, ed.picker);
+    try testing.expect(ed.run.? != before); // a new run
+    try testing.expectEqualStrings("echo runner", ed.run_command.?);
+    waitForRun(&ed);
+    // SPC r .: the last command, whatever row is selected.
+    try ed.feed("q<cmd:run_runner>iecho other<CR>");
+    waitForRun(&ed);
+    try ed.feed("q<Space>r");
+    settlePicker(&ed);
+    try ed.feed("j."); // on the older row, still the last command
+    try testing.expectEqual(null, ed.picker);
+    try testing.expectEqualStrings("echo other", ed.run_command.?);
+    waitForRun(&ed);
+}
+
+test "runner: s / Ctrl-s runs with the shell under the output; Ctrl-\\ swaps the keys; a plain run is alone again" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.run_memory_path = try std.fs.path.join(gpa, &.{ dir, "run-commands" });
+
+    // Typed, then Ctrl-s: the server runs, the shell under it has the keys.
+    try ed.feed("<cmd:run_runner>");
+    settlePicker(&ed);
+    try ed.feed("sleep 30; true<C-s>"); // (`; true`: sleep is a child of the shell)
+    try testing.expectEqual(null, ed.picker);
+    try testing.expectEqual(.run, ed.popup.?);
+    try testing.expectEqualStrings("sleep 30; true", ed.run_command.?);
+    try testing.expect(run_popup.splitShown(&ed));
+    try testing.expectEqual(ed.shell.?, run_popup.keyTerminal(&ed).?);
+    // Both are drawn: the run above, the shell's header between them.
+    {
+        const render = @import("../ui/render.zig");
+        const Grid = @import("../tui/Grid.zig");
+        const gfx = @import("../ui/gfx.zig");
+        var grid: Grid = .{};
+        defer grid.deinit(gpa);
+        try grid.resize(gpa, 80, 30);
+        gfx.grid = &grid;
+        defer gfx.grid = null;
+        var font = @import("../ui/Font.zig").cells();
+        const theme = @import("../ui/Theme.zig").get(ed.theme_index);
+        render.draw(&ed, &font, theme, render.prepare(&ed, &font, 80 * Grid.cell_w, 30 * Grid.cell_h));
+        try testing.expect(ed.run.?.rows + ed.shell.?.rows + 1 == ed.term_size.rows);
+        var found = false;
+        for (0..grid.rows) |r| {
+            var line: [80]u8 = undefined;
+            for (0..grid.cols) |c| line[c] = std.math.cast(u8, grid.cells[r * grid.cols + c].cp) orelse '?';
+            if (std.mem.indexOf(u8, &line, "Terminal") != null and std.mem.indexOf(u8, &line, "the other") != null) found = true;
+        }
+        try testing.expect(found);
+    }
+    // Ctrl-\ gives the keys to the run, and back.
+    try ed.feed("<C-\\>");
+    try testing.expectEqual(ed.run.?, run_popup.keyTerminal(&ed).?);
+    try ed.feed("<C-\\>");
+    try testing.expectEqual(ed.shell.?, run_popup.keyTerminal(&ed).?);
+    // Typing goes to the shell: `exit` leaves it, and that ends the run
+    // too, all of it (the sleep under its shell), and closes their popup.
+    const shell = ed.shell.?;
+    const run = ed.run.?;
+    try ed.feed("exit<CR>");
+    while (shell.isRunning()) std.Thread.yield() catch {};
+    try testing.expect(run.isRunning());
+    ed.tick();
+    try testing.expectEqual(null, ed.shell);
+    try testing.expectEqual(null, ed.popup);
+    var waited: usize = 0;
+    while (run.isRunning() and waited < 500) : (waited += 1) io_sleep(10);
+    try testing.expect(!run.isRunning()); // (not 30 seconds)
+    ed.tick();
+    try testing.expect(std.mem.indexOf(u8, ed.message.text(), "stopped with its terminal") != null);
+    try testing.expectEqual(.info, ed.message.kind);
+    // Again: with its terminal again.
+    try ed.feed("<cmd:run_again>");
+    try testing.expect(run_popup.splitShown(&ed));
+    try ed.feed("<C-\\><C-c>"); // (to the run: stopped by hand, the shell stays)
+    waited = 0;
+    while (ed.run.?.isRunning() and waited < 500) : (waited += 1) io_sleep(10);
+    try testing.expect(!ed.run.?.isRunning());
+    ed.tick();
+    try testing.expect(ed.shell != null);
+    try ed.feed("<Esc><Esc>");
+
+    // A plain run from the runner: no shell under it.
+    try ed.feed("<cmd:run_runner>");
+    settlePicker(&ed);
+    try ed.feed("iecho plain<CR>"); // (on the list: i types a new one)
+    try testing.expectEqualStrings("echo plain", ed.run_command.?);
+    try testing.expect(!ed.run_split);
+}
+
+test "runner: a run with a terminal that fails closes the terminal; the error keeps the popup, r brings both back" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    var ed = try testEditor("");
+    defer ed.deinit();
+    ed.run_memory_path = try std.fs.path.join(gpa, &.{ dir, "run-commands" });
+
+    try ed.feed("<cmd:run_runner>");
+    settlePicker(&ed);
+    try ed.feed("sleep 0.2; exit 3<C-s>");
+    try testing.expect(run_popup.splitShown(&ed));
+    var waited: usize = 0;
+    while (ed.run.?.isRunning() and waited < 500) : (waited += 1) io_sleep(10);
+    try testing.expect(!ed.run.?.isRunning());
+    ed.tick();
+    try testing.expectEqual(null, ed.shell);
+    try testing.expectEqual(.run, ed.popup.?);
+    try testing.expect(!run_popup.splitShown(&ed));
+    try testing.expectEqual(ed.run.?, run_popup.keyTerminal(&ed).?);
+    try testing.expectEqual(.err, ed.message.kind);
+    // Again: with its terminal again.
+    try ed.feed("<cmd:run_again>");
+    try testing.expect(run_popup.splitShown(&ed));
+}
+
+/// How many processes run exactly `cmdline` (by pgrep).
+fn countProcesses(cmdline: []const u8) !usize {
+    const gpa = testing.allocator;
+    const pattern = try std.fmt.allocPrint(gpa, "^{s}$", .{cmdline});
+    defer gpa.free(pattern);
+    const r = try std.process.run(gpa, testing.io, .{ .argv = &.{ "pgrep", "-f", pattern } });
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    return std.mem.count(u8, r.stdout, "\n");
+}
+
+test "a rerun ends the old run first, all of it (a server still running would hold its port)" {
+    var ed = try testEditor("");
+    defer ed.deinit();
+    // It says "clash" if it starts while an earlier one is still running
+    // (as a server would fail to bind); `; true` keeps sleep the shell's
+    // child, as `zig build-exe x.zig && ./x`'s server.
+    const cmd = "if pgrep -f '^sleep 77123$' >/dev/null; then echo clash; else echo alone; fi; sleep 77123; true";
+    try run_popup.startRun(&ed, cmd);
+    var waited: usize = 0;
+    while (try countProcesses("sleep 77123") == 0 and waited < 300) : (waited += 1) io_sleep(10);
+    try run_popup.rerun(&ed);
+    waited = 0;
+    while (try countProcesses("sleep 77123") == 0 and waited < 300) : (waited += 1) io_sleep(10);
+    const out = try ed.run.?.screenText(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "alone") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "clash") == null);
+    try testing.expectEqual(1, try countProcesses("sleep 77123"));
+    ed.popup = null;
 }
 
 test "terminal popup: keys go to the shell, Ctrl-\\ hides it and keeps it running" {
@@ -303,17 +465,16 @@ test "quickfix: without a run it is the project's live errors; a run's list take
     try testing.expectEqual(10, ed.cursorLine());
 }
 
-test "SPC ; runs a one-off shell command: empty prompt, survives being cleared, leaves the runner alone" {
+test "SPC ; runs a one-off shell command in the vim command editor, leaving the runner alone" {
     var ed = try testEditor("");
     defer ed.deinit();
     ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");
     try ed.feed("<Space>;");
-    try testing.expectEqual(PromptKind.run_command, ed.search_prompt.?.kind);
-    try testing.expectEqualStrings("", ed.search_prompt.?.input.items());
-    // Typing, deleting it all, and one more <BS>: still open.
-    try ed.feed("ab<BS><BS><BS><BS>");
-    try testing.expect(ed.search_prompt != null);
-    try ed.feed("echo once<CR>");
+    try testing.expect(ed.cmd_float != null); // the command editor, empty, typing
+    try testing.expectEqual(Mode.insert, ed.mode);
+    try expectText(&ed, "");
+    try ed.feed("echo oncx<BS>e<Esc><CR>"); // vim's keys; Enter in normal mode runs it
+    try testing.expectEqual(null, ed.cmd_float);
     waitForRun(&ed);
     try testing.expectEqualStrings("echo once", ed.run_command.?);
     try ed.feed("q");
@@ -322,9 +483,6 @@ test "SPC ; runs a one-off shell command: empty prompt, survives being cleared, 
     settlePicker(&ed);
     try testing.expectEqual(0, ed.picker.?.rowCount());
     try ed.feed("<Esc><Esc>");
-    // The search prompt still closes on <BS> when empty.
-    try ed.feed("/<BS>");
-    try testing.expectEqual(null, ed.search_prompt);
 }
 
 test "commands run in the folder of the code you are in" {
@@ -405,7 +563,7 @@ test "commands run in the folder of the code you are in" {
     try ed.feed("<Esc><Esc>");
     try ed.openFile(loose);
     // And that is where the command really runs.
-    try ed.feed("<Space>;pwd<CR>");
+    try ed.feed("<Space>;pwd<Esc><CR>");
     waitForRun(&ed);
     const out = try ed.run.?.screenText(gpa);
     defer gpa.free(out);
@@ -414,7 +572,7 @@ test "commands run in the folder of the code you are in" {
     try ed.feed("q");
 }
 
-test "runner: e / Ctrl-e pulls a previous command into the query to append to or cut down" {
+test "runner: e / Ctrl-e edits the command in the vim command editor (the one selected, or the one typed)" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -430,27 +588,27 @@ test "runner: e / Ctrl-e pulls a previous command into the query to append to or
     try ed.feed("q<cmd:run_runner>");
     settlePicker(&ed);
     try testing.expectEqualStrings("echo hello", ed.picker.?.itemAt(0).?.text);
-    try ed.feed("<Esc>e"); // from the list: into the query, typing again
-    try testing.expectEqual(Mode.picker, ed.mode);
-    try testing.expectEqualStrings("echo hello", ed.picker.?.query.items());
-    try ed.feed(" world<CR>"); // appended
+    try ed.feed("e"); // from the list: in the vim editor, normal mode
+    try testing.expectEqual(null, ed.picker);
+    try testing.expect(ed.cmd_float != null);
+    try testing.expectEqual(Mode.normal, ed.mode);
+    try expectText(&ed, "echo hello");
+    try ed.feed("A world<Esc><CR>"); // appended; Enter runs it
     waitForRun(&ed);
     try testing.expectEqualStrings("echo hello world", ed.run_command.?);
-    // Newest first now; Tab, cut the " world" off again, and Enter runs
-    // what is left, which is the older command.
+    // Remembered: newest first now.
     try ed.feed("q<cmd:run_runner>");
     settlePicker(&ed);
     try testing.expectEqualStrings("echo hello world", ed.picker.?.itemAt(0).?.text);
-    try ed.feed("<C-e><BS><BS><BS><BS><BS><BS><CR>"); // six: " world"
+    // Ctrl-e while typing a new one: what's typed so far goes there.
+    try ed.feed("iecho ty<C-e>");
+    try expectText(&ed, "echo ty");
+    try ed.feed("Aped<Esc><CR>");
     waitForRun(&ed);
-    try testing.expectEqualStrings("echo hello", ed.run_command.?);
-    // Cut down to something new: it runs as typed, not as the entry it resembles.
-    try ed.feed("q<cmd:run_runner><C-e><BS><BS>xy<CR>");
-    waitForRun(&ed);
-    try testing.expectEqualStrings("echo helxy", ed.run_command.?);
+    try testing.expectEqualStrings("echo typed", ed.run_command.?);
 }
 
-test "the runner: c changes a command in the vim command editor; Enter runs it" {
+test "the command editor: vim keys change the command; Enter runs it" {
     var ed = try testEditor("");
     defer ed.deinit();
     ed.run_memory_path = try testing.allocator.dupe(u8, "/nonexistent/run-commands");

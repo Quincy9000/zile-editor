@@ -336,7 +336,9 @@ pub const WorkspaceSymbol = struct {
 
 /// `run`: it runs. `runner`: it runs as a runner command (remembered).
 /// `debug`: it runs under gdb, and is what its runner command debugs as.
-pub const CommandPurpose = enum { run, runner, debug, claude, claude_inline };
+/// `prompt`: a boxed prompt's answer (a file's new name, a commit
+/// message), the prompt parked in `cmd_prompt` meanwhile.
+pub const CommandPurpose = enum { run, runner, debug, claude, claude_inline, prompt };
 
 /// A quickfix entry: a place (0-based line/col) and what's there.
 pub const QuickfixItem = struct {
@@ -499,8 +501,6 @@ pub const PromptKind = enum {
     save_as,
     rename_file,
     copy_file,
-    /// `SPC ;`: any one-off shell command.
-    run_command,
     /// The file browser's own operations (`o` `n` `r` `m` in its list): a
     /// name for a new folder or file, a new name, a new place.
     browse_new_folder,
@@ -532,7 +532,6 @@ pub const PromptKind = enum {
             .save_as => "Save as",
             .rename_file => "Rename / move file to",
             .copy_file => "Copy file to",
-            .run_command => "Run command",
             .browse_new_folder => "New folder (name)",
             .browse_new_file => "New file (name)",
             .browse_rename => "Rename to",
@@ -705,6 +704,15 @@ run_root_owned: ?[]u8 = null,
 run_reported: bool = true,
 /// The last run was under the debugger (`r` in its popup debugs it again).
 run_debug: bool = false,
+/// The last run was started with a terminal (the runner's `s`): its popup
+/// shows the shell under its output, to try it (curl a server) while it
+/// runs. Again (`r`, `.`) keeps it; a plain run from the runner doesn't.
+run_split: bool = false,
+/// In that popup the keys go to the shell (else to the run); Ctrl-\ swaps.
+split_keys_shell: bool = true,
+/// The run was ended by leaving its terminal (reported as that, not as a
+/// failure).
+run_stopped: bool = false,
 /// Debugging: the session, breakpoints, what to debug (debugging.zig).
 dbg: debugging.State = .{},
 /// The quickfix list (`]q` / `[q`, `SPC f q`): places to step through,
@@ -720,7 +728,7 @@ quickfix_index: ?usize = null,
 quickfix_origin: enum { none, live, run, picked } = .none,
 /// Stands in for the language servers' diagnostics (tests).
 live_errors_override: ?[]const QuickfixItem = null,
-/// Errors found in the last run's output (`SPC r e`).
+/// Errors found in the last run's output (`E` in the runner).
 run_errors: std.ArrayList(run_errors_mod.Error) = .empty,
 /// The command editor (`SPC r c`): a small floating window with its own
 /// scratch buffer, focused while open. Full vim editing works in it.
@@ -865,6 +873,9 @@ queue: std.ArrayList(KeyEvent) = .empty,
 
 /// The `/` or `?` prompt while it is open.
 search_prompt: ?SearchPrompt = null,
+/// A boxed prompt answered in the command editor (a vim window): parked
+/// here while it's open; Enter puts the text back and answers it.
+cmd_prompt: ?SearchPrompt = null,
 /// Find and replace across the project (`SPC c`; `<C-r>` in the grep
 /// picker), while its form is open.
 replace: ?*Replace = null,
@@ -1047,6 +1058,9 @@ showcmd_len: usize = 0,
 /// them). Replayed keys (macros, `.`) aren't pressed, so not in it.
 recent_keys: [5]KeyEvent = undefined,
 recent_len: usize = 0,
+/// Set by a jump (or a search) at the place it leaves: the next scroll
+/// puts the cursor's line in the middle of the view if it moved.
+center_from: ?struct { buffer: *Buffer, line: usize } = null,
 
 message: Message = .{},
 should_quit: bool = false,
@@ -1174,6 +1188,7 @@ pub fn deinit(ed: *Editor) void {
         k.deinit(ed.gpa);
     }
     if (ed.search_prompt) |*sp| sp.input.deinit(ed.gpa);
+    if (ed.cmd_prompt) |*sp| sp.input.deinit(ed.gpa);
     if (ed.replace) |r| r.destroy();
     ed.grow_stack.deinit(ed.gpa);
     ed.format_missing_told.deinit(ed.gpa);
@@ -1262,6 +1277,8 @@ pub fn unpeekWindow(ed: *Editor, p: Peek) void {
 /// picks up picker results from the worker.
 pub fn tick(ed: *Editor) void {
     ed.now = Io.Timestamp.now(ed.io, .awake);
+    // A boxed prompt opened other than by a key (the mouse): a vim window.
+    prompts.promptToEditor(ed) catch {};
     state_files.keepUndoHistories(ed);
     state_files.tickZigChecks(ed);
     file_ops.tickSaveChain(ed);
@@ -1323,6 +1340,13 @@ pub fn text(ed: *Editor) *Text {
 
 pub fn handleKey(ed: *Editor, ev: KeyEvent) void {
     ed.rememberKey(ev);
+    ed.routeKey(ev);
+    // A boxed prompt the key opened (wherever it went: the scratch pads,
+    // a picker) is answered in a vim window, before the next key.
+    prompts.promptToEditor(ed) catch {};
+}
+
+fn routeKey(ed: *Editor, ev: KeyEvent) void {
     if (color_wheel.colorKey(ed, ev)) return;
     if (run_popup.popupKey(ed, ev)) return;
     if (sql_ops.gridKey(ed, ev)) return;
@@ -1365,6 +1389,7 @@ pub fn feed(ed: *Editor, notation: []const u8) keys.ParseError!void {
             const close = std.mem.indexOfScalarPos(u8, notation, i, '>') orelse return error.InvalidNotation;
             const cmd = commands.find(notation[i + 5 .. close]) orelse return error.InvalidNotation;
             ed.runCommand(cmd) catch {};
+            prompts.promptToEditor(ed) catch {};
             // As a key would end: the undo step closes, the view follows.
             ed.afterKey();
             ed.scrollToCursor();
@@ -1439,6 +1464,8 @@ pub fn processKey(ed: *Editor, ev: KeyEvent) void {
     if (multi) multicursor.multiAfterKey(ed);
     // (After the other cursors had the key too: they are matches until then.)
     if (ed.mode != .visual) ed.matches_selected = false;
+    // A boxed prompt it opened is answered in a vim window.
+    prompts.promptToEditor(ed) catch {};
     ed.afterKey();
     // Autosave: what was just typed is written when insert mode is left
     // (after the undo step is closed, so the file isn't "modified" still).
@@ -1595,7 +1622,10 @@ pub fn handleKeyInner(ed: *Editor, ev: KeyEvent) !void {
                 return ed.setMessage(.info, "close the command editor first (<Esc> in normal mode)", .{});
             }
             // Leader menus, undo, `.` and the like act once, not per cursor.
-            if (cmd.jump and !ed.replaying and (ed.mode == .normal or ed.mode == .visual)) jumplist.pushJump(ed);
+            if (cmd.jump and !ed.replaying and (ed.mode == .normal or ed.mode == .visual)) {
+                jumplist.pushJump(ed);
+                if (cmd.in_view) ed.center_from = null;
+            }
             if (cmd.once or (seq[0].key == .codepoint and seq[0].key.codepoint == ' ')) ed.multi_once = true;
             ed.pending_len = 0;
             ed.count = 0;
@@ -1814,7 +1844,13 @@ pub fn scrollToCursor(ed: *Editor) void {
         top.sub = 0;
     } else top.sub = @intCast(@min(top.sub, row_model.subRows(ed, top.line) - 1));
     row_model.setTop(ed, top);
-    if (cur.before(top) or row_model.rowsFrom(ed, top, cur, so) < so) {
+    // After a jump or a search, the line it lands on goes in the middle (not
+    // when it didn't move: a search that found nothing).
+    const center = if (ed.center_from) |from| from.buffer != ed.buffer or from.line != ed.cursorLine() else false;
+    ed.center_from = null;
+    if (center) {
+        row_model.setTop(ed, row_model.stepRows(ed, cur, -@as(isize, @intCast(v.rows / 2))));
+    } else if (cur.before(top) or row_model.rowsFrom(ed, top, cur, so) < so) {
         row_model.setTop(ed, row_model.stepRows(ed, cur, -@as(isize, @intCast(so))));
     } else {
         // Keep `so` rows below the cursor, but only rows that exist: near
@@ -2009,6 +2045,8 @@ pub fn absolutePath(ed: *Editor, path: []const u8) Allocator.Error![]u8 {
 pub fn jumpTo(ed: *Editor, path: []const u8, line: usize, col: usize) !void {
     jumplist.pushJump(ed);
     try ed.moveTo(path, line, col);
+    // (It can come between keys, an answer of the language server's.)
+    ed.scrollToCursor();
 }
 
 /// `jumpTo` without recording a jump.
@@ -2140,7 +2178,7 @@ pub fn openPicker(ed: *Editor, kind: Picker.Kind, query: []const u8) !void {
     ed.picker = try Picker.create(ed, kind, query);
     // The theme picker starts on the theme in use (moving previews).
     if (kind == .themes) ed.picker.?.want_id = @intCast(ed.theme_index);
-    ed.mode = if (@import("picker/sources.zig").startsNormal(kind)) .picker_normal else .picker;
+    ed.mode = if (@import("picker/sources.zig").startsNormal(ed, kind)) .picker_normal else .picker;
 }
 
 // ---------------------------------------------------------------------------

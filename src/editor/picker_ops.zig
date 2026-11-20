@@ -62,6 +62,12 @@ pub fn acceptPickerAs(ed: *Editor, target: OpenTarget) !void {
         if (ed.picker == p) try p.refill();
         return;
     }
+    // Nothing to pick where typed text is a new one (the runner, empty):
+    // Enter starts typing it.
+    if (choice == .none and sources.createFirst(p.kind) and ed.mode == .picker_normal) {
+        ed.mode = .picker;
+        return;
+    }
     const deferred = ed.deferred_target;
     ed.deferred_target = null;
     picker_query.closePicker(ed);
@@ -115,7 +121,7 @@ pub fn runPendingAction(ed: *Editor, i: usize) !void {
         try a.run(ed, item);
         try ed.openPicker(origin, query);
         if (ed.picker) |np| np.selected = 0;
-        if (!sources.startsNormal(origin)) ed.mode = .picker_normal;
+        if (!sources.startsNormal(ed, origin)) ed.mode = .picker_normal;
         return;
     }
     try a.run(ed, item);

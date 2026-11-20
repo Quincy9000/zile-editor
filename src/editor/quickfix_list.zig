@@ -164,10 +164,10 @@ pub fn pickerToQuickfix(ed: *Editor) !void {
     try showQuickfix(ed);
 }
 
-/// `SPC r e` (or `e` in a finished run): the last run's errors in the
+/// `E` in the runner (or `e` in a finished run): the last run's errors in the
 /// quickfix panel.
 pub fn showRunErrors(ed: *Editor) !void {
-    if (ed.run == null) return ed.setMessage(.info, "nothing has been run yet (SPC r r)", .{});
+    if (ed.run == null) return ed.setMessage(.info, "nothing has been run yet (SPC r)", .{});
     if (ed.run_errors.items.len == 0) return ed.setMessage(.info, "no errors in the last run", .{});
     quickfixFromRunErrors(ed);
     try showQuickfix(ed);
@@ -198,8 +198,19 @@ pub fn pollTerminals(ed: *Editor) void {
             if (ok) "32" else "31", if (ok) "✓" else "✗", t.exit_code, secs, errs,
         }) catch "";
         t.print(line);
-        if (n > 0) {
-            ed.setMessage(if (ok) .info else .err, "{s}: exited {d} in {d:.2}s, {d} error{s} (SPC r e lists them)", .{ ed.run_command orelse "", t.exit_code, secs, n, if (n == 1) "" else "s" });
+        // A run with a terminal that failed: the terminal goes, the error
+        // gets the popup (`r` brings both back). Ctrl-c (130) is a stop, not
+        // a failure: the terminal stays.
+        if (!ok and t.exit_code != 130 and !ed.run_stopped and ed.run_split) if (ed.shell) |sh| {
+            sh.destroy();
+            ed.shell = null;
+        };
+        if (ed.run_stopped) {
+            // Ended with its terminal, as asked: not a failure.
+            ed.run_stopped = false;
+            ed.setMessage(.info, "{s}: stopped with its terminal (SPC r o shows the output)", .{ed.run_command orelse ""});
+        } else if (n > 0) {
+            ed.setMessage(if (ok) .info else .err, "{s}: exited {d} in {d:.2}s, {d} error{s} (SPC r E lists them)", .{ ed.run_command orelse "", t.exit_code, secs, n, if (n == 1) "" else "s" });
         } else {
             ed.setMessage(if (ok) .info else .err, "{s}: exited {d} in {d:.2}s (SPC r o shows the output)", .{ ed.run_command orelse "", t.exit_code, secs });
         }
@@ -214,5 +225,14 @@ pub fn pollTerminals(ed: *Editor) void {
         t.destroy();
         ed.shell = null;
         if (ed.popup == .shell) ed.popup = null;
+        // The terminal of a run started with one: leaving it ends the run
+        // too (the server it tried), and their popup goes.
+        if (ed.run_split) {
+            if (ed.run) |r| if (r.isRunning()) {
+                r.stop();
+                ed.run_stopped = true;
+            };
+            if (ed.popup == .run) ed.popup = null;
+        }
     };
 }

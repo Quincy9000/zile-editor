@@ -68,6 +68,47 @@ pub fn startSearch(ed: *Editor, forward: bool, kind: PromptKind) void {
     ed.mode = .search;
 }
 
+/// A boxed prompt (a file's new name, a commit message, the symbol's new
+/// name) is answered in the command editor, a vim window like the runner's:
+/// its text there (normal mode; empty: typing), Enter in normal mode
+/// answers, Esc cancels. Called after a key or a frame, once the prompt is
+/// set up with its text. The replace form keeps its own box (two fields and
+/// a live preview).
+pub fn promptToEditor(ed: *Editor) !void {
+    const sp = ed.search_prompt orelse return;
+    if (ed.mode != .search or !sp.kind.boxed() or sp.kind == .replace or ed.cmd_float != null) return;
+    const text = try ed.gpa.dupe(u8, sp.input.items());
+    defer ed.gpa.free(text);
+    ed.search_prompt = null;
+    ed.cmd_prompt = sp;
+    ed.mode = .normal;
+    run_popup.editCommand(ed, text, .prompt, null) catch |err| {
+        ed.search_prompt = ed.cmd_prompt;
+        ed.cmd_prompt = null;
+        ed.mode = .search;
+        return err;
+    };
+}
+
+/// The parked prompt `sp` answered with `text` (Enter in the command
+/// editor), as if typed into its box.
+pub fn answerParked(ed: *Editor, sp: Editor.SearchPrompt, text: []const u8) !void {
+    var p = sp;
+    try p.input.set(ed.gpa, text);
+    ed.search_prompt = p;
+    ed.mode = .search;
+    try acceptSearch(ed);
+}
+
+/// The parked prompt given up (the command editor closed without Enter).
+pub fn cancelParked(ed: *Editor) void {
+    const sp = ed.cmd_prompt orelse return;
+    ed.cmd_prompt = null;
+    ed.search_prompt = sp;
+    ed.mode = .search;
+    cancelSearch(ed);
+}
+
 /// Opens the rename prompt, prefilled with the identifier under the cursor.
 pub fn startRename(ed: *Editor) !void {
     if (lsp_ops.languageServer(ed) == null) return;
@@ -336,7 +377,6 @@ pub fn acceptSearch(ed: *Editor) !void {
         .git_commit => return git_ops.finishGitCommit(ed),
         .git_remote => return git_ops.finishGitRemote(ed),
         .new_file, .save_as, .rename_file, .copy_file => |k| return file_ops.finishFilePrompt(ed, k),
-        .run_command => |k| return run_popup.finishRunPrompt(ed, k),
         .browse_new_folder, .browse_new_file, .browse_rename, .browse_move => |k| return browser.finishBrowsePrompt(ed, k),
         .select_in => return multicursor.cursorsFromPrompt(ed),
         .replace => return replacing.finishReplace(ed),
