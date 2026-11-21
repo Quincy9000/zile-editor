@@ -113,6 +113,7 @@ The table below is the history of what was built, with its keys in this layout.
 | `Q{reg}` … `Q`, `@{reg}` | record / play a macro (`q` is the multicursor menu) | done |
 | `<C-a>` / `<C-x>` | add / subtract the count (1) on the decimal number under the cursor, else the next one on the line; a `-` before it is its sign, leading zeros keep their width; `.` repeats | done |
 | `<C-o>` / `<C-i>` (`<Tab>`), `SPC f j` | jumplist: back / forward, or pick from a list (newest first, previewed) | done |
+| `;` (`SPC ,`) | the last place you were, and again: back here (`;;` returns, wherever you moved since) | done |
 | `SPC w s` + `h/j/k/l` | split: a new window on that side showing this buffer (focus moves into it) | done |
 | `SPC w h/j/k/l`, `SPC w w` | focus the window on that side; the next window (wrapping) | done |
 | `SPC w d` / `SPC w c`, `SPC w o`, `SPC w =` | close window, close the others, equal sizes | done |

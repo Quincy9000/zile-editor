@@ -66,11 +66,21 @@ pub fn isHere(ed: *Editor, j: Editor.Jump) bool {
     return t.lineOf(@min(j.pos, t.len())) == ed.cursorLine();
 }
 
-/// `` SPC ` ``: back to where the last jump left from, and again: here again
-/// (vim's `''`, across files).
+/// `;` / `SPC ,`: to the last place you were, and again: back here (vim's
+/// `''`, across files). The place left is the newest jump, so the next
+/// press comes back to it, wherever you moved since.
 pub fn jumpToggle(ed: *Editor) !void {
-    if (ed.jump_index + 1 >= ed.jumps.items.len) return jumpOlder(ed, 1);
-    try jumpNewer(ed, 1);
+    pushJump(ed);
+    ed.jump_index = ed.jumps.items.len;
+    var i = ed.jumps.items.len -| 1; // (the place just left)
+    while (i > 0) {
+        i -= 1;
+        if (isHere(ed, ed.jumps.items[i])) continue;
+        try goJump(ed, i);
+        ed.jump_index = ed.jumps.items.len;
+        return;
+    }
+    ed.setMessage(.info, "no jumps yet", .{});
 }
 
 /// `<C-i>` / `<Tab>`: forward to a newer place.

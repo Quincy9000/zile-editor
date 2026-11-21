@@ -266,7 +266,7 @@ const base = [_]Command{
     .{ .name = "git_menu", .doc = "Git menu", .run = openPicker(.git_actions), .needs = "git" },
     .{ .name = "pick_windows", .doc = "Windows (split, close, resize, focus)", .run = openPicker(.windows) },
     .{ .name = "pick_toggles", .doc = "Toggles (every setting, the colour scheme, text size)", .run = openPicker(.toggles) },
-    .{ .name = "jump_toggle", .doc = "Back to the last jump, and again: back here", .run = jumpToggle, .once = true },
+    .{ .name = "jump_toggle", .doc = "The last place you were, and again: back here", .run = jumpToggle, .once = true },
     .{ .name = "leader_menu", .doc = "Leader menu (everything)", .run = openPicker(.leader), .once = true },
     .{ .name = "projects_menu", .doc = "Projects and sessions", .run = openPicker(.leader_projects) },
     .{ .name = "claude_menu", .doc = "AI (Claude, DeepSeek)", .run = openPicker(.leader_claude) },

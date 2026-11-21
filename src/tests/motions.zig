@@ -355,14 +355,48 @@ test "jumplist picker: the place picked sinks to the bottom, the place left is o
     try testing.expectEqual(5, ed.cursorLine());
 }
 
-test "jumplist: ; goes back from a jump, Tab forward again" {
+test "jumplist: ; goes to the last place you were, ;; back where you were (moved by hand or not)" {
     var ed = try testEditor("a\nb\nc\nd\ne\nf");
     defer ed.deinit();
     try ed.feed("jG"); // jumped from line 1 to the last
     try ed.feed(";");
     try testing.expectEqual(1, ed.cursorLine());
-    try ed.feed("<Tab>");
+    try ed.feed(";");
     try testing.expectEqual(5, ed.cursorLine());
+    try ed.feed(";;");
+    try testing.expectEqual(5, ed.cursorLine());
+    // Moved by hand after it: ;; comes back to that spot, not the jump's.
+    try ed.feed(";j");
+    try testing.expectEqual(2, ed.cursorLine());
+    try ed.feed(";");
+    try testing.expectEqual(5, ed.cursorLine());
+    try ed.feed(";");
+    try testing.expectEqual(2, ed.cursorLine());
+    // Two jumps (2 -> 0 -> 5): ; is the last one's start, not the first's.
+    try ed.feed("ggG;");
+    try testing.expectEqual(0, ed.cursorLine());
+    try ed.feed(";");
+    try testing.expectEqual(5, ed.cursorLine());
+    // <C-o> still walks the whole list back.
+    try ed.feed("<C-o><C-o>");
+    try testing.expect(ed.cursorLine() != 5);
+}
+
+test "jumplist: ; flips between files" {
+    var ed = try testEditor("one\ntwo\nthree");
+    defer ed.deinit();
+    const scratch = ed.buffer;
+    try ed.feed("jj");
+    try ed.jumpTo("src/pairs.zig", 0, 0); // (as gd does)
+    try testing.expect(ed.buffer != scratch);
+    const other = ed.buffer;
+    try ed.feed("3j");
+    try ed.feed(";");
+    try testing.expectEqual(scratch, ed.buffer);
+    try testing.expectEqual(2, ed.cursorLine());
+    try ed.feed(";");
+    try testing.expectEqual(other, ed.buffer);
+    try testing.expectEqual(3, ed.cursorLine());
 }
 
 test "jumplist: a place the cursor is already on is passed over" {

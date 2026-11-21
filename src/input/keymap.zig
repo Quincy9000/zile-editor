@@ -407,8 +407,9 @@ const binding_table = [_]struct { []const Mode, []const u8, []const u8 }{
 
     // Leader menus (Doom Emacs layout). The first binding of a command is the
     // one shown next to it in the command picker.
-    // `;`: back from a jump (one key, as often as it's used); Tab forward.
-    .{ N, ";", "jump_older" },
+    // `;`: the last place you were, and again: back (one key, as often as
+    // it's used). <C-o> / Tab walk the whole list.
+    .{ N, ";", "jump_toggle" },
     .{ N, "<C-o>", "jump_older" },
     .{ N, "<C-i>", "jump_newer" },
     .{ N, "<Tab>", "jump_newer" },

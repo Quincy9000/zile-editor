@@ -1,6 +1,6 @@
 .{
     .name = .zile,
-    .version = "0.6.0",
+    .version = "0.7.0",
     .fingerprint = 0x9650de37d0b9eb79,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
