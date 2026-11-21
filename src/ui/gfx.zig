@@ -25,6 +25,13 @@ pub fn rect(x: f32, y: f32, w: f32, h: f32, c: Color) void {
     rl.DrawRectangleRec(.{ .x = x, .y = y, .width = w, .height = h }, c);
 }
 
+/// A box's thin border around `x, y, w, h`: a pixel line in the window; in
+/// a terminal, box-drawing lines in the cells around it, on `fill`.
+pub fn frame(x: f32, y: f32, w: f32, h: f32, c: Color, fill: Color) void {
+    if (grid) |g| return g.frame(x, y, w, h, c, fill);
+    rl.DrawRectangleRec(.{ .x = x - 1, .y = y - 1, .width = w + 2, .height = h + 2 }, c);
+}
+
 /// A wavy underline `w` wide whose bottom is at `bottom` (in a terminal, a
 /// curly one).
 pub fn squiggle(x: f32, bottom: f32, w: f32, c: Color) void {

@@ -310,3 +310,35 @@ test "indent guide: appears once the cursor settles in a scope, hides at once on
     notifications.tickIndentGuide(&ed);
     try testing.expectEqual(6, ed.indent_guide.?.scope.first);
 }
+
+test "TUI: the command editor and the terminal popup are framed with box lines on any size, not a band of cells" {
+    const gpa = testing.allocator;
+    const render = @import("../ui/render.zig");
+    const Grid = @import("../tui/Grid.zig");
+    const gfx = @import("../ui/gfx.zig");
+    const Theme = @import("../ui/Theme.zig");
+    var ed = try testEditor("one\ntwo\n");
+    defer ed.deinit();
+    var font = @import("../ui/Font.zig").cells();
+    const theme = Theme.get(ed.theme_index);
+    const border = theme.popup_border;
+    // (Odd and even sizes: centered, the boxes would sit half a cell off.)
+    for ([_][2]usize{ .{ 80, 30 }, .{ 81, 31 }, .{ 83, 28 } }) |size| for (0..2) |which| {
+        if (which == 0) try ed.feed("<cmd:run_shell>") else try ed.feed("<cmd:terminal_toggle>");
+        var grid: Grid = .{};
+        defer grid.deinit(gpa);
+        try grid.resize(gpa, size[0], size[1]);
+        gfx.grid = &grid;
+        defer gfx.grid = null;
+        const sw: i32 = @intFromFloat(@as(f32, @floatFromInt(size[0])) * Grid.cell_w);
+        const sh: i32 = @intFromFloat(@as(f32, @floatFromInt(size[1])) * Grid.cell_h);
+        render.draw(&ed, &font, theme, render.prepare(&ed, &font, sw, sh));
+        var corners: usize = 0;
+        for (grid.cells) |cell| {
+            if (cell.cp == '╭' or cell.cp == '╮' or cell.cp == '╰' or cell.cp == '╯') corners += 1;
+            try testing.expect(!(cell.bg.r == border.r and cell.bg.g == border.g and cell.bg.b == border.b));
+        }
+        try testing.expectEqual(4, corners);
+        if (which == 0) try ed.feed("<Esc><Esc>") else try ed.feed("<cmd:terminal_toggle>");
+    };
+}

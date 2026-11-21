@@ -247,7 +247,19 @@ fn cmdFloatRect(ed: *Editor, font: *const Font, screen: Layout) Editor.Windows.R
     }
     const w = @max(@min(@floor(screen.width * 0.7 / font.cell_w), 120), 30) * font.cell_w;
     const h = (rows + 1) * font.cell_h; // + the title row
-    return .{ .x = @floor((screen.width - w) / 2), .y = @floor(@max(screen.status_y / 3 - h / 2, font.cell_h)), .w = w, .h = h };
+    return .{
+        .x = onCells(@floor((screen.width - w) / 2), font.cell_w),
+        .y = onCells(@floor(@max(screen.status_y / 3 - h / 2, font.cell_h)), font.cell_h),
+        .w = w,
+        .h = h,
+    };
+}
+
+/// In a terminal, `v` down to a whole cell: a centered box on the grid,
+/// its frame in the cells around it (half a cell off, a pixel border would
+/// fill a whole row or column).
+fn onCells(v: f32, cell: f32) f32 {
+    return if (gfx.grid != null) @floor(v / cell) * cell else v;
 }
 
 /// Where the bottom panels end: above the box to tell Claude something
@@ -310,7 +322,8 @@ fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.
     const claude = ed.cmd_purpose == .claude or rewrite;
     // (The docked box leaves the code as it is.)
     if (!claude) rect(0, 0, screen.width, screen.status_y, theme.backdrop);
-    rect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, theme.popup_border);
+    // (Docked, full width: just the line along its top, in a window.)
+    if (claude) rect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, theme.popup_border) else gfx.frame(r.x, r.y, r.w, r.h, theme.popup_border, theme.bg);
     rect(r.x, r.y, r.w, r.h, theme.bg);
     rect(r.x, r.y, r.w, font.cell_h, theme.status_bg);
     const debug = ed.cmd_purpose == .debug;
@@ -338,7 +351,12 @@ fn drawCmdFloat(ed: *Editor, font: *const Font, theme: *const Theme, f: *Editor.
 fn popupRect(font: *const Font, screen: Layout) Editor.Windows.Rect {
     const w = @max(@floor(screen.width * 0.9 / font.cell_w), 20) * font.cell_w;
     const h = @max(@floor(screen.status_y * 0.85 / font.cell_h), 4) * font.cell_h;
-    return .{ .x = @floor((screen.width - w) / 2), .y = @floor((screen.status_y - h) / 2), .w = w, .h = h };
+    return .{
+        .x = onCells(@floor((screen.width - w) / 2), font.cell_w),
+        .y = onCells(@floor((screen.status_y - h) / 2), font.cell_h),
+        .w = w,
+        .h = h,
+    };
 }
 
 fn rgbColor(c: Editor.Terminal.Rgb) rl.Color {
@@ -352,7 +370,7 @@ fn drawPopup(ed: *Editor, font: *const Font, theme: *const Theme, screen: Layout
     const cw = font.cell_w;
     const ch = font.cell_h;
     rect(0, 0, screen.width, screen.status_y, theme.backdrop);
-    rect(r.x - 1, r.y - 1, r.w + 2, r.h + 2, theme.popup_border);
+    gfx.frame(r.x, r.y, r.w, r.h, theme.popup_border, theme.popup_bg);
     rect(r.x, r.y, r.w, r.h, theme.popup_bg);
 
     // Header: what runs here and how it is going.

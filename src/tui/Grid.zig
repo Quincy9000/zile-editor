@@ -178,6 +178,41 @@ pub fn rect(g: *Grid, x: f32, y: f32, w: f32, h: f32, color: Color) void {
     };
 }
 
+/// A box's border: thin box-drawing lines in the cells around a rectangle
+/// of whole cells (the window draws a pixel line), on `fill`. Off-screen
+/// sides are left out.
+pub fn frame(g: *Grid, x: f32, y: f32, w: f32, h: f32, color: Color, fill: Color) void {
+    const c0 = cellIndex(x + g.off[0], cell_w) - 1;
+    const r0 = cellIndex(y + g.off[1], cell_h) - 1;
+    const c1 = cellIndex(x + w + g.off[0], cell_w);
+    const r1 = cellIndex(y + h + g.off[1], cell_h);
+    if (c1 - c0 < 2 or r1 - r0 < 2) return;
+    var c = c0 + 1;
+    while (c < c1) : (c += 1) {
+        g.frameCell(c, r0, '─', color, fill);
+        g.frameCell(c, r1, '─', color, fill);
+    }
+    var r = r0 + 1;
+    while (r < r1) : (r += 1) {
+        g.frameCell(c0, r, '│', color, fill);
+        g.frameCell(c1, r, '│', color, fill);
+    }
+    g.frameCell(c0, r0, '╭', color, fill);
+    g.frameCell(c1, r0, '╮', color, fill);
+    g.frameCell(c0, r1, '╰', color, fill);
+    g.frameCell(c1, r1, '╯', color, fill);
+}
+
+fn frameCell(g: *Grid, c: isize, r: isize, cp: u21, color: Color, fill: Color) void {
+    if (c < 0 or r < 0 or c >= @as(isize, @intCast(g.cols)) or r >= @as(isize, @intCast(g.rows))) return;
+    const col: usize = @intCast(c);
+    const row: usize = @intCast(r);
+    if (g.cursor) |cur| if (cur.col == col and cur.row == row) {
+        g.cursor = null;
+    };
+    g.cells[row * g.cols + col] = .{ .cp = cp, .fg = color, .bg = fill };
+}
+
 /// A curly underline `w` wide on the row whose bottom is at `bottom`.
 pub fn squiggle(g: *Grid, x: f32, bottom: f32, w: f32, color: Color) void {
     if (w <= 0 or color.a == 0) return;
@@ -275,6 +310,38 @@ test "rectangles, lines and text map onto cells" {
     g.popOffset();
     try std.testing.expectEqual(' ', g.cells[1 * 10 + 1].cp);
     try std.testing.expectEqual(255, g.cells[1 * 10 + 2].bg.r);
+}
+
+test "a frame: box-drawing lines in the cells around a box, the sides off the grid left out" {
+    var g: Grid = .{};
+    defer g.deinit(std.testing.allocator);
+    try g.resize(std.testing.allocator, 6, 5);
+    const black: Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
+    const red: Color = .{ .r = 255, .g = 0, .b = 0, .a = 255 };
+    const blue: Color = .{ .r = 0, .g = 0, .b = 255, .a = 255 };
+    g.clear(black);
+    g.put('x', 10, 20, red);
+    g.frame(20, 40, 20, 20, red, blue); // cells (2,2)-(3,2)
+    const at = struct {
+        fn f(gr: *const Grid, c: usize, r: usize) u21 {
+            return gr.cells[r * gr.cols + c].cp;
+        }
+    }.f;
+    try std.testing.expectEqual('╭', at(&g, 1, 1));
+    try std.testing.expectEqual('─', at(&g, 2, 1));
+    try std.testing.expectEqual('╮', at(&g, 4, 1));
+    try std.testing.expectEqual('│', at(&g, 1, 2));
+    try std.testing.expectEqual('│', at(&g, 4, 2));
+    try std.testing.expectEqual('╰', at(&g, 1, 3));
+    try std.testing.expectEqual('╯', at(&g, 4, 3));
+    try std.testing.expectEqual(' ', at(&g, 2, 2)); // (inside: the box's own)
+    try std.testing.expectEqual(255, g.cells[1 * 6 + 1].bg.b);
+    // At the grid's edge: the left side is off it.
+    g.clear(black);
+    g.frame(0, 20, 30, 20, red, blue);
+    try std.testing.expectEqual('─', at(&g, 0, 0));
+    try std.testing.expectEqual('╮', at(&g, 3, 0));
+    try std.testing.expectEqual(' ', at(&g, 0, 1));
 }
 
 test "a thin line underlines straight; a squiggle curly" {
